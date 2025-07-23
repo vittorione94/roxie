@@ -1,0 +1,14 @@
+# @package _global_
+
+agent:
+  name: "constant"
+
+env:
+  # Default parameters
+  env_name: CartpoleBalance
+  list_envs: false
+
+# Hydra configuration for logging and output directories
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
