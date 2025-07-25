@@ -31,7 +31,10 @@ class DDPG(agent.Agent):
         # Clip the final action to be within the environment's valid bounds
         return jnp.clip(action, self.action_low, self.action_high)
     
-    
+    def update(observations, rewards, resets, terminations, steps):
+        
+
+
     # def save():
     #     _, state = nnx.split(model)
     #     checkpointer = ocp.StandardCheckpointer()
