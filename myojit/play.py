@@ -17,13 +17,11 @@ def main(cfg: DictConfig):
     """
     Launches an interactive MuJoCo viewer with a random policy in a given environment.
     """
-    env_name = cfg.env.env_name
-    print(f"Selected environment: {env_name}")
 
     # 1. Create a JAX random key
     key = jax.random.PRNGKey(seed=0)
     # Load the environment
-    env, env_cfg = load_playground_env(env_name)
+    env, env_cfg = load_playground_env(cfg.env.env_name)
     
     # Get the standard MuJoCo model and data from the MJX-based environment
     model = env.mj_model

@@ -1,7 +1,13 @@
 # @package _global_
 
-agent:
-  name: "constant"
+
+# The defaults list tells Hydra how to build the final config.
+defaults:
+  - agent: normal_random      # Load `ddpg.yaml` from the `agent/` dir into the `agent` key.
+  - model: mlp     # Load `mlp.yaml` from the `model/` dir into the `network` key.
+  - _self_           # Allows this file to add its own values, too.
+
+seed: 0
 
 env:
   # Default parameters
