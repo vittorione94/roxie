@@ -4,7 +4,6 @@ actor:
   _target_: models.actors.DeterministicActor
 
   # --- Required __init__ arguments ---
-  in_features: 8        # Example: Matches environment's observation space shape
   features: [256, 256]  # Defines the two hidden layers
   action_dim: 2         # Example: Matches environment's action space shape
 
@@ -14,10 +13,10 @@ actor:
   # activation_fn can also be specified if you want to override the default
   # activation_fn: "flax.experimental.nnx.gelu"
 
-# critic:
-#   # Path to the Critic class
-#   _target_: models.critics.DeterministicCritic
-#   features: [256, 256]
-#   activation_fn: flax.linen.relu
-#   use_layer_norm: true # Example: Critic uses LayerNorm
-#   dropout_rate: 0.1   # Example: Critic uses Dropout
+critic:
+  # Path to the Critic class
+  _target_: models.critics.DeterministicCritic
+  features: [256, 256]
+  # activation_fn: flax.linen.relu
+  use_layer_norm: true # Example: Critic uses LayerNorm
+  dropout_rate: 0.1   # Example: Critic uses Dropout

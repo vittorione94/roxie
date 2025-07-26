@@ -2,8 +2,7 @@ import os
 import time
 
 import numpy as np
-
-from tonic import logger
+import jax
 
 
 class Trainer:
@@ -25,28 +24,52 @@ class Trainer:
         self.environment = environment
         self.test_environment = test_environment
 
-    def run(self, num_workers):
+    def run(self, NUM_ENVS):
         '''Runs the main training loop.'''
-
+            
         start_time = last_epoch_time = time.time()
 
-        # Start the environments.
-        observations = self.environment.start()
+        # --- Vectorization and JIT Compilation ---
 
-        num_workers = len(observations)
-        scores = np.zeros(num_workers)
-        lengths = np.zeros(num_workers, int)
+        # Create a vectorized version of the environment's reset function.
+        # jax.vmap will map the reset function over the first axis of its input (a batch of keys).
+        v_reset = jax.vmap(self.environment.reset)
+
+        # Create a vectorized version of the step function.
+        # jax.vmap will map over the first axis of both the states and actions.
+        v_step = jax.vmap(self.environment.step)
+
+        # Apply JIT compilation to the vectorized functions for maximum performance.
+        # This compiles the entire batched operation into a single optimized kernel.
+        jit_v_reset = jax.jit(v_reset)
+        jit_v_step = jax.jit(v_step)
+
+        print("Successfully created JIT-compiled, vectorized reset and step functions.")
+
+        # 1. Initialize the environments
+        print("Initializing environments...")
+        # Split the master key to get a unique key for each parallel environment.
+        key = jax.random.PRNGKey(seed=0)
+        key, reset_key = jax.random.split(key)
+        reset_keys = jax.random.split(reset_key, NUM_ENVS)
+        # Call the vectorized reset function to get the initial states for all envs.
+        states = jit_v_reset(reset_keys)
+
+        scores = np.zeros(NUM_ENVS)
+        lengths = np.zeros(NUM_ENVS, int)
         self.steps, epoch_steps, epochs, episodes = 0, 0, 0, 0
         steps_since_save = 0
 
         while True:
             # Select actions.
-            actions = self.agent.step(observations, self.steps)
-            assert not np.isnan(actions.sum())
+            actions = self.agent.step(states.obs, evaluate=False)
+            
+            # TODO use chex
+            #assert not np.isnan(actions.sum())
 
             # Take a step in the environments.
-            observations, infos = self.environment.step(actions)
-            self.agent.update(**infos, steps=self.steps)
+            next_states = jit_v_step(states, actions)
+            self.agent.update(next_states, steps=self.steps)
 
             # scores += infos['rewards']
             # lengths += 1
@@ -76,9 +99,9 @@ class Trainer:
             #     epochs += 1
             #     epoch_steps = 0
 
-            # # End of training.
-            # stop_training = self.steps >= self.max_steps
-
+            # End of training.
+            stop_training = self.steps >= self.max_steps
+            print("setps", self.steps)
             # Save a checkpoint.
             # if stop_training or steps_since_save >= self.save_steps:
             #     path = os.path.join(logger.get_path(), 'checkpoints')
@@ -94,36 +117,36 @@ class Trainer:
             if stop_training:
                 break
 
-    def _test(self):
-        '''Tests the agent on the test environment.'''
+    # def _test(self):
+    #     '''Tests the agent on the test environment.'''
 
-        # Start the environment.
-        if not hasattr(self, 'test_observations'):
-            self.test_observations = self.test_environment.start()
-            assert len(self.test_observations) == 1
+    #     # Start the environment.
+    #     if not hasattr(self, 'test_observations'):
+    #         self.test_observations = self.test_environment.start()
+    #         assert len(self.test_observations) == 1
 
-        # Test loop.
-        for _ in range(self.test_episodes):
-            score, length = 0, 0
+    #     # Test loop.
+    #     for _ in range(self.test_episodes):
+    #         score, length = 0, 0
 
-            while True:
-                # Select an action.
-                actions = self.agent.test_step(
-                    self.test_observations, self.steps)
-                assert not np.isnan(actions.sum())
-                logger.store('test/action', actions, stats=True)
+    #         while True:
+    #             # Select an action.
+    #             actions = self.agent.test_step(
+    #                 self.test_observations, self.steps)
+    #             assert not np.isnan(actions.sum())
+    #             logger.store('test/action', actions, stats=True)
 
-                # Take a step in the environment.
-                self.test_observations, infos = self.test_environment.step(
-                    actions)
-                self.agent.test_update(**infos, steps=self.steps)
+    #             # Take a step in the environment.
+    #             self.test_observations, infos = self.test_environment.step(
+    #                 actions)
+    #             self.agent.test_update(**infos, steps=self.steps)
 
-                score += infos['rewards'][0]
-                length += 1
+    #             score += infos['rewards'][0]
+    #             length += 1
 
-                if infos['resets'][0]:
-                    break
+    #             if infos['resets'][0]:
+    #                 break
 
-            # Log the data.
-            logger.store('test/episode_score', score, stats=True)
-            logger.store('test/episode_length', length, stats=True)
+    #         # Log the data.
+    #         logger.store('test/episode_score', score, stats=True)
+    #         logger.store('test/episode_length', length, stats=True)

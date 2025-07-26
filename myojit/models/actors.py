@@ -1,4 +1,4 @@
-from typing import Sequence, Callable
+from typing import Sequence, Callable, Optional
 from flax.experimental import nnx
 import jax.numpy as jnp
 

@@ -1,6 +1,7 @@
 from myojit.agents import agent
 import jax
 import jax.numpy as jnp
+import functools
 
 class DDPG(agent.Agent):
     def __init__(self, actor, critic, replay, exploration=None, actor_updater=None,
@@ -12,12 +13,12 @@ class DDPG(agent.Agent):
         self.action_high = 1
         
 
-    @jax.jit
     def step(self, state: jnp.ndarray, evaluate: bool = False) -> jnp.ndarray:
         """Selects an action, adding noise for exploration if not in evaluation mode."""
         
         # Get the deterministic action from the actor network
-        action = self.actor(state)
+        # When training, we need to pass the RNG key for dropout
+        action = self.actor(state, training=not evaluate)
         
         # Use jax.lax.cond for conditional logic inside a JIT-compiled function
         # action = jax.lax.cond(
@@ -31,9 +32,9 @@ class DDPG(agent.Agent):
         # Clip the final action to be within the environment's valid bounds
         return jnp.clip(action, self.action_low, self.action_high)
     
-    def update(observations, rewards, resets, terminations, steps):
-        
+    def update(self, states, steps):
 
+        return
 
     # def save():
     #     _, state = nnx.split(model)

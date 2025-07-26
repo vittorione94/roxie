@@ -153,7 +153,7 @@ for i in range(EPISODE_LENGTH):
     
     # Step all environments in parallel.
     next_states = jit_v_step(states, actions)
-    
+    print("next_states.shape", next_states.obs.shape) # 4060 x 5
     # Create a transition object from the collected data.
     transition = Transition(
         observation=current_obs,

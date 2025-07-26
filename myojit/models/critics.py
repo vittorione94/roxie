@@ -3,12 +3,20 @@ from typing import Sequence, Callable
 import jax.numpy as jnp
 
 class DeterministicCritic(nnx.Module):
-    features: Sequence[int]
-    activation_fn: Callable = nnx.relu
-    use_layer_norm: bool = False
-    dropout_rate: float = 0.0
+    
+    def __init__(
+        self,
+        in_features: int,
+        features: Sequence[int],
+        *,  # Make rngs a keyword-only argument
+        rngs: nnx.Rngs,
+        activation_fn: Callable = nnx.relu,
+        use_layer_norm: bool = False,
+        dropout_rate: float = 0.0,
+    ):
+        return
+    
 
-    @nnx.compact
     def __call__(self, state: jnp.ndarray, action: jnp.ndarray, training: bool) -> jnp.ndarray:
         # Concatenate state and action
         x = jnp.concatenate([state, action], axis=-1)
