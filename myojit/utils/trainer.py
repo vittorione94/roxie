@@ -3,13 +3,14 @@ import time
 
 import numpy as np
 import jax
-
+from myojit.utils import logger
+import jax.numpy as jnp
 
 class Trainer:
     '''Trainer used to train and evaluate an agent on an environment.'''
 
     def __init__(
-        self, steps=int(1e7), epoch_steps=int(2e4), save_steps=int(5e5),
+        self, steps=int(1e7), epoch_steps=int(2e4), save_steps=int(1e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,
     ):
         self.max_steps = steps
@@ -24,7 +25,7 @@ class Trainer:
         self.environment = environment
         self.test_environment = test_environment
 
-    def run(self, NUM_ENVS):
+    def run(self, NUM_ENVS, rngs):
         '''Runs the main training loop.'''
             
         start_time = last_epoch_time = time.time()
@@ -49,45 +50,51 @@ class Trainer:
         # 1. Initialize the environments
         print("Initializing environments...")
         # Split the master key to get a unique key for each parallel environment.
-        key = jax.random.PRNGKey(seed=0)
-        key, reset_key = jax.random.split(key)
-        reset_keys = jax.random.split(reset_key, NUM_ENVS)
+        
+        reset_keys = jax.random.split(rngs.envs(), NUM_ENVS)
         # Call the vectorized reset function to get the initial states for all envs.
         states = jit_v_reset(reset_keys)
 
-        scores = np.zeros(NUM_ENVS)
-        lengths = np.zeros(NUM_ENVS, int)
+        scores = jnp.zeros(NUM_ENVS)
+        lengths = jnp.zeros(NUM_ENVS, int)
         self.steps, epoch_steps, epochs, episodes = 0, 0, 0, 0
         steps_since_save = 0
-
+        
+        action_key, update_key = jax.random.split(rngs.agent(), 2)
         while True:
+
             # Select actions.
-            actions = self.agent.step(states.obs, evaluate=False)
+            # Pass a key for exploration noise.
+            actions = self.agent.step(states.obs, evaluate=False, key=action_key)
             
             # TODO use chex
             #assert not np.isnan(actions.sum())
 
             # Take a step in the environments.
             next_states = jit_v_step(states, actions)
-            self.agent.update(next_states, steps=self.steps)
+            new_buffer_state = self.agent.update(states, next_states, steps=self.steps, key=update_key)
 
-            # scores += infos['rewards']
-            # lengths += 1
-            # self.steps += num_workers
-            # epoch_steps += num_workers
-            # steps_since_save += num_workers
+            scores += next_states.reward
+            lengths += 1
+            self.steps += NUM_ENVS
+            epoch_steps += NUM_ENVS
+            steps_since_save += NUM_ENVS
 
-            # # Show the progress bar.
-            # if self.show_progress:
-            #     logger.show_progress(
-            #         self.steps, self.epoch_steps, self.max_steps)
+            # Show the progress bar.
+            if self.show_progress:
+                logger.show_progress(
+                    self.steps, self.epoch_steps, self.max_steps)
+            
+            # Check the finished episodes.
+            # Where next_states.done is True, set scores and lengths to 0.
+            # Otherwise, keep their original values.
+            scores = jnp.where(next_states.done, 0, scores)
+            lengths = jnp.where(next_states.done, 0, lengths)
+            
+            # Count the number of completed episodes by summing the boolean 'done' array
+            # (where True=1, False=0) and add it to the total count.
+            episodes = episodes + jnp.sum(next_states.done)
 
-            # # Check the finished episodes.
-            # for i in range(num_workers):
-            #     if infos['resets'][i]:
-            #         scores[i] = 0
-            #         lengths[i] = 0
-            #         episodes += 1
 
             # # End of the epoch.
             # if epoch_steps >= self.epoch_steps:
@@ -101,18 +108,17 @@ class Trainer:
 
             # End of training.
             stop_training = self.steps >= self.max_steps
-            print("setps", self.steps)
             # Save a checkpoint.
-            # if stop_training or steps_since_save >= self.save_steps:
-            #     path = os.path.join(logger.get_path(), 'checkpoints')
-            #     if os.path.isdir(path) and self.replace_checkpoint:
-            #         for file in os.listdir(path):
-            #             if file.startswith('step_'):
-            #                 os.remove(os.path.join(path, file))
-            #     checkpoint_name = f'step_{self.steps}'
-            #     save_path = os.path.join(path, checkpoint_name)
-            #     self.agent.save(save_path)
-            #     steps_since_save = self.steps % self.save_steps
+            if stop_training or steps_since_save >= self.save_steps:
+                path = os.path.join(logger.get_path(), 'checkpoints')
+                if os.path.isdir(path) and self.replace_checkpoint:
+                    for file in os.listdir(path):
+                        if file.startswith('step_'):
+                            os.remove(os.path.join(path, file))
+                checkpoint_name = f'step_{self.steps}'
+                save_path = os.path.join(path, checkpoint_name)
+                self.agent.save(save_path)
+                steps_since_save = self.steps % self.save_steps
 
             if stop_training:
                 break

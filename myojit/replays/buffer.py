@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import flax.struct as struct
 from typing import Dict
 import functools
+from typing import Dict, Any
 
 # A PyTree representing a single data transition (s, a, r, s', d).
 # This structure is JAX-native and can be passed into JIT-compiled functions.
@@ -28,7 +29,7 @@ class BufferState:
 class JaxReplayBuffer:
     """A JAX-native, GPU-optimized replay buffer."""
 
-    def __init__(self, capacity: int, batch_size: int):
+    def __init__(self, capacity: int, batch_size: int, batch_iterations: int, steps_before_batches: int, steps_between_batches: int):
         """
         Initializes the replay buffer with a fixed capacity.
         Note: This class is stateless. It only holds static configuration.
@@ -63,30 +64,34 @@ class JaxReplayBuffer:
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def add(self, state: BufferState, transition: Transition) -> BufferState:
+    def add_batch(self, state: BufferState, 
+                  experiences: Transition) -> BufferState:
         """
-        Adds a new transition to the buffer. This is a pure function.
+        Adds a batch of new experiences (a PyTree) to the buffer.
 
         Args:
             state: The current BufferState.
-            transition: The new Transition to add.
+            experiences: A PyTree of experiences to add. Each leaf must have a
+                         leading batch dimension and match the structure of the
+                         prototype used in `init`.
 
         Returns:
-            A new BufferState with the transition added.
+            A new BufferState with the batch of experiences added.
         """
-        # Use the `.at.set()` syntax for a functional update. This is the
-        # recommended JAX approach for updating array elements.
+
+        # The logic is generic and works on any PyTree structure.
+        batch_size = jax.tree_util.tree_leaves(experiences)[0].shape[0]
+        indices = (jnp.arange(batch_size) + state.pointer) % self.capacity
+
         updated_data = jax.tree_util.tree_map(
-            lambda buffer_leaf, transition_leaf: buffer_leaf.at[state.pointer].set(transition_leaf),
+            lambda buffer_leaf, experience_batch: buffer_leaf.at[indices].set(experience_batch),
             state.data,
-            transition
+            experiences
         )
 
-        # Increment pointer and size, wrapping around when capacity is reached.
-        new_pointer = (state.pointer + 1) % self.capacity
-        new_size = jnp.minimum(state.size + 1, self.capacity)
+        new_pointer = (state.pointer + batch_size) % self.capacity
+        new_size = jnp.minimum(state.size + batch_size, self.capacity)
 
-        # Return a new state object with the updated fields.
         return state.replace(
             data=updated_data,
             pointer=new_pointer,
