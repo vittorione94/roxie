@@ -7,13 +7,14 @@ from flax import nnx
 from myojit.utils.trainer import Trainer
 import jax.numpy as jnp
 from myojit.replays.buffer import Transition
-
+from hydra.core.hydra_config import HydraConfig
 
 @hydra.main(version_base=None, config_path="configs", config_name="myojit")
 def main(cfg: DictConfig):
     print(cfg.agent.name)
 
     env, env_cfg = load_playground_env(cfg.env.env_name)
+    output_dir = HydraConfig.get().runtime.output_dir
 
     prototype = Transition(
         observation=jnp.zeros(env.observation_size, dtype=jnp.float32),
@@ -45,10 +46,9 @@ def main(cfg: DictConfig):
         rngs=rngs
     )
     
-    
     agent = agents[cfg.agent.name](actor, critic, replay, buffer_state)
 
-    trainer = Trainer(steps=int(1e7), epoch_steps=int(2e4), save_steps=int(5e5),
+    trainer = Trainer(output_dir=output_dir, steps=int(1e7), epoch_steps=int(2e4), save_steps=int(5e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,)
     trainer.initialize(agent=agent, environment=env, test_environment=None)
     trainer.run(cfg.parallel_envs, rngs) 

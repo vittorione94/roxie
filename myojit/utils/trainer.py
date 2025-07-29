@@ -5,12 +5,13 @@ import numpy as np
 import jax
 from myojit.utils import logger
 import jax.numpy as jnp
+from myojit.agents.ddpg import DDPG
 
 class Trainer:
     '''Trainer used to train and evaluate an agent on an environment.'''
 
     def __init__(
-        self, steps=int(1e7), epoch_steps=int(2e4), save_steps=int(1e5),
+        self, output_dir, steps=int(1e7), epoch_steps=int(2e4), save_steps=int(1e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,
     ):
         self.max_steps = steps
@@ -19,6 +20,7 @@ class Trainer:
         self.test_episodes = test_episodes
         self.show_progress = show_progress
         self.replace_checkpoint = replace_checkpoint
+        self.output_dir = output_dir
 
     def initialize(self, agent, environment, test_environment=None):
         self.agent = agent
@@ -60,19 +62,18 @@ class Trainer:
         self.steps, epoch_steps, epochs, episodes = 0, 0, 0, 0
         steps_since_save = 0
         
-        action_key, update_key = jax.random.split(rngs.agent(), 2)
         while True:
 
             # Select actions.
             # Pass a key for exploration noise.
-            actions = self.agent.step(states.obs, evaluate=False, key=action_key)
+            actions = self.agent.step(states.obs, evaluate=False, key=rngs.agent())
             
             # TODO use chex
             #assert not np.isnan(actions.sum())
 
             # Take a step in the environments.
             next_states = jit_v_step(states, actions)
-            new_buffer_state = self.agent.update(states, next_states, steps=self.steps, key=update_key)
+            new_buffer_state = self.agent.update(states, next_states, steps=self.steps, key=rngs.agent())
 
             scores += next_states.reward
             lengths += 1
@@ -110,7 +111,7 @@ class Trainer:
             stop_training = self.steps >= self.max_steps
             # Save a checkpoint.
             if stop_training or steps_since_save >= self.save_steps:
-                path = os.path.join(logger.get_path(), 'checkpoints')
+                path = os.path.join(self.output_dir, 'checkpoints')
                 if os.path.isdir(path) and self.replace_checkpoint:
                     for file in os.listdir(path):
                         if file.startswith('step_'):

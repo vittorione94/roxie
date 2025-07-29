@@ -32,17 +32,17 @@ class DeterministicActor(nnx.Module):
         current_features = feat
 
     # Dropout and output layers
-    self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
+    # self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
     self.output_layer = nnx.Linear(current_features, action_dim, rngs=rngs)
 
-  def __call__(self, x: jnp.ndarray, training: bool) -> jnp.ndarray:
+  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
     # Use the layers defined in __init__
     for i, layer in enumerate(self.hidden_layers):
         x = layer(x)
         if self.use_layer_norm:
             x = self.norm_layers[i](x)
         x = self.activation_fn(x)
-        x = self.dropout(x, deterministic=not training)
+        # x = self.dropout(x, deterministic=not training)
     
     x = self.output_layer(x)
     # Scale output to action space range, e.g., [-1, 1]
