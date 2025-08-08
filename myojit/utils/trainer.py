@@ -6,12 +6,13 @@ import jax
 from myojit.utils import logger
 import jax.numpy as jnp
 from myojit.agents.ddpg import DDPG
+from mujoco_playground import wrapper
 
 class Trainer:
     '''Trainer used to train and evaluate an agent on an environment.'''
 
     def __init__(
-        self, output_dir, steps=int(1e7), epoch_steps=int(2e4), save_steps=int(1e5),
+        self, output_dir, steps=int(1e7), epoch_steps=int(5e4), save_steps=int(1e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,
     ):
         self.max_steps = steps
@@ -24,8 +25,12 @@ class Trainer:
 
     def initialize(self, agent, environment, test_environment=None):
         self.agent = agent
-        self.environment = environment
-        self.test_environment = test_environment
+        
+        self.environment = wrapper.wrap_for_brax_training(environment)
+        print("Environment wrapped for Brax training.", self.environment)
+
+        self.test_environment = wrapper.wrap_for_brax_training(test_environment)
+        print("Test environment wrapped for Brax training.", self.test_environment)
 
     def run(self, NUM_ENVS, rngs):
         '''Runs the main training loop.'''
@@ -54,6 +59,13 @@ class Trainer:
         # Split the master key to get a unique key for each parallel environment.
         
         reset_keys = jax.random.split(rngs.envs(), NUM_ENVS)
+        local_devices_to_use = 1
+        reset_keys = jnp.reshape(
+            reset_keys, (local_devices_to_use, -1) + reset_keys.shape[1:]
+        )
+        # reset_keys shape: (1, 150) -> num GPU devices, num environments per device
+
+        print("reset_keys shape:", reset_keys.shape)
         # Call the vectorized reset function to get the initial states for all envs.
         states = jit_v_reset(reset_keys)
 
@@ -96,16 +108,22 @@ class Trainer:
             # (where True=1, False=0) and add it to the total count.
             episodes = episodes + jnp.sum(next_states.done)
 
-
+            # print(f"Steps: {self.steps}, "
+            #       f"Epochs: {epochs}, "
+            #       f"Episodes: {episodes}, "
+            #       f"Scores: {scores.mean():.2f}, "
+            #       f"Lengths: {lengths.mean():.2f}, "
+            #       f"Time: {time.time() - start_time:.2f}s")
             # # End of the epoch.
-            # if epoch_steps >= self.epoch_steps:
-            #     # Evaluate the agent on the test environment.
-            #     if self.test_environment:
-            #         self._test()
+            if epoch_steps >= self.epoch_steps:
 
-            #     # Log the data.
-            #     epochs += 1
-            #     epoch_steps = 0
+                # Evaluate the agent on the test environment.
+                if self.test_environment:
+                    self._test(rngs.envs())
+
+                # Log the data.
+                epochs += 1
+                epoch_steps = 0
 
             # End of training.
             stop_training = self.steps >= self.max_steps
@@ -124,36 +142,35 @@ class Trainer:
             if stop_training:
                 break
 
-    # def _test(self):
-    #     '''Tests the agent on the test environment.'''
+    def _test(self, key):
+        '''Tests the agent on the test environment.'''
+        scores, lengths = [], []
 
-    #     # Start the environment.
-    #     if not hasattr(self, 'test_observations'):
-    #         self.test_observations = self.test_environment.start()
-    #         assert len(self.test_observations) == 1
+        jit_reset = jax.jit(self.test_environment.reset)
+        jit_step = jax.jit(self.test_environment.step)
 
-    #     # Test loop.
-    #     for _ in range(self.test_episodes):
-    #         score, length = 0, 0
+        # Test loop.
+        for _ in range(self.test_episodes):
+            score, length = 0, 0
+            state = jit_reset(key)
 
-    #         while True:
-    #             # Select an action.
-    #             actions = self.agent.test_step(
-    #                 self.test_observations, self.steps)
-    #             assert not np.isnan(actions.sum())
-    #             logger.store('test/action', actions, stats=True)
+            while True:
+                # Select an action.
+                actions = self.agent.step(state.obs, evaluate=True, key=key)
+                next_state = jit_step(state, actions)
+                score += next_state.reward
+                length += 1
+                
+                print(f"Test Episode: {_+1}, "
+                      f"Score: {score:.2f}, "
+                      f"Length: {length}")
+                if next_state.done:
+                    break
+            scores.append(score)
+            lengths.append(length)
 
-    #             # Take a step in the environment.
-    #             self.test_observations, infos = self.test_environment.step(
-    #                 actions)
-    #             self.agent.test_update(**infos, steps=self.steps)
+        print(f"Test results: "
+              f"Average score: {np.mean(scores):.2f}, "
+              f"Average length: {np.mean(lengths):.2f}, "
+              f"Scores: {scores}, Lengths: {lengths}")
 
-    #             score += infos['rewards'][0]
-    #             length += 1
-
-    #             if infos['resets'][0]:
-    #                 break
-
-    #         # Log the data.
-    #         logger.store('test/episode_score', score, stats=True)
-    #         logger.store('test/episode_length', length, stats=True)

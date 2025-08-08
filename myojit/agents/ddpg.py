@@ -3,12 +3,148 @@ import jax
 import jax.numpy as jnp
 import functools
 from myojit.replays.buffer import Transition, JaxReplayBuffer
-import flax.experimental.nnx as nnx
+from flax import nnx
 import orbax.checkpoint as ocp
 from pathlib import Path
 from typing import Union
 import optax
 import copy
+import dataclasses
+from typing import Any
+
+
+class TrainState(nnx.Module):
+  def __init__(
+      self,
+      *,
+      actor: nnx.Module,
+      critic: nnx.Module,
+      target_actor: nnx.Module,
+      target_critic: nnx.Module,
+      actor_optimizer: nnx.Optimizer,
+      critic_optimizer: nnx.Optimizer,
+      buffer_state: Any,
+  ):
+    """Initializes the training state.
+
+    The state components are defined as attributes of the module.
+    `nnx.Module` will automatically know how to handle them for
+    JAX transformations.
+    """
+    self.actor = actor
+    self.critic = critic
+    self.target_actor = target_actor
+    self.target_critic = target_critic
+
+    self.actor_optimizer = actor_optimizer
+    self.critic_optimizer = critic_optimizer
+
+    self.buffer_state = buffer_state
+
+
+def _critic_loss_fn(critic_model, target_actor_model, target_critic_model, samples, gamma):
+    """Calculates the MSE loss for the critic."""
+    next_actions = target_actor_model(samples['next_observations'])
+    next_q = target_critic_model(samples['next_observations'], next_actions)
+    
+    target_q = samples['rewards'] + gamma * (1.0 - samples['terminals']) * jnp.squeeze(next_q)
+    
+    current_q = critic_model(samples['observations'], samples['actions'])
+    
+    critic_loss = jnp.mean((jnp.squeeze(current_q) - target_q)**2)
+    return critic_loss
+
+def _actor_loss_fn(actor_model, critic_model, samples):
+    """Calculates the loss for the actor (aims to maximize Q-value)."""
+    actions = actor_model(samples['observations'])
+    q_values = critic_model(samples['observations'], actions)
+    actor_loss = -jnp.mean(q_values)
+    return actor_loss
+
+
+# This is the core computational kernel that will be JIT-compiled.
+@functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn'))
+def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: float, replay_sample_fn):
+    """Performs one full gradient update step and returns the new state."""
+    # 1. Sample from the replay buffer
+    samples = replay_sample_fn(state.buffer_state, key)
+
+    # 2. Calculate critic gradients and update the critic
+    critic_grads = nnx.grad(_critic_loss_fn)(
+        state.critic, state.target_actor, state.target_critic, samples, gamma
+    )
+    state.critic_optimizer.update(critic_grads)
+    
+    # 3. Calculate actor gradients and update the actor
+    # Use the *original* critic for the actor loss calculation, not the updated one
+    actor_grads = nnx.grad(_actor_loss_fn)(
+        state.actor, state.critic, samples
+    )
+    state.actor_optimizer.update(actor_grads)
+    
+    new_actor_tensors = nnx.state(state.actor, nnx.Param)
+    old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
+    new_target_actor_tensors = optax.incremental_update(
+          new_tensors=new_actor_tensors,
+          old_tensors=old_actor_tensors,
+          step_size=tau)
+    
+    new_critic_tensors = nnx.state(state.critic, nnx.Param)
+    old_critic_tensors = nnx.state(state.target_critic, nnx.Param)
+    new_target_critic_tensors = optax.incremental_update(
+          new_tensors=new_critic_tensors,
+          old_tensors=old_critic_tensors,
+          step_size=tau)
+    
+
+    nnx.update(state.target_actor, new_target_actor_tensors)
+    nnx.update(state.target_critic, new_target_critic_tensors)
+
+    # 5. Return the new, updated state object
+    return TrainState(
+            actor=state.actor,
+            critic=state.critic,
+            actor_optimizer=state.actor_optimizer,
+            target_actor=state.target_actor,
+            target_critic=state.target_critic,
+            critic_optimizer=state.critic_optimizer,
+            buffer_state=state.buffer_state
+        )
+
+
+@functools.partial(jax.jit, static_argnames=('actor_model', 'evaluate',))
+def _step_fn(
+    actor_model,
+    observation: jnp.ndarray,
+    key: jax.random.PRNGKey,
+    exploration_noise: float,
+    action_low: float,
+    action_high: float,
+    evaluate: bool = False,
+):
+    """
+    A pure function to select an action.
+    Its output depends only on its inputs.
+    """
+    # Get the deterministic action from the actor network.
+    action = actor_model(observation)
+
+    # Generate noise unconditionally to keep the computation graph static.
+    noise = jax.random.normal(key, action.shape)
+    
+    # Use jax.lax.cond to select the noise scale based on the static 'evaluate' flag.
+    noise_scale = jax.lax.cond(
+        evaluate,
+        lambda: 0.0,                   # If evaluating, scale is 0.
+        lambda: exploration_noise      # If training, use the defined scale.
+    )
+    
+    # Apply the scaled noise.
+    noisy_action = action + noise * noise_scale
+            
+    # Clip the final action to be within the environment's valid bounds.
+    return jnp.clip(noisy_action, action_low, action_high)
+
 
 class DDPG(agent.Agent):
     def __init__(self, 
@@ -20,63 +156,63 @@ class DDPG(agent.Agent):
                  learning_rate: float = 3e-4,
                  gamma: float = 0.99,
                  tau: float = 0.005,
-                 exploration_noise: float = 0.1):
-        self.actor = actor
-        self.critic = critic
+                 exploration_noise: float = 0.1,
+                 steps_before_learning: int = 10000,
+                 steps_between_updates: int = 500):
 
         # create targets
-        self.target_actor = copy.deepcopy(actor)
-        self.target_critic = copy.deepcopy(critic)
-
-        self.replay = replay
-        self.buffer_state = buffer_state
+        target_actor = copy.deepcopy(actor)
+        target_critic = copy.deepcopy(critic)
         
+        actor_optimizer = nnx.Optimizer(
+            actor, optax.adam(learning_rate), wrt=nnx.Param
+        )
+
+        critic_optimizer = nnx.Optimizer(
+            critic, optax.adam(learning_rate), wrt=nnx.Param
+        )
+
+        self.state = TrainState(
+            actor=actor,
+            critic=critic,
+            target_actor=target_actor,
+            target_critic=target_critic,
+            actor_optimizer=actor_optimizer,
+            critic_optimizer=critic_optimizer,
+            buffer_state=buffer_state, # Assuming buffer has an init method
+        )
+
         # --- Store hyperparameters ---
         self.gamma = gamma
         self.tau = tau
         self.exploration_noise = exploration_noise
         self.action_low = -1
         self.action_high = 1
+        self.replay = replay
+        self.steps_before_learning = steps_before_learning
+        self.steps_between_updates = steps_between_updates
 
-        self.actor_optimizer = nnx.Optimizer(
-            self.actor, optax.adam(learning_rate), wrt=nnx.Param
-        )
 
-        self.critic_optimizer = nnx.Optimizer(
-            self.critic, optax.adam(learning_rate), wrt=nnx.Param
-        )
 
-    @functools.partial(jax.jit, static_argnums=(0, 2, ))
-    def step(self, state: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None) -> jnp.ndarray:
-        """Selects an action, adding noise for exploration if not in evaluation mode."""
+    def step(self, observation: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None) -> jnp.ndarray:
+        """
+        Selects an action by calling the pure, JIT-compiled step function.
+        """
         
-        # Get the deterministic action from the actor network.
-        # The 'dropout' RNG stream will be used internally by the actor if training=True.
-        # This part is fine as nnx handles the context correctly.
-        action = self.actor(state)
-
-        # 1. Generate noise UNCONDITIONALLY.
-        # This ensures an RNG key from the 'agent' stream is always used,
-        # making the computation graph static and JIT-compatible.
-        noise = jax.random.normal(key, action.shape)
-        
-        # 2. Use jax.lax.cond to select the SCALE of the noise.
-        # This operates on simple float values and is safe to JIT.
-        noise_scale = jax.lax.cond(
+        # Call the standalone function, passing in the required parts from the agent's state.
+        action = _step_fn(
+            self.state.actor,
+            observation,
+            key,
+            self.exploration_noise,
+            self.action_low,
+            self.action_high,
             evaluate,
-            lambda: 0.0,                   # If evaluating, scale noise by 0.
-            lambda: self.exploration_noise # If training, use the defined noise scale.
         )
-        
-        # 3. Apply the scaled noise to the action.
-        # If evaluating, this is equivalent to `action + 0`.
-        noisy_action = action + noise * noise_scale
-                
-        # Clip the final action to be within the environment's valid bounds.
-        return jnp.clip(noisy_action, self.action_low, self.action_high)
+        return action
     
-    def update(self, prev_states, states, steps, key):
-        
+
+    def update(self, prev_states, states, steps, key: jax.random.PRNGKey = None):
         experiences = Transition(
             observation=prev_states.obs,
             action=states.data.ctrl,
@@ -85,56 +221,20 @@ class DDPG(agent.Agent):
             terminal=states.done,
         )
         # store in memory
-        self.buffer_state = self.replay.add_batch(self.buffer_state, experiences)
+        self.state.buffer_state = self.replay.add_batch(self.state.buffer_state, experiences)
 
-        # If steps are enough update:
-        samples = self.replay.sample(self.buffer_state, key)
-
-        #1. update actor 
-        # This function takes the actor module whose parameters we want to differentiate.
-        def actor_loss_fn(actor_to_grad, critic):
-            # Use the actor passed to the function to get actions
-            actions = actor_to_grad(samples['observations'])
-            
-            # The critic's parameters are treated as constant here, which is correct for an actor update.
-            q_values = critic(samples['observations'], actions)
-            
-            # The loss is the negative mean of the Q-values, which we want to maximize.
-            loss = -jnp.mean(q_values)
-            return loss
-
-        # 2. Use nnx.grad to compute gradients for the actor's parameters.
-        # nnx.grad is designed to work with NNX modules and correctly handles their state.
-        actor_grads = nnx.grad(actor_loss_fn)(self.actor, self.critic)
-        self.actor_optimizer.update(actor_grads)
-
-
-        #2. update critic
-        def critic_loss_fn(critic_to_grad, target_actor, target_critic):
-            # Get next actions from the TARGET actor, not the main one.
-            next_actions = target_actor(samples['next_observations'])
-            
-            # Get Q-values for the next states from the TARGET critic.
-            next_q_values = target_critic(samples['next_observations'], next_actions)
-            
-            # Compute the Bellman target.
-            target_q_values = samples['rewards'] + self.gamma * (1.0 - samples['terminals']) * jnp.squeeze(next_q_values)
-            
-            # Get current Q-values from the critic we are differentiating.
-            q_values = critic_to_grad(samples['observations'], samples['actions'])
-            
-            # Compute the MSE loss.
-            loss = jnp.mean((jnp.squeeze(q_values) - target_q_values)**2)
-            return loss
-
-        critic_grads = nnx.grad(critic_loss_fn)(self.critic, self.target_actor, self.target_critic)
-        self.critic_optimizer.update(critic_grads)
-
-        # 3. Soft-update target networks
-        self.soft_update(self.tau, self.actor, self.target_actor)
-        self.soft_update(self.tau, self.critic, self.target_critic)
+        # Conditionally call the JIT-compiled gradient step
+        if steps > self.steps_before_learning and steps % self.steps_between_updates == 0:
+            for _ in range(50):
+                self.state = _grad_step(
+                    self.state, 
+                    key, 
+                    self.gamma, 
+                    self.tau,
+                    self.replay.sample # Pass the sample method itself
+                )
                          
-        return self.buffer_state
+        return self.state.buffer_state
 
     def soft_update(self, tau: float, online_model: nnx.Module, target_model: nnx.Module):
         """
@@ -179,14 +279,14 @@ class DDPG(agent.Agent):
         # path.mkdir(parents=True, exist_ok=True)
         
         # Split models into static graph definition and dynamic state
-        _, actor_state = nnx.split(self.actor)
-        _, critic_state = nnx.split(self.critic)
+        _, actor_state = nnx.split(self.state.actor)
+        _, critic_state = nnx.split(self.state.critic)
 
         # Create a Pytree containing all the data to save
         save_data = {
             'actor': actor_state,
             'critic': critic_state,
-            'buffer': self.buffer_state
+            'buffer': self.state.buffer_state
         }
         
         # Use Orbax to save the Pytree

@@ -50,7 +50,7 @@ def main(cfg: DictConfig):
 
     trainer = Trainer(output_dir=output_dir, steps=int(1e7), epoch_steps=int(2e4), save_steps=int(5e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,)
-    trainer.initialize(agent=agent, environment=env, test_environment=None)
+    trainer.initialize(agent=agent, environment=env, test_environment=env)
     trainer.run(cfg.parallel_envs, rngs) 
 
     return
