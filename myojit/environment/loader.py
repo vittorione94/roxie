@@ -77,9 +77,6 @@ class TerminationWrapper(wrapper.Wrapper):
         # next_env_state.done is the termination signal from the base env.
         done = jnp.logical_or(next_env_state.done, truncated)
         
-        
-        print("Truncated", truncated, "Done", done)
-
         # Update the info dictionary for observation purposes
         new_info = next_env_state.info | {
             'truncation': truncated,

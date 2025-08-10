@@ -50,13 +50,11 @@ class Trainer:
 
         print("Successfully created JIT-compiled, vectorized reset and step functions.")
 
-        # 1. Initialize the environments
         print("Initializing environments...")
         # Split the master key to get a unique key for each parallel environment.
         loop_rng = rngs.envs()
         reset_keys = jax.random.split(loop_rng, NUM_ENVS)
 
-        print("reset_keys shape:", reset_keys.shape)
         # Call the vectorized reset function to get the initial states for all envs.
         wrapped_states = jit_v_reset(reset_keys)
 
@@ -71,18 +69,18 @@ class Trainer:
 
             # `wrapped_states` holds the state at time `t`.
             
-            # 1. Get actions for the current state (s_t).
+            # Get actions for the current state (s_t).
             actions = self.agent.step(wrapped_states.env_state.obs, evaluate=False, key=action_key)
             # TODO use chex
             #assert not np.isnan(actions.sum())
 
-            # 2. Store the current state before it's overwritten. This is your "old state".
+            # Store the current state before it's overwritten. This is your "old state".
             old_wrapped_states = wrapped_states
             
-            # 3. Perform the step to get the "new state" (s_t+1).
+            # Perform the step to get the "new state" (s_t+1).
             new_wrapped_states = jit_v_step(old_wrapped_states, actions)
             
-            # 4. Pass BOTH the old and new states to the agent for the full transition.
+            # Pass BOTH the old and new states to the agent for the full transition.
             new_buffer_state = self.agent.update(
                 old_wrapped_states.env_state, 
                 new_wrapped_states.env_state, 
@@ -92,17 +90,18 @@ class Trainer:
 
             dones = new_wrapped_states.env_state.done
             
-            # 2. Generate new keys for the environments that need resetting.
+            # Generate new keys for the environments that need resetting.
             reset_keys = jax.random.split(reset_key_batch, NUM_ENVS)
             
-            # 3. Get a batch of *potential* new states by calling the reset function.
-            #    We do this for all environments; `where` will select only the needed ones.
+            # Get a batch of *potential* new states by calling the reset function.
+            # We do this for all environments; `where` will select only the needed ones.
             reset_states = jit_v_reset(reset_keys)
             
-            # 4. The main event: Use tree_map and where to create the true next state.
-            #    For each leaf in the state PyTree, it picks from `reset_states` if done,
-            #    otherwise it keeps the state from `new_wrapped_states`.
-            final_states = jax.tree.map(
+            # The main event: Use tree_map and where to create the true next state.
+            # For each leaf in the state PyTree, it picks from `reset_states` if done,
+            # otherwise it keeps the state from `new_wrapped_states`.
+            # CRITICAL: Update the main state variable for the next loop iteration.
+            wrapped_states = jax.tree.map(
                 lambda reset_leaf, next_leaf: jnp.where(
                     dones.reshape((dones.shape[0],) + (1,) * (reset_leaf.ndim - 1)), # Ensure `dones` broadcasts correctly to array shapes
                     reset_leaf,
@@ -111,9 +110,6 @@ class Trainer:
                 reset_states,
                 new_wrapped_states
             )
-            
-            # 5. CRITICAL: Update the main state variable for the next loop iteration.
-            wrapped_states = final_states
 
             scores += new_wrapped_states.env_state.reward
             lengths += 1
@@ -167,13 +163,14 @@ class Trainer:
         '''Tests the agent on the test environment.'''
         scores, lengths = [], []
 
+        # TODO: jitting should be done onece outside this function
         jit_reset = jax.jit(self.test_environment.reset)
         jit_step = jax.jit(self.test_environment.step)
 
         # Test loop.
         for _ in range(self.test_episodes):
             score, length = 0, 0
-            # CORRECT: Initialize a 'current_state' that will be updated
+            # Initialize a 'current_state' that will be updated
             current_state = jit_reset(key)
 
             while True:
