@@ -8,6 +8,7 @@ from myojit.utils.trainer import Trainer
 import jax.numpy as jnp
 from myojit.replays.buffer import Transition
 from hydra.core.hydra_config import HydraConfig
+import copy
 
 @hydra.main(version_base=None, config_path="configs", config_name="myojit")
 def main(cfg: DictConfig):
@@ -48,9 +49,9 @@ def main(cfg: DictConfig):
     
     agent = agents[cfg.agent.name](actor, critic, replay, buffer_state)
 
-    trainer = Trainer(output_dir=output_dir, steps=int(1e7), epoch_steps=int(2e4), save_steps=int(5e5),
+    trainer = Trainer(output_dir=output_dir, steps=int(1e7), epoch_steps=int(1e5), save_steps=int(5e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,)
-    trainer.initialize(agent=agent, environment=env, test_environment=env)
+    trainer.initialize(agent=agent, environment=env, test_environment=copy.deepcopy(env))
     trainer.run(cfg.parallel_envs, rngs) 
 
     return

@@ -61,7 +61,6 @@ def _actor_loss_fn(actor_model, critic_model, samples):
     actor_loss = -jnp.mean(q_values)
     return actor_loss
 
-
 # This is the core computational kernel that will be JIT-compiled.
 @functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn'))
 def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: float, replay_sample_fn):
@@ -110,7 +109,6 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
             critic_optimizer=state.critic_optimizer,
             buffer_state=state.buffer_state
         )
-
 
 @functools.partial(jax.jit, static_argnames=('actor_model', 'evaluate',))
 def _step_fn(
@@ -192,8 +190,6 @@ class DDPG(agent.Agent):
         self.steps_before_learning = steps_before_learning
         self.steps_between_updates = steps_between_updates
 
-
-
     def step(self, observation: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None) -> jnp.ndarray:
         """
         Selects an action by calling the pure, JIT-compiled step function.
@@ -211,7 +207,6 @@ class DDPG(agent.Agent):
         )
         return action
     
-
     def update(self, prev_states, states, steps, key: jax.random.PRNGKey = None):
         experiences = Transition(
             observation=prev_states.obs,

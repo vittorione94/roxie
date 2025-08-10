@@ -6,13 +6,13 @@ import jax
 from myojit.utils import logger
 import jax.numpy as jnp
 from myojit.agents.ddpg import DDPG
-from mujoco_playground import wrapper
+
 
 class Trainer:
     '''Trainer used to train and evaluate an agent on an environment.'''
 
     def __init__(
-        self, output_dir, steps=int(1e7), epoch_steps=int(5e4), save_steps=int(1e5),
+        self, output_dir, steps=int(1e7), epoch_steps=int(1e5), save_steps=int(1e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,
     ):
         self.max_steps = steps
@@ -25,12 +25,8 @@ class Trainer:
 
     def initialize(self, agent, environment, test_environment=None):
         self.agent = agent
-        
-        self.environment = wrapper.wrap_for_brax_training(environment)
-        print("Environment wrapped for Brax training.", self.environment)
-
-        self.test_environment = wrapper.wrap_for_brax_training(test_environment)
-        print("Test environment wrapped for Brax training.", self.test_environment)
+        self.environment = environment
+        self.test_environment = test_environment
 
     def run(self, NUM_ENVS, rngs):
         '''Runs the main training loop.'''
@@ -57,17 +53,12 @@ class Trainer:
         # 1. Initialize the environments
         print("Initializing environments...")
         # Split the master key to get a unique key for each parallel environment.
-        
-        reset_keys = jax.random.split(rngs.envs(), NUM_ENVS)
-        local_devices_to_use = 1
-        reset_keys = jnp.reshape(
-            reset_keys, (local_devices_to_use, -1) + reset_keys.shape[1:]
-        )
-        # reset_keys shape: (1, 150) -> num GPU devices, num environments per device
+        loop_rng = rngs.envs()
+        reset_keys = jax.random.split(loop_rng, NUM_ENVS)
 
         print("reset_keys shape:", reset_keys.shape)
         # Call the vectorized reset function to get the initial states for all envs.
-        states = jit_v_reset(reset_keys)
+        wrapped_states = jit_v_reset(reset_keys)
 
         scores = jnp.zeros(NUM_ENVS)
         lengths = jnp.zeros(NUM_ENVS, int)
@@ -75,19 +66,56 @@ class Trainer:
         steps_since_save = 0
         
         while True:
+            # Split the main loop's RNG key for each iteration.
+            loop_rng, action_key, update_key, reset_key_batch = jax.random.split(loop_rng, 4)
 
-            # Select actions.
-            # Pass a key for exploration noise.
-            actions = self.agent.step(states.obs, evaluate=False, key=rngs.agent())
+            # `wrapped_states` holds the state at time `t`.
             
+            # 1. Get actions for the current state (s_t).
+            actions = self.agent.step(wrapped_states.env_state.obs, evaluate=False, key=action_key)
             # TODO use chex
             #assert not np.isnan(actions.sum())
 
-            # Take a step in the environments.
-            next_states = jit_v_step(states, actions)
-            new_buffer_state = self.agent.update(states, next_states, steps=self.steps, key=rngs.agent())
+            # 2. Store the current state before it's overwritten. This is your "old state".
+            old_wrapped_states = wrapped_states
+            
+            # 3. Perform the step to get the "new state" (s_t+1).
+            new_wrapped_states = jit_v_step(old_wrapped_states, actions)
+            
+            # 4. Pass BOTH the old and new states to the agent for the full transition.
+            new_buffer_state = self.agent.update(
+                old_wrapped_states.env_state, 
+                new_wrapped_states.env_state, 
+                steps=self.steps, 
+                key=update_key
+            )
 
-            scores += next_states.reward
+            dones = new_wrapped_states.env_state.done
+            
+            # 2. Generate new keys for the environments that need resetting.
+            reset_keys = jax.random.split(reset_key_batch, NUM_ENVS)
+            
+            # 3. Get a batch of *potential* new states by calling the reset function.
+            #    We do this for all environments; `where` will select only the needed ones.
+            reset_states = jit_v_reset(reset_keys)
+            
+            # 4. The main event: Use tree_map and where to create the true next state.
+            #    For each leaf in the state PyTree, it picks from `reset_states` if done,
+            #    otherwise it keeps the state from `new_wrapped_states`.
+            final_states = jax.tree.map(
+                lambda reset_leaf, next_leaf: jnp.where(
+                    dones.reshape((dones.shape[0],) + (1,) * (reset_leaf.ndim - 1)), # Ensure `dones` broadcasts correctly to array shapes
+                    reset_leaf,
+                    next_leaf
+                ),
+                reset_states,
+                new_wrapped_states
+            )
+            
+            # 5. CRITICAL: Update the main state variable for the next loop iteration.
+            wrapped_states = final_states
+
+            scores += new_wrapped_states.env_state.reward
             lengths += 1
             self.steps += NUM_ENVS
             epoch_steps += NUM_ENVS
@@ -101,19 +129,12 @@ class Trainer:
             # Check the finished episodes.
             # Where next_states.done is True, set scores and lengths to 0.
             # Otherwise, keep their original values.
-            scores = jnp.where(next_states.done, 0, scores)
-            lengths = jnp.where(next_states.done, 0, lengths)
-            
+            scores = jnp.where(new_wrapped_states.env_state.done, 0, scores)
+            lengths = jnp.where(new_wrapped_states.env_state.done, 0, lengths)
             # Count the number of completed episodes by summing the boolean 'done' array
             # (where True=1, False=0) and add it to the total count.
-            episodes = episodes + jnp.sum(next_states.done)
+            episodes = episodes + jnp.sum(new_wrapped_states.env_state.done)
 
-            # print(f"Steps: {self.steps}, "
-            #       f"Epochs: {epochs}, "
-            #       f"Episodes: {episodes}, "
-            #       f"Scores: {scores.mean():.2f}, "
-            #       f"Lengths: {lengths.mean():.2f}, "
-            #       f"Time: {time.time() - start_time:.2f}s")
             # # End of the epoch.
             if epoch_steps >= self.epoch_steps:
 
@@ -152,19 +173,17 @@ class Trainer:
         # Test loop.
         for _ in range(self.test_episodes):
             score, length = 0, 0
-            state = jit_reset(key)
+            # CORRECT: Initialize a 'current_state' that will be updated
+            current_state = jit_reset(key)
 
             while True:
                 # Select an action.
-                actions = self.agent.step(state.obs, evaluate=True, key=key)
-                next_state = jit_step(state, actions)
-                score += next_state.reward
+                actions = self.agent.step(current_state.env_state.obs, evaluate=True, key=key)
+                current_state = jit_step(current_state, actions)
+                score += current_state.env_state.reward
                 length += 1
-                
-                print(f"Test Episode: {_+1}, "
-                      f"Score: {score:.2f}, "
-                      f"Length: {length}")
-                if next_state.done:
+   
+                if current_state.env_state.done:
                     break
             scores.append(score)
             lengths.append(length)

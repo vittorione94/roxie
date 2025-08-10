@@ -86,7 +86,7 @@ def main(checkpoint_path):
     with mujoco.viewer.launch_passive(model, data) as viewer:
         # Reset the environment to get the initial state
         key, reset_key = jax.random.split(key)
-        state = jit_reset(rng=reset_key)
+        wrapped_state = jit_reset(key=reset_key)
         mujoco.mj_forward(model, data)
 
         # Run the simulation loop
@@ -94,12 +94,12 @@ def main(checkpoint_path):
             step_start = time.time()
 
             # Take a random action
-            action = agent.step([state.obs], evaluate=True, key=key)
+            action = agent.step([wrapped_state.env_state.obs], evaluate=True, key=key)
 
             # Step the environment
-            state = jit_step(state, action[0])
+            wrapped_state = jit_step(wrapped_state, action[0])
 
-            new_data = mjx.get_data(model, state.data)
+            new_data = mjx.get_data(model, wrapped_state.env_state.data)
 
             data.qpos = new_data.qpos
             data.qvel = new_data.qvel
