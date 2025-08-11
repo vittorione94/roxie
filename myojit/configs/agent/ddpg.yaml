@@ -7,12 +7,12 @@ args:
   critic_learning_rate: 1e-3
   exploration_noise: 0.1
   steps_before_learning: 1000
-  memory_warmup: 100000
+  memory_warmup: 1000
   steps_between_updates: 500
   learning_steps: 150
 
 memory:
   _target_: replays.buffer.JaxReplayBuffer
   
-  capacity: 1_000_000
+  capacity: 10_000_000
   batch_size: 256

@@ -69,14 +69,14 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
     samples = replay_sample_fn(state.buffer_state, key)
 
     # 2. Calculate critic gradients and update the critic
-    critic_grads = nnx.grad(_critic_loss_fn)(
+    critic_loss, critic_grads = nnx.value_and_grad(_critic_loss_fn)(
         state.critic, state.target_actor, state.target_critic, samples, gamma
     )
     state.critic_optimizer.update(critic_grads)
     
     # 3. Calculate actor gradients and update the actor
     # Use the *original* critic for the actor loss calculation, not the updated one
-    actor_grads = nnx.grad(_actor_loss_fn)(
+    actor_loss, actor_grads = nnx.value_and_grad(_actor_loss_fn)(
         state.actor, state.critic, samples
     )
     state.actor_optimizer.update(actor_grads)
@@ -110,7 +110,8 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
             target_critic=state.target_critic,
             critic_optimizer=state.critic_optimizer,
             buffer_state=state.buffer_state
-        ), samples["indices"]
+        ), actor_loss, critic_loss
+
 
 @functools.partial(jax.jit, static_argnames=('actor_model', 'evaluate',))
 def _step_fn(
@@ -259,12 +260,14 @@ class DDPG(agent.Agent):
         self.state.buffer_state = self.replay.add_batch(self.state.buffer_state, experiences)
 
         gradient_steps = 0
+        actor_loss, critic_loss = 0, 0
+
         # Conditionally call the JIT-compiled gradient step
         if steps > self.steps_before_learning and steps % self.steps_between_updates == 0:
             for gradient_steps in range(self.learning_steps):
                 agent_rng, key = jax.random.split(agent_rng, 2)
 
-                self.state, _ = _grad_step(
+                self.state, actor_loss, critic_loss = _grad_step(
                     self.state, 
                     key, 
                     self.gamma, 
@@ -283,7 +286,8 @@ class DDPG(agent.Agent):
             # )
 
 
-        return gradient_steps
+        return gradient_steps, actor_loss, critic_loss
+
 
     def save(self, path: Union[str, Path]):
         """

@@ -65,6 +65,8 @@ class Trainer:
         lengths = jnp.zeros(NUM_ENVS, int)
         self.steps, epoch_steps, epochs, episodes, tot_gradient_steps = 0, 0, 0, 0, 0
         steps_since_save = 0
+        actor_losses = []
+        critic_losses = []
         
         while True:
             # Split the main loop's RNG key for each iteration.
@@ -88,12 +90,15 @@ class Trainer:
             new_wrapped_states = jit_v_step(old_wrapped_states, actions)
             
             # Pass BOTH the old and new states to the agent for the full transition.
-            gradient_steps = self.agent.update(
+            gradient_steps, actor_loss, critic_loss = self.agent.update(
                 old_wrapped_states.env_state, 
                 new_wrapped_states.env_state, 
                 steps=self.steps, 
                 agent_rng=rngs.agent()
             )
+            actor_losses.append(actor_loss)
+            critic_losses.append(critic_loss)
+
             tot_gradient_steps += gradient_steps
 
             dones = new_wrapped_states.env_state.done
@@ -160,8 +165,12 @@ class Trainer:
                       f"    Warmup: {self.steps < self.agent.memory_warmup} \n"
                       f"    Average score: {jnp.mean(scores):.2f} \n"
                       f"    Average length: {jnp.mean(lengths):.2f} \n"
-                      f"    Gradient steps: {tot_gradient_steps} \n")
-                
+                      f"    Gradient steps: {tot_gradient_steps} \n"
+                      f"    Actor loss: {np.mean(actor_losses):.2f} \n"
+                      f"    Critic loss: {np.mean(critic_losses):.2f} \n")
+                actor_losses = []
+                critic_losses = []  
+
                 last_epoch_time = time.time()
 
             # End of training.
