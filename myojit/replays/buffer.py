@@ -29,7 +29,7 @@ class BufferState:
 class JaxReplayBuffer:
     """A JAX-native, GPU-optimized replay buffer."""
 
-    def __init__(self, capacity: int, batch_size: int, batch_iterations: int, steps_before_batches: int, steps_between_batches: int):
+    def __init__(self, capacity: int, batch_size: int):
         """
         Initializes the replay buffer with a fixed capacity.
         Note: This class is stateless. It only holds static configuration.
@@ -127,6 +127,7 @@ class JaxReplayBuffer:
             "rewards": batch_data.reward,
             "next_observations": batch_data.next_observation,
             "terminals": batch_data.terminal,
+            "indices": indices
         }
 
     @functools.partial(jax.jit, static_argnums=(0,))

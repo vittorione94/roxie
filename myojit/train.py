@@ -26,13 +26,13 @@ def main(cfg: DictConfig):
     )
 
     replay = hydra.utils.instantiate(
-        cfg.agent.memory
+        cfg.agent.memory,
+        capacity=cfg.agent.memory.capacity,
+        batch_size=cfg.agent.memory.batch_size
     )
     buffer_state = replay.init(prototype)
     
-
     action_dim = env.action_size
-    #TODO: study properly this
     rngs = nnx.Rngs(params=0, dropout=1, envs=2, agent=3) # Use your seed from cfg.seed
 
     # A more direct check:
@@ -47,7 +47,7 @@ def main(cfg: DictConfig):
         rngs=rngs
     )
     
-    agent = agents[cfg.agent.name](actor, critic, replay, buffer_state)
+    agent = agents[cfg.agent.name](actor, critic, replay, buffer_state, **cfg.agent.args)
 
     trainer = Trainer(output_dir=output_dir, steps=int(1e7), epoch_steps=int(1e5), save_steps=int(5e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,)

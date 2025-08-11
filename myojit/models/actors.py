@@ -1,5 +1,5 @@
 from typing import Sequence, Callable, Optional
-from flax.experimental import nnx
+from flax import nnx
 import jax.numpy as jnp
 
 class DeterministicActor(nnx.Module):
@@ -17,6 +17,7 @@ class DeterministicActor(nnx.Module):
     # --- Store static configuration ---
     self.use_layer_norm = use_layer_norm
     self.activation_fn = activation_fn
+    self.action_dim = action_dim
 
     # --- Define stateful layers ---
     self.hidden_layers = []

@@ -1,16 +1,18 @@
 name: "ddpg"
-gamma: 0.99
-tau: 0.005
-learning_rate_actor: 1e-4
-learning_rate_critic: 1e-3
+
+args: 
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 1e-3
+  critic_learning_rate: 1e-2
+  exploration_noise: 0.1
+  steps_before_learning: 1000
+  memory_warmup: 50000
+  steps_between_updates: 500
+  learning_steps: 150
 
 memory:
   _target_: replays.buffer.JaxReplayBuffer
   
   capacity: 1_000_000
   batch_size: 256
-  batch_iterations: 50
-  steps_before_batches: 1e4
-  steps_between_batches: 50
-  # n_step: 1
-  # gamma: 0.99

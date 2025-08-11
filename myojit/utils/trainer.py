@@ -47,6 +47,9 @@ class Trainer:
         # This compiles the entire batched operation into a single optimized kernel.
         jit_v_reset = jax.jit(v_reset)
         jit_v_step = jax.jit(v_step)
+        
+        jit_test_reset = jax.jit(self.test_environment.reset)
+        jit_test_step = jax.jit(self.test_environment.step)
 
         print("Successfully created JIT-compiled, vectorized reset and step functions.")
 
@@ -65,12 +68,16 @@ class Trainer:
         
         while True:
             # Split the main loop's RNG key for each iteration.
-            loop_rng, action_key, update_key, reset_key_batch = jax.random.split(loop_rng, 4)
+            loop_rng, action_key, reset_key_batch = jax.random.split(loop_rng, 3)
 
             # `wrapped_states` holds the state at time `t`.
             
             # Get actions for the current state (s_t).
-            actions = self.agent.step(wrapped_states.env_state.obs, evaluate=False, key=action_key)
+            if self.steps > self.agent.memory_warmup:
+                actions = self.agent.step(wrapped_states.env_state.obs, evaluate=False, key=action_key)
+            else:
+                actions = jax.random.uniform(action_key, (NUM_ENVS, self.environment.action_size), minval=-1.0, maxval=1.0)
+            
             # TODO use chex
             #assert not np.isnan(actions.sum())
 
@@ -85,7 +92,7 @@ class Trainer:
                 old_wrapped_states.env_state, 
                 new_wrapped_states.env_state, 
                 steps=self.steps, 
-                key=update_key
+                agent_rng=rngs.agent()
             )
 
             dones = new_wrapped_states.env_state.done
@@ -136,7 +143,7 @@ class Trainer:
 
                 # Evaluate the agent on the test environment.
                 if self.test_environment:
-                    self._test(rngs.envs())
+                    self._test(rngs.envs(), jit_test_reset, jit_test_step)
 
                 # Log the data.
                 epochs += 1
@@ -159,24 +166,22 @@ class Trainer:
             if stop_training:
                 break
 
-    def _test(self, key):
+    def _test(self, rng, jit_reset, jit_step):
         '''Tests the agent on the test environment.'''
-        scores, lengths = [], []
-
-        # TODO: jitting should be done onece outside this function
-        jit_reset = jax.jit(self.test_environment.reset)
-        jit_step = jax.jit(self.test_environment.step)
+        scores, lengths, actions = [], [], []       
 
         # Test loop.
         for _ in range(self.test_episodes):
             score, length = 0, 0
+            rng, reset_key = jax.random.split(rng, 2)
+    
             # Initialize a 'current_state' that will be updated
-            current_state = jit_reset(key)
-
+            current_state = jit_reset(reset_key)
             while True:
                 # Select an action.
-                actions = self.agent.step(current_state.env_state.obs, evaluate=True, key=key)
-                current_state = jit_step(current_state, actions)
+                action = self.agent.step(current_state.env_state.obs, evaluate=True, key=reset_key)
+                actions.append(action)
+                current_state = jit_step(current_state, action)
                 score += current_state.env_state.reward
                 length += 1
    
@@ -188,5 +193,6 @@ class Trainer:
         print(f"Test results: "
               f"Average score: {np.mean(scores):.2f}, "
               f"Average length: {np.mean(lengths):.2f}, "
-              f"Scores: {scores}, Lengths: {lengths}")
+              f"Scores: {scores}, Lengths: {lengths}"
+              f"Actions mean: {np.mean(actions)}, Actions std: {np.std(actions)}")
 

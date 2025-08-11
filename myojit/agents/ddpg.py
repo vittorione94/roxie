@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Union
 import optax
 import copy
-import dataclasses
 from typing import Any
 
 
@@ -61,6 +60,7 @@ def _actor_loss_fn(actor_model, critic_model, samples):
     actor_loss = -jnp.mean(q_values)
     return actor_loss
 
+
 # This is the core computational kernel that will be JIT-compiled.
 @functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn'))
 def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: float, replay_sample_fn):
@@ -81,8 +81,10 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
     )
     state.actor_optimizer.update(actor_grads)
     
-    new_actor_tensors = nnx.state(state.actor, nnx.Param)
+    # 4. Update target networks using soft updates
+    new_actor_tensors = nnx.state(state.actor, nnx.Param)  # Use updated_actor
     old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
+
     new_target_actor_tensors = optax.incremental_update(
           new_tensors=new_actor_tensors,
           old_tensors=old_actor_tensors,
@@ -108,7 +110,7 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
             target_critic=state.target_critic,
             critic_optimizer=state.critic_optimizer,
             buffer_state=state.buffer_state
-        )
+        ), samples["indices"]
 
 @functools.partial(jax.jit, static_argnames=('actor_model', 'evaluate',))
 def _step_fn(
@@ -137,12 +139,32 @@ def _step_fn(
         lambda: exploration_noise      # If training, use the defined scale.
     )
     
+    _n = noise * noise_scale
     # Apply the scaled noise.
-    noisy_action = action + noise * noise_scale
+    noisy_action = action + _n
             
     # Clip the final action to be within the environment's valid bounds.
-    return jnp.clip(noisy_action, action_low, action_high)
+    return jnp.clip(noisy_action, action_low, action_high), _n
 
+# @functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn', 'num_steps'))
+# def _multiple_grad_steps_nnx(
+#     state: TrainState, 
+#     key: jax.random.PRNGKey, 
+#     gamma: float, 
+#     tau: float, 
+#     replay_sample_fn,
+#     num_steps: int
+# ):
+#     """Performs multiple gradient update steps using nnx.fori_loop."""
+    
+#     def single_step(i, carry):
+#         current_state, current_key = carry
+#         current_key, subkey = jax.random.split(current_key)
+#         updated_state, _ = _grad_step(current_state, subkey, gamma, tau, replay_sample_fn)
+#         return updated_state, current_key
+    
+#     final_state, _ = nnx.fori_loop(0, num_steps, single_step, (state, key))
+#     return final_state
 
 class DDPG(agent.Agent):
     def __init__(self, 
@@ -151,23 +173,27 @@ class DDPG(agent.Agent):
                  replay: JaxReplayBuffer, 
                  buffer_state: 'BufferState', 
                  *,
-                 learning_rate: float = 3e-4,
+                 actor_learning_rate: float = 3e-4,
+                 critic_learning_rate: float = 3e-4,
                  gamma: float = 0.99,
                  tau: float = 0.005,
                  exploration_noise: float = 0.1,
                  steps_before_learning: int = 10000,
-                 steps_between_updates: int = 500):
+                 steps_between_updates: int = 500,
+                 learning_steps: int = 100,
+                 memory_warmup: int = 10000,
+                 ):
 
         # create targets
         target_actor = copy.deepcopy(actor)
         target_critic = copy.deepcopy(critic)
         
         actor_optimizer = nnx.Optimizer(
-            actor, optax.adam(learning_rate), wrt=nnx.Param
+            actor, optax.adam(actor_learning_rate), wrt=nnx.Param
         )
 
         critic_optimizer = nnx.Optimizer(
-            critic, optax.adam(learning_rate), wrt=nnx.Param
+            critic, optax.adam(critic_learning_rate), wrt=nnx.Param
         )
 
         self.state = TrainState(
@@ -189,14 +215,16 @@ class DDPG(agent.Agent):
         self.replay = replay
         self.steps_before_learning = steps_before_learning
         self.steps_between_updates = steps_between_updates
+        self.learning_steps = learning_steps
+        self.memory_warmup = memory_warmup
+
 
     def step(self, observation: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None) -> jnp.ndarray:
         """
         Selects an action by calling the pure, JIT-compiled step function.
         """
-        
         # Call the standalone function, passing in the required parts from the agent's state.
-        action = _step_fn(
+        action, noise = _step_fn(
             self.state.actor,
             observation,
             key,
@@ -205,9 +233,10 @@ class DDPG(agent.Agent):
             self.action_high,
             evaluate,
         )
+        
         return action
     
-    def update(self, prev_states, states, steps, key: jax.random.PRNGKey = None):
+    def update(self, prev_states, states, steps, agent_rng):
         experiences = Transition(
             observation=prev_states.obs,
             action=states.data.ctrl,
@@ -220,44 +249,29 @@ class DDPG(agent.Agent):
 
         # Conditionally call the JIT-compiled gradient step
         if steps > self.steps_before_learning and steps % self.steps_between_updates == 0:
-            for _ in range(50):
-                self.state = _grad_step(
+            for i in range(self.learning_steps):
+                agent_rng, key = jax.random.split(agent_rng, 2)
+
+                self.state, _ = _grad_step(
                     self.state, 
                     key, 
                     self.gamma, 
                     self.tau,
                     self.replay.sample # Pass the sample method itself
                 )
-                         
+
+                # Perform multiple gradient steps in a single JIT-compiled call
+            # self.state = _multiple_grad_steps_nnx(
+            #     self.state, 
+            #     key, 
+            #     self.gamma, 
+            #     self.tau,
+            #     self.replay.sample,
+            #     self.learning_steps
+            # )
+
+
         return self.state.buffer_state
-
-    def soft_update(self, tau: float, online_model: nnx.Module, target_model: nnx.Module):
-        """
-        Performs a soft update of the target model's parameters from the online model's parameters.
-
-        This function modifies the `target_model` in place.
-
-        Args:
-            tau: The interpolation parameter (typically a small value like 0.005).
-            online_model: The model being trained directly (source of new parameters).
-            target_model: The model to be updated slowly (destination).
-        """
-        # 1. Get the parameters from both the online and target models.
-        #    nnx.state() returns a pytree of the model's state, which we filter for just nnx.Param.
-        online_params = nnx.state(online_model, nnx.Param)
-        target_params = nnx.state(target_model, nnx.Param)
-
-        # 2. Use jax.tree_util.tree_map to apply the soft update formula to each parameter.
-        #    The lambda function is applied element-wise to each parameter tensor in the pytrees.
-        new_target_params = jax.tree_util.tree_map(
-            lambda online, target: tau * online + (1 - tau) * target,
-            online_params,
-            target_params
-        )
-
-        # 3. Update the target model with the new parameters.
-        #    nnx.update() applies the changes from the pytree back to the model object.
-        nnx.update(target_model, new_target_params)
 
     def save(self, path: Union[str, Path]):
         """
