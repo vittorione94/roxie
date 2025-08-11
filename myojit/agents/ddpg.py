@@ -219,6 +219,17 @@ class DDPG(agent.Agent):
         self.memory_warmup = memory_warmup
 
 
+        print("DDPG agent initialized.")
+        print("Params: \n" \
+        f"   gamma {self.gamma} \n" \
+        f"   tau {self.tau}\n" \
+        f"   exploration_noise {self.exploration_noise}\n" \
+        f"   steps_before_learning {self.steps_before_learning}\n" \
+        f"   steps_between_updates {self.steps_between_updates}\n" \
+        f"   learning_steps {self.learning_steps}\n" \
+        f"   memory_warmup {self.memory_warmup}\n")
+
+
     def step(self, observation: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None) -> jnp.ndarray:
         """
         Selects an action by calling the pure, JIT-compiled step function.
@@ -247,9 +258,10 @@ class DDPG(agent.Agent):
         # store in memory
         self.state.buffer_state = self.replay.add_batch(self.state.buffer_state, experiences)
 
+        gradient_steps = 0
         # Conditionally call the JIT-compiled gradient step
         if steps > self.steps_before_learning and steps % self.steps_between_updates == 0:
-            for i in range(self.learning_steps):
+            for gradient_steps in range(self.learning_steps):
                 agent_rng, key = jax.random.split(agent_rng, 2)
 
                 self.state, _ = _grad_step(
@@ -271,7 +283,7 @@ class DDPG(agent.Agent):
             # )
 
 
-        return self.state.buffer_state
+        return gradient_steps
 
     def save(self, path: Union[str, Path]):
         """

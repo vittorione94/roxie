@@ -4,10 +4,10 @@ args:
   gamma: 0.99
   tau: 0.005
   actor_learning_rate: 1e-3
-  critic_learning_rate: 1e-2
+  critic_learning_rate: 1e-3
   exploration_noise: 0.1
   steps_before_learning: 1000
-  memory_warmup: 50000
+  memory_warmup: 100000
   steps_between_updates: 500
   learning_steps: 150
 

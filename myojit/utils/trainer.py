@@ -63,7 +63,7 @@ class Trainer:
 
         scores = jnp.zeros(NUM_ENVS)
         lengths = jnp.zeros(NUM_ENVS, int)
-        self.steps, epoch_steps, epochs, episodes = 0, 0, 0, 0
+        self.steps, epoch_steps, epochs, episodes, tot_gradient_steps = 0, 0, 0, 0, 0
         steps_since_save = 0
         
         while True:
@@ -88,12 +88,13 @@ class Trainer:
             new_wrapped_states = jit_v_step(old_wrapped_states, actions)
             
             # Pass BOTH the old and new states to the agent for the full transition.
-            new_buffer_state = self.agent.update(
+            gradient_steps = self.agent.update(
                 old_wrapped_states.env_state, 
                 new_wrapped_states.env_state, 
                 steps=self.steps, 
                 agent_rng=rngs.agent()
             )
+            tot_gradient_steps += gradient_steps
 
             dones = new_wrapped_states.env_state.done
             
@@ -138,7 +139,7 @@ class Trainer:
             # (where True=1, False=0) and add it to the total count.
             episodes = episodes + jnp.sum(new_wrapped_states.env_state.done)
 
-            # # End of the epoch.
+            # End of the epoch.
             if epoch_steps >= self.epoch_steps:
 
                 # Evaluate the agent on the test environment.
@@ -148,6 +149,20 @@ class Trainer:
                 # Log the data.
                 epochs += 1
                 epoch_steps = 0
+
+                print("\nEpoch Stats: \n"
+                      f"    Epoch: {epochs} \n"
+                      f"    Steps: {self.steps} \n"
+                      f"    Episodes: {episodes} \n"
+                      f"    Time: {time.time() - start_time:.2f} \n"
+                      f"    Epoch time: {time.time() - last_epoch_time:.2f} \n"
+                      f"    Steps per second: {self.steps / (time.time() - start_time):.2f} \n"
+                      f"    Warmup: {self.steps < self.agent.memory_warmup} \n"
+                      f"    Average score: {jnp.mean(scores):.2f} \n"
+                      f"    Average length: {jnp.mean(lengths):.2f} \n"
+                      f"    Gradient steps: {tot_gradient_steps} \n")
+                
+                last_epoch_time = time.time()
 
             # End of training.
             stop_training = self.steps >= self.max_steps
@@ -190,9 +205,12 @@ class Trainer:
             scores.append(score)
             lengths.append(length)
 
-        print(f"Test results: "
-              f"Average score: {np.mean(scores):.2f}, "
-              f"Average length: {np.mean(lengths):.2f}, "
-              f"Scores: {scores}, Lengths: {lengths}"
-              f"Actions mean: {np.mean(actions)}, Actions std: {np.std(actions)}")
+        print(
+            "\nTest results: \n"
+            f"    Average score: {np.mean(scores):.2f} \n"
+            f"    Average length: {np.mean(lengths):.2f} \n"
+            f"    Scores: {scores} \n"
+            f"    Actions mean: {np.mean(actions)} \n"
+            f"    Actions std: {np.std(actions)}"
+        )
 

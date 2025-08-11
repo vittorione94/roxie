@@ -37,6 +37,11 @@ class JaxReplayBuffer:
         self.capacity = capacity
         self.batch_size = batch_size
 
+        print("Replay buffer initialized.")
+        print("Params: \n" \
+        f"   capacity {self.capacity} \n" \
+        f"   batch_size {self.batch_size}\n")
+
 
     def init(self, transition_prototype: Transition) -> BufferState:
         """
