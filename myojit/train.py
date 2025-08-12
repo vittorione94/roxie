@@ -6,6 +6,7 @@ from myojit.replays.buffer import JaxReplayBuffer
 from flax import nnx
 from myojit.utils.trainer import Trainer
 import jax.numpy as jnp
+import jax
 from myojit.replays.buffer import Transition
 from hydra.core.hydra_config import HydraConfig
 import copy
@@ -14,7 +15,18 @@ import copy
 def main(cfg: DictConfig):
     print(cfg.agent.name)
 
+    print("JAX devices:", jax.devices())
+    print("JAX platform:", jax.default_backend())
+    
+    # Test array placement
+    test_array = jnp.ones(3)
+    print("Test array device:", test_array.devices())
+
+
     env, env_cfg = load_playground_env(cfg.env.env_name)
+
+    print("Environment configuration:", env_cfg)
+
     output_dir = HydraConfig.get().runtime.output_dir
 
     prototype = Transition(
@@ -47,7 +59,11 @@ def main(cfg: DictConfig):
         rngs=rngs
     )
     
-    agent = agents[cfg.agent.name](actor, critic, replay, buffer_state, **cfg.agent.args)
+    ctrl_range = jnp.array(env.mj_model.actuator_ctrlrange)  # shape (action_dim, 2)
+    action_low = ctrl_range[:, 0]
+    action_high = ctrl_range[:, 1]
+    agent = agents[cfg.agent.name](actor, critic, replay, buffer_state, \
+                                   action_low=action_low, action_high=action_high, **cfg.agent.args)
 
     trainer = Trainer(output_dir=output_dir, steps=int(1e7), epoch_steps=int(1e5), save_steps=int(5e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,)

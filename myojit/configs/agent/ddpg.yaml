@@ -3,16 +3,21 @@ name: "ddpg"
 args: 
   gamma: 0.99
   tau: 0.005
-  actor_learning_rate: 1e-3
+  actor_learning_rate: 5e-4
   critic_learning_rate: 1e-3
-  exploration_noise: 0.1
-  steps_before_learning: 1000
-  memory_warmup: 1000
-  steps_between_updates: 500
-  learning_steps: 150
+  init_noise: 0.1         # action selection noise
+  min_noise: 0.02
+  noise_decay_transitions: 5_000_000   # linear decay horizon
+  target_policy_noise: 0.05       # target smoothing noise
+  target_noise_clip: 0.1
+  memory_warmup: 15_000            # start updates after 15k transitions (~75 loops @ 200 envs)
+  steps_before_learning: 15_000    # same as warmup (can differ if desired)
+  steps_between_updates: 200      # update every 200 new transitions (~once per trainer loop)
+  learning_steps: 1              # gradient steps per update trigger
+  max_grad_norm: 0.5
 
 memory:
   _target_: replays.buffer.JaxReplayBuffer
   
-  capacity: 10_000_000
+  capacity: 1_000_000
   batch_size: 256

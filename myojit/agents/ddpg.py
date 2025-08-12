@@ -41,13 +41,25 @@ class TrainState(nnx.Module):
     self.buffer_state = buffer_state
 
 
-def _critic_loss_fn(critic_model, target_actor_model, target_critic_model, samples, gamma):
+def _critic_loss_fn(critic_model, target_actor_model, target_critic_model, samples, \
+                    gamma, noise_key, target_policy_noise, target_noise_clip,  action_low, action_high):
     """Calculates the MSE loss for the critic."""
     next_actions = target_actor_model(samples['next_observations'])
+
+    noise = jax.random.normal(noise_key, next_actions.shape) * target_policy_noise
+    noise = jnp.clip(noise, -target_noise_clip, target_noise_clip)
+    next_actions = next_actions + noise
+    # Clip actions to valid range (assuming -1 to 1)
+    next_actions = jnp.clip(next_actions, action_low, action_high)
+
     next_q = target_critic_model(samples['next_observations'], next_actions)
     
-    target_q = samples['rewards'] + gamma * (1.0 - samples['terminals']) * jnp.squeeze(next_q)
-    
+    term = samples['terminals'].astype(jnp.float32)
+    reward = jnp.squeeze(samples['rewards'])
+    next_q = jnp.squeeze(next_q)
+    target_q = reward + gamma * (1.0 - term) * next_q
+    target_q = jax.lax.stop_gradient(target_q)
+
     current_q = critic_model(samples['observations'], samples['actions'])
     
     critic_loss = jnp.mean((jnp.squeeze(current_q) - target_q)**2)
@@ -63,14 +75,17 @@ def _actor_loss_fn(actor_model, critic_model, samples):
 
 # This is the core computational kernel that will be JIT-compiled.
 @functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn'))
-def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: float, replay_sample_fn):
+def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: float, replay_sample_fn, \
+               exploration_noise: float, target_policy_noise: float, target_noise_clip: float, action_low: float, action_high: float):
     """Performs one full gradient update step and returns the new state."""
     # 1. Sample from the replay buffer
+    key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
 
     # 2. Calculate critic gradients and update the critic
     critic_loss, critic_grads = nnx.value_and_grad(_critic_loss_fn)(
-        state.critic, state.target_actor, state.target_critic, samples, gamma
+        state.critic, state.target_actor, state.target_critic, samples, gamma, noise_key, \
+            target_policy_noise, target_noise_clip, action_low, action_high
     )
     state.critic_optimizer.update(critic_grads)
     
@@ -178,23 +193,42 @@ class DDPG(agent.Agent):
                  critic_learning_rate: float = 3e-4,
                  gamma: float = 0.99,
                  tau: float = 0.005,
-                 exploration_noise: float = 0.1,
-                 steps_before_learning: int = 10000,
-                 steps_between_updates: int = 500,
-                 learning_steps: int = 100,
-                 memory_warmup: int = 10000,
+                #  exploration_noise: float = 0.1,
+                 init_noise: float = 0.1,
+                 min_noise: float = 0.01,
+                 noise_decay_transitions: int = 100000,
+                 steps_before_learning: int = 100,
+                 steps_between_updates: int = 10,
+                 learning_steps: int = 5,
+                 memory_warmup: int = 100,
+                 target_noise_clip: float = 0.1,
+                 target_policy_noise: float = 0.1,
+                 max_grad_norm: float = 1.0,
+                 action_low: float = -1.0,
+                 action_high: float = 1.0
                  ):
 
         # create targets
         target_actor = copy.deepcopy(actor)
         target_critic = copy.deepcopy(critic)
         
+        # Add gradient clipping to optimizers
         actor_optimizer = nnx.Optimizer(
-            actor, optax.adam(actor_learning_rate), wrt=nnx.Param
+            actor, 
+            optax.chain(
+                optax.clip_by_global_norm(max_grad_norm),
+                optax.adam(actor_learning_rate)
+            ), 
+            wrt=nnx.Param
         )
 
         critic_optimizer = nnx.Optimizer(
-            critic, optax.adam(critic_learning_rate), wrt=nnx.Param
+            critic, 
+            optax.chain(
+                optax.clip_by_global_norm(max_grad_norm),
+                optax.adam(critic_learning_rate)
+            ), 
+            wrt=nnx.Param
         )
 
         self.state = TrainState(
@@ -210,15 +244,19 @@ class DDPG(agent.Agent):
         # --- Store hyperparameters ---
         self.gamma = gamma
         self.tau = tau
-        self.exploration_noise = exploration_noise
-        self.action_low = -1
-        self.action_high = 1
+        self.exploration_noise = init_noise
+        self.init_noise = init_noise
+        self.noise_decay_transitions = noise_decay_transitions
+        self.min_noise = min_noise
+        self.action_low = action_low
+        self.action_high = action_high
         self.replay = replay
         self.steps_before_learning = steps_before_learning
         self.steps_between_updates = steps_between_updates
         self.learning_steps = learning_steps
         self.memory_warmup = memory_warmup
-
+        self.target_noise_clip = target_noise_clip
+        self.target_policy_noise = target_policy_noise
 
         print("DDPG agent initialized.")
         print("Params: \n" \
@@ -228,7 +266,14 @@ class DDPG(agent.Agent):
         f"   steps_before_learning {self.steps_before_learning}\n" \
         f"   steps_between_updates {self.steps_between_updates}\n" \
         f"   learning_steps {self.learning_steps}\n" \
-        f"   memory_warmup {self.memory_warmup}\n")
+        f"   memory_warmup {self.memory_warmup}\n" \
+        f"   target_noise_clip {self.target_noise_clip}\n" \
+        f"   action_low {self.action_low}\n" \
+        f"   action_high {self.action_high}\n" \
+        f"   max_grad_norm {max_grad_norm}\n" \
+        f"   actor_learning_rate {actor_learning_rate}\n" \
+        f"   critic_learning_rate {critic_learning_rate}\n" \
+        f"   target_policy_noise {target_policy_noise}\n" )
 
 
     def step(self, observation: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None) -> jnp.ndarray:
@@ -248,10 +293,15 @@ class DDPG(agent.Agent):
         
         return action
     
-    def update(self, prev_states, states, steps, agent_rng):
+    def _decay_noise(self, steps):
+        f = min(1.0, steps / self.noise_decay_transitions)
+        self.exploration_noise = float(self.init_noise - (self.init_noise - self.min_noise) * f)
+
+
+    def update(self, prev_states, states, steps, agent_rng, actions):
         experiences = Transition(
             observation=prev_states.obs,
-            action=states.data.ctrl,
+            action=actions,
             reward=states.reward,
             next_observation=states.obs,
             terminal=states.done,
@@ -262,9 +312,12 @@ class DDPG(agent.Agent):
         gradient_steps = 0
         actor_loss, critic_loss = 0, 0
 
+        self._decay_noise(steps)
+
         # Conditionally call the JIT-compiled gradient step
-        if steps > self.steps_before_learning and steps % self.steps_between_updates == 0:
-            for gradient_steps in range(self.learning_steps):
+        if steps >= self.steps_before_learning and \
+           (steps - self.steps_before_learning) % self.steps_between_updates == 0:
+            for _ in range(self.learning_steps):
                 agent_rng, key = jax.random.split(agent_rng, 2)
 
                 self.state, actor_loss, critic_loss = _grad_step(
@@ -272,9 +325,14 @@ class DDPG(agent.Agent):
                     key, 
                     self.gamma, 
                     self.tau,
-                    self.replay.sample # Pass the sample method itself
+                    self.replay.sample, # Pass the sample method itself,
+                    self.exploration_noise,
+                    self.target_policy_noise,  # Use target_policy_noise
+                    self.target_noise_clip,
+                    self.action_low,
+                    self.action_high
                 )
-
+            gradient_steps += self.learning_steps
                 # Perform multiple gradient steps in a single JIT-compiled call
             # self.state = _multiple_grad_steps_nnx(
             #     self.state, 
@@ -303,19 +361,29 @@ class DDPG(agent.Agent):
         path = Path(path).resolve()
         # path.mkdir(parents=True, exist_ok=True)
         
-        # Split models into static graph definition and dynamic state
+            # Extract parameters and move to CPU
         _, actor_state = nnx.split(self.state.actor)
         _, critic_state = nnx.split(self.state.critic)
-
-        # Create a Pytree containing all the data to save
+        _, target_actor_state = nnx.split(self.state.target_actor)
+        _, target_critic_state = nnx.split(self.state.target_critic)
+        
         save_data = {
-            'actor': actor_state,
-            'critic': critic_state,
-            'buffer': self.state.buffer_state
+            'actor': jax.device_get(actor_state),
+            'critic': jax.device_get(critic_state),
+            'target_actor': jax.device_get(target_actor_state),
+            'target_critic': jax.device_get(target_critic_state),
+            'buffer': jax.device_get(self.state.buffer_state),
+            'hyperparams': {
+                'gamma': self.gamma,
+                'tau': self.tau,
+                'exploration_noise': self.exploration_noise,
+                'target_noise_clip': self.target_noise_clip,
+                'action_low': self.action_low,
+                'action_high': self.action_high
+            }
         }
         
-        # Use Orbax to save the Pytree
-        checkpointer = ocp.PyTreeCheckpointer()
+        checkpointer = ocp.StandardCheckpointer()  # More device-agnostic
         checkpointer.save(path, save_data)
         print(f"Agent state saved to {path}")
 

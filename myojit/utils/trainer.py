@@ -94,7 +94,8 @@ class Trainer:
                 old_wrapped_states.env_state, 
                 new_wrapped_states.env_state, 
                 steps=self.steps, 
-                agent_rng=rngs.agent()
+                agent_rng=rngs.agent(),
+                actions=actions
             )
             actor_losses.append(actor_loss)
             critic_losses.append(critic_loss)
