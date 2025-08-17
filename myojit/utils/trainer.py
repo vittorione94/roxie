@@ -45,11 +45,25 @@ class Trainer:
 
         # Apply JIT compilation to the vectorized functions for maximum performance.
         # This compiles the entire batched operation into a single optimized kernel.
+        jit_reset = jax.jit(self.environment.reset)  # single-env reset
         jit_v_reset = jax.jit(v_reset)
         jit_v_step = jax.jit(v_step)
-        
-        jit_test_reset = jax.jit(self.test_environment.reset)
-        jit_test_step = jax.jit(self.test_environment.step)
+
+        # JIT the test envs outside the test function (batched over test_episodes)
+        v_test_reset = jax.jit(jax.vmap(self.test_environment.reset))
+        v_test_step = jax.jit(jax.vmap(self.test_environment.step))
+
+        # Helper: lazily reset only the envs that are done (per-env cond, vmapped and jitted)
+        def _selective_reset(done, key, state):
+            # If this env is done, reset it with key; otherwise keep the new state.
+            return jax.lax.cond(
+                done,
+                lambda k: jit_reset(k),     # reset returns a single-env wrapped state
+                lambda _: state,            # keep the provided single-env state
+                key,
+            )
+
+        v_selective_reset = jax.jit(jax.vmap(_selective_reset))
 
         print("Successfully created JIT-compiled, vectorized reset and step functions.")
 
@@ -57,9 +71,10 @@ class Trainer:
         # Split the master key to get a unique key for each parallel environment.
         loop_rng = rngs.envs()
         reset_keys = jax.random.split(loop_rng, NUM_ENVS)
-
-        # Call the vectorized reset function to get the initial states for all envs.
         wrapped_states = jit_v_reset(reset_keys)
+
+        # Add a persistent RNG for agent updates
+        agent_key = rngs.agent()
 
         scores = jnp.zeros(NUM_ENVS)
         lengths = jnp.zeros(NUM_ENVS, int)
@@ -78,7 +93,10 @@ class Trainer:
             if self.steps > self.agent.memory_warmup:
                 actions = self.agent.step(wrapped_states.env_state.obs, evaluate=False, key=action_key)
             else:
-                actions = jax.random.uniform(action_key, (NUM_ENVS, self.environment.action_size), minval=-1.0, maxval=1.0)
+                low = self.agent.action_low
+                high = self.agent.action_high
+                u = jax.random.uniform(action_key, (NUM_ENVS, self.environment.action_size), minval=0.0, maxval=1.0)
+                actions = low + (high - low) * u
             
             # TODO use chex
             #assert not np.isnan(actions.sum())
@@ -90,11 +108,13 @@ class Trainer:
             new_wrapped_states = jit_v_step(old_wrapped_states, actions)
             
             # Pass BOTH the old and new states to the agent for the full transition.
+            # Split a fresh key for agent update every loop
+            agent_key, update_key = jax.random.split(agent_key)
             gradient_steps, actor_loss, critic_loss = self.agent.update(
                 old_wrapped_states.env_state, 
                 new_wrapped_states.env_state, 
                 steps=self.steps, 
-                agent_rng=rngs.agent(),
+                agent_rng=update_key,
                 actions=actions
             )
             actor_losses.append(actor_loss)
@@ -107,23 +127,9 @@ class Trainer:
             # Generate new keys for the environments that need resetting.
             reset_keys = jax.random.split(reset_key_batch, NUM_ENVS)
             
-            # Get a batch of *potential* new states by calling the reset function.
-            # We do this for all environments; `where` will select only the needed ones.
-            reset_states = jit_v_reset(reset_keys)
-            
-            # The main event: Use tree_map and where to create the true next state.
-            # For each leaf in the state PyTree, it picks from `reset_states` if done,
-            # otherwise it keeps the state from `new_wrapped_states`.
-            # CRITICAL: Update the main state variable for the next loop iteration.
-            wrapped_states = jax.tree.map(
-                lambda reset_leaf, next_leaf: jnp.where(
-                    dones.reshape((dones.shape[0],) + (1,) * (reset_leaf.ndim - 1)), # Ensure `dones` broadcasts correctly to array shapes
-                    reset_leaf,
-                    next_leaf
-                ),
-                reset_states,
-                new_wrapped_states
-            )
+            # Lazily reset only the envs that are done, keep others as-is.
+            # This avoids computing reset() for every env at every step.
+            wrapped_states = v_selective_reset(dones, reset_keys, new_wrapped_states)
 
             scores += new_wrapped_states.env_state.reward
             lengths += 1
@@ -150,7 +156,7 @@ class Trainer:
 
                 # Evaluate the agent on the test environment.
                 if self.test_environment:
-                    self._test(rngs.envs(), jit_test_reset, jit_test_step)
+                    self._test(rngs.envs(), v_test_reset, v_test_step)
 
                 # Log the data.
                 epochs += 1
@@ -191,36 +197,64 @@ class Trainer:
             if stop_training:
                 break
 
-    def _test(self, rng, jit_reset, jit_step):
-        '''Tests the agent on the test environment.'''
-        scores, lengths, actions = [], [], []       
+    def _test(self, rng, v_reset, v_step):
+        '''Tests the agent on the test environment (batched; env fns are JITed outside).'''
+        num_tests = int(self.test_episodes)
 
-        # Test loop.
-        for _ in range(self.test_episodes):
-            score, length = 0, 0
-            rng, reset_key = jax.random.split(rng, 2)
-    
-            # Initialize a 'current_state' that will be updated
-            current_state = jit_reset(reset_key)
-            while True:
-                # Select an action.
-                action = self.agent.step(current_state.env_state.obs, evaluate=True, key=reset_key)
-                actions.append(action)
-                current_state = jit_step(current_state, action)
-                score += current_state.env_state.reward
-                length += 1
-   
-                if current_state.env_state.done:
-                    break
-            scores.append(score)
-            lengths.append(length)
+        # Reset all test envs in parallel
+        rng, keys_rng = jax.random.split(rng, 2)
+        reset_keys = jax.random.split(keys_rng, num_tests)
+        states = v_reset(reset_keys)
+
+        scores = jnp.zeros((num_tests,), dtype=jnp.float32)
+        lengths = jnp.zeros((num_tests,), dtype=jnp.int32)
+        dones = jnp.zeros((num_tests,), dtype=bool)
+
+        # Online action statistics (scalar mean/std)
+        action_sum = 0.0
+        action_sumsq = 0.0
+        action_count = 0
+
+        # Step all envs in parallel until all are done
+        eval_key = rng  # evaluate=True disables exploration noise
+        while not bool(jnp.all(dones)):
+            obs = states.env_state.obs
+            actions = self.agent.step(obs, evaluate=True, key=eval_key)  # shape (num_tests, act_dim)
+            next_states = v_step(states, actions)
+
+            not_done = ~dones
+            scores = scores + next_states.env_state.reward * not_done.astype(jnp.float32)
+            lengths = lengths + not_done.astype(jnp.int32)
+
+            # Keep state for finished envs; advance the others
+            def select_leaf(old, new):
+                # Broadcast dones to leaf shape (B, 1, ..., 1)
+                broadcast_shape = (dones.shape[0],) + (1,) * max(new.ndim - 1, 0)
+                mask = dones.reshape(broadcast_shape)
+                return jnp.where(mask, old, new)
+            states = jax.tree.map(select_leaf, states, next_states)
+
+            # Latch dones
+            dones = jnp.logical_or(dones, next_states.env_state.done)
+
+            # Update action stats
+            action_sum += float(jnp.sum(actions))
+            action_sumsq += float(jnp.sum(jnp.square(actions)))
+            action_count += int(actions.size)
+
+        # Final stats
+        scores_np = np.array(scores)
+        lengths_np = np.array(lengths)
+        act_mean = action_sum / max(1, action_count)
+        act_var = max(0.0, action_sumsq / max(1, action_count) - act_mean * act_mean)
+        act_std = float(np.sqrt(act_var))
 
         print(
             "\nTest results: \n"
-            f"    Average score: {np.mean(scores):.2f} \n"
-            f"    Average length: {np.mean(lengths):.2f} \n"
-            f"    Scores: {scores} \n"
-            f"    Actions mean: {np.mean(actions)} \n"
-            f"    Actions std: {np.std(actions)}"
+            f"    Average score: {np.mean(scores_np):.2f} \n"
+            f"    Average length: {np.mean(lengths_np):.2f} \n"
+            f"    Scores: {scores_np.tolist()} \n"
+            f"    Actions mean: {act_mean:.4f} \n"
+            f"    Actions std: {act_std:.4f}"
         )
 

@@ -45,18 +45,21 @@ def main(cfg: DictConfig):
     buffer_state = replay.init(prototype)
     
     action_dim = env.action_size
-    rngs = nnx.Rngs(params=0, dropout=1, envs=2, agent=3) # Use your seed from cfg.seed
+    # rngs = nnx.Rngs(params=0, dropout=1, envs=2, agent=3) # Use your seed from cfg.seed
+    actor_rngs = nnx.Rngs(params=0, dropout=1)
+    critic_rngs = nnx.Rngs(params=0, dropout=1)
+    training_rngs = nnx.Rngs(envs=2, agent=3) # Use your seed from cfg.seed
 
     # A more direct check:
     actor = hydra.utils.instantiate(
             cfg.model.actor,
             in_features=env.observation_size,
             action_dim=action_dim,
-            rngs=rngs)
+            rngs=actor_rngs)
     critic = hydra.utils.instantiate(
         cfg.model.critic,
         in_features=env.observation_size + action_dim,
-        rngs=rngs
+        rngs=critic_rngs
     )
     
     ctrl_range = jnp.array(env.mj_model.actuator_ctrlrange)  # shape (action_dim, 2)
@@ -68,7 +71,7 @@ def main(cfg: DictConfig):
     trainer = Trainer(output_dir=output_dir, steps=int(1e7), epoch_steps=int(1e5), save_steps=int(5e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,)
     trainer.initialize(agent=agent, environment=env, test_environment=copy.deepcopy(env))
-    trainer.run(cfg.parallel_envs, rngs) 
+    trainer.run(cfg.parallel_envs, training_rngs) 
 
     return
 

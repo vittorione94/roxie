@@ -44,14 +44,18 @@ class TerminationWrapper(wrapper.Wrapper):
         # Reset the base environment to get the initial mjx_env.State
         initial_env_state = super().reset(key)
 
-        # Update the info dictionary for observation purposes
-        new_info = initial_env_state.info | {
-            'truncation': False,
-            'termination': False,
-        }
+        # Normalize flags to 0-d jnp.bool_ for JAX consistency
+        false_b = jnp.array(False, dtype=jnp.bool_)
 
-        # Create the final environment state with the updated done flag and info
-        initial_env_state = initial_env_state.replace(info=new_info)
+        # Update info and explicitly set done=False with consistent dtype
+        new_info = initial_env_state.info | {
+            'truncation': false_b,
+            'termination': false_b,
+        }
+        initial_env_state = initial_env_state.replace(
+            done=false_b,
+            info=new_info
+        )
 
         # Return the initial WrapperState, starting the step count at 0
         return WrapperState(
@@ -76,15 +80,20 @@ class TerminationWrapper(wrapper.Wrapper):
         # The episode is done if the base environment terminates OR if it's truncated.
         # next_env_state.done is the termination signal from the base env.
         done = jnp.logical_or(next_env_state.done, truncated)
+
+        # Normalize flags to 0-d jnp.bool_
+        trunc_b = jnp.asarray(truncated, dtype=jnp.bool_)
+        term_b = jnp.asarray(next_env_state.done, dtype=jnp.bool_)
+        done_b = jnp.asarray(done, dtype=jnp.bool_)
         
         # Update the info dictionary for observation purposes
         new_info = next_env_state.info | {
-            'truncation': truncated,
-            'termination': next_env_state.done,
+            'truncation': trunc_b,
+            'termination': term_b,
         }
 
         # Create the final environment state with the updated done flag and info
-        final_env_state = next_env_state.replace(done=done, info=new_info)
+        final_env_state = next_env_state.replace(done=done_b, info=new_info)
 
         # Return the new WrapperState containing the new env state and step count
         return WrapperState(

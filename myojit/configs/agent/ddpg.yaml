@@ -13,7 +13,7 @@ args:
   memory_warmup: 15_000            # start updates after 15k transitions (~75 loops @ 200 envs)
   steps_before_learning: 15_000    # same as warmup (can differ if desired)
   steps_between_updates: 200      # update every 200 new transitions (~once per trainer loop)
-  learning_steps: 1              # gradient steps per update trigger
+  learning_steps: 4              # gradient steps per update trigger
   max_grad_norm: 0.5
 
 memory:

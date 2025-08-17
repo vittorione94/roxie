@@ -99,9 +99,9 @@ def main(checkpoint_path):
         while viewer.is_running():
             step_start = time.time()
 
-            # Take a random action
-            action = agent.step([wrapped_state.env_state.obs], evaluate=True, key=key)
-
+            # Take a policy action
+            obs_b = jnp.expand_dims(wrapped_state.env_state.obs, axis=0)
+            action = agent.step(obs_b, evaluate=True, key=key)   # shape (1, act_dim)
             # Step the environment
             wrapped_state = jit_step(wrapped_state, action[0])
 
