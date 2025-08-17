@@ -8,7 +8,7 @@ defaults:
   - _self_           # Allows this file to add its own values, too.
 
 seed: 0
-parallel_envs: 200
+parallel_envs: 400
 
 env:
   # Default parameters

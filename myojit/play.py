@@ -56,18 +56,22 @@ def main(checkpoint_path):
 
     action_dim = env.action_size
     #TODO: study properly this
-    rngs = nnx.Rngs(params=0, dropout=1, envs=2, agent=3) # Use your seed from cfg.seed
+    # rngs = nnx.Rngs(params=0, dropout=1, envs=2, agent=3) # Use your seed from cfg.seed
+    actor_rngs = nnx.Rngs(params=0, dropout=1)
+    critic_rngs = nnx.Rngs(params=0, dropout=1)
+    # training_rngs = nnx.Rngs(envs=2, agent=3) # Use your seed from cfg.seed
 
     # A more direct check:
     actor = hydra.utils.instantiate(
             cfg.model.actor,
             in_features=env.observation_size,
             action_dim=action_dim,
-            rngs=rngs)
+            rngs=actor_rngs)
+    
     critic = hydra.utils.instantiate(
         cfg.model.critic,
         in_features=env.observation_size + action_dim,
-        rngs=rngs
+        rngs=critic_rngs
     )
 
 
@@ -102,6 +106,12 @@ def main(checkpoint_path):
             # Take a policy action
             obs_b = jnp.expand_dims(wrapped_state.env_state.obs, axis=0)
             action = agent.step(obs_b, evaluate=True, key=key)   # shape (1, act_dim)
+
+            # noise = jax.random.uniform(key, shape=(1, action_dim), minval=-1, maxval=1)  # Add some noise
+            # print(f"Action: {action[0]} Noise: {noise[0]}")
+            # action = jnp.clip(action + noise, -1, 1)
+            # print(f"Noisy Action: {action[0]}")
+
             # Step the environment
             wrapped_state = jit_step(wrapped_state, action[0])
 

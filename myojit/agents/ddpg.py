@@ -11,7 +11,7 @@ import optax
 import copy
 from typing import Any
 import flax.struct as struct
-
+import numpy as np
 
 class TrainState(nnx.Module):
   def __init__(
@@ -129,6 +129,19 @@ def _actor_loss_fn(actor_model, critic_model, samples, obs_mean, obs_std, obs_cl
     q_values = critic_model(obs, actions)
     actor_loss = -jnp.mean(q_values)
     return actor_loss
+
+# Helpers to serialize/deserialize bounds minimally
+def _serialize_bound(x):
+    x = jax.device_get(x)
+    if isinstance(x, (jnp.ndarray, np.ndarray)):
+        return float(x) if x.shape == () else np.asarray(x, dtype=np.float32).tolist()
+    if hasattr(x, "item"):
+        return x.item()
+    return float(x)
+
+def _deserialize_bound(x):
+    # Accept scalar or list -> jnp.array
+    return jnp.asarray(x, dtype=jnp.float32)
 
 
 # This is the core computational kernel that will be JIT-compiled.
@@ -447,37 +460,32 @@ class DDPG(agent.Agent):
 
 
     def save(self, path: Union[str, Path]):
-        # Ensure the path exists
         path = Path(path).resolve()
 
-        # Extract parameters and move to CPU
-        actor_graphdef, actor_state = nnx.split(self.state.actor)
-        critic_graphdef, critic_state = nnx.split(self.state.critic)
-        _, target_actor_state = nnx.split(self.state.target_actor)
-        _, target_critic_state = nnx.split(self.state.target_critic)
+        # 1) Split once; keep BOTH graphdef and state
+        graphdef, state_tree = nnx.split(self.state)
 
         save_data = {
-            # Save graphdefs to avoid merge mismatches at load time
-            'actor_graphdef': actor_graphdef,
-            'critic_graphdef': critic_graphdef,
+            # <-- keep the exact graph topology for reliable restore
+            'trainstate_graphdef': graphdef,
+            'trainstate_state': jax.device_get(state_tree),
 
-            'actor': jax.device_get(actor_state),
-            'critic': jax.device_get(critic_state),
-            'target_actor': jax.device_get(target_actor_state),
-            'target_critic': jax.device_get(target_critic_state),
-            'buffer': jax.device_get(self.state.buffer_state),
-            'obs_stats': jax.device_get(self.state.obs_stats),
+            # Minimal hyperparams (unchanged)
             'hyperparams': {
                 'gamma': self.gamma,
                 'tau': self.tau,
                 'exploration_noise': self.exploration_noise,
                 'target_noise_clip': self.target_noise_clip,
                 'target_policy_noise': self.target_policy_noise,
-                'action_low': self.action_low,
-                'action_high': self.action_high,
+                'action_low': _serialize_bound(self.action_low),
+                'action_high': _serialize_bound(self.action_high),
                 'normalize_observations': self.normalize_observations,
                 'obs_norm_clip': self.obs_clip,
                 'obs_norm_eps': self.obs_eps,
+                'steps_before_learning': self.steps_before_learning,
+                'steps_between_updates': self.steps_between_updates,
+                'learning_steps': self.learning_steps,
+                'memory_warmup': self.memory_warmup,
             }
         }
 
@@ -486,32 +494,17 @@ class DDPG(agent.Agent):
         print(f"Agent state saved to {path}")
 
     @classmethod
-    def load(cls, path: Union[str, Path], actor: nnx.Module, critic: nnx.Module, replay: JaxReplayBuffer):
-        """
-        Loads the agent's state from a directory.
-        """
+    def load(cls, path, actor, critic, replay):
         path = Path(path).resolve()
-        checkpointer = ocp.PyTreeCheckpointer()
-        loaded = checkpointer.restore(path)
+        loaded = ocp.PyTreeCheckpointer().restore(path)
 
-        # Prefer saved graphdefs if present; fallback to provided placeholders.
-        saved_actor_gd = loaded.get('actor_graphdef', nnx.split(actor)[0])
-        saved_critic_gd = loaded.get('critic_graphdef', nnx.split(critic)[0])
+        ckpt_state = loaded["trainstate_state"]
+        hyper = loaded.get("hyperparams", {})
 
-        actor = nnx.merge(saved_actor_gd, loaded['actor'])
-        critic = nnx.merge(saved_critic_gd, loaded['critic'])
-        target_actor = None
-        target_critic = None
-        if 'target_actor' in loaded:
-            target_actor = nnx.merge(saved_actor_gd, loaded['target_actor'])
-        if 'target_critic' in loaded:
-            target_critic = nnx.merge(saved_critic_gd, loaded['target_critic'])
+        # (Optional) carry over buffer_state for shape continuity
+        buffer_state = ckpt_state.get("buffer_state", None) if isinstance(ckpt_state, dict) else None
 
-        buffer_state = loaded.get('buffer', None)
-        obs_stats = loaded.get('obs_stats', None)
-        hyper = loaded.get('hyperparams', {})
-
-        # Build agent with restored hyperparams when available
+        # 1) Construct fresh agent to create live topology
         agent = cls(
             actor=actor,
             critic=critic,
@@ -519,24 +512,77 @@ class DDPG(agent.Agent):
             buffer_state=buffer_state,
             gamma=float(hyper.get('gamma', 0.99)),
             tau=float(hyper.get('tau', 0.005)),
-            action_low=jnp.array(hyper.get('action_low', -1.0)),
-            action_high=jnp.array(hyper.get('action_high', 1.0)),
+            action_low=_deserialize_bound(hyper.get('action_low', -1.0)),
+            action_high=_deserialize_bound(hyper.get('action_high', 1.0)),
             normalize_observations=bool(hyper.get('normalize_observations', True)),
             obs_norm_clip=float(hyper.get('obs_norm_clip', 5.0)),
             obs_norm_eps=float(hyper.get('obs_norm_eps', 1e-8)),
             target_noise_clip=float(hyper.get('target_noise_clip', 0.1)),
             target_policy_noise=float(hyper.get('target_policy_noise', 0.1)),
+            steps_before_learning=int(hyper.get('steps_before_learning', 100)),
+            steps_between_updates=int(hyper.get('steps_between_updates', 10)),
+            learning_steps=int(hyper.get('learning_steps', 5)),
+            memory_warmup=int(hyper.get('memory_warmup', 100)),
         )
 
-        # Restore targets and obs stats if present
-        if target_actor is not None:
-            agent.state.target_actor = target_actor
-        if target_critic is not None:
-            agent.state.target_critic = target_critic
-        if obs_stats is not None:
-            agent.state.obs_stats = obs_stats
-        if 'exploration_noise' in hyper:
-            agent.exploration_noise = float(hyper['exploration_noise'])
+        # Helper: convert numpy -> jax arrays
+        import numpy as _np
+        def _to_jax(x):
+            return jnp.asarray(x) if isinstance(x, _np.ndarray) else x
+
+        # 2) Merge submodules individually
+        def _restore_submodule(name: str):
+            if not (isinstance(ckpt_state, dict) and name in ckpt_state):
+                print(f"Info: '{name}' not in checkpoint; keeping live {name}.")
+                return
+            sub_ckpt = jax.tree.map(_to_jax, ckpt_state[name], is_leaf=lambda x: isinstance(x, _np.ndarray))
+            sub_live = getattr(agent.state, name)
+            gdef, _ = nnx.split(sub_live)
+            try:
+                restored = nnx.merge(gdef, sub_ckpt)
+                setattr(agent.state, name, restored)
+            except ValueError as e:
+                # Architecture drift or partial state → fall back to replacing just params where possible
+                print(f"Warning: merge({name}) failed ({e}). Falling back to param-only copy.")
+                try:
+                    dst_params = nnx.state(sub_live, nnx.Param)
+                    src_params = sub_ckpt.get('params', None) if isinstance(sub_ckpt, dict) else None
+                    if src_params is None:
+                        print(f"Warning: no 'params' found for {name}; skipping.")
+                    else:
+                        # Only update params; let NNX map into its own topology.
+                        nnx.update(sub_live, {'params': src_params})
+                except Exception as ee:
+                    print(f"Warning: param-only update for {name} failed ({ee}). Skipping.")
+
+        for name in ("actor", "critic", "target_actor", "target_critic"):
+            _restore_submodule(name)
+
+        # 3) Restore simple values directly (replace whole object; don't partial-update)
+        if isinstance(ckpt_state, dict) and "obs_stats" in ckpt_state:
+            try:
+                obs = ckpt_state["obs_stats"]
+                # obs may be dict-like; normalize to ObsStats dataclass
+                if isinstance(obs, dict):
+                    agent.state.obs_stats = ObsStats(
+                        count=jnp.asarray(obs["count"]),
+                        sum=jnp.asarray(obs["sum"]),
+                        sumsq=jnp.asarray(obs["sumsq"]),
+                    )
+                else:
+                    # If it was saved as a struct-compatible tree, just assign it.
+                    agent.state.obs_stats = jax.tree_map(_to_jax, obs, is_leaf=lambda x: isinstance(x, _np.ndarray))
+            except Exception as e:
+                print(f"Warning: could not restore obs_stats ({e}); using live stats.")
+
+        # (Optional) if you really want buffer snapshot:
+        if isinstance(ckpt_state, dict) and "buffer_state" in ckpt_state:
+            agent.state.buffer_state = ckpt_state["buffer_state"]
+
+        # 4) DO NOT restore optimizer internals: they’re brittle; let them be reinitialized.
+
+        if "exploration_noise" in hyper:
+            agent.exploration_noise = float(hyper["exploration_noise"])
 
         print(f"Agent state loaded from {path}")
         return agent
