@@ -1,4 +1,4 @@
-from myojit.agents import agent
+from myojit.agents.agent import Agent, TrainState, ObsStats 
 import jax
 import jax.numpy as jnp
 import functools
@@ -9,96 +9,20 @@ from pathlib import Path
 from typing import Union
 import optax
 import copy
-from typing import Any
-import flax.struct as struct
-import numpy as np
-
-class TrainState(nnx.Module):
-  def __init__(
-      self,
-      *,
-      actor: nnx.Module,
-      critic: nnx.Module,
-      target_actor: nnx.Module,
-      target_critic: nnx.Module,
-      actor_optimizer: nnx.Optimizer,
-      critic_optimizer: nnx.Optimizer,
-      buffer_state: Any,
-      obs_stats: Any
-  ):
-    """Initializes the training state.
-
-    The state components are defined as attributes of the module.
-    `nnx.Module` will automatically know how to handle them for
-    JAX transformations.
-    """
-    self.actor = actor
-    self.critic = critic
-    self.target_actor = target_actor
-    self.target_critic = target_critic
-
-    self.actor_optimizer = actor_optimizer
-    self.critic_optimizer = critic_optimizer
-
-    self.buffer_state = buffer_state
-    self.obs_stats = obs_stats  # Stores observation statistics for normalization
-
-@struct.dataclass
-class ObsStats:
-    count: jnp.ndarray      # shape: ()
-    sum: jnp.ndarray        # shape: obs_shape
-    sumsq: jnp.ndarray      # shape: obs_shape
-
-
-def _init_obs_stats(obs_shape) -> ObsStats:
-    return ObsStats(
-        count=jnp.array(0.0, dtype=jnp.float32),
-        sum=jnp.zeros(obs_shape, dtype=jnp.float32),
-        sumsq=jnp.zeros(obs_shape, dtype=jnp.float32),
-    )
-
-def _update_obs_stats(stats: ObsStats, batch_obs: jnp.ndarray) -> ObsStats:
-    # batch_obs: (B, *obs_shape)
-    b = batch_obs.shape[0]
-    batch_sum = jnp.sum(batch_obs, axis=0)
-    batch_sumsq = jnp.sum(jnp.square(batch_obs), axis=0)
-    return stats.replace(
-        count=stats.count + b,
-        sum=stats.sum + batch_sum,
-        sumsq=stats.sumsq + batch_sumsq,
-    )
-
-def _obs_mean_std(stats: ObsStats, eps: float):
-    # If no data yet, return zeros and ones to effectively skip normalization.
-    def compute():
-        mean = stats.sum / stats.count
-        var = stats.sumsq / stats.count - jnp.square(mean)
-        std = jnp.sqrt(jnp.maximum(var, 0.0))  # avoid negatives due to numerics
-        std = jnp.maximum(std, eps)
-        return mean, std
-    def skip():
-        return jnp.zeros_like(stats.sum), jnp.ones_like(stats.sum)
-    return jax.lax.cond(stats.count > 0.0, compute, skip)
-
-def _normalize_obs(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, clip: float):
-    return jnp.clip((x - mean) / std, -clip, clip)
-
-def _scale_to_env(x: jnp.ndarray, low: jnp.ndarray, high: jnp.ndarray):
-    # x in [-1, 1] -> [low, high]
-    return low + 0.5 * (x + 1.0) * (high - low)
-
+from myojit.agents.utils import serialize_bound, deserialize_bound
+from typing import Any, Union
 
 def _critic_loss_fn(critic_model, target_actor_model, target_critic_model, samples, \
                     gamma, noise_key, target_policy_noise, target_noise_clip,  action_low, action_high, \
                     obs_mean, obs_std, obs_clip):
     """Calculates the MSE loss for the critic."""
     # Normalize observations
-    obs = _normalize_obs(samples['observations'], obs_mean, obs_std, obs_clip)
-    next_obs = _normalize_obs(samples['next_observations'], obs_mean, obs_std, obs_clip)
+    obs = Agent.normalize_obs(samples['observations'], obs_mean, obs_std, obs_clip)
+    next_obs = Agent.normalize_obs(samples['next_observations'], obs_mean, obs_std, obs_clip)
 
     # Target actions in env scale
     next_actions = target_actor_model(next_obs)                 # [-1, 1]
-    next_actions = _scale_to_env(next_actions, action_low, action_high)
+    next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
 
     # Target smoothing noise in env units
     act_span = (action_high - action_low)
@@ -123,25 +47,12 @@ def _critic_loss_fn(critic_model, target_actor_model, target_critic_model, sampl
 
 def _actor_loss_fn(actor_model, critic_model, samples, obs_mean, obs_std, obs_clip, action_low, action_high):
     """Calculates the loss for the actor (aims to maximize Q-value)."""
-    obs = _normalize_obs(samples['observations'], obs_mean, obs_std, obs_clip)
+    obs = Agent.normalize_obs(samples['observations'], obs_mean, obs_std, obs_clip)
     actions = actor_model(obs)                                  # [-1, 1]
-    actions = _scale_to_env(actions, action_low, action_high)   # [low, high]
+    actions = Agent.scale_to_env(actions, action_low, action_high)   # [low, high]
     q_values = critic_model(obs, actions)
     actor_loss = -jnp.mean(q_values)
     return actor_loss
-
-# Helpers to serialize/deserialize bounds minimally
-def _serialize_bound(x):
-    x = jax.device_get(x)
-    if isinstance(x, (jnp.ndarray, np.ndarray)):
-        return float(x) if x.shape == () else np.asarray(x, dtype=np.float32).tolist()
-    if hasattr(x, "item"):
-        return x.item()
-    return float(x)
-
-def _deserialize_bound(x):
-    # Accept scalar or list -> jnp.array
-    return jnp.asarray(x, dtype=jnp.float32)
 
 
 # This is the core computational kernel that will be JIT-compiled.
@@ -155,7 +66,7 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
     samples = replay_sample_fn(state.buffer_state, key)
 
     # 1.1 Compute current normalization parameters
-    obs_mean, obs_std = _obs_mean_std(state.obs_stats, obs_eps)
+    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
     # 2. Critic update
     critic_loss, critic_grads = nnx.value_and_grad(_critic_loss_fn)(
@@ -204,70 +115,17 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
         ), actor_loss, critic_loss
 
 
-@functools.partial(nnx.jit, static_argnames=('evaluate',))
-def _step_fn(
-    actor_model: nnx.Module,
-    observation: jnp.ndarray,
-    key: jax.random.PRNGKey,
-    exploration_noise: float,
-    action_low: jnp.ndarray,
-    action_high: jnp.ndarray,
-    evaluate: bool = False,
-):
-    """
-    A pure function to select an action.
-    Its output depends only on its inputs.
-    """
-    # Deterministic action in [-1, 1]
-    action = actor_model(observation)
-    # Scale to env range
-    action = _scale_to_env(action, action_low, action_high)
-
-    # Generate noise (env units), disabled in eval
-    noise = jax.random.normal(key, action.shape)
-    noise_scale = jax.lax.cond(
-        evaluate,
-        lambda: 0.0,
-        lambda: exploration_noise
-    )
-    act_span = (action_high - action_low)
-    _n = noise * noise_scale * act_span
-
-    noisy_action = jnp.clip(action + _n, action_low, action_high)
-    return noisy_action, _n
-
-# @functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn', 'num_steps'))
-# def _multiple_grad_steps_nnx(
-#     state: TrainState, 
-#     key: jax.random.PRNGKey, 
-#     gamma: float, 
-#     tau: float, 
-#     replay_sample_fn,
-#     num_steps: int
-# ):
-#     """Performs multiple gradient update steps using nnx.fori_loop."""
-    
-#     def single_step(i, carry):
-#         current_state, current_key = carry
-#         current_key, subkey = jax.random.split(current_key)
-#         updated_state, _ = _grad_step(current_state, subkey, gamma, tau, replay_sample_fn)
-#         return updated_state, current_key
-    
-#     final_state, _ = nnx.fori_loop(0, num_steps, single_step, (state, key))
-#     return final_state
-
-class DDPG(agent.Agent):
+class DDPG(Agent):
     def __init__(self, 
                  actor: nnx.Module, 
                  critic: nnx.Module, 
                  replay: JaxReplayBuffer, 
-                 buffer_state: 'BufferState', 
+                 buffer_state: Any, 
                  *,
                  actor_learning_rate: float = 3e-4,
                  critic_learning_rate: float = 3e-4,
                  gamma: float = 0.99,
                  tau: float = 0.005,
-                #  exploration_noise: float = 0.1,
                  init_noise: float = 0.1,
                  min_noise: float = 0.01,
                  noise_decay_transitions: int = 100000,
@@ -326,7 +184,7 @@ class DDPG(agent.Agent):
             obs = data["observation"] if isinstance(data, dict) else data.observation
             obs_shape = tuple(obs.shape[1:])
 
-        obs_stats = _init_obs_stats(obs_shape)
+        obs_stats = Agent.init_obs_stats(obs_shape)
 
         self.state = TrainState(
             actor=actor,
@@ -383,10 +241,10 @@ class DDPG(agent.Agent):
         """
         # Call the standalone function, passing in the required parts from the agent's state.
         if self.normalize_observations:
-            mean, std = _obs_mean_std(self.state.obs_stats, self.obs_eps)
-            observation = _normalize_obs(observation, mean, std, self.obs_clip)
+            mean, std = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
+            observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
         
-        action, noise = _step_fn(
+        action, noise = Agent.step_fn(
             self.state.actor,
             observation,
             key,
@@ -398,6 +256,7 @@ class DDPG(agent.Agent):
         
         return action
     
+
     def _decay_noise(self, steps):
         f = min(1.0, steps / self.noise_decay_transitions)
         self.exploration_noise = float(self.init_noise - (self.init_noise - self.min_noise) * f)
@@ -417,7 +276,7 @@ class DDPG(agent.Agent):
         # Update observation normalization stats with both current and next observations
         if self.normalize_observations:
             obs_batch = jnp.concatenate([prev_states.obs, states.obs], axis=0)
-            self.state.obs_stats = _update_obs_stats(self.state.obs_stats, obs_batch)
+            self.state.obs_stats = Agent.update_obs_stats(self.state.obs_stats, obs_batch)
 
 
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
@@ -445,16 +304,6 @@ class DDPG(agent.Agent):
                     self.obs_clip
                 )
             gradient_steps += self.learning_steps
-                # Perform multiple gradient steps in a single JIT-compiled call
-            # self.state = _multiple_grad_steps_nnx(
-            #     self.state, 
-            #     key, 
-            #     self.gamma, 
-            #     self.tau,
-            #     self.replay.sample,
-            #     self.learning_steps
-            # )
-
 
         return gradient_steps, actor_loss, critic_loss
 
@@ -477,8 +326,8 @@ class DDPG(agent.Agent):
                 'exploration_noise': self.exploration_noise,
                 'target_noise_clip': self.target_noise_clip,
                 'target_policy_noise': self.target_policy_noise,
-                'action_low': _serialize_bound(self.action_low),
-                'action_high': _serialize_bound(self.action_high),
+                'action_low': serialize_bound(self.action_low),
+                'action_high': serialize_bound(self.action_high),
                 'normalize_observations': self.normalize_observations,
                 'obs_norm_clip': self.obs_clip,
                 'obs_norm_eps': self.obs_eps,
@@ -512,8 +361,8 @@ class DDPG(agent.Agent):
             buffer_state=buffer_state,
             gamma=float(hyper.get('gamma', 0.99)),
             tau=float(hyper.get('tau', 0.005)),
-            action_low=_deserialize_bound(hyper.get('action_low', -1.0)),
-            action_high=_deserialize_bound(hyper.get('action_high', 1.0)),
+            action_low=deserialize_bound(hyper.get('action_low', -1.0)),
+            action_high=deserialize_bound(hyper.get('action_high', 1.0)),
             normalize_observations=bool(hyper.get('normalize_observations', True)),
             obs_norm_clip=float(hyper.get('obs_norm_clip', 5.0)),
             obs_norm_eps=float(hyper.get('obs_norm_eps', 1e-8)),

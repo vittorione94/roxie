@@ -1,14 +1,12 @@
 import os
 import time
 
-from myojit.agents import agent
 import numpy as np
 import jax
 from myojit.utils import logger
 import jax.numpy as jnp
-from myojit.agents.ddpg import DDPG
-from myojit.agents.ddpg import _step_fn
 from flax import nnx
+from myojit.agents.agent import Agent
 
 class Trainer:
     '''Trainer used to train and evaluate an agent on an environment.'''
@@ -199,67 +197,6 @@ class Trainer:
             if stop_training:
                 break
 
-    # def _test(self, rng, v_reset, v_step):
-    #     '''Tests the agent on the test environment (batched; env fns are JITed outside).'''
-    #     num_tests = int(self.test_episodes)
-
-    #     # Reset all test envs in parallel
-    #     rng, keys_rng = jax.random.split(rng, 2)
-    #     reset_keys = jax.random.split(keys_rng, num_tests)
-    #     states = v_reset(reset_keys)
-
-    #     scores = jnp.zeros((num_tests,), dtype=jnp.float32)
-    #     lengths = jnp.zeros((num_tests,), dtype=jnp.int32)
-    #     dones = jnp.zeros((num_tests,), dtype=bool)
-
-    #     # Online action statistics (scalar mean/std)
-    #     action_sum = 0.0
-    #     action_sumsq = 0.0
-    #     action_count = 0
-
-    #     # Step all envs in parallel until all are done
-    #     eval_key = rng  # evaluate=True disables exploration noise
-    #     while not bool(jnp.all(dones)):
-    #         obs = states.env_state.obs
-    #         actions = self.agent.step(obs, evaluate=True, key=eval_key)  # shape (num_tests, act_dim)
-    #         next_states = v_step(states, actions)
-
-    #         not_done = ~dones
-    #         scores = scores + next_states.env_state.reward * not_done.astype(jnp.float32)
-    #         lengths = lengths + not_done.astype(jnp.int32)
-
-    #         # Keep state for finished envs; advance the others
-    #         def select_leaf(old, new):
-    #             # Broadcast dones to leaf shape (B, 1, ..., 1)
-    #             broadcast_shape = (dones.shape[0],) + (1,) * max(new.ndim - 1, 0)
-    #             mask = dones.reshape(broadcast_shape)
-    #             return jnp.where(mask, old, new)
-    #         states = jax.tree.map(select_leaf, states, next_states)
-
-    #         # Latch dones
-    #         dones = jnp.logical_or(dones, next_states.env_state.done)
-
-    #         # Update action stats
-    #         action_sum += float(jnp.sum(actions))
-    #         action_sumsq += float(jnp.sum(jnp.square(actions)))
-    #         action_count += int(actions.size)
-
-    #     # Final stats
-    #     scores_np = np.array(scores)
-    #     lengths_np = np.array(lengths)
-    #     act_mean = action_sum / max(1, action_count)
-    #     act_var = max(0.0, action_sumsq / max(1, action_count) - act_mean * act_mean)
-    #     act_std = float(np.sqrt(act_var))
-
-    #     print(
-    #         "\nTest results: \n"
-    #         f"    Average score: {np.mean(scores_np):.2f} \n"
-    #         f"    Average length: {np.mean(lengths_np):.2f} \n"
-    #         f"    Scores: {scores_np.tolist()} \n"
-    #         f"    Actions mean: {act_mean:.4f} \n"
-    #         f"    Actions std: {act_std:.4f}"
-    #     )
-
     def _test(self, rng, v_reset, v_step):
         """Vectorized test loop, runs fully on device."""
 
@@ -287,15 +224,20 @@ class Trainer:
             return dones_mask.reshape((dones_mask.shape[0],) + (1,) * max(leaf.ndim - 1, 0))
 
         def cond(carry):
-            actor, action_low, action_high, states, dones, scores, lengths, action_sum, action_sumsq, action_count = carry
+            actor, action_low, action_high, mean0, \
+            std0, clip0, states, dones, scores, lengths, \
+            action_sum, action_sumsq, action_count = carry
             return ~jnp.all(dones)  # keep going until all done
 
         def body(carry):
-            actor, action_low, action_high, states, dones, scores, lengths, action_sum, action_sumsq, action_count = carry
+            actor, action_low, action_high, mean0, \
+            std0, clip0, states, dones, scores, lengths, \
+            action_sum, action_sumsq, action_count = carry
 
             obs = states.env_state.obs
+            obs = Agent.normalize_obs(obs, mean0, std0, clip0)
 
-            actions, _ = _step_fn(
+            actions, _ = Agent.step_fn(
                 actor_model=actor,
                 observation=obs,
                 key=eval_key,
@@ -308,37 +250,40 @@ class Trainer:
 
             not_done = ~dones
             not_done_f32 = not_done.astype(jnp.float32)
-
             scores = scores + next_states.env_state.reward * not_done_f32
             lengths = lengths + not_done.astype(jnp.int32)
 
-            # Masked state update: keep old for done, new for ongoing (per-leaf broadcast)
             states = jax.tree.map(
                 lambda old, new: jnp.where(_broadcast_mask(dones, new), old, new)
                 if isinstance(new, jnp.ndarray) and new.shape[:1] == dones.shape
                 else new,
                 states, next_states
             )
-
             dones = jnp.logical_or(dones, next_states.env_state.done)
 
-            # Accumulate action stats (all on-device)
             action_sum = action_sum + jnp.sum(actions)
             action_sumsq = action_sumsq + jnp.sum(jnp.square(actions))
-            action_count = action_count + actions.size  # static int is fine here
+            action_count = action_count + actions.size
 
-            # IMPORTANT: return the SAME carry structure as cond() unpacked
-            return (actor, action_low, action_high, states, dones, scores, lengths, action_sum, action_sumsq, action_count)
+            # Return the SAME structure (13 items)
+            return (
+                actor, action_low, action_high, mean0, std0, clip0,
+                states, dones, scores, lengths, action_sum, action_sumsq, action_count
+            )
 
         # Run while loop on device (nnx.while_loop keeps module refs intact)
         actor0 = self.agent.state.actor
         action_low0 = self.agent.action_low
         action_high0 = self.agent.action_high
+        mean0, std0 = Agent.obs_mean_std(self.agent.state.obs_stats, self.agent.obs_eps)
+        clip0 = self.agent.obs_clip
 
-        actor, action_low, action_high, states, dones, scores, lengths, action_sum, action_sumsq, action_count = nnx.while_loop(
+        actor0, action_low0, action_high0, mean0, std0, clip0, \
+        states, dones, scores, lengths, action_sum, action_sumsq, action_count = nnx.while_loop(
             cond,
             body,
-            (actor0, action_low0, action_high0, states, dones, scores, lengths, action_sum, action_sumsq, action_count),
+            (actor0, action_low0, action_high0, mean0, std0, clip0,
+             states, dones, scores, lengths, action_sum, action_sumsq, action_count),
         )
 
         # Compute stats (host)
