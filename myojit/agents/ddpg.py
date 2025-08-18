@@ -4,13 +4,10 @@ import jax.numpy as jnp
 import functools
 from myojit.replays.buffer import Transition, JaxReplayBuffer
 from flax import nnx
-import orbax.checkpoint as ocp
-from pathlib import Path
-from typing import Union
 import optax
 import copy
 from myojit.agents.utils import serialize_bound, deserialize_bound
-from typing import Any, Union
+from typing import Any
 
 def _critic_loss_fn(critic_model, target_actor_model, target_critic_model, samples, \
                     gamma, noise_key, target_policy_noise, target_noise_clip,  action_low, action_high, \
@@ -147,21 +144,25 @@ class DDPG(Agent):
         target_actor = copy.deepcopy(actor)
         target_critic = copy.deepcopy(critic)
         
+        self.critic_learning_rate = critic_learning_rate
+        self.actor_learning_rate = actor_learning_rate
+        self.max_grad_norm = max_grad_norm
+
         # Add gradient clipping to optimizers
         actor_optimizer = nnx.Optimizer(
             actor, 
             optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
-                optax.adam(actor_learning_rate)
-            ), 
+                optax.clip_by_global_norm(self.max_grad_norm),
+                optax.adam(self.actor_learning_rate)
+            ),
             wrt=nnx.Param
         )
 
         critic_optimizer = nnx.Optimizer(
             critic, 
             optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
-                optax.adam(critic_learning_rate)
+                optax.clip_by_global_norm(self.max_grad_norm),
+                optax.adam(self.critic_learning_rate)
             ), 
             wrt=nnx.Param
         )
@@ -308,130 +309,28 @@ class DDPG(Agent):
         return gradient_steps, actor_loss, critic_loss
 
 
-    def save(self, path: Union[str, Path]):
-        path = Path(path).resolve()
+    def _export_hyperparams(self) -> dict:
+        # Keep this minimal and JSON-serializable
+        return {
+            "gamma": float(self.gamma),
+            "tau": float(self.tau),
+            "init_noise": float(self.init_noise),
+            "min_noise": float(self.min_noise),
+            "noise_decay_transitions": int(self.noise_decay_transitions),
+            "actor_learning_rate": float(self.actor_learning_rate),
+            "critic_learning_rate": float(self.critic_learning_rate),
+            "max_grad_norm": float(self.max_grad_norm),
 
-        # 1) Split once; keep BOTH graphdef and state
-        graphdef, state_tree = nnx.split(self.state)
-
-        save_data = {
-            # <-- keep the exact graph topology for reliable restore
-            'trainstate_graphdef': graphdef,
-            'trainstate_state': jax.device_get(state_tree),
-
-            # Minimal hyperparams (unchanged)
-            'hyperparams': {
-                'gamma': self.gamma,
-                'tau': self.tau,
-                'exploration_noise': self.exploration_noise,
-                'target_noise_clip': self.target_noise_clip,
-                'target_policy_noise': self.target_policy_noise,
-                'action_low': serialize_bound(self.action_low),
-                'action_high': serialize_bound(self.action_high),
-                'normalize_observations': self.normalize_observations,
-                'obs_norm_clip': self.obs_clip,
-                'obs_norm_eps': self.obs_eps,
-                'steps_before_learning': self.steps_before_learning,
-                'steps_between_updates': self.steps_between_updates,
-                'learning_steps': self.learning_steps,
-                'memory_warmup': self.memory_warmup,
-            }
+            "target_policy_noise": float(self.target_policy_noise),
+            "target_noise_clip": float(self.target_noise_clip),
+            "steps_before_learning": int(self.steps_before_learning),
+            "steps_between_updates": int(self.steps_between_updates),
+            "learning_steps": int(self.learning_steps),
+            "memory_warmup": int(self.memory_warmup),
+            "normalize_observations": bool(self.normalize_observations),
+            "obs_norm_clip": float(self.obs_clip),
+            "obs_norm_eps": float(self.obs_eps),
+            # bounds can be scalar or arrays → use your helpers
+            "action_low": serialize_bound(self.action_low),
+            "action_high": serialize_bound(self.action_high),
         }
-
-        checkpointer = ocp.PyTreeCheckpointer()
-        checkpointer.save(path, save_data)
-        print(f"Agent state saved to {path}")
-
-    @classmethod
-    def load(cls, path, actor, critic, replay):
-        path = Path(path).resolve()
-        loaded = ocp.PyTreeCheckpointer().restore(path)
-
-        ckpt_state = loaded["trainstate_state"]
-        hyper = loaded.get("hyperparams", {})
-
-        # (Optional) carry over buffer_state for shape continuity
-        buffer_state = ckpt_state.get("buffer_state", None) if isinstance(ckpt_state, dict) else None
-
-        # 1) Construct fresh agent to create live topology
-        agent = cls(
-            actor=actor,
-            critic=critic,
-            replay=replay,
-            buffer_state=buffer_state,
-            gamma=float(hyper.get('gamma', 0.99)),
-            tau=float(hyper.get('tau', 0.005)),
-            action_low=deserialize_bound(hyper.get('action_low', -1.0)),
-            action_high=deserialize_bound(hyper.get('action_high', 1.0)),
-            normalize_observations=bool(hyper.get('normalize_observations', True)),
-            obs_norm_clip=float(hyper.get('obs_norm_clip', 5.0)),
-            obs_norm_eps=float(hyper.get('obs_norm_eps', 1e-8)),
-            target_noise_clip=float(hyper.get('target_noise_clip', 0.1)),
-            target_policy_noise=float(hyper.get('target_policy_noise', 0.1)),
-            steps_before_learning=int(hyper.get('steps_before_learning', 100)),
-            steps_between_updates=int(hyper.get('steps_between_updates', 10)),
-            learning_steps=int(hyper.get('learning_steps', 5)),
-            memory_warmup=int(hyper.get('memory_warmup', 100)),
-        )
-
-        # Helper: convert numpy -> jax arrays
-        import numpy as _np
-        def _to_jax(x):
-            return jnp.asarray(x) if isinstance(x, _np.ndarray) else x
-
-        # 2) Merge submodules individually
-        def _restore_submodule(name: str):
-            if not (isinstance(ckpt_state, dict) and name in ckpt_state):
-                print(f"Info: '{name}' not in checkpoint; keeping live {name}.")
-                return
-            sub_ckpt = jax.tree.map(_to_jax, ckpt_state[name], is_leaf=lambda x: isinstance(x, _np.ndarray))
-            sub_live = getattr(agent.state, name)
-            gdef, _ = nnx.split(sub_live)
-            try:
-                restored = nnx.merge(gdef, sub_ckpt)
-                setattr(agent.state, name, restored)
-            except ValueError as e:
-                # Architecture drift or partial state → fall back to replacing just params where possible
-                print(f"Warning: merge({name}) failed ({e}). Falling back to param-only copy.")
-                try:
-                    dst_params = nnx.state(sub_live, nnx.Param)
-                    src_params = sub_ckpt.get('params', None) if isinstance(sub_ckpt, dict) else None
-                    if src_params is None:
-                        print(f"Warning: no 'params' found for {name}; skipping.")
-                    else:
-                        # Only update params; let NNX map into its own topology.
-                        nnx.update(sub_live, {'params': src_params})
-                except Exception as ee:
-                    print(f"Warning: param-only update for {name} failed ({ee}). Skipping.")
-
-        for name in ("actor", "critic", "target_actor", "target_critic"):
-            _restore_submodule(name)
-
-        # 3) Restore simple values directly (replace whole object; don't partial-update)
-        if isinstance(ckpt_state, dict) and "obs_stats" in ckpt_state:
-            try:
-                obs = ckpt_state["obs_stats"]
-                # obs may be dict-like; normalize to ObsStats dataclass
-                if isinstance(obs, dict):
-                    agent.state.obs_stats = ObsStats(
-                        count=jnp.asarray(obs["count"]),
-                        sum=jnp.asarray(obs["sum"]),
-                        sumsq=jnp.asarray(obs["sumsq"]),
-                    )
-                else:
-                    # If it was saved as a struct-compatible tree, just assign it.
-                    agent.state.obs_stats = jax.tree_map(_to_jax, obs, is_leaf=lambda x: isinstance(x, _np.ndarray))
-            except Exception as e:
-                print(f"Warning: could not restore obs_stats ({e}); using live stats.")
-
-        # (Optional) if you really want buffer snapshot:
-        if isinstance(ckpt_state, dict) and "buffer_state" in ckpt_state:
-            agent.state.buffer_state = ckpt_state["buffer_state"]
-
-        # 4) DO NOT restore optimizer internals: they’re brittle; let them be reinitialized.
-
-        if "exploration_noise" in hyper:
-            agent.exploration_noise = float(hyper["exploration_noise"])
-
-        print(f"Agent state loaded from {path}")
-        return agent

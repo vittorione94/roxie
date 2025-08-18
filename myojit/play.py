@@ -84,7 +84,7 @@ def main(checkpoint_path):
 
     # When loading the agent, ensure it's on CPU
     # with jax.default_device(jax.devices('cpu')[0]):
-    agent = agents[cfg.agent.name].load(checkpoint_path, actor, critic, replay)
+    agent = agents[cfg.agent.name].load(checkpoint_path, actor=actor, critic=critic, replay=replay)
 
 
     # agent.initialize(env.observation_size, env.action_size)
