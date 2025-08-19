@@ -153,6 +153,7 @@ class Trainer:
 
             # End of the epoch.
             if epoch_steps >= self.epoch_steps:
+                self.agent.noise_module.reset_noise()  # reset noise process at epoch end
 
                 # Evaluate the agent on the test environment.
                 if self.test_environment:
@@ -224,13 +225,13 @@ class Trainer:
             return dones_mask.reshape((dones_mask.shape[0],) + (1,) * max(leaf.ndim - 1, 0))
 
         def cond(carry):
-            actor, action_low, action_high, mean0, \
+            actor, noise_module0, action_low, action_high, mean0, \
             std0, clip0, states, dones, scores, lengths, \
             action_sum, action_sumsq, action_count = carry
             return ~jnp.all(dones)  # keep going until all done
 
         def body(carry):
-            actor, action_low, action_high, mean0, \
+            actor, noise_module0, action_low, action_high, mean0, \
             std0, clip0, states, dones, scores, lengths, \
             action_sum, action_sumsq, action_count = carry
 
@@ -241,7 +242,7 @@ class Trainer:
                 actor_model=actor,
                 observation=obs,
                 key=eval_key,
-                exploration_noise=0.0,
+                noise_module=noise_module0,  # Pass the agent's noise module
                 action_low=action_low,
                 action_high=action_high,
                 evaluate=True,
@@ -267,22 +268,23 @@ class Trainer:
 
             # Return the SAME structure (13 items)
             return (
-                actor, action_low, action_high, mean0, std0, clip0,
+                actor, noise_module0, action_low, action_high, mean0, std0, clip0,
                 states, dones, scores, lengths, action_sum, action_sumsq, action_count
             )
 
         # Run while loop on device (nnx.while_loop keeps module refs intact)
         actor0 = self.agent.state.actor
+        noise_module0 = self.agent.noise_module
         action_low0 = self.agent.action_low
         action_high0 = self.agent.action_high
         mean0, std0 = Agent.obs_mean_std(self.agent.state.obs_stats, self.agent.obs_eps)
         clip0 = self.agent.obs_clip
 
-        actor0, action_low0, action_high0, mean0, std0, clip0, \
+        actor0, noise_module0, action_low0, action_high0, mean0, std0, clip0, \
         states, dones, scores, lengths, action_sum, action_sumsq, action_count = nnx.while_loop(
             cond,
             body,
-            (actor0, action_low0, action_high0, mean0, std0, clip0,
+            (actor0, noise_module0, action_low0, action_high0, mean0, std0, clip0,
              states, dones, scores, lengths, action_sum, action_sumsq, action_count),
         )
 

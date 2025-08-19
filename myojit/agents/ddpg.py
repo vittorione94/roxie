@@ -55,7 +55,7 @@ def _actor_loss_fn(actor_model, critic_model, samples, obs_mean, obs_std, obs_cl
 # This is the core computational kernel that will be JIT-compiled.
 @functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn'))
 def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: float, replay_sample_fn, \
-               exploration_noise: float, target_policy_noise: float, target_noise_clip: float, action_low: float, action_high: float,
+               target_policy_noise: float, target_noise_clip: float, action_low: float, action_high: float,
                obs_eps: float, obs_clip: float):
     """Performs one full gradient update step and returns the new state."""
     # 1. Sample from the replay buffer
@@ -116,6 +116,7 @@ class DDPG(Agent):
     def __init__(self, 
                  actor: nnx.Module, 
                  critic: nnx.Module, 
+                 noise_module: nnx.Module,
                  replay: JaxReplayBuffer, 
                  buffer_state: Any, 
                  *,
@@ -123,9 +124,6 @@ class DDPG(Agent):
                  critic_learning_rate: float = 3e-4,
                  gamma: float = 0.99,
                  tau: float = 0.005,
-                 init_noise: float = 0.1,
-                 min_noise: float = 0.01,
-                 noise_decay_transitions: int = 100000,
                  steps_before_learning: int = 100,
                  steps_between_updates: int = 10,
                  learning_steps: int = 5,
@@ -147,6 +145,7 @@ class DDPG(Agent):
         self.critic_learning_rate = critic_learning_rate
         self.actor_learning_rate = actor_learning_rate
         self.max_grad_norm = max_grad_norm
+        self.noise_module = noise_module
 
         # Add gradient clipping to optimizers
         actor_optimizer = nnx.Optimizer(
@@ -201,10 +200,6 @@ class DDPG(Agent):
         # --- Store hyperparameters ---
         self.gamma = gamma
         self.tau = tau
-        self.exploration_noise = init_noise
-        self.init_noise = init_noise
-        self.noise_decay_transitions = noise_decay_transitions
-        self.min_noise = min_noise
         self.action_low = action_low
         self.action_high = action_high
         self.replay = replay
@@ -222,7 +217,6 @@ class DDPG(Agent):
         print("Params: \n" \
         f"   gamma {self.gamma} \n" \
         f"   tau {self.tau}\n" \
-        f"   exploration_noise {self.exploration_noise}\n" \
         f"   steps_before_learning {self.steps_before_learning}\n" \
         f"   steps_between_updates {self.steps_between_updates}\n" \
         f"   learning_steps {self.learning_steps}\n" \
@@ -235,6 +229,7 @@ class DDPG(Agent):
         f"   critic_learning_rate {critic_learning_rate}\n" \
         f"   target_policy_noise {target_policy_noise}\n" )
 
+        print("Noise module hyperparameters:", self.noise_module.hyperparameters())
 
     def step(self, observation: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None) -> jnp.ndarray:
         """
@@ -249,7 +244,7 @@ class DDPG(Agent):
             self.state.actor,
             observation,
             key,
-            self.exploration_noise,
+            self.noise_module,
             self.action_low,
             self.action_high,
             evaluate,
@@ -257,12 +252,6 @@ class DDPG(Agent):
         
         return action
     
-
-    def _decay_noise(self, steps):
-        f = min(1.0, steps / self.noise_decay_transitions)
-        self.exploration_noise = float(self.init_noise - (self.init_noise - self.min_noise) * f)
-
-
     def update(self, prev_states, states, steps, agent_rng, actions):
         experiences = Transition(
             observation=prev_states.obs,
@@ -282,8 +271,6 @@ class DDPG(Agent):
 
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
-        self._decay_noise(steps)
-
         # Conditionally call the JIT-compiled gradient step
         if steps >= self.steps_before_learning and \
            (steps - self.steps_before_learning) % self.steps_between_updates == 0:
@@ -296,7 +283,6 @@ class DDPG(Agent):
                     self.gamma, 
                     self.tau,
                     self.replay.sample, # Pass the sample method itself,
-                    self.exploration_noise,
                     self.target_policy_noise,  # Use target_policy_noise
                     self.target_noise_clip,
                     self.action_low,
@@ -314,9 +300,6 @@ class DDPG(Agent):
         return {
             "gamma": float(self.gamma),
             "tau": float(self.tau),
-            "init_noise": float(self.init_noise),
-            "min_noise": float(self.min_noise),
-            "noise_decay_transitions": int(self.noise_decay_transitions),
             "actor_learning_rate": float(self.actor_learning_rate),
             "critic_learning_rate": float(self.critic_learning_rate),
             "max_grad_norm": float(self.max_grad_norm),

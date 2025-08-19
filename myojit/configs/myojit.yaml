@@ -5,6 +5,7 @@
 defaults:
   - agent: ddpg      # Load `ddpg.yaml` from the `agent/` dir into the `agent` key.
   - model: mlp     # Load `mlp.yaml` from the `model/` dir into the `network` key.
+  - noise: ou
   - _self_           # Allows this file to add its own values, too.
 
 seed: 0
@@ -12,7 +13,7 @@ parallel_envs: 400
 
 env:
   # Default parameters
-  env_name: CartpoleBalance
+  env_name: AcrobotSwingup # CartpoleBalance
   list_envs: false
 
 # Hydra configuration for logging and output directories

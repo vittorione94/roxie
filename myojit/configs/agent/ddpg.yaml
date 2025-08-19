@@ -5,16 +5,13 @@ args:
   tau: 0.005
   actor_learning_rate: 5e-4
   critic_learning_rate: 1e-3
-  init_noise: 0.1         # action selection noise
-  min_noise: 0.02
-  noise_decay_transitions: 5_000_000   # linear decay horizon
   target_policy_noise: 0.05       # target smoothing noise
   target_noise_clip: 0.1
   memory_warmup: 30_000            # start updates after 30k transitions (~75 loops @ 400 envs)
   steps_before_learning: 30_000    # same as warmup (can differ if desired)
   steps_between_updates: 400      # update every 400 new transitions (~once per trainer loop)
-  learning_steps: 10              # gradient steps per update trigger
-  max_grad_norm: 0.5
+  learning_steps: 20              # gradient steps per update trigger
+  max_grad_norm: 1
 
 memory:
   _target_: replays.buffer.JaxReplayBuffer

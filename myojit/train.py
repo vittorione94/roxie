@@ -61,14 +61,18 @@ def main(cfg: DictConfig):
         in_features=env.observation_size + action_dim,
         rngs=critic_rngs
     )
+    noise_module = hydra.utils.instantiate(
+        cfg.noise,
+        action_shape=(action_dim,),
+    )
     
     ctrl_range = jnp.array(env.mj_model.actuator_ctrlrange)  # shape (action_dim, 2)
     action_low = ctrl_range[:, 0]
     action_high = ctrl_range[:, 1]
-    agent = agents[cfg.agent.name](actor, critic, replay, buffer_state, \
+    agent = agents[cfg.agent.name](actor, critic, noise_module, replay, buffer_state, \
                                    action_low=action_low, action_high=action_high, **cfg.agent.args)
 
-    trainer = Trainer(output_dir=output_dir, steps=int(1e7), epoch_steps=int(1e5), save_steps=int(5e5),
+    trainer = Trainer(output_dir=output_dir, steps=int(1e9), epoch_steps=int(1e5), save_steps=int(5e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,)
     trainer.initialize(agent=agent, environment=env, test_environment=copy.deepcopy(env))
     trainer.run(cfg.parallel_envs, training_rngs) 

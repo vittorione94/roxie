@@ -1,0 +1,9 @@
+_target_: exploration.noisy.AdaptiveNoise
+initial_noise_scale: 0.1
+decay_schedule:
+  _target_: exploration.schedulers.LinearDecay
+  decay_steps: 100000
+  final_value: 0.01
+adaptation_rate: 0.01
+target_variance: 0.1
+window_size: 100

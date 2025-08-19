@@ -1,0 +1,6 @@
+_target_: exploration.noisy.GaussianNoise
+initial_noise_scale: 0.1
+decay_schedule:
+  _target_: exploration.noisy.LinearDecay
+  decay_steps: 100000
+  final_value: 0.01

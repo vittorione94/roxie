@@ -73,6 +73,10 @@ def main(checkpoint_path):
         in_features=env.observation_size + action_dim,
         rngs=critic_rngs
     )
+    noise_module = hydra.utils.instantiate(
+        cfg.noise,
+        action_shape=(action_dim,),
+    )
 
 
     # Get the standard MuJoCo model and data from the MJX-based environment
@@ -84,7 +88,7 @@ def main(checkpoint_path):
 
     # When loading the agent, ensure it's on CPU
     # with jax.default_device(jax.devices('cpu')[0]):
-    agent = agents[cfg.agent.name].load(checkpoint_path, actor=actor, critic=critic, replay=replay)
+    agent = agents[cfg.agent.name].load(checkpoint_path, actor=actor, critic=critic, replay=replay, noise_module=noise_module)
 
 
     # agent.initialize(env.observation_size, env.action_size)
@@ -115,10 +119,10 @@ def main(checkpoint_path):
             # Step the environment
             wrapped_state = jit_step(wrapped_state, action[0])
 
-            new_data = mjx.get_data(model, wrapped_state.env_state.data)
+            # new_data = mjx.get_data(model, wrapped_state.env_state.data)
 
-            data.qpos = new_data.qpos
-            data.qvel = new_data.qvel
+            data.qpos = wrapped_state.env_state.data.qpos
+            data.qvel = wrapped_state.env_state.data.qvel
             data.ctrl = action
             mujoco.mj_forward(model, data)
 

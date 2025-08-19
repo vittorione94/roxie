@@ -65,7 +65,7 @@ class Agent(abc.ABC):
         actor_model: nnx.Module,
         observation: jnp.ndarray,
         key: jax.Array,
-        exploration_noise: float,
+        noise_module: nnx.Module,
         action_low: jnp.ndarray,
         action_high: jnp.ndarray,
         evaluate: bool = False,
@@ -79,13 +79,8 @@ class Agent(abc.ABC):
         action = actor_model(observation)  # [-1, 1]
         action = Agent.scale_to_env(action, action_low, action_high)
 
-        noise = jax.random.normal(key, action.shape)
-        noise_scale = jax.lax.cond(evaluate, lambda: 0.0, lambda: exploration_noise)
-        act_span = (action_high - action_low)
-        _n = noise * noise_scale * act_span
-
-        noisy_action = jnp.clip(action + _n, action_low, action_high)
-        return noisy_action, _n
+        noisy_action = noise_module.add_noise(action, key, evaluate)
+        return noisy_action, action - noisy_action  # return noise for logging
 
     @staticmethod
     def init_obs_stats(obs_shape) -> ObsStats:
@@ -160,7 +155,7 @@ class Agent(abc.ABC):
         print(f"[Agent.save] Saved to {path}")
 
     @classmethod
-    def load(cls, path: str | Path, actor, critic, replay):
+    def load(cls, path: str | Path, actor, critic, replay, noise_module):
         path = Path(path).resolve()
         loaded = ocp.PyTreeCheckpointer().restore(path)
 
@@ -170,7 +165,7 @@ class Agent(abc.ABC):
         # (Optional) carry over buffer_state for shape continuity
         buffer_state = ckpt_state.get("buffer_state", None) if isinstance(ckpt_state, dict) else None
 
-        agent = cls(actor=actor, critic=critic, replay=replay, buffer_state=buffer_state, **(hyper or {}))
+        agent = cls(actor=actor, noise_module=noise_module, critic=critic, replay=replay, buffer_state=buffer_state, **(hyper or {}))
 
         # Minimal fields commonly used at play time
         hyper = ckpt_state.get("hyperparams", {}) or {}
