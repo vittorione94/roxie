@@ -1,5 +1,6 @@
 TODO:
 
-Add tests
-Add PPO 
-Fix Play script
+- [ ] Add tests
+- [ ] Add PPO 
+- [ ] Fix Play script
+
