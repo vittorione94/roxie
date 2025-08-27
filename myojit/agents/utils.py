@@ -13,7 +13,3 @@ def serialize_bound(x):
     if hasattr(x, "item"):
         return x.item()
     return float(x)
-
-def deserialize_bound(x):
-    # Accept scalar or list -> jnp.array
-    return jnp.asarray(x, dtype=jnp.float32)

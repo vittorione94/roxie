@@ -90,7 +90,7 @@ class Trainer:
             # `wrapped_states` holds the state at time `t`.
             
             # Get actions for the current state (s_t).
-            if self.steps > self.agent.memory_warmup:
+            if hasattr(self.agent, "memory_warmup") and self.steps > getattr(self.agent, "memory_warmup", 0):
                 actions = self.agent.step(wrapped_states.env_state.obs, evaluate=False, key=action_key)
             else:
                 low = self.agent.action_low
@@ -153,10 +153,11 @@ class Trainer:
 
             # End of the epoch.
             if epoch_steps >= self.epoch_steps:
-                self.agent.noise_module.reset_noise()  # reset noise process at epoch end
+                if hasattr(self.agent, "noise_module"):
+                    self.agent.noise_module.reset_noise()  # reset noise process at epoch end
 
                 # Evaluate the agent on the test environment.
-                if self.test_environment:
+                if self.test_environment and hasattr(self.agent, "state"):
                     self._test(rngs.envs(), v_test_reset, v_test_step)
 
                 # Log the data.
@@ -170,7 +171,7 @@ class Trainer:
                       f"    Time: {time.time() - start_time:.2f} \n"
                       f"    Epoch time: {time.time() - last_epoch_time:.2f} \n"
                       f"    Steps per second: {self.steps / (time.time() - start_time):.2f} \n"
-                      f"    Warmup: {self.steps < self.agent.memory_warmup} \n"
+                    #   f"    Warmup: {self.steps < self.agent.memory_warmup} \n"
                       f"    Average score: {jnp.mean(scores):.2f} \n"
                       f"    Average length: {jnp.mean(lengths):.2f} \n"
                       f"    Gradient steps: {tot_gradient_steps} \n"

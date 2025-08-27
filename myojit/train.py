@@ -22,55 +22,36 @@ def main(cfg: DictConfig):
     test_array = jnp.ones(3)
     print("Test array device:", test_array.devices())
 
-
     env, env_cfg = load_playground_env(cfg.env.env_name)
-
     print("Environment configuration:", env_cfg)
 
     output_dir = HydraConfig.get().runtime.output_dir
-
-    prototype = Transition(
-        observation=jnp.zeros(env.observation_size, dtype=jnp.float32),
-        action=jnp.zeros(env.action_size, dtype=jnp.float32),
-        reward=jnp.zeros((), dtype=jnp.float32),
-        next_observation=jnp.zeros(env.observation_size, dtype=jnp.float32),
-        terminal=jnp.zeros((), dtype=jnp.bool_)
-    )
-
-    replay = hydra.utils.instantiate(
-        cfg.agent.memory,
-        capacity=cfg.agent.memory.capacity,
-        batch_size=cfg.agent.memory.batch_size
-    )
-    buffer_state = replay.init(prototype)
     
-    action_dim = env.action_size
-    # rngs = nnx.Rngs(params=0, dropout=1, envs=2, agent=3) # Use your seed from cfg.seed
-    actor_rngs = nnx.Rngs(params=0, dropout=1)
-    critic_rngs = nnx.Rngs(params=0, dropout=1)
+    # Create RNGs for agent initialization
     training_rngs = nnx.Rngs(envs=2, agent=3) # Use your seed from cfg.seed
 
-    # A more direct check:
-    actor = hydra.utils.instantiate(
-            cfg.model.actor,
-            in_features=env.observation_size,
-            action_dim=action_dim,
-            rngs=actor_rngs)
-    critic = hydra.utils.instantiate(
-        cfg.model.critic,
-        in_features=env.observation_size + action_dim,
-        rngs=critic_rngs
-    )
-    noise_module = hydra.utils.instantiate(
-        cfg.noise,
-        action_shape=(action_dim,),
-    )
-    
+    # Agent handles all component instantiation internally
     ctrl_range = jnp.array(env.mj_model.actuator_ctrlrange)  # shape (action_dim, 2)
     action_low = ctrl_range[:, 0]
     action_high = ctrl_range[:, 1]
-    agent = agents[cfg.agent.name](actor, critic, noise_module, replay, buffer_state, \
-                                   action_low=action_low, action_high=action_high, **cfg.agent.args)
+    
+    agent_args = {
+        "env_obs_size": env.observation_size,
+        "env_action_size": env.action_size,
+        "action_low": action_low,
+        "action_high": action_high,
+        **cfg.agent.args
+    }
+    if "actor" in cfg.agent:
+        agent_args["actor_config"] = cfg.agent.actor
+    if "critic" in cfg.agent:
+        agent_args["critic_config"] = cfg.agent.critic
+    if "memory" in cfg.agent:
+        agent_args["memory_config"] = cfg.agent.memory
+    if "noise" in cfg:
+        agent_args["noise_config"] = cfg.noise
+
+    agent = agents[cfg.agent.name](**agent_args)
 
     trainer = Trainer(output_dir=output_dir, steps=int(1e9), epoch_steps=int(1e5), save_steps=int(5e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,)

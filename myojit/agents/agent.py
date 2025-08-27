@@ -116,9 +116,10 @@ class Agent(abc.ABC):
     def normalize_obs(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, clip: float):
         return jnp.clip((x - mean) / std, -clip, clip)
 
-    def update(self, observations, rewards, resets, terminations, steps):
+    def update(self, old_states, new_states, steps, agent_rng, actions):
         '''Informs the agent of the latest transitions during training.'''
-        pass
+        gradient_steps, actor_loss, critic_loss = 0, 0, 0
+        return gradient_steps, actor_loss, critic_loss
 
     def test_update(self, observations, rewards, resets, terminations, steps):
         '''Informs the agent of the latest transitions during testing.'''
@@ -137,23 +138,27 @@ class Agent(abc.ABC):
         *,
         format_version: int = 1,  # bump format
         extra_metadata: Optional[Dict[str, Any]] = None,
-    ):
-        if not hasattr(self, "state"):
-            raise AttributeError("Agent must define `self.state` (an nnx.Module).")
+    ):  
+        try:
+            if not hasattr(self, "state"):
+                raise AttributeError("Agent must define `self.state` (an nnx.Module).")
 
-        path = Path(path).resolve()
-        graphdef, state_tree = nnx.split(self.state)
+            path = Path(path).resolve()
+            graphdef, state_tree = nnx.split(self.state)
 
-        payload = {
-            "format_version": format_version,
-            "trainstate_graphdef": graphdef,     # serialized topology
-            "trainstate_state": jax.device_get(state_tree),  # numeric pytree
-            "hyperparams": self._export_hyperparams(),
-            "metadata": (extra_metadata or {}),
-        }
-        ocp.PyTreeCheckpointer().save(path, payload)
-        print(f"[Agent.save] Saved to {path}")
-
+            payload = {
+                "format_version": format_version,
+                "trainstate_graphdef": graphdef,     # serialized topology
+                "trainstate_state": jax.device_get(state_tree),  # numeric pytree
+                "hyperparams": self._export_hyperparams(),
+                "metadata": (extra_metadata or {}),
+            }
+            ocp.PyTreeCheckpointer().save(path, payload)
+            print(f"[Agent.save] Saved to {path}")
+        except Exception as e:
+            print(f"[Agent.save] Warning: could not save to {path} ({e}) \
+                  Probably a basic agent without state.")
+        
     @classmethod
     def load(cls, path: str | Path, actor, critic, replay, noise_module):
         path = Path(path).resolve()

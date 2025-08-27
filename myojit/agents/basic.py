@@ -3,17 +3,17 @@
 import numpy as np
 
 from myojit.agents.agent import Agent
-
+from typing import Any, Dict
 
 class NormalRandom(Agent):
     '''Random agent producing actions from normal distributions.'''
 
-    def __init__(self, loc=0, scale=1):
+    def __init__(self, env_obs_size, env_action_size, action_low, action_high, seed=0, loc=0, scale=1):
         self.loc = loc
         self.scale = scale
-
-    def initialize(self, observation_size, action_size, seed=None):
-        self.action_size = action_size
+        self.action_size = env_action_size
+        self.action_low = action_low
+        self.action_high = action_high
         self.np_random = np.random.RandomState(seed)
 
     def step(self, observations, steps):
@@ -24,6 +24,9 @@ class NormalRandom(Agent):
 
     def _policy(self, observations):
         return self.np_random.normal(self.loc, self.scale, self.action_size)
+
+    def _export_hyperparams(self) -> Dict[str, Any]:
+        return {}
 
 
 class UniformRandom(Agent):

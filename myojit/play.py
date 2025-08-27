@@ -53,13 +53,9 @@ def main(checkpoint_path):
     )
     buffer_state = replay.init(prototype)
     
-
     action_dim = env.action_size
-    #TODO: study properly this
-    # rngs = nnx.Rngs(params=0, dropout=1, envs=2, agent=3) # Use your seed from cfg.seed
     actor_rngs = nnx.Rngs(params=0, dropout=1)
     critic_rngs = nnx.Rngs(params=0, dropout=1)
-    # training_rngs = nnx.Rngs(envs=2, agent=3) # Use your seed from cfg.seed
 
     # A more direct check:
     actor = hydra.utils.instantiate(
@@ -90,9 +86,6 @@ def main(checkpoint_path):
     # with jax.default_device(jax.devices('cpu')[0]):
     agent = agents[cfg.agent.name].load(checkpoint_path, actor=actor, critic=critic, replay=replay, noise_module=noise_module)
 
-
-    # agent.initialize(env.observation_size, env.action_size)
-
     # Launch the interactive viewer
     with mujoco.viewer.launch_passive(model, data) as viewer:
         # Reset the environment to get the initial state
@@ -110,11 +103,6 @@ def main(checkpoint_path):
             # Take a policy action
             obs_b = jnp.expand_dims(wrapped_state.env_state.obs, axis=0)
             action = agent.step(obs_b, evaluate=True, key=key)   # shape (1, act_dim)
-
-            # noise = jax.random.uniform(key, shape=(1, action_dim), minval=-1, maxval=1)  # Add some noise
-            # print(f"Action: {action[0]} Noise: {noise[0]}")
-            # action = jnp.clip(action + noise, -1, 1)
-            # print(f"Noisy Action: {action[0]}")
 
             # Step the environment
             wrapped_state = jit_step(wrapped_state, action[0])
