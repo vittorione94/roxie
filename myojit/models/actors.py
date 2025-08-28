@@ -52,29 +52,9 @@ class DeterministicActor(nnx.Module):
     
 
 # --- Actor for SAC/PPO ---
-# class StochasticActor(nnx.Module):
-#     features: Sequence[int]
-#     action_dim: int
-#     log_std_min: Optional[float] = -20
-#     log_std_max: Optional[float] = 2
+class StochasticActor(nnx.Module):
+    def __init__(self):
+        pass
 
-#     @nnx.compact
-#     def __call__(self, state: jnp.ndarray) -> distrax.Distribution:
-#         x = state
-#         for feat in self.features:
-#             x = nnx.Dense(feat)(x)
-#             x = nnx.relu(x)
-        
-#         # Output parameters for a Gaussian distribution
-#         # One output for the mean, one for the log_std
-#         mean = nnx.Dense(self.action_dim, name="mean")(x)
-#         log_std = nnx.Dense(self.action_dim, name="log_std")(x)
-
-#         # Clamp log_std for numerical stability
-#         log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
-
-#         # Create and return a Tanh-squashed Gaussian distribution
-#         return distrax.Transformed(
-#             distrax.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std)),
-#             distrax.Block(distrax.Tanh(), ndims=1)
-#         )
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        pass

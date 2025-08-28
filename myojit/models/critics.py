@@ -77,3 +77,11 @@ class DeterministicCritic(nnx.Module):
         
         x = self.output_layer(x)
         return x
+    
+
+def StochasticCritic():
+    def __init__(self):
+        pass
+
+    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray, training: bool = False) -> jnp.ndarray:
+        pass

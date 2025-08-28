@@ -9,49 +9,8 @@ import copy
 from myojit.agents.utils import serialize_bound
 from typing import Any
 import hydra
-
-def _critic_loss_fn(critic_model, target_actor_model, target_critic_model, samples, \
-                    gamma, noise_key, target_policy_noise, target_noise_clip,  action_low, action_high, \
-                    obs_mean, obs_std, obs_clip):
-    """Calculates the MSE loss for the critic."""
-    # Normalize observations
-    obs = Agent.normalize_obs(samples['observations'], obs_mean, obs_std, obs_clip)
-    next_obs = Agent.normalize_obs(samples['next_observations'], obs_mean, obs_std, obs_clip)
-
-    # Target actions in env scale
-    next_actions = target_actor_model(next_obs)                 # [-1, 1]
-    next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
-
-    # Target smoothing noise in env units
-    act_span = (action_high - action_low)
-    noise = jax.random.normal(noise_key, next_actions.shape) * (target_policy_noise * act_span)
-    noise_clip = target_noise_clip * act_span
-    noise = jnp.clip(noise, -noise_clip, noise_clip)
-
-    next_actions = jnp.clip(next_actions + noise, action_low, action_high)
-
-    next_q = target_critic_model(next_obs, next_actions)
-    
-    term = samples['terminals'].astype(jnp.float32)
-    reward = jnp.squeeze(samples['rewards'])
-    next_q = jnp.squeeze(next_q)
-    target_q = reward + gamma * (1.0 - term) * next_q
-    target_q = jax.lax.stop_gradient(target_q)
-
-    current_q = critic_model(obs, samples['actions'])
-    
-    critic_loss = jnp.mean((jnp.squeeze(current_q) - target_q)**2)
-    return critic_loss
-
-def _actor_loss_fn(actor_model, critic_model, samples, obs_mean, obs_std, obs_clip, action_low, action_high):
-    """Calculates the loss for the actor (aims to maximize Q-value)."""
-    obs = Agent.normalize_obs(samples['observations'], obs_mean, obs_std, obs_clip)
-    actions = actor_model(obs)                                  # [-1, 1]
-    actions = Agent.scale_to_env(actions, action_low, action_high)   # [low, high]
-    q_values = critic_model(obs, actions)
-    actor_loss = -jnp.mean(q_values)
-    return actor_loss
-
+from myojit.losses.actor_losses import ddpg_actor_loss_fn
+from myojit.losses.critic_losses import ddpg_critic_loss_fn
 
 # This is the core computational kernel that will be JIT-compiled.
 @functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn'))
@@ -67,7 +26,7 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
     # 2. Critic update
-    critic_loss, critic_grads = nnx.value_and_grad(_critic_loss_fn)(
+    critic_loss, critic_grads = nnx.value_and_grad(ddpg_critic_loss_fn)(
         state.critic, state.target_actor, state.target_critic, samples, gamma, noise_key, \
             target_policy_noise, target_noise_clip, action_low, action_high, \
             obs_mean, obs_std, obs_clip
@@ -75,7 +34,7 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
     state.critic_optimizer.update(critic_grads)
 
     # 3. Actor update (use scaled actions)
-    actor_loss, actor_grads = nnx.value_and_grad(_actor_loss_fn)(
+    actor_loss, actor_grads = nnx.value_and_grad(ddpg_actor_loss_fn)(
         state.actor, state.critic, samples, obs_mean, obs_std, obs_clip, action_low, action_high
     )
     state.actor_optimizer.update(actor_grads)
@@ -316,7 +275,6 @@ class DDPG(Agent):
             gradient_steps += self.learning_steps
 
         return gradient_steps, actor_loss, critic_loss
-
 
     def _export_hyperparams(self) -> dict:
         # Keep this minimal and JSON-serializable
