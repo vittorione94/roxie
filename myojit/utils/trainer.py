@@ -225,29 +225,15 @@ class Trainer:
             # Make mask shape (B, 1, 1, ..., 1) to match each leaf's rank
             return dones_mask.reshape((dones_mask.shape[0],) + (1,) * max(leaf.ndim - 1, 0))
 
-        def cond(carry):
-            actor, noise_module0, action_low, action_high, mean0, \
-            std0, clip0, states, dones, scores, lengths, \
-            action_sum, action_sumsq, action_count = carry
-            return ~jnp.all(dones)  # keep going until all done
-
-        def body(carry):
-            actor, noise_module0, action_low, action_high, mean0, \
-            std0, clip0, states, dones, scores, lengths, \
-            action_sum, action_sumsq, action_count = carry
-
-            obs = states.env_state.obs
-            obs = Agent.normalize_obs(obs, mean0, std0, clip0)
-
-            actions, _ = Agent.step_fn(
-                actor_model=actor,
-                observation=obs,
-                key=eval_key,
-                noise_module=noise_module0,  # Pass the agent's noise module
-                action_low=action_low,
-                action_high=action_high,
+        # Use a regular Python while loop instead of nnx.while_loop
+        # This avoids the trace context error
+        while not jnp.all(dones):
+            actions = self.agent.step(
+                states.env_state.obs,
                 evaluate=True,
+                key=eval_key
             )
+
             next_states = v_step(states, actions)
 
             not_done = ~dones
@@ -266,28 +252,6 @@ class Trainer:
             action_sum = action_sum + jnp.sum(actions)
             action_sumsq = action_sumsq + jnp.sum(jnp.square(actions))
             action_count = action_count + actions.size
-
-            # Return the SAME structure (13 items)
-            return (
-                actor, noise_module0, action_low, action_high, mean0, std0, clip0,
-                states, dones, scores, lengths, action_sum, action_sumsq, action_count
-            )
-
-        # Run while loop on device (nnx.while_loop keeps module refs intact)
-        actor0 = self.agent.state.actor
-        noise_module0 = self.agent.noise_module
-        action_low0 = self.agent.action_low
-        action_high0 = self.agent.action_high
-        mean0, std0 = Agent.obs_mean_std(self.agent.state.obs_stats, self.agent.obs_eps)
-        clip0 = self.agent.obs_clip
-
-        actor0, noise_module0, action_low0, action_high0, mean0, std0, clip0, \
-        states, dones, scores, lengths, action_sum, action_sumsq, action_count = nnx.while_loop(
-            cond,
-            body,
-            (actor0, noise_module0, action_low0, action_high0, mean0, std0, clip0,
-             states, dones, scores, lengths, action_sum, action_sumsq, action_count),
-        )
 
         # Compute stats (host)
         scores_np = np.array(scores)

@@ -2,7 +2,7 @@ from myojit.agents.agent import Agent, TrainState
 import jax
 import jax.numpy as jnp
 import functools
-from myojit.replays.buffer import Transition, JaxReplayBuffer
+from myojit.replays.buffer import Transition
 from flax import nnx
 import optax
 import copy
@@ -222,15 +222,15 @@ class DDPG(Agent):
             mean, std = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
         
-        action, noise = Agent.step_fn(
+        action, noise = Agent.deterministic_step_fn(
             self.state.actor,
             observation,
             key,
             self.noise_module,
-            self.action_low,
-            self.action_high,
             evaluate,
         )
+
+        action = Agent.scale_to_env(action, self.action_low, self.action_high)
         
         return action
     

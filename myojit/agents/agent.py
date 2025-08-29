@@ -5,10 +5,10 @@ from flax import nnx
 import flax.struct as struct
 import functools
 import orbax.checkpoint as ocp
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 from pathlib import Path
 import numpy as np
-import cloudpickle
+import optax 
 
 class TrainState(nnx.Module):
   def __init__(
@@ -16,8 +16,8 @@ class TrainState(nnx.Module):
       *,
       actor: nnx.Module,
       critic: nnx.Module,
-      target_actor: nnx.Module,
-      target_critic: nnx.Module,
+      target_actor: Optional[nnx.Module],
+      target_critic: Optional[nnx.Module],
       actor_optimizer: nnx.Optimizer,
       critic_optimizer: nnx.Optimizer,
       buffer_state: Any,
@@ -49,10 +49,6 @@ class ObsStats:
 
 class Agent(abc.ABC):
     '''Abstract class used to build agents.'''
-
-    def initialize(self, observation_space, action_space, seed=None):
-        pass
-    
     @staticmethod
     @jax.jit
     def scale_to_env(x: jnp.ndarray, low: jnp.ndarray, high: jnp.ndarray):
@@ -61,26 +57,42 @@ class Agent(abc.ABC):
 
     @staticmethod
     @functools.partial(nnx.jit, static_argnames=('evaluate',))
-    def step_fn(
+    def deterministic_step_fn(
         actor_model: nnx.Module,
         observation: jnp.ndarray,
         key: jax.Array,
         noise_module: nnx.Module,
-        action_low: jnp.ndarray,
-        action_high: jnp.ndarray,
         evaluate: bool = False,
     ):
         """
         Pure action selection for any actor-critic agent.
         - actor outputs actions in [-1, 1]
-        - scale to [action_low, action_high]
         - add exploration noise in env units when not evaluating
         """
-        action = actor_model(observation)  # [-1, 1]
-        action = Agent.scale_to_env(action, action_low, action_high)
-
+        action = actor_model(observation)
+        
         noisy_action = noise_module.add_noise(action, key, evaluate)
+        noisy_action = jnp.clip(noisy_action, -1.0, 1.0)  # ensure in [-1, 1]
         return noisy_action, action - noisy_action  # return noise for logging
+    
+
+    @staticmethod
+    @nnx.jit
+    def stochastic_step_fn(
+        actor_model: nnx.Module,
+        observation: jnp.ndarray,
+        key: jax.Array,
+    ):
+        """
+        Pure action selection for any actor-critic agent.
+        - actor outputs actions in [-1, 1]
+        - add exploration noise in env units when not evaluating
+        """
+        distribution = actor_model(observation)
+        action, log_probs = distribution.sample_and_log_prob(seed=key)
+
+        return action, log_probs
+
 
     @staticmethod
     def init_obs_stats(obs_shape) -> ObsStats:
