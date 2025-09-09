@@ -34,7 +34,9 @@ critic:
   dropout_rate: 0.   
 
 memory:
-  _target_: replays.buffer.JaxReplayBuffer
-  
-  capacity: 1_000_000
-  batch_size: 256
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 1_000_000
+  min_length: 1_000
+  sample_batch_size: 256
+  add_sequences: False
+  add_batch_size: 400

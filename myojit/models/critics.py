@@ -83,5 +83,5 @@ def StochasticCritic():
     def __init__(self):
         pass
 
-    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray, training: bool = False) -> jnp.ndarray:
+    def __call__(self, observations: jnp.ndarray) -> jnp.ndarray:
         pass

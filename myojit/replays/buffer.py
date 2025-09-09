@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import flax.struct as struct
 from typing import Dict
 import functools
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # A PyTree representing a single data transition (s, a, r, s', d).
 # This structure is JAX-native and can be passed into JIT-compiled functions.
@@ -14,6 +14,7 @@ class Transition:
     reward: jnp.ndarray
     next_observation: jnp.ndarray
     terminal: jnp.ndarray
+    # log_probs: Optional[jnp.ndarray] = None  # Optional, used in some algorithms
 
 # A PyTree that holds the entire state of the replay buffer.
 # This includes the stored data and the buffer's internal pointers.
@@ -29,18 +30,20 @@ class BufferState:
 class JaxReplayBuffer:
     """A JAX-native, GPU-optimized replay buffer."""
 
-    def __init__(self, capacity: int, batch_size: int):
+    def __init__(self, capacity: int, batch_size: int, num_envs: int = 1):
         """
         Initializes the replay buffer with a fixed capacity.
         Note: This class is stateless. It only holds static configuration.
         """
         self.capacity = capacity
         self.batch_size = batch_size
+        self.num_envs = num_envs
 
         print("Replay buffer initialized.")
         print("Params: \n" \
         f"   capacity {self.capacity} \n" \
-        f"   batch_size {self.batch_size}\n")
+        f"   batch_size {self.batch_size}\n" \
+        f"   num_envs {self.num_envs}\n")
 
 
     def init(self, transition_prototype: Transition) -> BufferState:
@@ -134,6 +137,53 @@ class JaxReplayBuffer:
             "terminals": batch_data.terminal,
             "indices": indices
         }
+    
+    # On-policy: fetch last T steps in time-major order [T, B, ...] + bootstrap obs [B, ...]
+    def get_recent_window(self, state: BufferState, T: int) -> Dict[str, jnp.ndarray]:
+        """
+        Returns:
+            dict with keys observations/actions/rewards/next_observations/terminals/log_probs
+            each shaped [T, B, ...], and 'bootstrap_observation' shaped [B, ...].
+        Assumes each add_batch wrote exactly num_envs rows (one per env).
+        """
+
+        B = self.num_envs
+        assert (int(state.size) % B) == 0, "Buffer size must be a multiple of num_envs"
+        steps_written = int(state.size) // B
+
+        # effective rollout length
+        T_eff = min(int(T), steps_written)
+
+        # pointer is in slots; convert to 'step units'
+        step_pointer = int(state.pointer) // B  # next step index to write
+        # the window occupies steps [step_pointer - T_eff, ..., step_pointer - 1] modulo max_steps
+        max_steps = self.capacity // B
+        start_step = (step_pointer - T_eff) % max_steps
+        start_slot = (start_step * B) % self.capacity
+
+        # flat slot indices for the window (wrap-around safe)
+        idx = (jnp.arange(T_eff * B) + start_slot) % self.capacity
+
+        def gather_reshape(x):
+            xb = x[idx]                                # [T_eff * B, ...]
+            return xb.reshape(T_eff, B, *xb.shape[1:]) # [T_eff, B, ...]
+
+        window = jax.tree_util.tree_map(gather_reshape, state.data)
+
+        # Bootstrap comes from the last time slice's next_observation
+        bootstrap_observation = window.next_observation[-1]  # [B, ...]
+
+        return {
+            "observations":       window.observation,       # [T, B, ...]
+            "actions":            window.action,            # [T, B, ...]
+            "rewards":            window.reward,            # [T, B]
+            "next_observations":  window.next_observation,  # [T, B, ...]
+            "terminals":          window.terminal,          # [T, B]
+            "log_probs":          window.log_probs,         # [T, B, ...] or [T,B]
+            "bootstrap_observation": bootstrap_observation, # [B, ...]
+            "T_eff":              jnp.array(T_eff, dtype=jnp.int32),
+            "B":                  jnp.array(B, dtype=jnp.int32),
+        }
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def flush(self, state: BufferState) -> BufferState:
@@ -149,57 +199,4 @@ class JaxReplayBuffer:
         return state.replace(
             pointer=jnp.array(0, dtype=jnp.int32),
             size=jnp.array(0, dtype=jnp.int32)
-        )
-
-if __name__ == "__main__":
-    # --- Example Setup ---
-    CAPACITY = 10000
-    OBS_DIM = 4
-    ACTION_DIM = 1
-    BATCH_SIZE = 256
-
-    # 1. Instantiate the buffer (stateless object)
-    replay_buffer = JaxReplayBuffer(capacity=CAPACITY)
-
-    # 2. Create a prototype transition to define shapes and dtypes
-    prototype = Transition(
-        observation=jnp.zeros(OBS_DIM, dtype=jnp.float32),
-        action=jnp.zeros(ACTION_DIM, dtype=jnp.float32),
-        reward=jnp.zeros((), dtype=jnp.float32),
-        next_observation=jnp.zeros(OBS_DIM, dtype=jnp.float32),
-        terminal=jnp.zeros((), dtype=jnp.bool_)
-    )
-
-    # 3. Initialize the buffer state
-    buffer_state = replay_buffer.init(prototype)
-
-    # 4. Add some data (e.g., in a loop)
-    # In a real application, this would come from your environment.
-    for i in range(500):
-        dummy_transition = Transition(
-            observation=jnp.full(OBS_DIM, i, dtype=jnp.float32),
-            action=jnp.full(ACTION_DIM, i, dtype=jnp.float32),
-            reward=jnp.array(i, dtype=jnp.float32),
-            next_observation=jnp.full(OBS_DIM, i + 1, dtype=jnp.float32),
-            terminal=jnp.array(i == 499)
-        )
-        # The add function returns a *new* state
-        buffer_state = replay_buffer.add(buffer_state, dummy_transition)
-
-    print(f"Buffer size after adding data: {buffer_state.size}")
-
-    # 5. Sample a batch of data
-    # Create a JAX random key
-    key = jax.random.PRNGKey(0)
-    key, sample_key = jax.random.split(key)
-
-    # Sample the buffer
-    batch = replay_buffer.sample(buffer_state, BATCH_SIZE, sample_key)
-
-    print(f"\nSampled batch shapes:")
-    for name, arr in batch.items():
-        print(f"- {name}: {arr.shape}")
-
-    # 6. Flush the buffer
-    buffer_state = replay_buffer.flush(buffer_state)
-    print(f"\nBuffer size after flushing: {buffer_state.size}")
+        ) 

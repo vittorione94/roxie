@@ -8,7 +8,7 @@ import orbax.checkpoint as ocp
 from typing import Any, Dict, Optional
 from pathlib import Path
 import numpy as np
-import optax 
+import inspect 
 
 class TrainState(nnx.Module):
   def __init__(
@@ -128,7 +128,7 @@ class Agent(abc.ABC):
     def normalize_obs(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, clip: float):
         return jnp.clip((x - mean) / std, -clip, clip)
 
-    def update(self, old_states, new_states, steps, agent_rng, actions):
+    def update(self, old_states, new_states, steps, agent_rng):
         '''Informs the agent of the latest transitions during training.'''
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
         return gradient_steps, actor_loss, critic_loss
@@ -172,17 +172,26 @@ class Agent(abc.ABC):
                   Probably a basic agent without state.")
         
     @classmethod
-    def load(cls, path: str | Path, actor, critic, replay, noise_module):
+    def load(cls, 
+             path: str | Path, 
+             actor_config: dict,
+             critic_config: dict,
+             memory_config: dict,
+             noise_config: dict,):
         path = Path(path).resolve()
         loaded = ocp.PyTreeCheckpointer().restore(path)
 
         ckpt_state = loaded["trainstate_state"]
         hyper = loaded.get("hyperparams", {})
-
-        # (Optional) carry over buffer_state for shape continuity
-        buffer_state = ckpt_state.get("buffer_state", None) if isinstance(ckpt_state, dict) else None
-
-        agent = cls(actor=actor, noise_module=noise_module, critic=critic, replay=replay, buffer_state=buffer_state, **(hyper or {}))
+        print(hyper)
+        
+        valid_params = set(inspect.signature(cls.__init__).parameters.keys())
+        filtered_hyper = {k: v for k, v in (hyper or {}).items() if k in valid_params}
+        agent = cls(actor_config=actor_config,
+                 critic_config=critic_config,
+                 memory_config=memory_config,
+                 noise_config=noise_config,
+                 **(filtered_hyper or {}))
 
         # Minimal fields commonly used at play time
         hyper = ckpt_state.get("hyperparams", {}) or {}

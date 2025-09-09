@@ -39,23 +39,15 @@ def ddpg_critic_loss_fn(critic_model, target_actor_model, target_critic_model, s
 
 @nnx.jit
 def ppo_critic_loss_fn(critic_model, samples, \
-                    gamma, noise_key, action_low, action_high, \
+                    gamma, action_low, action_high, \
                     obs_mean, obs_std, obs_clip):
     """Calculates the MSE loss for the critic using PPO."""
-    # Normalize observations
-    obs = Agent.normalize_obs(samples['observations'], obs_mean, obs_std, obs_clip)
-    next_obs = Agent.normalize_obs(samples['next_observations'], obs_mean, obs_std, obs_clip)
-    # Actions in env scale
-    actions = samples['actions']
-    actions = Agent.scale_to_env(actions, action_low, action_high)
-    next_actions = samples['next_actions']
-    next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
-    next_q = critic_model(next_obs, next_actions)
-    term = samples['terminals'].astype(jnp.float32)
+    
+    obs = samples['observations']
+    nxt_obs = samples['next_observations']
     reward = jnp.squeeze(samples['rewards'])
-    next_q = jnp.squeeze(next_q)
-    target_q = reward + gamma * (1.0 - term) * next_q
-    target_q = jax.lax.stop_gradient(target_q)
-    current_q = critic_model(obs, actions)
-    critic_loss = jnp.mean((jnp.squeeze(current_q) - target_q)**2)
-    return critic_loss
+    term = samples['terminals'].astype(jnp.float32)
+    
+
+    v = critic_model(obs).squeeze(-1)         # [N]
+    v_next = critic_model(nxt_obs).squeeze(-1)# [N]

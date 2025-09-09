@@ -8,6 +8,119 @@ from myojit.agents.agent import Agent, TrainState
 from myojit.agents.utils import serialize_bound
 import jax
 from myojit.agents.ppo import ppo_loss_fn, ppo_critic_loss_fn
+import functools
+
+
+
+# This is the core computational kernel that will be JIT-compiled.
+@functools.partial(nnx.jit, static_argnames=(
+    'gamma', 'gae_lambda', 'clip_eps', 'entropy_coef', 'value_coef', 'replay_get_fn'
+))
+def _grad_step(
+    state: TrainState,
+    key: jax.random.PRNGKey,
+    gamma: float,
+    gae_lambda: float,
+    clip_eps: float,
+    entropy_coef: float,
+    value_coef: float,
+    replay_get_fn,  # Function to get the on-policy data
+    action_low: jnp.ndarray,
+    action_high: jnp.ndarray,
+    obs_eps: float,
+    obs_clip: float
+):
+    """
+    Performs a single gradient update step for the PPO agent.
+    This function is JIT-compiled for performance.
+    """
+    # 1. Get the most recent on-policy data from the buffer
+    # This function is expected to be `replay.get_recent_window`
+    data = replay_get_fn(state.buffer_state)
+    
+    # Unpack data for convenience
+    observations = data["observations"]
+    actions = data["actions"]
+    rewards = data["rewards"]
+    terminals = data["terminals"]
+    old_log_probs = data["log_probs"]
+    bootstrap_obs = data["bootstrap_observation"]
+
+    # 2. Normalize observations
+    mean, std = Agent.obs_mean_std(state.obs_stats, obs_eps)
+    norm_obs = Agent.normalize_obs(observations, mean, std, obs_clip)
+    norm_bootstrap_obs = Agent.normalize_obs(bootstrap_obs, mean, std, obs_clip)
+
+    # 3. Calculate GAE (Generalized Advantage Estimation)
+    # Get value estimates for all observations in the rollout
+    values = state.critic(norm_obs)
+    # Get the value estimate for the bootstrap state (the state after the last action)
+    bootstrap_value = state.critic(norm_bootstrap_obs)
+
+    # GAE requires values for s_t and s_{t+1}. We concatenate the rollout values
+    # with the bootstrap value to easily compute deltas.
+    all_values = jnp.concatenate([values, bootstrap_value[jnp.newaxis, ...]], axis=0)
+    
+    # Calculate temporal difference errors (deltas)
+    deltas = rewards + gamma * (1.0 - terminals) * all_values[1:] - all_values[:-1]
+
+    # Define the GAE scan function
+    def gae_scan_fn(carry, delta_t):
+        advantage = delta_t + gamma * gae_lambda * carry
+        return advantage, advantage
+
+    # Compute advantages by scanning backwards over the deltas
+    # The initial carry is zero.
+    _, advantages = jax.lax.scan(gae_scan_fn, jnp.zeros_like(bootstrap_value), deltas, reverse=True)
+    
+    # Calculate returns (targets for the value function)
+    returns = advantages + values
+
+    # Normalize advantages for stability
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    # 4. Compute Actor and Critic Gradients
+    
+    # Actor update
+    actor_grad_fn = nnx.value_and_grad(
+        lambda actor: ppo_loss_fn(
+            actor,
+            observations=norm_obs,
+            actions=actions,
+            old_log_probs=old_log_probs,
+            advantages=advantages,
+            clip_eps=clip_eps,
+            entropy_coef=entropy_coef
+        ),
+        wrt=nnx.Param
+    )
+    actor_loss, actor_grads = actor_grad_fn(state.actor)
+    state.actor_optimizer.apply_gradient(actor_grads)
+
+    # Critic update
+    critic_grad_fn = nnx.value_and_grad(
+        lambda critic: ppo_critic_loss_fn(
+            critic,
+            observations=norm_obs,
+            returns=returns,
+            value_coef=value_coef
+        ),
+        wrt=nnx.Param
+    )
+    critic_loss, critic_grads = critic_grad_fn(state.critic)
+    state.critic_optimizer.apply_gradient(critic_grads)
+    
+    # 5. Return the new, updated state object
+    return TrainState(
+            actor=state.actor,
+            critic=state.critic,
+            actor_optimizer=state.actor_optimizer,
+            target_actor=state.target_actor,
+            target_critic=state.target_critic,
+            critic_optimizer=state.critic_optimizer,
+            buffer_state=state.buffer_state,
+            obs_stats=state.obs_stats
+        ), actor_loss, critic_loss
 
 
 class PPO(Agent):
@@ -136,21 +249,24 @@ class PPO(Agent):
             mean, std = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
         
-        action, log_prob = Agent.stochastic_step_fn(
+        action, self.last_log_prob = Agent.stochastic_step_fn(
             self.state.actor,
             observation,
             key,
         )
-        
-        return Agent.scale_to_env(action, self.action_low, self.action_high)
 
-    def update(self, prev_states, states, steps, agent_rng, actions):
+        self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
+
+        return self.last_action
+
+    def update(self, prev_states, states, steps, agent_rng):
         experiences = Transition(
             observation=prev_states.obs,
-            action=actions,
+            action=self.last_action,
             reward=states.reward,
             next_observation=states.obs,
             terminal=states.done,
+            log_probs=self.last_log_prob
         )
         # store in memory
         self.state.buffer_state = self.replay.add_batch(self.state.buffer_state, experiences)
@@ -168,20 +284,15 @@ class PPO(Agent):
             for _ in range(self.learning_steps):
                 agent_rng, key = jax.random.split(agent_rng, 2)
 
-                self.state, actor_loss, critic_loss = Agent._grad_step(
+                self.state, actor_loss, critic_loss = _grad_step(
                     self.state, 
                     key, 
                     self.gamma, 
-                    self.tau,
-                    self.replay.sample, # Pass the sample method itself,
-                    self.target_policy_noise,  # Use target_policy_noise
-                    self.target_noise_clip,
+                    self.replay.get_recent_window,  # Pass the sample method itself,
                     self.action_low,
                     self.action_high,
                     self.obs_eps,
-                    self.obs_clip,
-                    actor_loss_fn=ppo_loss_fn,
-                    critic_loss_fn=ppo_critic_loss_fn
+                    self.obs_clip
                 )
             gradient_steps += self.learning_steps
             

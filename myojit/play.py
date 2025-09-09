@@ -39,41 +39,18 @@ def main(checkpoint_path):
 
     # Load the environment
     env, env_cfg = load_playground_env(cfg.env.env_name)
-    
-    prototype = Transition(
-        observation=jnp.zeros(env.observation_size, dtype=jnp.float32),
-        action=jnp.zeros(env.action_size, dtype=jnp.float32),
-        reward=jnp.zeros((), dtype=jnp.float32),
-        next_observation=jnp.zeros(env.observation_size, dtype=jnp.float32),
-        terminal=jnp.zeros((), dtype=jnp.bool_)
-    )
 
-    replay = hydra.utils.instantiate(
-        cfg.agent.memory
-    )
-    buffer_state = replay.init(prototype)
-    
-    action_dim = env.action_size
-    actor_rngs = nnx.Rngs(params=0, dropout=1)
-    critic_rngs = nnx.Rngs(params=0, dropout=1)
+    agent_args = {}
+    if "actor" in cfg.agent:
+        agent_args["actor_config"] = cfg.agent.actor
+    if "critic" in cfg.agent:
+        agent_args["critic_config"] = cfg.agent.critic
+    if "memory" in cfg.agent:
+        agent_args["memory_config"] = cfg.agent.memory
+    if "noise" in cfg:
+        agent_args["noise_config"] = cfg.noise
 
-    # A more direct check:
-    actor = hydra.utils.instantiate(
-            cfg.model.actor,
-            in_features=env.observation_size,
-            action_dim=action_dim,
-            rngs=actor_rngs)
-    
-    critic = hydra.utils.instantiate(
-        cfg.model.critic,
-        in_features=env.observation_size + action_dim,
-        rngs=critic_rngs
-    )
-    noise_module = hydra.utils.instantiate(
-        cfg.noise,
-        action_shape=(action_dim,),
-    )
-
+    agent = agents[cfg.agent.name].load(path=checkpoint_path, **agent_args)
 
     # Get the standard MuJoCo model and data from the MJX-based environment
     model = env.mj_model
@@ -81,10 +58,6 @@ def main(checkpoint_path):
 
     jit_reset = jax.jit(env.reset)
     jit_step = jax.jit(env.step)
-
-    # When loading the agent, ensure it's on CPU
-    # with jax.default_device(jax.devices('cpu')[0]):
-    agent = agents[cfg.agent.name].load(checkpoint_path, actor=actor, critic=critic, replay=replay, noise_module=noise_module)
 
     # Launch the interactive viewer
     with mujoco.viewer.launch_passive(model, data) as viewer:

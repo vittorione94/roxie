@@ -22,6 +22,9 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
 
+    print("Sampled batch shapes:", {k: v.shape for k, v in samples.items()})
+    print("Sampled batch", samples)
+    
     # 1.1 Compute current normalization parameters
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
@@ -126,6 +129,9 @@ class DDPG(Agent):
             terminal=jnp.zeros((), dtype=jnp.bool_)
         )
         replay = hydra.utils.instantiate(memory_config)
+        self.batch_size = memory_config.sample_batch_size
+        self.buffer_size = memory_config.max_length
+
         buffer_state = replay.init(prototype)
 
         # Instantiate noise module
@@ -163,23 +169,7 @@ class DDPG(Agent):
         )
 
         # Init observation stats from buffer state's observation shape
-        data = None
-        if buffer_state is not None:
-            if hasattr(buffer_state, "data"):
-                data = buffer_state.data
-            elif isinstance(buffer_state, dict):
-                data = buffer_state.get("data", buffer_state)
-
-        if data is None:
-            # Fallback: infer from the replay instance (adjust to your replay API)
-            obs_src = getattr(replay, "data", {}).get("observation", None) if isinstance(getattr(replay, "data", {}), dict) else None
-            if obs_src is None:
-                raise ValueError("Could not infer observation shape from buffer_state or replay.")
-            obs_shape = tuple(obs_src.shape[1:])
-        else:
-            obs = data["observation"] if isinstance(data, dict) else data.observation
-            obs_shape = tuple(obs.shape[1:])
-
+        obs_shape = buffer_state.experience.observation.shape  # Exclude batch dimension
         obs_stats = Agent.init_obs_stats(obs_shape)
 
         self.state = TrainState(
@@ -230,20 +220,21 @@ class DDPG(Agent):
             evaluate,
         )
 
-        action = Agent.scale_to_env(action, self.action_low, self.action_high)
+        self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
         
-        return action
-    
-    def update(self, prev_states, states, steps, agent_rng, actions):
+        return self.last_action
+
+    def update(self, prev_states, states, steps, agent_rng):
         experiences = Transition(
             observation=prev_states.obs,
-            action=actions,
+            action=self.last_action,
             reward=states.reward,
             next_observation=states.obs,
             terminal=states.done,
         )
+
         # store in memory
-        self.state.buffer_state = self.replay.add_batch(self.state.buffer_state, experiences)
+        self.state.buffer_state = self.replay.add(self.state.buffer_state, experiences)
 
         # Update observation normalization stats with both current and next observations
         if self.normalize_observations:
@@ -277,6 +268,9 @@ class DDPG(Agent):
         return gradient_steps, actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
+        print(self.state.buffer_state)
+        print(self.state.buffer_state.experience.observation.shape)
+        print(self.state.buffer_state.experience.action.shape)
         # Keep this minimal and JSON-serializable
         return {
             "gamma": float(self.gamma),
@@ -285,14 +279,16 @@ class DDPG(Agent):
             "critic_learning_rate": float(self.critic_learning_rate),
             "max_grad_norm": float(self.max_grad_norm),
 
+            "env_obs_size": self.state.buffer_state.experience.observation.shape[2],
+            "env_action_size": self.state.buffer_state.experience.action.shape[2],
             "target_policy_noise": float(self.target_policy_noise),
             "target_noise_clip": float(self.target_noise_clip),
             "steps_before_learning": int(self.steps_before_learning),
             "steps_between_updates": int(self.steps_between_updates),
             "learning_steps": int(self.learning_steps),
             "memory_warmup": int(self.memory_warmup),
-            "memory_capacity": int(self.replay.capacity),
-            "memory_batch_size": int(self.replay.batch_size),
+            "memory_capacity": int(self.buffer_size),
+            "memory_batch_size": int(self.batch_size),
             "normalize_observations": bool(self.normalize_observations),
             "obs_norm_clip": float(self.obs_clip),
             "obs_norm_eps": float(self.obs_eps),

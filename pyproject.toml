@@ -18,7 +18,8 @@ dependencies = [
   "distrax",
   "hydra-core",
   "playground",
-  "termcolor"
+  "termcolor",
+  "flashbax"
 ]
 
 [tool.pytest.ini_options]

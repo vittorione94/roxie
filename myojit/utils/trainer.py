@@ -97,6 +97,7 @@ class Trainer:
                 high = self.agent.action_high
                 u = jax.random.uniform(action_key, (NUM_ENVS, self.environment.action_size), minval=0.0, maxval=1.0)
                 actions = low + (high - low) * u
+                self.agent.last_action = actions 
             
             # TODO use chex
             #assert not np.isnan(actions.sum())
@@ -115,7 +116,6 @@ class Trainer:
                 new_wrapped_states.env_state, 
                 steps=self.steps, 
                 agent_rng=update_key,
-                actions=actions
             )
             actor_losses.append(actor_loss)
             critic_losses.append(critic_loss)
