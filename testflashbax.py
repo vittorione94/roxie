@@ -68,6 +68,10 @@ assert buffer.can_sample(state), "Buffer cannot sample yet—need more timesteps
 key, sub = jax.random.split(key)
 batch = buffer.sample(state, sub)
 
+print(type(batch))  # flashbax.buffers.flat_buffer.TransitionSample
+print(type(batch.experience)) # flashbax.buffers.flat_buffer.ExperiencePair
+print(type(batch.experience.first)) # dict
+
 print("batch keys:", batch.experience.first.keys()) # experience pair of (t, t+1)
 print("batch keys second:", batch.experience.second.keys())
 

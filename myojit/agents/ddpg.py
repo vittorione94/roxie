@@ -2,7 +2,7 @@ from myojit.agents.agent import Agent, TrainState
 import jax
 import jax.numpy as jnp
 import functools
-from myojit.replays.buffer import Transition
+from myojit.agents.utils import Transition
 from flax import nnx
 import optax
 import copy
@@ -22,15 +22,23 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
 
-    print("Sampled batch shapes:", {k: v.shape for k, v in samples.items()})
-    print("Sampled batch", samples)
-    
+    # type(samples)  flashbax.buffers.flat_buffer.TransitionSample
+    # type(samples.experience) flashbax.buffers.flat_buffer.ExperiencePair
+    # type(samples.experience.first) myojit.replays.buffer.Transition
+    re_packed_samples =  {
+        "observations": samples.experience.first.observation,
+        "actions": samples.experience.first.action,
+        "rewards": samples.experience.first.reward,
+        "next_observations": samples.experience.second.observation,
+        "terminals": samples.experience.first.terminal,
+    }
+
     # 1.1 Compute current normalization parameters
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
     # 2. Critic update
     critic_loss, critic_grads = nnx.value_and_grad(ddpg_critic_loss_fn)(
-        state.critic, state.target_actor, state.target_critic, samples, gamma, noise_key, \
+        state.critic, state.target_actor, state.target_critic, re_packed_samples, gamma, noise_key, \
             target_policy_noise, target_noise_clip, action_low, action_high, \
             obs_mean, obs_std, obs_clip
     )
@@ -38,7 +46,7 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
 
     # 3. Actor update (use scaled actions)
     actor_loss, actor_grads = nnx.value_and_grad(ddpg_actor_loss_fn)(
-        state.actor, state.critic, samples, obs_mean, obs_std, obs_clip, action_low, action_high
+        state.actor, state.critic, re_packed_samples, obs_mean, obs_std, obs_clip, action_low, action_high
     )
     state.actor_optimizer.update(actor_grads)
     
@@ -125,7 +133,7 @@ class DDPG(Agent):
             observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
             action=jnp.zeros(env_action_size, dtype=jnp.float32),
             reward=jnp.zeros((), dtype=jnp.float32),
-            next_observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
+            # next_observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
             terminal=jnp.zeros((), dtype=jnp.bool_)
         )
         replay = hydra.utils.instantiate(memory_config)
@@ -143,7 +151,7 @@ class DDPG(Agent):
         # Create targets
         target_actor = copy.deepcopy(actor)
         target_critic = copy.deepcopy(critic)
-        
+
         self.critic_learning_rate = critic_learning_rate
         self.actor_learning_rate = actor_learning_rate
         self.max_grad_norm = max_grad_norm
@@ -151,7 +159,7 @@ class DDPG(Agent):
 
         # Add gradient clipping to optimizers
         actor_optimizer = nnx.Optimizer(
-            actor, 
+            actor,
             optax.chain(
                 optax.clip_by_global_norm(self.max_grad_norm),
                 optax.adam(self.actor_learning_rate)
@@ -160,16 +168,16 @@ class DDPG(Agent):
         )
 
         critic_optimizer = nnx.Optimizer(
-            critic, 
+            critic,
             optax.chain(
                 optax.clip_by_global_norm(self.max_grad_norm),
                 optax.adam(self.critic_learning_rate)
-            ), 
+            ),
             wrt=nnx.Param
         )
 
         # Init observation stats from buffer state's observation shape
-        obs_shape = buffer_state.experience.observation.shape  # Exclude batch dimension
+        obs_shape = buffer_state.experience.observation.shape[-1]  # Exclude batch dimension
         obs_stats = Agent.init_obs_stats(obs_shape)
 
         self.state = TrainState(
@@ -211,7 +219,7 @@ class DDPG(Agent):
         if self.normalize_observations:
             mean, std = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
-        
+
         action, noise = Agent.deterministic_step_fn(
             self.state.actor,
             observation,
@@ -221,15 +229,21 @@ class DDPG(Agent):
         )
 
         self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
-        
+
         return self.last_action
 
     def update(self, prev_states, states, steps, agent_rng):
+        # prev_states.obs.shape   (num_envs, obs_dim)
+        # states.reward.shape     (num_envs,)
+        # states.done.shape       (num_envs,)
+        # self.last_action.shape  (num_envs, action_dim)
+        # states.obs.shape        (num_envs, obs_dim)
+
         experiences = Transition(
             observation=prev_states.obs,
             action=self.last_action,
             reward=states.reward,
-            next_observation=states.obs,
+            # next_observation=states.obs,
             terminal=states.done,
         )
 
@@ -239,8 +253,8 @@ class DDPG(Agent):
         # Update observation normalization stats with both current and next observations
         if self.normalize_observations:
             obs_batch = jnp.concatenate([prev_states.obs, states.obs], axis=0)
+            # obs_batch.shape --> (2 * num_envs, obs_dim)
             self.state.obs_stats = Agent.update_obs_stats(self.state.obs_stats, obs_batch)
-
 
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
@@ -249,7 +263,6 @@ class DDPG(Agent):
            (steps - self.steps_before_learning) % self.steps_between_updates == 0:
             for _ in range(self.learning_steps):
                 agent_rng, key = jax.random.split(agent_rng, 2)
-
                 self.state, actor_loss, critic_loss = _grad_step(
                     self.state, 
                     key, 
@@ -268,9 +281,8 @@ class DDPG(Agent):
         return gradient_steps, actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
-        print(self.state.buffer_state)
-        print(self.state.buffer_state.experience.observation.shape)
-        print(self.state.buffer_state.experience.action.shape)
+        # self.state.buffer_state.experience.observation.shape  (num_envs, steps, obs_dim)
+        # self.state.buffer_state.experience.action.shape       (num_envs, steps, action_dim)
         # Keep this minimal and JSON-serializable
         return {
             "gamma": float(self.gamma),

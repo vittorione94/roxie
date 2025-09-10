@@ -1,11 +1,8 @@
 import mujoco
 import mujoco.viewer
 import numpy as np
-import random
 import time
-import argparse
 import jax
-from mujoco import mjx
 from myojit.environment.loader import load_playground_env
 import hydra
 from omegaconf import OmegaConf
@@ -13,19 +10,16 @@ from myojit.agents import agents
 import os 
 import click
 import hydra
-from omegaconf import DictConfig
 from myojit.agents import agents
 from myojit.environment.loader import load_playground_env
-from myojit.replays.buffer import JaxReplayBuffer
 from flax import nnx
 from myojit.utils.trainer import Trainer
 import jax.numpy as jnp
-from myojit.replays.buffer import Transition
 from hydra.core.hydra_config import HydraConfig
 
 
 @click.command()
-@click.option('--checkpoint_path', type=str, help='Path to the checkpoint file.')
+@click.option('--checkpoint-path', type=str, help='Path to the checkpoint file.')
 def main(checkpoint_path):
     """
     Launches an interactive MuJoCo viewer with a random policy in a given environment.

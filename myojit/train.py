@@ -2,12 +2,11 @@ import hydra
 from omegaconf import DictConfig
 from myojit.agents import agents
 from myojit.environment.loader import load_playground_env
-from myojit.replays.buffer import JaxReplayBuffer
 from flax import nnx
 from myojit.utils.trainer import Trainer
 import jax.numpy as jnp
 import jax
-from myojit.replays.buffer import Transition
+from myojit.agents.utils import Transition
 from hydra.core.hydra_config import HydraConfig
 import copy
 

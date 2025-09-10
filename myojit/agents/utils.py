@@ -1,9 +1,18 @@
 import jax
 import jax.numpy as jnp
-from flax import nnx
 from typing import Any, Dict, Iterable
-import numbers
 import numpy as np
+import flax.struct as struct
+
+
+@struct.dataclass
+class Transition:
+    observation: jnp.ndarray
+    action: jnp.ndarray
+    reward: jnp.ndarray
+    # next_observation: jnp.ndarray
+    terminal: jnp.ndarray
+    # log_probs: Optional[jnp.ndarray] = None  # Optional, used in some algorithms
 
 # Helpers to serialize/deserialize bounds minimally
 def serialize_bound(x):
