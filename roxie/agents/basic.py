@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from myojit.agents.agent import Agent
+from roxie.agents.agent import Agent
 from typing import Any, Dict
 
 class NormalRandom(Agent):

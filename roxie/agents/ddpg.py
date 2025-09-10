@@ -1,16 +1,16 @@
-from myojit.agents.agent import Agent, TrainState 
+from roxie.agents.agent import Agent, TrainState 
 import jax
 import jax.numpy as jnp
 import functools
-from myojit.agents.utils import Transition
+from roxie.agents.utils import Transition
 from flax import nnx
 import optax
 import copy
-from myojit.agents.utils import serialize_bound
+from roxie.agents.utils import serialize_bound
 from typing import Any
 import hydra
-from myojit.losses.actor_losses import ddpg_actor_loss_fn
-from myojit.losses.critic_losses import ddpg_critic_loss_fn
+from roxie.losses.actor_losses import ddpg_actor_loss_fn
+from roxie.losses.critic_losses import ddpg_critic_loss_fn
 
 # This is the core computational kernel that will be JIT-compiled.
 @functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn'))
@@ -24,7 +24,7 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
 
     # type(samples)  flashbax.buffers.flat_buffer.TransitionSample
     # type(samples.experience) flashbax.buffers.flat_buffer.ExperiencePair
-    # type(samples.experience.first) myojit.replays.buffer.Transition
+    # type(samples.experience.first) roxie.replays.buffer.Transition
     re_packed_samples =  {
         "observations": samples.experience.first.observation,
         "actions": samples.experience.first.action,

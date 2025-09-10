@@ -3,17 +3,17 @@ import mujoco.viewer
 import numpy as np
 import time
 import jax
-from myojit.environment.loader import load_playground_env
+from roxie.environment.loader import load_playground_env
 import hydra
 from omegaconf import OmegaConf
-from myojit.agents import agents
+from roxie.agents import agents
 import os 
 import click
 import hydra
-from myojit.agents import agents
-from myojit.environment.loader import load_playground_env
+from roxie.agents import agents
+from roxie.environment.loader import load_playground_env
 from flax import nnx
-from myojit.utils.trainer import Trainer
+from roxie.utils.trainer import Trainer
 import jax.numpy as jnp
 from hydra.core.hydra_config import HydraConfig
 

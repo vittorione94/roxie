@@ -3,10 +3,10 @@ import time
 
 import numpy as np
 import jax
-from myojit.utils import logger
+from roxie.utils import logger
 import jax.numpy as jnp
 from flax import nnx
-from myojit.agents.agent import Agent
+from roxie.agents.agent import Agent
 
 class Trainer:
     '''Trainer used to train and evaluate an agent on an environment.'''

@@ -16,7 +16,7 @@ args:
 actor:
   # The _target_ points to the Python class you want to instantiate.
   # Make sure the path is correct for your project structure.
-  _target_: models.actors.DeterministicActor
+  _target_: roxie.models.actors.DeterministicActor
 
   # --- Required __init__ arguments ---
   features: [256, 256]  # Defines the two hidden layers
@@ -28,7 +28,7 @@ actor:
 
 critic:
   # Path to the Critic class
-  _target_: models.critics.DeterministicCritic
+  _target_: roxie.models.critics.DeterministicCritic
   features: [256, 256]
   use_layer_norm: false 
   dropout_rate: 0.   

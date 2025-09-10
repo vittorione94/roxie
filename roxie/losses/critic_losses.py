@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from myojit.agents.agent import Agent
+from roxie.agents.agent import Agent
 from flax import nnx
 
 @nnx.jit

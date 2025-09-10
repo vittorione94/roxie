@@ -1,13 +1,13 @@
-from myojit.agents.agent import Agent
+from roxie.agents.agent import Agent
 import jax.numpy as jnp
 from flax import nnx
 import hydra
-from myojit.replays.buffer import Transition
+from roxie.replays.buffer import Transition
 import optax
-from myojit.agents.agent import Agent, TrainState 
-from myojit.agents.utils import serialize_bound
+from roxie.agents.agent import Agent, TrainState 
+from roxie.agents.utils import serialize_bound
 import jax
-from myojit.agents.ppo import ppo_loss_fn, ppo_critic_loss_fn
+from roxie.agents.ppo import ppo_loss_fn, ppo_critic_loss_fn
 import functools
 
 

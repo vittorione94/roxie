@@ -1,16 +1,16 @@
 import hydra
 from omegaconf import DictConfig
-from myojit.agents import agents
-from myojit.environment.loader import load_playground_env
+from roxie.agents import agents
+from roxie.environment.loader import load_playground_env
 from flax import nnx
-from myojit.utils.trainer import Trainer
+from roxie.utils.trainer import Trainer
 import jax.numpy as jnp
 import jax
-from myojit.agents.utils import Transition
+from roxie.agents.utils import Transition
 from hydra.core.hydra_config import HydraConfig
 import copy
 
-@hydra.main(version_base=None, config_path="configs", config_name="myojit")
+@hydra.main(version_base=None, config_path="configs", config_name="roxie")
 def main(cfg: DictConfig):
     print(cfg.agent.name)
 

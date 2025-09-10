@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from typing import Optional
-from myojit.exploration.schedulers import DecaySchedule, ConstantSchedule
+from roxie.exploration.schedulers import DecaySchedule, ConstantSchedule
 
 # Base noise module
 class NoiseModule(nnx.Module):
