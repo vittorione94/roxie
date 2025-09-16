@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 import flax.struct as struct
 import jax
@@ -11,9 +11,8 @@ class Transition:
     observation: jnp.ndarray
     action: jnp.ndarray
     reward: jnp.ndarray
-    # next_observation: jnp.ndarray
     terminal: jnp.ndarray
-    # log_probs: Optional[jnp.ndarray] = None  # Optional, used in some algorithms
+    log_probs: Optional[jnp.ndarray] = None  # Optional, used in some algorithms
 
 
 # Helpers to serialize/deserialize bounds minimally

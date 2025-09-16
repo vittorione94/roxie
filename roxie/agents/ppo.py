@@ -7,8 +7,9 @@ import optax
 from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
-from roxie.agents.ppo import ppo_critic_loss_fn, ppo_loss_fn
 from roxie.agents.utils import Transition, serialize_bound
+from roxie.losses.actor_losses import ppo_loss_fn
+from roxie.losses.critic_losses import ppo_critic_loss_fn
 
 
 # This is the core computational kernel that will be JIT-compiled.
@@ -177,8 +178,8 @@ class PPO(Agent):
             observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
             action=jnp.zeros(env_action_size, dtype=jnp.float32),
             reward=jnp.zeros((), dtype=jnp.float32),
-            next_observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
             terminal=jnp.zeros((), dtype=jnp.bool_),
+            log_probs=jnp.zeros((), dtype=jnp.float32),
         )
         replay = hydra.utils.instantiate(memory_config)
         buffer_state = replay.init(prototype)
@@ -207,29 +208,9 @@ class PPO(Agent):
         )
 
         # Init observation stats from buffer state's observation shape
-        data = None
-        if buffer_state is not None:
-            if hasattr(buffer_state, "data"):
-                data = buffer_state.data
-            elif isinstance(buffer_state, dict):
-                data = buffer_state.get("data", buffer_state)
-
-        if data is None:
-            # Fallback: infer from the replay instance (adjust to your replay API)
-            obs_src = (
-                getattr(replay, "data", {}).get("observation", None)
-                if isinstance(getattr(replay, "data", {}), dict)
-                else None
-            )
-            if obs_src is None:
-                raise ValueError(
-                    "Could not infer observation shape from buffer_state or replay."
-                )
-            obs_shape = tuple(obs_src.shape[1:])
-        else:
-            obs = data["observation"] if isinstance(data, dict) else data.observation
-            obs_shape = tuple(obs.shape[1:])
-
+        obs_shape = buffer_state.experience.observation.shape[
+            -1
+        ]  # Exclude batch dimension
         obs_stats = Agent.init_obs_stats(obs_shape)
 
         self.state = TrainState(
@@ -284,7 +265,6 @@ class PPO(Agent):
             observation=prev_states.obs,
             action=self.last_action,
             reward=states.reward,
-            next_observation=states.obs,
             terminal=states.done,
             log_probs=self.last_log_prob,
         )
