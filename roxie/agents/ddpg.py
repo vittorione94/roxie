@@ -1,22 +1,34 @@
-from roxie.agents.agent import Agent, TrainState 
+import copy
+import functools
+from typing import Any
+
+import hydra
 import jax
 import jax.numpy as jnp
-import functools
-from roxie.agents.utils import Transition
-from flax import nnx
 import optax
-import copy
-from roxie.agents.utils import serialize_bound
-from typing import Any
-import hydra
+from flax import nnx
+
+from roxie.agents.agent import Agent, TrainState
+from roxie.agents.utils import Transition, serialize_bound
 from roxie.losses.actor_losses import ddpg_actor_loss_fn
 from roxie.losses.critic_losses import ddpg_critic_loss_fn
 
+
 # This is the core computational kernel that will be JIT-compiled.
-@functools.partial(nnx.jit, static_argnames=('gamma', 'tau', 'replay_sample_fn'))
-def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: float, replay_sample_fn, \
-               target_policy_noise: float, target_noise_clip: float, action_low: float, action_high: float,
-               obs_eps: float, obs_clip: float):
+@functools.partial(nnx.jit, static_argnames=("gamma", "tau", "replay_sample_fn"))
+def _grad_step(
+    state: TrainState,
+    key: jax.random.PRNGKey,
+    gamma: float,
+    tau: float,
+    replay_sample_fn,
+    target_policy_noise: float,
+    target_noise_clip: float,
+    action_low: float,
+    action_high: float,
+    obs_eps: float,
+    obs_clip: float,
+):
     """Performs one full gradient update step and returns the new state."""
     # 1. Sample from the replay buffer
     key, noise_key = jax.random.split(key)
@@ -25,7 +37,7 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
     # type(samples)  flashbax.buffers.flat_buffer.TransitionSample
     # type(samples.experience) flashbax.buffers.flat_buffer.ExperiencePair
     # type(samples.experience.first) roxie.replays.buffer.Transition
-    re_packed_samples =  {
+    re_packed_samples = {
         "observations": samples.experience.first.observation,
         "actions": samples.experience.first.action,
         "rewards": samples.experience.first.reward,
@@ -38,40 +50,55 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
 
     # 2. Critic update
     critic_loss, critic_grads = nnx.value_and_grad(ddpg_critic_loss_fn)(
-        state.critic, state.target_actor, state.target_critic, re_packed_samples, gamma, noise_key, \
-            target_policy_noise, target_noise_clip, action_low, action_high, \
-            obs_mean, obs_std, obs_clip
+        state.critic,
+        state.target_actor,
+        state.target_critic,
+        re_packed_samples,
+        gamma,
+        noise_key,
+        target_policy_noise,
+        target_noise_clip,
+        action_low,
+        action_high,
+        obs_mean,
+        obs_std,
+        obs_clip,
     )
     state.critic_optimizer.update(critic_grads)
 
     # 3. Actor update (use scaled actions)
     actor_loss, actor_grads = nnx.value_and_grad(ddpg_actor_loss_fn)(
-        state.actor, state.critic, re_packed_samples, obs_mean, obs_std, obs_clip, action_low, action_high
+        state.actor,
+        state.critic,
+        re_packed_samples,
+        obs_mean,
+        obs_std,
+        obs_clip,
+        action_low,
+        action_high,
     )
     state.actor_optimizer.update(actor_grads)
-    
+
     # 4. Update target networks using soft updates
     new_actor_tensors = nnx.state(state.actor, nnx.Param)  # Use updated_actor
     old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
 
     new_target_actor_tensors = optax.incremental_update(
-          new_tensors=new_actor_tensors,
-          old_tensors=old_actor_tensors,
-          step_size=tau)
-    
+        new_tensors=new_actor_tensors, old_tensors=old_actor_tensors, step_size=tau
+    )
+
     new_critic_tensors = nnx.state(state.critic, nnx.Param)
     old_critic_tensors = nnx.state(state.target_critic, nnx.Param)
     new_target_critic_tensors = optax.incremental_update(
-          new_tensors=new_critic_tensors,
-          old_tensors=old_critic_tensors,
-          step_size=tau)
-    
+        new_tensors=new_critic_tensors, old_tensors=old_critic_tensors, step_size=tau
+    )
 
     nnx.update(state.target_actor, new_target_actor_tensors)
     nnx.update(state.target_critic, new_target_critic_tensors)
 
     # 5. Return the new, updated state object
-    return TrainState(
+    return (
+        TrainState(
             actor=state.actor,
             critic=state.critic,
             actor_optimizer=state.actor_optimizer,
@@ -79,53 +106,55 @@ def _grad_step(state: TrainState, key: jax.random.PRNGKey, gamma: float, tau: fl
             target_critic=state.target_critic,
             critic_optimizer=state.critic_optimizer,
             buffer_state=state.buffer_state,
-            obs_stats=state.obs_stats
-        ), actor_loss, critic_loss
+            obs_stats=state.obs_stats,
+        ),
+        actor_loss,
+        critic_loss,
+    )
 
 
 class DDPG(Agent):
-    def __init__(self, 
-                 env_obs_size: int,
-                 env_action_size: int,
-                 action_low: jnp.ndarray,
-                 action_high: jnp.ndarray,
-                 actor_config: dict,
-                 critic_config: dict,
-                 memory_config: dict,
-                 noise_config: dict,
-                 *,
-                 actor_learning_rate: float = 3e-4,
-                 critic_learning_rate: float = 3e-4,
-                 gamma: float = 0.99,
-                 tau: float = 0.005,
-                 steps_before_learning: int = 100,
-                 steps_between_updates: int = 10,
-                 learning_steps: int = 5,
-                 memory_warmup: int = 100,
-                 target_noise_clip: float = 0.1,
-                 target_policy_noise: float = 0.1,
-                 max_grad_norm: float = 1.0,
-                 normalize_observations: bool = True,
-                 obs_norm_clip: float = 5.0,
-                 obs_norm_eps: float = 1e-8,
-                 ):
+    def __init__(
+        self,
+        env_obs_size: int,
+        env_action_size: int,
+        action_low: jnp.ndarray,
+        action_high: jnp.ndarray,
+        actor_config: dict,
+        critic_config: dict,
+        memory_config: dict,
+        noise_config: dict,
+        *,
+        actor_learning_rate: float = 3e-4,
+        critic_learning_rate: float = 3e-4,
+        gamma: float = 0.99,
+        tau: float = 0.005,
+        steps_before_learning: int = 100,
+        steps_between_updates: int = 10,
+        learning_steps: int = 5,
+        memory_warmup: int = 100,
+        target_noise_clip: float = 0.1,
+        target_policy_noise: float = 0.1,
+        max_grad_norm: float = 1.0,
+        normalize_observations: bool = True,
+        obs_norm_clip: float = 5.0,
+        obs_norm_eps: float = 1e-8,
+    ):
 
         actor_rngs = nnx.Rngs(params=0, dropout=1)
-        critic_rngs = nnx.Rngs(params=0, dropout=1)        
+        critic_rngs = nnx.Rngs(params=0, dropout=1)
 
         # Instantiate actor
         actor = hydra.utils.instantiate(
             actor_config,
             in_features=env_obs_size,
             action_dim=env_action_size,
-            rngs=actor_rngs
+            rngs=actor_rngs,
         )
 
         # Instantiate critic
         critic = hydra.utils.instantiate(
-            critic_config,
-            in_features=env_obs_size + env_action_size,
-            rngs=critic_rngs
+            critic_config, in_features=env_obs_size + env_action_size, rngs=critic_rngs
         )
 
         # Instantiate replay buffer
@@ -134,7 +163,7 @@ class DDPG(Agent):
             action=jnp.zeros(env_action_size, dtype=jnp.float32),
             reward=jnp.zeros((), dtype=jnp.float32),
             # next_observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
-            terminal=jnp.zeros((), dtype=jnp.bool_)
+            terminal=jnp.zeros((), dtype=jnp.bool_),
         )
         replay = hydra.utils.instantiate(memory_config)
         self.batch_size = memory_config.sample_batch_size
@@ -144,8 +173,7 @@ class DDPG(Agent):
 
         # Instantiate noise module
         noise_module = hydra.utils.instantiate(
-            noise_config,
-            action_shape=(env_action_size,)
+            noise_config, action_shape=(env_action_size,)
         )
 
         # Create targets
@@ -162,22 +190,24 @@ class DDPG(Agent):
             actor,
             optax.chain(
                 optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.actor_learning_rate)
+                optax.adam(self.actor_learning_rate),
             ),
-            wrt=nnx.Param
+            wrt=nnx.Param,
         )
 
         critic_optimizer = nnx.Optimizer(
             critic,
             optax.chain(
                 optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.critic_learning_rate)
+                optax.adam(self.critic_learning_rate),
             ),
-            wrt=nnx.Param
+            wrt=nnx.Param,
         )
 
         # Init observation stats from buffer state's observation shape
-        obs_shape = buffer_state.experience.observation.shape[-1]  # Exclude batch dimension
+        obs_shape = buffer_state.experience.observation.shape[
+            -1
+        ]  # Exclude batch dimension
         obs_stats = Agent.init_obs_stats(obs_shape)
 
         self.state = TrainState(
@@ -188,7 +218,7 @@ class DDPG(Agent):
             actor_optimizer=actor_optimizer,
             critic_optimizer=critic_optimizer,
             buffer_state=buffer_state,
-            obs_stats=obs_stats
+            obs_stats=obs_stats,
         )
 
         # Store hyperparameters
@@ -211,7 +241,12 @@ class DDPG(Agent):
         print("Noise module hyperparameters:", self.noise_module.hyperparameters())
         print("Hyper Params:", self._export_hyperparams())
 
-    def step(self, observation: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None) -> jnp.ndarray:
+    def step(
+        self,
+        observation: jnp.ndarray,
+        evaluate: bool = False,
+        key: jax.random.PRNGKey = None,
+    ) -> jnp.ndarray:
         """
         Selects an action by calling the pure, JIT-compiled step function.
         """
@@ -254,27 +289,31 @@ class DDPG(Agent):
         if self.normalize_observations:
             obs_batch = jnp.concatenate([prev_states.obs, states.obs], axis=0)
             # obs_batch.shape --> (2 * num_envs, obs_dim)
-            self.state.obs_stats = Agent.update_obs_stats(self.state.obs_stats, obs_batch)
+            self.state.obs_stats = Agent.update_obs_stats(
+                self.state.obs_stats, obs_batch
+            )
 
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
         # Conditionally call the JIT-compiled gradient step
-        if steps >= self.steps_before_learning and \
-           (steps - self.steps_before_learning) % self.steps_between_updates == 0:
+        if (
+            steps >= self.steps_before_learning
+            and (steps - self.steps_before_learning) % self.steps_between_updates == 0
+        ):
             for _ in range(self.learning_steps):
                 agent_rng, key = jax.random.split(agent_rng, 2)
                 self.state, actor_loss, critic_loss = _grad_step(
-                    self.state, 
-                    key, 
-                    self.gamma, 
+                    self.state,
+                    key,
+                    self.gamma,
                     self.tau,
-                    self.replay.sample, # Pass the sample method itself,
+                    self.replay.sample,  # Pass the sample method itself,
                     self.target_policy_noise,  # Use target_policy_noise
                     self.target_noise_clip,
                     self.action_low,
                     self.action_high,
                     self.obs_eps,
-                    self.obs_clip
+                    self.obs_clip,
                 )
             gradient_steps += self.learning_steps
 
@@ -290,7 +329,6 @@ class DDPG(Agent):
             "actor_learning_rate": float(self.actor_learning_rate),
             "critic_learning_rate": float(self.critic_learning_rate),
             "max_grad_norm": float(self.max_grad_norm),
-
             "env_obs_size": self.state.buffer_state.experience.observation.shape[2],
             "env_action_size": self.state.buffer_state.experience.action.shape[2],
             "target_policy_noise": float(self.target_policy_noise),

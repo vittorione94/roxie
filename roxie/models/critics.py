@@ -1,6 +1,8 @@
-from flax import nnx
-from typing import Sequence, Callable
+from typing import Callable, Sequence
+
 import jax.numpy as jnp
+from flax import nnx
+
 
 class DeterministicCritic(nnx.Module):
     """
@@ -10,6 +12,7 @@ class DeterministicCritic(nnx.Module):
     single Q-value. It's composed of a series of dense layers with optional
     layer normalization and dropout.
     """
+
     def __init__(
         self,
         in_features: int,
@@ -40,7 +43,7 @@ class DeterministicCritic(nnx.Module):
         self.hidden_layers = []
         if self.use_layer_norm:
             self.norm_layers = []
-        
+
         # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
@@ -53,7 +56,9 @@ class DeterministicCritic(nnx.Module):
         self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.output_layer = nnx.Linear(current_features, 1, rngs=rngs)
 
-    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray, training: bool = False) -> jnp.ndarray:
+    def __call__(
+        self, observations: jnp.ndarray, actions: jnp.ndarray, training: bool = False
+    ) -> jnp.ndarray:
         """
         Performs the forward pass of the critic network.
 
@@ -74,10 +79,10 @@ class DeterministicCritic(nnx.Module):
                 x = self.norm_layers[i](x)
             x = self.activation_fn(x)
             x = self.dropout(x, deterministic=not training)
-        
+
         x = self.output_layer(x)
         return x
-    
+
 
 def StochasticCritic():
     def __init__(self):

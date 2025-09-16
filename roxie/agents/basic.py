@@ -1,14 +1,25 @@
-'''Some basic non-learning agents used for example for debugging.'''
+"""Some basic non-learning agents used for example for debugging."""
+
+from typing import Any, Dict
 
 import numpy as np
 
 from roxie.agents.agent import Agent
-from typing import Any, Dict
+
 
 class NormalRandom(Agent):
-    '''Random agent producing actions from normal distributions.'''
+    """Random agent producing actions from normal distributions."""
 
-    def __init__(self, env_obs_size, env_action_size, action_low, action_high, seed=0, loc=0, scale=1):
+    def __init__(
+        self,
+        env_obs_size,
+        env_action_size,
+        action_low,
+        action_high,
+        seed=0,
+        loc=0,
+        scale=1,
+    ):
         self.loc = loc
         self.scale = scale
         self.action_size = env_action_size
@@ -30,7 +41,7 @@ class NormalRandom(Agent):
 
 
 class UniformRandom(Agent):
-    '''Random agent producing actions from uniform distributions.'''
+    """Random agent producing actions from uniform distributions."""
 
     def initialize(self, observation_space, action_size, seed=None):
         self.action_size = action_size
@@ -47,9 +58,9 @@ class UniformRandom(Agent):
 
 
 class OrnsteinUhlenbeck(Agent):
-    '''Random agent producing correlated actions from an OU process.'''
+    """Random agent producing correlated actions from an OU process."""
 
-    def __init__(self, scale=0.2, clip=2, theta=.15, dt=1e-2):
+    def __init__(self, scale=0.2, clip=2, theta=0.15, dt=1e-2):
         self.scale = scale
         self.clip = clip
         self.theta = theta
@@ -88,14 +99,14 @@ class OrnsteinUhlenbeck(Agent):
         return next_actions
 
     def update(self, observations, rewards, resets, terminations, steps):
-        self.train_actions *= (1. - resets)[:, None]
+        self.train_actions *= (1.0 - resets)[:, None]
 
     def test_update(self, observations, rewards, resets, terminations, steps):
-        self.test_actions *= (1. - resets)[:, None]
+        self.test_actions *= (1.0 - resets)[:, None]
 
 
 class Constant(Agent):
-    '''Agent producing a unique constant action.'''
+    """Agent producing a unique constant action."""
 
     def __init__(self, constant=0.0):
         self.constant = constant

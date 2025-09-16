@@ -1,19 +1,27 @@
 import os
 import time
 
-import numpy as np
 import jax
-from roxie.utils import logger
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
+
 from roxie.agents.agent import Agent
+from roxie.utils import logger
+
 
 class Trainer:
-    '''Trainer used to train and evaluate an agent on an environment.'''
+    """Trainer used to train and evaluate an agent on an environment."""
 
     def __init__(
-        self, output_dir, steps=int(1e7), epoch_steps=int(3e5), save_steps=int(1e5),
-        test_episodes=5, show_progress=True, replace_checkpoint=False,
+        self,
+        output_dir,
+        steps=int(1e7),
+        epoch_steps=int(3e5),
+        save_steps=int(1e5),
+        test_episodes=5,
+        show_progress=True,
+        replace_checkpoint=False,
     ):
         self.max_steps = steps
         self.epoch_steps = epoch_steps
@@ -29,8 +37,8 @@ class Trainer:
         self.test_environment = test_environment
 
     def run(self, NUM_ENVS, rngs):
-        '''Runs the main training loop.'''
-            
+        """Runs the main training loop."""
+
         start_time = last_epoch_time = time.time()
 
         # --- Vectorization and JIT Compilation ---
@@ -58,8 +66,8 @@ class Trainer:
             # If this env is done, reset it with key; otherwise keep the new state.
             return jax.lax.cond(
                 done,
-                lambda k: jit_reset(k),     # reset returns a single-env wrapped state
-                lambda _: state,            # keep the provided single-env state
+                lambda k: jit_reset(k),  # reset returns a single-env wrapped state
+                lambda _: state,  # keep the provided single-env state
                 key,
             )
 
@@ -82,39 +90,48 @@ class Trainer:
         steps_since_save = self.save_steps
         actor_losses = []
         critic_losses = []
-        
+
         while True:
             # Split the main loop's RNG key for each iteration.
             loop_rng, action_key, reset_key_batch = jax.random.split(loop_rng, 3)
 
             # `wrapped_states` holds the state at time `t`.
-            
+
             # Get actions for the current state (s_t).
-            if hasattr(self.agent, "memory_warmup") and self.steps > getattr(self.agent, "memory_warmup", 0):
-                actions = self.agent.step(wrapped_states.env_state.obs, evaluate=False, key=action_key)
+            if hasattr(self.agent, "memory_warmup") and self.steps > getattr(
+                self.agent, "memory_warmup", 0
+            ):
+                actions = self.agent.step(
+                    wrapped_states.env_state.obs, evaluate=False, key=action_key
+                )
             else:
                 low = self.agent.action_low
                 high = self.agent.action_high
-                u = jax.random.uniform(action_key, (NUM_ENVS, self.environment.action_size), minval=0.0, maxval=1.0)
+                u = jax.random.uniform(
+                    action_key,
+                    (NUM_ENVS, self.environment.action_size),
+                    minval=0.0,
+                    maxval=1.0,
+                )
                 actions = low + (high - low) * u
-                self.agent.last_action = actions 
-            
+                self.agent.last_action = actions
+
             # TODO use chex
-            #assert not np.isnan(actions.sum())
+            # assert not np.isnan(actions.sum())
 
             # Store the current state before it's overwritten. This is your "old state".
             old_wrapped_states = wrapped_states
-            
+
             # Perform the step to get the "new state" (s_t+1).
             new_wrapped_states = jit_v_step(old_wrapped_states, actions)
-            
+
             # Pass BOTH the old and new states to the agent for the full transition.
             # Split a fresh key for agent update every loop
             agent_key, update_key = jax.random.split(agent_key)
             gradient_steps, actor_loss, critic_loss = self.agent.update(
-                old_wrapped_states.env_state, 
-                new_wrapped_states.env_state, 
-                steps=self.steps, 
+                old_wrapped_states.env_state,
+                new_wrapped_states.env_state,
+                steps=self.steps,
                 agent_rng=update_key,
             )
             actor_losses.append(actor_loss)
@@ -123,10 +140,10 @@ class Trainer:
             tot_gradient_steps += gradient_steps
 
             dones = new_wrapped_states.env_state.done
-            
+
             # Generate new keys for the environments that need resetting.
             reset_keys = jax.random.split(reset_key_batch, NUM_ENVS)
-            
+
             # Lazily reset only the envs that are done, keep others as-is.
             # This avoids computing reset() for every env at every step.
             wrapped_states = v_selective_reset(dones, reset_keys, new_wrapped_states)
@@ -139,9 +156,8 @@ class Trainer:
 
             # Show the progress bar.
             if self.show_progress:
-                logger.show_progress(
-                    self.steps, self.epoch_steps, self.max_steps)
-            
+                logger.show_progress(self.steps, self.epoch_steps, self.max_steps)
+
             # Check the finished episodes.
             # Where next_states.done is True, set scores and lengths to 0.
             # Otherwise, keep their original values.
@@ -164,21 +180,23 @@ class Trainer:
                 epochs += 1
                 epoch_steps = 0
 
-                print("\nEpoch Stats: \n"
-                      f"    Epoch: {epochs} \n"
-                      f"    Steps: {self.steps} \n"
-                      f"    Episodes: {episodes} \n"
-                      f"    Time: {time.time() - start_time:.2f} \n"
-                      f"    Epoch time: {time.time() - last_epoch_time:.2f} \n"
-                      f"    Steps per second: {self.steps / (time.time() - start_time):.2f} \n"
+                print(
+                    "\nEpoch Stats: \n"
+                    f"    Epoch: {epochs} \n"
+                    f"    Steps: {self.steps} \n"
+                    f"    Episodes: {episodes} \n"
+                    f"    Time: {time.time() - start_time:.2f} \n"
+                    f"    Epoch time: {time.time() - last_epoch_time:.2f} \n"
+                    f"    Steps per second: {self.steps / (time.time() - start_time):.2f} \n"
                     #   f"    Warmup: {self.steps < self.agent.memory_warmup} \n"
-                      f"    Average score: {jnp.mean(scores):.2f} \n"
-                      f"    Average length: {jnp.mean(lengths):.2f} \n"
-                      f"    Gradient steps: {tot_gradient_steps} \n"
-                      f"    Actor loss: {np.mean(actor_losses):.2f} \n"
-                      f"    Critic loss: {np.mean(critic_losses):.2f} \n")
+                    f"    Average score: {jnp.mean(scores):.2f} \n"
+                    f"    Average length: {jnp.mean(lengths):.2f} \n"
+                    f"    Gradient steps: {tot_gradient_steps} \n"
+                    f"    Actor loss: {np.mean(actor_losses):.2f} \n"
+                    f"    Critic loss: {np.mean(critic_losses):.2f} \n"
+                )
                 actor_losses = []
-                critic_losses = []  
+                critic_losses = []
 
                 last_epoch_time = time.time()
 
@@ -186,12 +204,12 @@ class Trainer:
             stop_training = self.steps >= self.max_steps
             # Save a checkpoint.
             if stop_training or steps_since_save >= self.save_steps:
-                path = os.path.join(self.output_dir, 'checkpoints')
+                path = os.path.join(self.output_dir, "checkpoints")
                 if os.path.isdir(path) and self.replace_checkpoint:
                     for file in os.listdir(path):
-                        if file.startswith('step_'):
+                        if file.startswith("step_"):
                             os.remove(os.path.join(path, file))
-                checkpoint_name = f'step_{self.steps}'
+                checkpoint_name = f"step_{self.steps}"
                 save_path = os.path.join(path, checkpoint_name)
                 self.agent.save(save_path)
                 steps_since_save = self.steps % self.save_steps
@@ -223,16 +241,14 @@ class Trainer:
 
         def _broadcast_mask(dones_mask, leaf):
             # Make mask shape (B, 1, 1, ..., 1) to match each leaf's rank
-            return dones_mask.reshape((dones_mask.shape[0],) + (1,) * max(leaf.ndim - 1, 0))
+            return dones_mask.reshape(
+                (dones_mask.shape[0],) + (1,) * max(leaf.ndim - 1, 0)
+            )
 
         # Use a regular Python while loop instead of nnx.while_loop
         # This avoids the trace context error
         while not jnp.all(dones):
-            actions = self.agent.step(
-                states.env_state.obs,
-                evaluate=True,
-                key=eval_key
-            )
+            actions = self.agent.step(states.env_state.obs, evaluate=True, key=eval_key)
 
             next_states = v_step(states, actions)
 
@@ -242,10 +258,13 @@ class Trainer:
             lengths = lengths + not_done.astype(jnp.int32)
 
             states = jax.tree.map(
-                lambda old, new: jnp.where(_broadcast_mask(dones, new), old, new)
-                if isinstance(new, jnp.ndarray) and new.shape[:1] == dones.shape
-                else new,
-                states, next_states
+                lambda old, new: (
+                    jnp.where(_broadcast_mask(dones, new), old, new)
+                    if isinstance(new, jnp.ndarray) and new.shape[:1] == dones.shape
+                    else new
+                ),
+                states,
+                next_states,
             )
             dones = jnp.logical_or(dones, next_states.env_state.done)
 
@@ -258,7 +277,9 @@ class Trainer:
         lengths_np = np.array(lengths)
 
         act_mean = float(action_sum / jnp.maximum(1, action_count))
-        act_var = jnp.maximum(0.0, action_sumsq / jnp.maximum(1, action_count) - act_mean * act_mean)
+        act_var = jnp.maximum(
+            0.0, action_sumsq / jnp.maximum(1, action_count) - act_mean * act_mean
+        )
         act_std = float(jnp.sqrt(act_var))
 
         print(
@@ -269,4 +290,3 @@ class Trainer:
             f"    Actions mean: {act_mean:.4f} \n"
             f"    Actions std: {act_std:.4f}"
         )
-

@@ -1,9 +1,10 @@
-from mujoco_playground import registry
-from mujoco_playground import wrapper
 from typing import Any, Callable, Optional
+
 import jax.numpy as jnp
-from mujoco_playground._src import mjx_env
 from flax import struct
+from mujoco_playground import registry, wrapper
+from mujoco_playground._src import mjx_env
+
 
 @struct.dataclass
 class WrapperState:
@@ -12,33 +13,33 @@ class WrapperState:
     This makes state explicit, containing the original environment state
     and the wrapper's step counter.
     """
+
     env_state: mjx_env.State
     step_count: jnp.ndarray
-
 
 
 class TerminationWrapper(wrapper.Wrapper):
     """
     Non-invasive wrapper that extends mujoco_playground's base Wrapper.
-    
+
     Key principle: Never modify the original playground state.
     Instead, we return a tuple of (original_state, wrapper_info) or use
     a separate tracking mechanism.
     """
-    
+
     def __init__(
         self,
         env: Any,
         max_episode_steps: int = 1000,
     ):
         super().__init__(env)
-        
+
         self.max_episode_steps = max_episode_steps
-        
+
         # External tracking (not part of state)
         self._current_step_count = 0
         self._episode_active = False
-    
+
     def reset(self, key: jnp.ndarray) -> WrapperState:
         """Resets the environment and the wrapper's state."""
         # Reset the base environment to get the initial mjx_env.State
@@ -49,13 +50,10 @@ class TerminationWrapper(wrapper.Wrapper):
 
         # Update info and explicitly set done=False with consistent dtype
         new_info = initial_env_state.info | {
-            'truncation': false_b,
-            'termination': false_b,
+            "truncation": false_b,
+            "termination": false_b,
         }
-        initial_env_state = initial_env_state.replace(
-            done=false_b,
-            info=new_info
-        )
+        initial_env_state = initial_env_state.replace(done=false_b, info=new_info)
 
         # Return the initial WrapperState, starting the step count at 0
         return WrapperState(
@@ -70,7 +68,7 @@ class TerminationWrapper(wrapper.Wrapper):
         """
         # Step the underlying environment using its state
         next_env_state = super().step(state.env_state, action)
-        
+
         # Increment the step count from the input state
         new_step_count = state.step_count + 1
 
@@ -85,23 +83,18 @@ class TerminationWrapper(wrapper.Wrapper):
         trunc_b = jnp.asarray(truncated, dtype=jnp.bool_)
         term_b = jnp.asarray(next_env_state.done, dtype=jnp.bool_)
         done_b = jnp.asarray(done, dtype=jnp.bool_)
-        
+
         # Update the info dictionary for observation purposes
         new_info = next_env_state.info | {
-            'truncation': trunc_b,
-            'termination': term_b,
+            "truncation": trunc_b,
+            "termination": term_b,
         }
 
         # Create the final environment state with the updated done flag and info
         final_env_state = next_env_state.replace(done=done_b, info=new_info)
 
         # Return the new WrapperState containing the new env state and step count
-        return WrapperState(
-            env_state=final_env_state,
-            step_count=new_step_count
-        )
-
-
+        return WrapperState(env_state=final_env_state, step_count=new_step_count)
 
 
 def load_playground_env(env_name: str):

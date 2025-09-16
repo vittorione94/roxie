@@ -1,21 +1,28 @@
-from roxie.agents.agent import Agent
-import jax.numpy as jnp
-from flax import nnx
-import hydra
-from roxie.replays.buffer import Transition
-import optax
-from roxie.agents.agent import Agent, TrainState 
-from roxie.agents.utils import serialize_bound
-import jax
-from roxie.agents.ppo import ppo_loss_fn, ppo_critic_loss_fn
 import functools
 
+import hydra
+import jax
+import jax.numpy as jnp
+import optax
+from flax import nnx
+
+from roxie.agents.agent import Agent, TrainState
+from roxie.agents.ppo import ppo_critic_loss_fn, ppo_loss_fn
+from roxie.agents.utils import Transition, serialize_bound
 
 
 # This is the core computational kernel that will be JIT-compiled.
-@functools.partial(nnx.jit, static_argnames=(
-    'gamma', 'gae_lambda', 'clip_eps', 'entropy_coef', 'value_coef', 'replay_get_fn'
-))
+@functools.partial(
+    nnx.jit,
+    static_argnames=(
+        "gamma",
+        "gae_lambda",
+        "clip_eps",
+        "entropy_coef",
+        "value_coef",
+        "replay_get_fn",
+    ),
+)
 def _grad_step(
     state: TrainState,
     key: jax.random.PRNGKey,
@@ -28,7 +35,7 @@ def _grad_step(
     action_low: jnp.ndarray,
     action_high: jnp.ndarray,
     obs_eps: float,
-    obs_clip: float
+    obs_clip: float,
 ):
     """
     Performs a single gradient update step for the PPO agent.
@@ -37,7 +44,7 @@ def _grad_step(
     # 1. Get the most recent on-policy data from the buffer
     # This function is expected to be `replay.get_recent_window`
     data = replay_get_fn(state.buffer_state)
-    
+
     # Unpack data for convenience
     observations = data["observations"]
     actions = data["actions"]
@@ -60,7 +67,7 @@ def _grad_step(
     # GAE requires values for s_t and s_{t+1}. We concatenate the rollout values
     # with the bootstrap value to easily compute deltas.
     all_values = jnp.concatenate([values, bootstrap_value[jnp.newaxis, ...]], axis=0)
-    
+
     # Calculate temporal difference errors (deltas)
     deltas = rewards + gamma * (1.0 - terminals) * all_values[1:] - all_values[:-1]
 
@@ -71,8 +78,10 @@ def _grad_step(
 
     # Compute advantages by scanning backwards over the deltas
     # The initial carry is zero.
-    _, advantages = jax.lax.scan(gae_scan_fn, jnp.zeros_like(bootstrap_value), deltas, reverse=True)
-    
+    _, advantages = jax.lax.scan(
+        gae_scan_fn, jnp.zeros_like(bootstrap_value), deltas, reverse=True
+    )
+
     # Calculate returns (targets for the value function)
     returns = advantages + values
 
@@ -80,7 +89,7 @@ def _grad_step(
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     # 4. Compute Actor and Critic Gradients
-    
+
     # Actor update
     actor_grad_fn = nnx.value_and_grad(
         lambda actor: ppo_loss_fn(
@@ -90,9 +99,9 @@ def _grad_step(
             old_log_probs=old_log_probs,
             advantages=advantages,
             clip_eps=clip_eps,
-            entropy_coef=entropy_coef
+            entropy_coef=entropy_coef,
         ),
-        wrt=nnx.Param
+        wrt=nnx.Param,
     )
     actor_loss, actor_grads = actor_grad_fn(state.actor)
     state.actor_optimizer.apply_gradient(actor_grads)
@@ -100,18 +109,16 @@ def _grad_step(
     # Critic update
     critic_grad_fn = nnx.value_and_grad(
         lambda critic: ppo_critic_loss_fn(
-            critic,
-            observations=norm_obs,
-            returns=returns,
-            value_coef=value_coef
+            critic, observations=norm_obs, returns=returns, value_coef=value_coef
         ),
-        wrt=nnx.Param
+        wrt=nnx.Param,
     )
     critic_loss, critic_grads = critic_grad_fn(state.critic)
     state.critic_optimizer.apply_gradient(critic_grads)
-    
+
     # 5. Return the new, updated state object
-    return TrainState(
+    return (
+        TrainState(
             actor=state.actor,
             critic=state.critic,
             actor_optimizer=state.actor_optimizer,
@@ -119,47 +126,50 @@ def _grad_step(
             target_critic=state.target_critic,
             critic_optimizer=state.critic_optimizer,
             buffer_state=state.buffer_state,
-            obs_stats=state.obs_stats
-        ), actor_loss, critic_loss
+            obs_stats=state.obs_stats,
+        ),
+        actor_loss,
+        critic_loss,
+    )
 
 
 class PPO(Agent):
-    '''Proximal Policy Optimization agent.'''
+    """Proximal Policy Optimization agent."""
 
-    def __init__(self, 
-                 env_obs_size: int,
-                 env_action_size: int,
-                 action_low: jnp.ndarray,
-                 action_high: jnp.ndarray,
-                 actor_config: dict,
-                 critic_config: dict,
-                 memory_config: dict,
-                 *,
-                 actor_learning_rate: float = 3e-4,
-                 critic_learning_rate: float = 3e-4,
-                 gamma: float = 0.99,
-                 learning_steps: int = 5,
-                 max_grad_norm: float = 1.0,
-                 normalize_observations: bool = True,
-                 obs_norm_clip: float = 5.0,
-                 obs_norm_eps: float = 1e-8,):
-        
+    def __init__(
+        self,
+        env_obs_size: int,
+        env_action_size: int,
+        action_low: jnp.ndarray,
+        action_high: jnp.ndarray,
+        actor_config: dict,
+        critic_config: dict,
+        memory_config: dict,
+        *,
+        actor_learning_rate: float = 3e-4,
+        critic_learning_rate: float = 3e-4,
+        gamma: float = 0.99,
+        learning_steps: int = 5,
+        max_grad_norm: float = 1.0,
+        normalize_observations: bool = True,
+        obs_norm_clip: float = 5.0,
+        obs_norm_eps: float = 1e-8,
+    ):
+
         actor_rngs = nnx.Rngs(params=0, dropout=1)
-        critic_rngs = nnx.Rngs(params=0, dropout=1)        
+        critic_rngs = nnx.Rngs(params=0, dropout=1)
 
         # Instantiate actor
         actor = hydra.utils.instantiate(
             actor_config,
             in_features=env_obs_size,
             action_dim=env_action_size,
-            rngs=actor_rngs
+            rngs=actor_rngs,
         )
 
         # Instantiate critic
         critic = hydra.utils.instantiate(
-            critic_config,
-            in_features=env_obs_size + env_action_size,
-            rngs=critic_rngs
+            critic_config, in_features=env_obs_size + env_action_size, rngs=critic_rngs
         )
 
         # Instantiate replay buffer
@@ -168,7 +178,7 @@ class PPO(Agent):
             action=jnp.zeros(env_action_size, dtype=jnp.float32),
             reward=jnp.zeros((), dtype=jnp.float32),
             next_observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
-            terminal=jnp.zeros((), dtype=jnp.bool_)
+            terminal=jnp.zeros((), dtype=jnp.bool_),
         )
         replay = hydra.utils.instantiate(memory_config)
         buffer_state = replay.init(prototype)
@@ -179,21 +189,21 @@ class PPO(Agent):
 
         # Add gradient clipping to optimizers
         actor_optimizer = nnx.Optimizer(
-            actor, 
+            actor,
             optax.chain(
                 optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.actor_learning_rate)
+                optax.adam(self.actor_learning_rate),
             ),
-            wrt=nnx.Param
+            wrt=nnx.Param,
         )
 
         critic_optimizer = nnx.Optimizer(
-            critic, 
+            critic,
             optax.chain(
                 optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.critic_learning_rate)
-            ), 
-            wrt=nnx.Param
+                optax.adam(self.critic_learning_rate),
+            ),
+            wrt=nnx.Param,
         )
 
         # Init observation stats from buffer state's observation shape
@@ -206,9 +216,15 @@ class PPO(Agent):
 
         if data is None:
             # Fallback: infer from the replay instance (adjust to your replay API)
-            obs_src = getattr(replay, "data", {}).get("observation", None) if isinstance(getattr(replay, "data", {}), dict) else None
+            obs_src = (
+                getattr(replay, "data", {}).get("observation", None)
+                if isinstance(getattr(replay, "data", {}), dict)
+                else None
+            )
             if obs_src is None:
-                raise ValueError("Could not infer observation shape from buffer_state or replay.")
+                raise ValueError(
+                    "Could not infer observation shape from buffer_state or replay."
+                )
             obs_shape = tuple(obs_src.shape[1:])
         else:
             obs = data["observation"] if isinstance(data, dict) else data.observation
@@ -224,7 +240,7 @@ class PPO(Agent):
             actor_optimizer=actor_optimizer,
             critic_optimizer=critic_optimizer,
             buffer_state=buffer_state,
-            obs_stats=obs_stats
+            obs_stats=obs_stats,
         )
 
         # Store hyperparameters
@@ -239,8 +255,12 @@ class PPO(Agent):
 
         print("PPO agent initialized.")
 
-
-    def step(self, observation: jnp.ndarray, evaluate: bool = False, key: jax.random.PRNGKey = None):
+    def step(
+        self,
+        observation: jnp.ndarray,
+        evaluate: bool = False,
+        key: jax.random.PRNGKey = None,
+    ):
         """
         Selects an action by calling the pure, JIT-compiled step function.
         """
@@ -248,7 +268,7 @@ class PPO(Agent):
         if self.normalize_observations:
             mean, std = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
-        
+
         action, self.last_log_prob = Agent.stochastic_step_fn(
             self.state.actor,
             observation,
@@ -266,36 +286,39 @@ class PPO(Agent):
             reward=states.reward,
             next_observation=states.obs,
             terminal=states.done,
-            log_probs=self.last_log_prob
+            log_probs=self.last_log_prob,
         )
         # store in memory
-        self.state.buffer_state = self.replay.add_batch(self.state.buffer_state, experiences)
+        self.state.buffer_state = self.replay.add_batch(
+            self.state.buffer_state, experiences
+        )
 
         # Update observation normalization stats with both current and next observations
         if self.normalize_observations:
             obs_batch = jnp.concatenate([prev_states.obs, states.obs], axis=0)
-            self.state.obs_stats = Agent.update_obs_stats(self.state.obs_stats, obs_batch)
-
+            self.state.obs_stats = Agent.update_obs_stats(
+                self.state.obs_stats, obs_batch
+            )
 
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
         # The buffer is full, so we can start learning
-        if self.state.buffer_state == self.replay.capacity :
+        if self.state.buffer_state == self.replay.capacity:
             for _ in range(self.learning_steps):
                 agent_rng, key = jax.random.split(agent_rng, 2)
 
                 self.state, actor_loss, critic_loss = _grad_step(
-                    self.state, 
-                    key, 
-                    self.gamma, 
+                    self.state,
+                    key,
+                    self.gamma,
                     self.replay.get_recent_window,  # Pass the sample method itself,
                     self.action_low,
                     self.action_high,
                     self.obs_eps,
-                    self.obs_clip
+                    self.obs_clip,
                 )
             gradient_steps += self.learning_steps
-            
+
             # empty the buffer after learning
             self.state.buffer_state = self.replay.flush(self.state.buffer_state)
 
@@ -306,7 +329,6 @@ class PPO(Agent):
             "actor_learning_rate": float(self.actor_learning_rate),
             "critic_learning_rate": float(self.critic_learning_rate),
             "max_grad_norm": float(self.max_grad_norm),
-
             "learning_steps": int(self.learning_steps),
             "memory_capacity": int(self.replay.capacity),
             "memory_batch_size": int(self.replay.batch_size),

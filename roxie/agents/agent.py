@@ -1,54 +1,58 @@
 import abc
+import functools
+import inspect
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import flax.struct as struct
 import jax
 import jax.numpy as jnp
-from flax import nnx
-import flax.struct as struct
-import functools
-import orbax.checkpoint as ocp
-from typing import Any, Dict, Optional
-from pathlib import Path
 import numpy as np
-import inspect 
+import orbax.checkpoint as ocp
+from flax import nnx
+
 
 class TrainState(nnx.Module):
-  def __init__(
-      self,
-      *,
-      actor: nnx.Module,
-      critic: nnx.Module,
-      target_actor: Optional[nnx.Module],
-      target_critic: Optional[nnx.Module],
-      actor_optimizer: nnx.Optimizer,
-      critic_optimizer: nnx.Optimizer,
-      buffer_state: Any,
-      obs_stats: Any
-  ):
-    """Initializes the training state.
+    def __init__(
+        self,
+        *,
+        actor: nnx.Module,
+        critic: nnx.Module,
+        target_actor: Optional[nnx.Module],
+        target_critic: Optional[nnx.Module],
+        actor_optimizer: nnx.Optimizer,
+        critic_optimizer: nnx.Optimizer,
+        buffer_state: Any,
+        obs_stats: Any,
+    ):
+        """Initializes the training state.
 
-    The state components are defined as attributes of the module.
-    `nnx.Module` will automatically know how to handle them for
-    JAX transformations.
-    """
-    self.actor = actor
-    self.critic = critic
-    self.target_actor = target_actor
-    self.target_critic = target_critic
+        The state components are defined as attributes of the module.
+        `nnx.Module` will automatically know how to handle them for
+        JAX transformations.
+        """
+        self.actor = actor
+        self.critic = critic
+        self.target_actor = target_actor
+        self.target_critic = target_critic
 
-    self.actor_optimizer = actor_optimizer
-    self.critic_optimizer = critic_optimizer
+        self.actor_optimizer = actor_optimizer
+        self.critic_optimizer = critic_optimizer
 
-    self.buffer_state = buffer_state
-    self.obs_stats = obs_stats  # Stores observation statistics for normalization
+        self.buffer_state = buffer_state
+        self.obs_stats = obs_stats  # Stores observation statistics for normalization
+
 
 @struct.dataclass
 class ObsStats:
-    count: jnp.ndarray      # shape: ()
-    sum: jnp.ndarray        # shape: obs_shape
-    sumsq: jnp.ndarray      # shape: obs_shape
+    count: jnp.ndarray  # shape: ()
+    sum: jnp.ndarray  # shape: obs_shape
+    sumsq: jnp.ndarray  # shape: obs_shape
 
 
 class Agent(abc.ABC):
-    '''Abstract class used to build agents.'''
+    """Abstract class used to build agents."""
+
     @staticmethod
     @jax.jit
     def scale_to_env(x: jnp.ndarray, low: jnp.ndarray, high: jnp.ndarray):
@@ -56,7 +60,7 @@ class Agent(abc.ABC):
         return low + 0.5 * (x + 1.0) * (high - low)
 
     @staticmethod
-    @functools.partial(nnx.jit, static_argnames=('evaluate',))
+    @functools.partial(nnx.jit, static_argnames=("evaluate",))
     def deterministic_step_fn(
         actor_model: nnx.Module,
         observation: jnp.ndarray,
@@ -70,11 +74,10 @@ class Agent(abc.ABC):
         - add exploration noise in env units when not evaluating
         """
         action = actor_model(observation)
-        
+
         noisy_action = noise_module.add_noise(action, key, evaluate)
         noisy_action = jnp.clip(noisy_action, -1.0, 1.0)  # ensure in [-1, 1]
         return noisy_action, action - noisy_action  # return noise for logging
-    
 
     @staticmethod
     @nnx.jit
@@ -92,7 +95,6 @@ class Agent(abc.ABC):
         action, log_probs = distribution.sample_and_log_prob(seed=key)
 
         return action, log_probs
-
 
     @staticmethod
     def init_obs_stats(obs_shape) -> ObsStats:
@@ -129,12 +131,12 @@ class Agent(abc.ABC):
         return jnp.clip((x - mean) / std, -clip, clip)
 
     def update(self, old_states, new_states, steps, agent_rng):
-        '''Informs the agent of the latest transitions during training.'''
+        """Informs the agent of the latest transitions during training."""
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
         return gradient_steps, actor_loss, critic_loss
 
     def test_update(self, observations, rewards, resets, terminations, steps):
-        '''Informs the agent of the latest transitions during testing.'''
+        """Informs the agent of the latest transitions during testing."""
         pass
 
     # --------------------------
@@ -150,7 +152,7 @@ class Agent(abc.ABC):
         *,
         format_version: int = 1,  # bump format
         extra_metadata: Optional[Dict[str, Any]] = None,
-    ):  
+    ):
         try:
             if not hasattr(self, "state"):
                 raise AttributeError("Agent must define `self.state` (an nnx.Module).")
@@ -160,7 +162,7 @@ class Agent(abc.ABC):
 
             payload = {
                 "format_version": format_version,
-                "trainstate_graphdef": graphdef,     # serialized topology
+                "trainstate_graphdef": graphdef,  # serialized topology
                 "trainstate_state": jax.device_get(state_tree),  # numeric pytree
                 "hyperparams": self._export_hyperparams(),
                 "metadata": (extra_metadata or {}),
@@ -168,30 +170,36 @@ class Agent(abc.ABC):
             ocp.PyTreeCheckpointer().save(path, payload)
             print(f"[Agent.save] Saved to {path}")
         except Exception as e:
-            print(f"[Agent.save] Warning: could not save to {path} ({e}) \
-                  Probably a basic agent without state.")
-        
+            print(
+                f"[Agent.save] Warning: could not save to {path} ({e}) \
+                  Probably a basic agent without state."
+            )
+
     @classmethod
-    def load(cls, 
-             path: str | Path, 
-             actor_config: dict,
-             critic_config: dict,
-             memory_config: dict,
-             noise_config: dict,):
+    def load(
+        cls,
+        path: str | Path,
+        actor_config: dict,
+        critic_config: dict,
+        memory_config: dict,
+        noise_config: dict,
+    ):
         path = Path(path).resolve()
         loaded = ocp.PyTreeCheckpointer().restore(path)
 
         ckpt_state = loaded["trainstate_state"]
         hyper = loaded.get("hyperparams", {})
         print(hyper)
-        
+
         valid_params = set(inspect.signature(cls.__init__).parameters.keys())
         filtered_hyper = {k: v for k, v in (hyper or {}).items() if k in valid_params}
-        agent = cls(actor_config=actor_config,
-                 critic_config=critic_config,
-                 memory_config=memory_config,
-                 noise_config=noise_config,
-                 **(filtered_hyper or {}))
+        agent = cls(
+            actor_config=actor_config,
+            critic_config=critic_config,
+            memory_config=memory_config,
+            noise_config=noise_config,
+            **(filtered_hyper or {}),
+        )
 
         # Minimal fields commonly used at play time
         hyper = ckpt_state.get("hyperparams", {}) or {}
@@ -199,6 +207,7 @@ class Agent(abc.ABC):
 
         # Helper: convert numpy -> jax arrays
         import numpy as _np
+
         def _to_jax(x):
             return jnp.asarray(x) if isinstance(x, _np.ndarray) else x
 
@@ -207,7 +216,9 @@ class Agent(abc.ABC):
             if not (isinstance(ckpt_state, dict) and name in ckpt_state):
                 print(f"Info: '{name}' not in checkpoint; keeping live {name}.")
                 return
-            sub_ckpt = jax.tree.map(_to_jax, ckpt_state[name], is_leaf=lambda x: isinstance(x, _np.ndarray))
+            sub_ckpt = jax.tree.map(
+                _to_jax, ckpt_state[name], is_leaf=lambda x: isinstance(x, _np.ndarray)
+            )
             sub_live = getattr(agent.state, name)
             gdef, _ = nnx.split(sub_live)
             try:
@@ -215,17 +226,25 @@ class Agent(abc.ABC):
                 setattr(agent.state, name, restored)
             except ValueError as e:
                 # Architecture drift or partial state → fall back to replacing just params where possible
-                print(f"Warning: merge({name}) failed ({e}). Falling back to param-only copy.")
+                print(
+                    f"Warning: merge({name}) failed ({e}). Falling back to param-only copy."
+                )
                 try:
                     dst_params = nnx.state(sub_live, nnx.Param)
-                    src_params = sub_ckpt.get('params', None) if isinstance(sub_ckpt, dict) else None
+                    src_params = (
+                        sub_ckpt.get("params", None)
+                        if isinstance(sub_ckpt, dict)
+                        else None
+                    )
                     if src_params is None:
                         print(f"Warning: no 'params' found for {name}; skipping.")
                     else:
                         # Only update params; let NNX map into its own topology.
-                        nnx.update(sub_live, {'params': src_params})
+                        nnx.update(sub_live, {"params": src_params})
                 except Exception as ee:
-                    print(f"Warning: param-only update for {name} failed ({ee}). Skipping.")
+                    print(
+                        f"Warning: param-only update for {name} failed ({ee}). Skipping."
+                    )
 
         for name in ("actor", "critic", "target_actor", "target_critic"):
             _restore_submodule(name)
@@ -243,7 +262,9 @@ class Agent(abc.ABC):
                     )
                 else:
                     # If it was saved as a struct-compatible tree, just assign it.
-                    agent.state.obs_stats = jax.tree_map(_to_jax, obs, is_leaf=lambda x: isinstance(x, _np.ndarray))
+                    agent.state.obs_stats = jax.tree_map(
+                        _to_jax, obs, is_leaf=lambda x: isinstance(x, _np.ndarray)
+                    )
             except Exception as e:
                 print(f"Warning: could not restore obs_stats ({e}); using live stats.")
 

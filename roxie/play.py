@@ -1,25 +1,24 @@
+import os
+import time
+
+import click
+import hydra
+import jax
+import jax.numpy as jnp
 import mujoco
 import mujoco.viewer
 import numpy as np
-import time
-import jax
-from roxie.environment.loader import load_playground_env
-import hydra
-from omegaconf import OmegaConf
-from roxie.agents import agents
-import os 
-import click
-import hydra
-from roxie.agents import agents
-from roxie.environment.loader import load_playground_env
 from flax import nnx
-from roxie.utils.trainer import Trainer
-import jax.numpy as jnp
 from hydra.core.hydra_config import HydraConfig
+from omegaconf import OmegaConf
+
+from roxie.agents import agents
+from roxie.environment.loader import load_playground_env
+from roxie.utils.trainer import Trainer
 
 
 @click.command()
-@click.option('--checkpoint-path', type=str, help='Path to the checkpoint file.')
+@click.option("--checkpoint-path", type=str, help="Path to the checkpoint file.")
 def main(checkpoint_path):
     """
     Launches an interactive MuJoCo viewer with a random policy in a given environment.
@@ -59,7 +58,7 @@ def main(checkpoint_path):
         key, reset_key = jax.random.split(key)
         wrapped_state = jit_reset(key=reset_key)
         mujoco.mj_forward(model, data)
-        
+
         score = 0.0
         actions = []
 
@@ -69,7 +68,7 @@ def main(checkpoint_path):
 
             # Take a policy action
             obs_b = jnp.expand_dims(wrapped_state.env_state.obs, axis=0)
-            action = agent.step(obs_b, evaluate=True, key=key)   # shape (1, act_dim)
+            action = agent.step(obs_b, evaluate=True, key=key)  # shape (1, act_dim)
 
             # Step the environment
             wrapped_state = jit_step(wrapped_state, action[0])
@@ -93,7 +92,7 @@ def main(checkpoint_path):
                 mujoco.mj_resetData(model, data)
                 score = 0.0
                 actions = []
-            
+
             # Sync the viewer with the new data
             viewer.sync()
 
@@ -101,7 +100,6 @@ def main(checkpoint_path):
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
 
-        
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

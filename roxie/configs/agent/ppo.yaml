@@ -1,0 +1,42 @@
+name: "ppo"
+
+args: 
+  gamma: 0.99
+  actor_learning_rate: 5e-4
+  critic_learning_rate: 1e-3
+  steps_before_learning: 30_000    # same as warmup (can differ if desired)
+  learning_steps: 20              # gradient steps per update trigger
+  max_grad_norm: 1
+
+actor:
+  # The _target_ points to the Python class you want to instantiate.
+  # Make sure the path is correct for your project structure.
+  _target_: roxie.models.actors.StochasticActor
+
+  # --- Required __init__ arguments ---
+  features: [256, 256]  # Defines the two hidden layers
+
+  # --- Optional __init__ arguments ---
+  use_layer_norm: false
+  dropout_rate: 0.
+
+
+critic:
+  # Path to the Critic class
+  _target_: roxie.models.critics.StochasticCritic
+  features: [256, 256]
+  use_layer_norm: false 
+  dropout_rate: 0.   
+
+memory:
+  _target_: flashbax.buffers.make_trajectory_queue
+  # max_length: 1_000_000
+  # min_length: 1_000
+  # sample_batch_size: 256
+  # add_sequences: False
+  # add_batch_size: 400
+  max_length_time_axis: 400_000
+  add_batch_size: 400
+  add_sequence_length: rollout_len
+  sample_sequence_length: rollout_len
+
