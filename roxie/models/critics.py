@@ -84,7 +84,7 @@ class DeterministicCritic(nnx.Module):
         return x
 
 
-def StochasticCritic():
+class StochasticCritic(nnx.Module):
     def __init__(self):
         pass
 

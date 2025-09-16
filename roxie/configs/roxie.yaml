@@ -3,8 +3,8 @@
 
 # The defaults list tells Hydra how to build the final config.
 defaults:
-  - agent: ddpg      # Load `ddpg.yaml` from the `agent/` dir into the `agent` key.
-  - noise: ou
+  - agent: ppo      # Load `ddpg.yaml` from the `agent/` dir into the `agent` key.
+  # - noise: ou
   - _self_           # Allows this file to add its own values, too.
 
 seed: 0
