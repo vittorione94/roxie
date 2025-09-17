@@ -13,6 +13,7 @@ class Transition:
     reward: jnp.ndarray
     terminal: jnp.ndarray
     log_probs: Optional[jnp.ndarray] = None  # Optional, used in some algorithms
+    value: Optional[jnp.ndarray] = None      # Optional, used in some algorithms
 
 
 # Helpers to serialize/deserialize bounds minimally

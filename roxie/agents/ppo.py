@@ -269,7 +269,7 @@ class PPO(Agent):
             log_probs=self.last_log_prob,
         )
         # store in memory
-        self.state.buffer_state = self.replay.add_batch(
+        self.state.buffer_state = self.replay.add(
             self.state.buffer_state, experiences
         )
 

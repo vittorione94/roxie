@@ -30,13 +30,8 @@ critic:
 
 memory:
   _target_: flashbax.buffers.make_trajectory_queue
-  # max_length: 1_000_000
-  # min_length: 1_000
-  # sample_batch_size: 256
-  # add_sequences: False
-  # add_batch_size: 400
   max_length_time_axis: 400_000
-  add_batch_size: 400
-  add_sequence_length: rollout_len
-  sample_sequence_length: rollout_len
+  add_batch_size: 1
+  add_sequence_length: 64
+  sample_sequence_length: 64
 

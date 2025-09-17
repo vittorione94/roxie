@@ -98,13 +98,15 @@ class Trainer:
             # `wrapped_states` holds the state at time `t`.
 
             # Get actions for the current state (s_t).
-            if hasattr(self.agent, "memory_warmup") and self.steps > getattr(
+            if self.steps >= getattr(
                 self.agent, "memory_warmup", 0
             ):
+                print("Agent is acting...")
                 actions = self.agent.step(
                     wrapped_states.env_state.obs, evaluate=False, key=action_key
                 )
             else:
+                print("Agent is warming up...")
                 low = self.agent.action_low
                 high = self.agent.action_high
                 u = jax.random.uniform(
