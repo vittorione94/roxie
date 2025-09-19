@@ -182,6 +182,8 @@ class PPO(Agent):
             log_probs=jnp.zeros((), dtype=jnp.float32),
         )
         replay = hydra.utils.instantiate(memory_config)
+        self.add_sequence_length = memory_config.add_sequence_length
+
         buffer_state = replay.init(prototype)
 
         self.critic_learning_rate = critic_learning_rate

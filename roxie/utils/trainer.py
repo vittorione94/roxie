@@ -8,7 +8,7 @@ from flax import nnx
 
 from roxie.agents.agent import Agent
 from roxie.utils import logger
-
+from functools import partial
 
 class Trainer:
     """Trainer used to train and evaluate an agent on an environment."""
@@ -36,42 +36,90 @@ class Trainer:
         self.environment = environment
         self.test_environment = test_environment
 
+    @partial(jax.jit, static_argnums=(0,))
+    def _collect_step(self, carry):
+        """
+        Collect a single environment step across all vectorized envs.
+        
+        Args:
+            carry: (env_states, agent_state, rng, scores, lengths)
+                env_states: [n_envs] wrapped environment states
+                agent_state: agent's internal state (networks, optimizers, memory)
+                rng: random key
+                scores: [n_envs] episode returns
+                lengths: [n_envs] episode lengths
+        
+        Returns:
+            Updated carry tuple
+        """
+        env_states, agent_state, rng, scores, lengths = carry
+        
+        # Split keys for this iteration
+        rng, action_key, reset_key, update_key = jax.random.split(rng, 4)
+        
+        # Agent selects actions - shape: [n_envs, action_dim]
+        actions = self.agent.step(
+            env_states.obs,  # [n_envs, obs_dim]
+            evaluate=False,
+            key=action_key
+        )
+        
+        # Environment step (vectorized) - returns new wrapped states
+        next_env_states = self.v_step(env_states, actions)
+        
+        # Agent processes transition and potentially updates
+        # For off-policy: stores in replay buffer, samples and updates if ready
+        # For on-policy: accumulates trajectory, updates when buffer full
+        gradient_steps, actor_loss, critic_loss = self.agent.update(
+            env_states,      # old states
+            actions,         # [n_envs, action_dim]
+            next_env_states, # new states including rewards/dones
+            update_key
+        )
+        
+        # Update metrics
+        scores = scores + next_env_states.reward  # [n_envs]
+        lengths = lengths + 1
+        
+        # Reset done environments lazily
+        def reset_if_done(env_state, done, key):
+            """Reset single env conditionally"""
+            return jax.lax.cond(
+                done,
+                lambda k: self.env.reset(k),
+                lambda _: env_state,
+                key
+            )
+        
+        reset_keys = jax.random.split(reset_key, self.n_envs)
+        env_states = jax.vmap(reset_if_done)(
+            next_env_states, 
+            next_env_states.done,
+            reset_keys
+        )
+        
+        # Reset metrics for done episodes
+        scores = jnp.where(next_env_states.done, 0.0, scores)
+        lengths = jnp.where(next_env_states.done, 0, lengths)
+        
+        return (env_states, agent_state, rng, scores, lengths), next_env_states.done
+    
     def run(self, NUM_ENVS, rngs):
         """Runs the main training loop."""
-
         start_time = last_epoch_time = time.time()
 
         # --- Vectorization and JIT Compilation ---
-
         # Create a vectorized version of the environment's reset function.
         # jax.vmap will map the reset function over the first axis of its input (a batch of keys).
-        v_reset = jax.vmap(self.environment.reset)
+        self.v_reset = jax.jit(jax.vmap(self.environment.reset))
 
         # Create a vectorized version of the step function.
         # jax.vmap will map over the first axis of both the states and actions.
-        v_step = jax.vmap(self.environment.step)
-
-        # Apply JIT compilation to the vectorized functions for maximum performance.
-        # This compiles the entire batched operation into a single optimized kernel.
-        jit_reset = jax.jit(self.environment.reset)  # single-env reset
-        jit_v_reset = jax.jit(v_reset)
-        jit_v_step = jax.jit(v_step)
+        self.v_step = jax.jit(jax.vmap(self.environment.step))
 
         # JIT the test envs outside the test function (batched over test_episodes)
-        v_test_reset = jax.jit(jax.vmap(self.test_environment.reset))
-        v_test_step = jax.jit(jax.vmap(self.test_environment.step))
-
-        # Helper: lazily reset only the envs that are done (per-env cond, vmapped and jitted)
-        def _selective_reset(done, key, state):
-            # If this env is done, reset it with key; otherwise keep the new state.
-            return jax.lax.cond(
-                done,
-                lambda k: jit_reset(k),  # reset returns a single-env wrapped state
-                lambda _: state,  # keep the provided single-env state
-                key,
-            )
-
-        v_selective_reset = jax.jit(jax.vmap(_selective_reset))
+        self.v_test_reset = jax.jit(jax.vmap(self.test_environment.reset))
+        self.v_test_step = jax.jit(jax.vmap(self.test_environment.step))
 
         print("Successfully created JIT-compiled, vectorized reset and step functions.")
 
@@ -79,7 +127,7 @@ class Trainer:
         # Split the master key to get a unique key for each parallel environment.
         loop_rng = rngs.envs()
         reset_keys = jax.random.split(loop_rng, NUM_ENVS)
-        wrapped_states = jit_v_reset(reset_keys)
+        wrapped_states = self.v_reset(reset_keys)
 
         # Add a persistent RNG for agent updates
         agent_key = rngs.agent()
@@ -91,83 +139,26 @@ class Trainer:
         actor_losses = []
         critic_losses = []
 
+        #  Determine collection size based on algorithm type
+        # On-policy: collect full trajectories before update
+        # Off-policy: collect single steps (agent handles replay internally)
+        collect_steps = self.agent.collect_steps if hasattr(self.agent, 'collect_steps') else 1
+
         while True:
-            # Split the main loop's RNG key for each iteration.
-            loop_rng, action_key, reset_key_batch = jax.random.split(loop_rng, 3)
-
-            # `wrapped_states` holds the state at time `t`.
-
-            # Get actions for the current state (s_t).
-            if self.steps >= getattr(
-                self.agent, "memory_warmup", 0
-            ):
-                print("Agent is acting...")
-                actions = self.agent.step(
-                    wrapped_states.env_state.obs, evaluate=False, key=action_key
-                )
-            else:
-                print("Agent is warming up...")
-                low = self.agent.action_low
-                high = self.agent.action_high
-                u = jax.random.uniform(
-                    action_key,
-                    (NUM_ENVS, self.environment.action_size),
-                    minval=0.0,
-                    maxval=1.0,
-                )
-                actions = low + (high - low) * u
-                self.agent.last_action = actions
-
-            # TODO use chex
-            # assert not np.isnan(actions.sum())
-
-            # Store the current state before it's overwritten. This is your "old state".
-            old_wrapped_states = wrapped_states
-
-            # Perform the step to get the "new state" (s_t+1).
-            new_wrapped_states = jit_v_step(old_wrapped_states, actions)
-
-            # Pass BOTH the old and new states to the agent for the full transition.
-            # Split a fresh key for agent update every loop
-            agent_key, update_key = jax.random.split(agent_key)
-            gradient_steps, actor_loss, critic_loss = self.agent.update(
-                old_wrapped_states.env_state,
-                new_wrapped_states.env_state,
-                steps=self.steps,
-                agent_rng=update_key,
+            # Collect experience
+            carry = (env_states, agent_state, rng, scores, lengths)
+            (env_states, agent_state, rng, scores, lengths), dones = jax.lax.scan(
+                self._collect_step,
+                carry,
+                None,
+                length=collect_steps
             )
-            actor_losses.append(actor_loss)
-            critic_losses.append(critic_loss)
 
-            tot_gradient_steps += gradient_steps
-
-            dones = new_wrapped_states.env_state.done
-
-            # Generate new keys for the environments that need resetting.
-            reset_keys = jax.random.split(reset_key_batch, NUM_ENVS)
-
-            # Lazily reset only the envs that are done, keep others as-is.
-            # This avoids computing reset() for every env at every step.
-            wrapped_states = v_selective_reset(dones, reset_keys, new_wrapped_states)
-
-            scores += new_wrapped_states.env_state.reward
-            lengths += 1
-            self.steps += NUM_ENVS
-            epoch_steps += NUM_ENVS
-            steps_since_save += NUM_ENVS
+            self.steps += NUM_ENVS * collect_steps
 
             # Show the progress bar.
             if self.show_progress:
                 logger.show_progress(self.steps, self.epoch_steps, self.max_steps)
-
-            # Check the finished episodes.
-            # Where next_states.done is True, set scores and lengths to 0.
-            # Otherwise, keep their original values.
-            scores = jnp.where(new_wrapped_states.env_state.done, 0, scores)
-            lengths = jnp.where(new_wrapped_states.env_state.done, 0, lengths)
-            # Count the number of completed episodes by summing the boolean 'done' array
-            # (where True=1, False=0) and add it to the total count.
-            episodes = episodes + jnp.sum(new_wrapped_states.env_state.done)
 
             # End of the epoch.
             if epoch_steps >= self.epoch_steps:
@@ -176,7 +167,7 @@ class Trainer:
 
                 # Evaluate the agent on the test environment.
                 if self.test_environment and hasattr(self.agent, "state"):
-                    self._test(rngs.envs(), v_test_reset, v_test_step)
+                    self._test(rngs.envs(), self.v_test_reset, self.v_test_step)
 
                 # Log the data.
                 epochs += 1

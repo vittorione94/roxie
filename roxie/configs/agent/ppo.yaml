@@ -30,8 +30,8 @@ critic:
 
 memory:
   _target_: flashbax.buffers.make_trajectory_queue
-  max_length_time_axis: 400_000
-  add_batch_size: 1
-  add_sequence_length: 64
-  sample_sequence_length: 64
+  max_length_time_axis: 1000 # max length of each env trajectory
+  add_batch_size: 400 # the number of envs
+  add_sequence_length: 1000 
+  sample_sequence_length: 256 # equivalent to sample_batch_size for flat buffer
 
