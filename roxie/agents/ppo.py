@@ -10,7 +10,7 @@ from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import Transition, serialize_bound
 from roxie.losses.actor_losses import ppo_loss_fn
 from roxie.losses.critic_losses import ppo_critic_loss_fn
-
+import rlax 
 
 # This is the core computational kernel that will be JIT-compiled.
 @functools.partial(
@@ -20,7 +20,6 @@ from roxie.losses.critic_losses import ppo_critic_loss_fn
         "gae_lambda",
         "clip_eps",
         "entropy_coef",
-        "value_coef",
         "replay_get_fn",
     ),
 )
@@ -31,12 +30,11 @@ def _grad_step(
     gae_lambda: float,
     clip_eps: float,
     entropy_coef: float,
-    value_coef: float,
     replay_get_fn,  # Function to get the on-policy data
     action_low: jnp.ndarray,
     action_high: jnp.ndarray,
-    obs_eps: float,
     obs_clip: float,
+    obs_eps: float,
 ):
     """
     Performs a single gradient update step for the PPO agent.
@@ -44,61 +42,42 @@ def _grad_step(
     """
     # 1. Get the most recent on-policy data from the buffer
     # This function is expected to be `replay.get_recent_window`
-    data = replay_get_fn(state.buffer_state)
+    _, data  = replay_get_fn(state.buffer_state)
 
-    # Unpack data for convenience
-    observations = data["observations"]
-    actions = data["actions"]
-    rewards = data["rewards"]
-    terminals = data["terminals"]
-    old_log_probs = data["log_probs"]
-    bootstrap_obs = data["bootstrap_observation"]
+    # everything is wrapped in an experience attribute
+    data = getattr(data, "experience", data)
 
-    # 2. Normalize observations
-    mean, std = Agent.obs_mean_std(state.obs_stats, obs_eps)
-    norm_obs = Agent.normalize_obs(observations, mean, std, obs_clip)
-    norm_bootstrap_obs = Agent.normalize_obs(bootstrap_obs, mean, std, obs_clip)
+    re_packed_samples = {
+        "observations": data.observation,
+        "actions": data.action,
+        "log_probs": data.log_probs,
+        "rewards": data.reward,
+        "values": data.value,
+        "terminals": data.terminal,
+    }
 
-    # 3. Calculate GAE (Generalized Advantage Estimation)
-    # Get value estimates for all observations in the rollout
-    values = state.critic(norm_obs)
-    # Get the value estimate for the bootstrap state (the state after the last action)
-    bootstrap_value = state.critic(norm_bootstrap_obs)
-
-    # GAE requires values for s_t and s_{t+1}. We concatenate the rollout values
-    # with the bootstrap value to easily compute deltas.
-    all_values = jnp.concatenate([values, bootstrap_value[jnp.newaxis, ...]], axis=0)
-
-    # Calculate temporal difference errors (deltas)
-    deltas = rewards + gamma * (1.0 - terminals) * all_values[1:] - all_values[:-1]
-
-    # Define the GAE scan function
-    def gae_scan_fn(carry, delta_t):
-        advantage = delta_t + gamma * gae_lambda * carry
-        return advantage, advantage
-
-    # Compute advantages by scanning backwards over the deltas
-    # The initial carry is zero.
-    _, advantages = jax.lax.scan(
-        gae_scan_fn, jnp.zeros_like(bootstrap_value), deltas, reverse=True
-    )
-
-    # Calculate returns (targets for the value function)
-    returns = advantages + values
-
-    # Normalize advantages for stability
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
+    norm_obs = Agent.normalize_obs(re_packed_samples["observations"], obs_mean, obs_std, obs_clip)
 
     # 4. Compute Actor and Critic Gradients
+    discounts = gamma * (1.0 - re_packed_samples["terminals"])
+    # adv_t = rlax.truncated_generalized_advantage_estimation(re_packed_samples["rewards"], discounts, gae_lambda, re_packed_samples["values"], True)
+    # With this:
+    gae_fn = jax.vmap(
+        lambda r, d, v: rlax.truncated_generalized_advantage_estimation(r, d, gae_lambda, v, True),
+        in_axes=(0, 0, 0)  # Batch over first dimension
+    )
+    adv_t = gae_fn(re_packed_samples["rewards"], discounts, re_packed_samples["values"])
 
     # Actor update
     actor_grad_fn = nnx.value_and_grad(
         lambda actor: ppo_loss_fn(
             actor,
             observations=norm_obs,
-            actions=actions,
-            old_log_probs=old_log_probs,
-            advantages=advantages,
+            old_log_probs=re_packed_samples["log_probs"],
+            action_low=action_low,
+            action_high=action_high,
+            advantages=adv_t,
             clip_eps=clip_eps,
             entropy_coef=entropy_coef,
         ),
@@ -110,7 +89,10 @@ def _grad_step(
     # Critic update
     critic_grad_fn = nnx.value_and_grad(
         lambda critic: ppo_critic_loss_fn(
-            critic, observations=norm_obs, returns=returns, value_coef=value_coef
+            critic, 
+            observations=norm_obs, 
+            values=re_packed_samples["values"], 
+            advantages=adv_t,
         ),
         wrt=nnx.Param,
     )
@@ -170,16 +152,19 @@ class PPO(Agent):
 
         # Instantiate critic
         critic = hydra.utils.instantiate(
-            critic_config, in_features=env_obs_size + env_action_size, rngs=critic_rngs
+            critic_config, in_features=env_obs_size, rngs=critic_rngs
         )
 
         # Instantiate replay buffer
+        print("env_obs_size:", env_obs_size)
+        print("env_action_size:", env_action_size)
         prototype = Transition(
             observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
             action=jnp.zeros(env_action_size, dtype=jnp.float32),
             reward=jnp.zeros((), dtype=jnp.float32),
             terminal=jnp.zeros((), dtype=jnp.bool_),
             log_probs=jnp.zeros((), dtype=jnp.float32),
+            value=jnp.zeros((), dtype=jnp.float32),
         )
         replay = hydra.utils.instantiate(memory_config)
         self.add_sequence_length = memory_config.add_sequence_length
@@ -252,23 +237,28 @@ class PPO(Agent):
             mean, std = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
 
-        action, self.last_log_prob = Agent.stochastic_step_fn(
+        action, self.last_log_prob, _ = Agent.stochastic_step_fn(
             self.state.actor,
             observation,
             key,
         )
+
+        self.last_values = self.state.critic(observation)
 
         self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
 
         return self.last_action
 
     def update(self, prev_states, states, steps, agent_rng):
+
+        # Add sequence dimension (length=1) to match trajectory buffer format
         experiences = Transition(
-            observation=prev_states.obs,
-            action=self.last_action,
-            reward=states.reward,
-            terminal=states.done,
-            log_probs=self.last_log_prob,
+            observation=prev_states.obs[:, None, :],  # (400,) -> (400, 1, obs_dim)
+            action=self.last_action[:, None, :],      # (400, 6) -> (400, 1, 6)
+            reward=states.reward[:, None],            # (400,) -> (400, 1)
+            terminal=states.done[:, None],            # (400,) -> (400, 1)
+            log_probs=self.last_log_prob[:, None],    # (400,) -> (400, 1)
+            value=self.last_values,          # (400, 1)
         )
         # store in memory
         self.state.buffer_state = self.replay.add(
@@ -285,24 +275,27 @@ class PPO(Agent):
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
         # The buffer is full, so we can start learning
-        if self.state.buffer_state == self.replay.capacity:
-            for _ in range(self.learning_steps):
-                agent_rng, key = jax.random.split(agent_rng, 2)
+        while self.replay.can_sample(self.state.buffer_state):
+            agent_rng, key = jax.random.split(agent_rng, 2)
 
-                self.state, actor_loss, critic_loss = _grad_step(
-                    self.state,
-                    key,
-                    self.gamma,
-                    self.replay.get_recent_window,  # Pass the sample method itself,
-                    self.action_low,
-                    self.action_high,
-                    self.obs_eps,
-                    self.obs_clip,
-                )
-            gradient_steps += self.learning_steps
+            self.state, actor_loss, critic_loss = _grad_step(
+                state=self.state,
+                key=key,
+                gamma=self.gamma,
+                gae_lambda=0.95, # TODO: make configurable
+                clip_eps=0.2,    # TODO: make configurable
+                entropy_coef=0.01, # TODO: make configurable
+                replay_get_fn=self.replay.sample,  # Pass the sample method itself,
+                action_low=self.action_low,
+                action_high=self.action_high,
+                obs_clip=self.obs_clip,
+                obs_eps=self.obs_eps,
+            )
+        gradient_steps += self.learning_steps
 
-            # empty the buffer after learning
-            self.state.buffer_state = self.replay.flush(self.state.buffer_state)
+        # empty the buffer after learning
+        # self.state.buffer_state = self.replay.flush(self.state.buffer_state)
+        return gradient_steps, actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
         # Keep this minimal and JSON-serializable

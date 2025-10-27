@@ -58,14 +58,16 @@ def ddpg_critic_loss_fn(
 
 @nnx.jit
 def ppo_critic_loss_fn(
-    critic_model, samples, gamma, action_low, action_high, obs_mean, obs_std, obs_clip
+    critic_model, 
+    observations,
+    values, 
+    advantages, 
 ):
     """Calculates the MSE loss for the critic using PPO."""
+    v_t = critic_model(observations)
 
-    obs = samples["observations"]
-    nxt_obs = samples["next_observations"]
-    reward = jnp.squeeze(samples["rewards"])
-    term = samples["terminals"].astype(jnp.float32)
-
-    v = critic_model(obs).squeeze(-1)  # [N]
-    v_next = critic_model(nxt_obs).squeeze(-1)  # [N]
+    target_values = values + advantages
+    value_loss = jnp.square(v_t[:-1] - target_values)
+     
+    loss = jnp.mean(value_loss)
+    return loss

@@ -16,6 +16,7 @@ def make_fake_batch(add_batch_size, add_sequence_length, obs_dim, offset=0.0):
     action = (jnp.arange(B * T, dtype=jnp.int32).reshape(B, T)) % 4
     reward = jnp.linspace(0.0, 1.0, B * T, dtype=jnp.float32).reshape(B, T)
     discount = jnp.ones((B, T), dtype=jnp.float32)  # or (B,T) float
+    print('fake batch shapes:', tree_shapes({"obs": obs, "action": action, "reward": reward, "discount": discount}))
     return {"obs": obs, "action": action, "reward": reward, "discount": discount}
 
 def unwrap_experience(sample_obj):

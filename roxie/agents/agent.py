@@ -94,7 +94,9 @@ class Agent(abc.ABC):
         distribution = actor_model(observation)
         action, log_probs = distribution.sample_and_log_prob(seed=key)
 
-        return action, log_probs
+        entropy = distribution.entropy()
+
+        return action, log_probs, entropy
 
     @staticmethod
     def init_obs_stats(obs_shape) -> ObsStats:

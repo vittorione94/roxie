@@ -2,7 +2,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from roxie.agents.agent import Agent
-
+import rlax
 
 @nnx.jit
 def ddpg_actor_loss_fn(
@@ -27,29 +27,20 @@ def ddpg_actor_loss_fn(
 @nnx.jit
 def ppo_loss_fn(
     actor_model,
-    critic_model,
-    samples,
-    obs_mean,
-    obs_std,
-    obs_clip,
+    observations,
+    old_log_probs,
     action_low,
     action_high,
-    clip_epsilon=0.2,
+    advantages,
+    clip_epsilon,
+    entropy_coef,
 ):
     """Calculates the loss for the actor using PPO clipped objective."""
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    actions, logp_new = Agent.stochastic_step_fn(actor_model, obs)
+    actions, logp_new, entropy = Agent.stochastic_step_fn(actor_model, observations)
     actions = Agent.scale_to_env(actions, action_low, action_high)
 
-    logp_old = samples["log_probs"]
-    ratio = jnp.exp(logp_new - logp_old)
+    ratio = jnp.exp(logp_new - old_log_probs)
 
-    clipped_ratio = jnp.clip(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
+    pg_loss = rlax.clipped_surrogate_pg_loss(ratio, advantages, clip_epsilon)
 
-    # unclipped surrogate
-    surr1 = ratio * advantages
-
-    # clipped surrogate
-    surr2 = clipped_ratio * advantages
-
-    return -jnp.mean(jnp.maximum(surr1, surr2))
+    return pg_loss - entropy_coef * entropy
