@@ -104,8 +104,6 @@ class Trainer:
                 actions = low + (high - low) * u
                 self.agent.last_action = actions 
             
-            # TODO use chex
-            #assert not np.isnan(actions.sum())
 
             # Store the current state before it's overwritten. This is your "old state".
             old_wrapped_states = wrapped_states
@@ -116,14 +114,21 @@ class Trainer:
             # Pass BOTH the old and new states to the agent for the full transition.
             # Split a fresh key for agent update every loop
             agent_key, update_key = jax.random.split(agent_key)
-            gradient_steps, actor_loss, critic_loss = self.agent.update(
+
+            self.agent.add(
                 old_wrapped_states.env_state, 
-                new_wrapped_states.env_state, 
-                steps=self.steps, 
-                agent_rng=update_key,
-            )
-            actor_losses.append(actor_loss)
-            critic_losses.append(critic_loss)
+                new_wrapped_states.env_state)
+
+            gradient_steps = 0
+            
+            if self.agent.replay.can_sample(self.agent.state.buffer_state):
+                gradient_steps, actor_loss, critic_loss = self.agent.update(
+                    steps=self.steps, 
+                    agent_rng=update_key,
+                )
+
+                actor_losses.append(actor_loss)
+                critic_losses.append(critic_loss)
 
             tot_gradient_steps += gradient_steps
 
@@ -147,11 +152,7 @@ class Trainer:
                 logger.show_progress(
                     self.steps, self.epoch_steps, self.max_steps)
             
-            # Check the finished episodes.
-            # Where next_states.done is True, set scores and lengths to 0.
-            # Otherwise, keep their original values.
-            scores = jnp.where(new_wrapped_states.env_state.done, 0, scores)
-            lengths = jnp.where(new_wrapped_states.env_state.done, 0, lengths)
+            
             # Count the number of completed episodes by summing the boolean 'done' array
             # (where True=1, False=0) and add it to the total count.
             episodes = episodes + jnp.sum(new_wrapped_states.env_state.done)
@@ -181,11 +182,17 @@ class Trainer:
                       f"    Average length: {jnp.mean(lengths):.2f} \n"
                       f"    Gradient steps: {tot_gradient_steps} \n"
                       f"    Actor loss: {np.mean(actor_losses):.2f} \n"
-                      f"    Critic loss: {np.mean(critic_losses):.2f} \n")
+                      f"    Critic loss: {np.mean(critic_losses):.10f} \n")
                 actor_losses = []
                 critic_losses = []  
 
                 last_epoch_time = time.time()
+            
+            # Check the finished episodes.
+            # Where next_states.done is True, set scores and lengths to 0.
+            # Otherwise, keep their original values.
+            scores = jnp.where(new_wrapped_states.env_state.done, 0, scores)
+            lengths = jnp.where(new_wrapped_states.env_state.done, 0, lengths)
 
             # End of training.
             stop_training = self.steps >= self.max_steps

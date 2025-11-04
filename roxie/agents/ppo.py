@@ -12,6 +12,7 @@ from roxie.losses.actor_losses import ppo_loss_fn
 from roxie.losses.critic_losses import ppo_critic_loss_fn
 import rlax 
 
+
 # This is the core computational kernel that will be JIT-compiled.
 @functools.partial(
     nnx.jit,
@@ -42,18 +43,18 @@ def _grad_step(
     """
     # 1. Get the most recent on-policy data from the buffer
     # This function is expected to be `replay.get_recent_window`
-    _, data  = replay_get_fn(state.buffer_state)
+    state.buffer_state, data  = replay_get_fn(state.buffer_state)
 
     # everything is wrapped in an experience attribute
     data = getattr(data, "experience", data)
 
     re_packed_samples = {
-        "observations": data.observation,
-        "actions": data.action,
-        "log_probs": data.log_probs,
-        "rewards": data.reward,
-        "values": data.value,
-        "terminals": data.terminal,
+        "observations": data.observation, # (NUM_ENVS, BATCH_SIZE, OBS_SIZE)
+        "actions": data.action, # (NUM_ENVS, BATCH_SIZE, ACT_SIZE)
+        "log_probs": data.log_probs, # (NUM_ENVS, BATCH_SIZE)
+        "rewards": data.reward, # (NUM_ENVS, BATCH_SIZE)
+        "values": data.value, # (NUM_ENVS, BATCH_SIZE)
+        "terminals": data.terminal, # (NUM_ENVS, BATCH_SIZE)
     }
 
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
@@ -67,37 +68,33 @@ def _grad_step(
         lambda r, d, v: rlax.truncated_generalized_advantage_estimation(r, d, gae_lambda, v, True),
         in_axes=(0, 0, 0)  # Batch over first dimension
     )
-    adv_t = gae_fn(re_packed_samples["rewards"], discounts, re_packed_samples["values"])
+
+    adv_t = gae_fn(re_packed_samples["rewards"][:, :-1], discounts[:, :-1], re_packed_samples["values"])
+    adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
     # Actor update
-    actor_grad_fn = nnx.value_and_grad(
-        lambda actor: ppo_loss_fn(
-            actor,
+    actor_loss, actor_grads = nnx.value_and_grad(ppo_loss_fn)(
+            actor_model=state.actor,
             observations=norm_obs,
+            actions_buf=re_packed_samples["actions"],
             old_log_probs=re_packed_samples["log_probs"],
             action_low=action_low,
             action_high=action_high,
             advantages=adv_t,
-            clip_eps=clip_eps,
+            clip_epsilon=clip_eps,
             entropy_coef=entropy_coef,
-        ),
-        wrt=nnx.Param,
-    )
-    actor_loss, actor_grads = actor_grad_fn(state.actor)
-    state.actor_optimizer.apply_gradient(actor_grads)
+            key=key
+        )
+    state.actor_optimizer.update(actor_grads)
 
     # Critic update
-    critic_grad_fn = nnx.value_and_grad(
-        lambda critic: ppo_critic_loss_fn(
-            critic, 
+    critic_loss, critic_grads = nnx.value_and_grad(ppo_critic_loss_fn)(
+            state.critic, 
             observations=norm_obs, 
             values=re_packed_samples["values"], 
             advantages=adv_t,
-        ),
-        wrt=nnx.Param,
-    )
-    critic_loss, critic_grads = critic_grad_fn(state.critic)
-    state.critic_optimizer.apply_gradient(critic_grads)
+        )
+    state.critic_optimizer.update(critic_grads)
 
     # 5. Return the new, updated state object
     return (
@@ -168,6 +165,8 @@ class PPO(Agent):
         )
         replay = hydra.utils.instantiate(memory_config)
         self.add_sequence_length = memory_config.add_sequence_length
+        self.max_length_time_axis = memory_config.max_length_time_axis
+        self.batch_size = memory_config.add_batch_size
 
         buffer_state = replay.init(prototype)
 
@@ -240,30 +239,30 @@ class PPO(Agent):
         action, self.last_log_prob, _ = Agent.stochastic_step_fn(
             self.state.actor,
             observation,
+            evaluate,
             key,
         )
 
         self.last_values = self.state.critic(observation)
-
         self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
 
         return self.last_action
 
-    def update(self, prev_states, states, steps, agent_rng):
-
+    def add(self, prev_states, states):
         # Add sequence dimension (length=1) to match trajectory buffer format
         experiences = Transition(
-            observation=prev_states.obs[:, None, :],  # (400,) -> (400, 1, obs_dim)
-            action=self.last_action[:, None, :],      # (400, 6) -> (400, 1, 6)
-            reward=states.reward[:, None],            # (400,) -> (400, 1)
-            terminal=states.done[:, None],            # (400,) -> (400, 1)
-            log_probs=self.last_log_prob[:, None],    # (400,) -> (400, 1)
-            value=self.last_values,          # (400, 1)
+            observation=prev_states.obs[:, None, :],  # (NUM_ENVS,) -> (NUM_ENVS, 1, obs_dim)
+            action=self.last_action[:, None, :],      # (NUM_ENVS, act_dim) -> (NUM_ENVS, 1, act_dim)
+            reward=states.reward[:, None],            # (NUM_ENVS,) -> (NUM_ENVS, 1)
+            terminal=states.done[:, None],            # (NUM_ENVS,) -> (NUM_ENVS, 1)
+            log_probs=self.last_log_prob[:, None],    # (NUM_ENVS,) -> (NUM_ENVS, 1)
+            value=self.last_values,          # (NUM_ENVS, 1)
         )
         # store in memory
         self.state.buffer_state = self.replay.add(
             self.state.buffer_state, experiences
         )
+        # print(self.state.buffer_state.experience.observation.shape) --> (NUM_ENVS, TIME, OBS_SPACE)
 
         # Update observation normalization stats with both current and next observations
         if self.normalize_observations:
@@ -272,6 +271,7 @@ class PPO(Agent):
                 self.state.obs_stats, obs_batch
             )
 
+    def update(self, steps, agent_rng):
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
         # The buffer is full, so we can start learning
@@ -291,10 +291,10 @@ class PPO(Agent):
                 obs_clip=self.obs_clip,
                 obs_eps=self.obs_eps,
             )
+        
         gradient_steps += self.learning_steps
 
         # empty the buffer after learning
-        # self.state.buffer_state = self.replay.flush(self.state.buffer_state)
         return gradient_steps, actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
@@ -305,8 +305,8 @@ class PPO(Agent):
             "critic_learning_rate": float(self.critic_learning_rate),
             "max_grad_norm": float(self.max_grad_norm),
             "learning_steps": int(self.learning_steps),
-            "memory_capacity": int(self.replay.capacity),
-            "memory_batch_size": int(self.replay.batch_size),
+            "memory_capacity": int(self.max_length_time_axis),
+            "memory_batch_size": int(self.batch_size),
             "normalize_observations": bool(self.normalize_observations),
             "obs_norm_clip": float(self.obs_clip),
             "obs_norm_eps": float(self.obs_eps),

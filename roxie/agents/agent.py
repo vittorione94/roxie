@@ -2,7 +2,7 @@ import abc
 import functools
 import inspect
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import flax.struct as struct
 import jax
@@ -80,10 +80,11 @@ class Agent(abc.ABC):
         return noisy_action, action - noisy_action  # return noise for logging
 
     @staticmethod
-    @nnx.jit
+    @functools.partial(nnx.jit, static_argnames=("evaluate",))
     def stochastic_step_fn(
         actor_model: nnx.Module,
         observation: jnp.ndarray,
+        evaluate: bool,
         key: jax.Array,
     ):
         """
@@ -92,10 +93,27 @@ class Agent(abc.ABC):
         - add exploration noise in env units when not evaluating
         """
         distribution = actor_model(observation)
+
+        if evaluate:
+            # Deterministic action selection for evaluation: return the distribution mean
+            # Do not sample so results are deterministic.
+            # distrax distributions expose a `mean()` method for the expected value
+            # and `log_prob(x)` / `entropy()` methods for diagnostics.
+            try:
+                action = distribution.mean()
+            except TypeError:
+                # Some distrax versions expose mean as a property
+                action = distribution.mean
+
+            # Compute log-prob of the mean (useful for logging); this is deterministic.
+            # For multivariate normals the log_prob returns a scalar per batch element.
+            log_probs = distribution.log_prob(action)
+            entropy = distribution.entropy()
+            return action, log_probs, entropy
+
+        # Training / exploration mode: sample from the policy
         action, log_probs = distribution.sample_and_log_prob(seed=key)
-
         entropy = distribution.entropy()
-
         return action, log_probs, entropy
 
     @staticmethod
@@ -169,7 +187,11 @@ class Agent(abc.ABC):
                 "hyperparams": self._export_hyperparams(),
                 "metadata": (extra_metadata or {}),
             }
-            ocp.PyTreeCheckpointer().save(path, payload)
+            checkpointer = ocp.StandardCheckpointer()
+
+            # ocp.PyTreeCheckpointer().save(path, payload)
+            checkpointer.save(path, payload)
+            
             print(f"[Agent.save] Saved to {path}")
         except Exception as e:
             print(
@@ -281,3 +303,4 @@ class Agent(abc.ABC):
 
         print(f"Agent state loaded from {path}")
         return agent
+

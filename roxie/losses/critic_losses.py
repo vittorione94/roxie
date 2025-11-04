@@ -64,10 +64,12 @@ def ppo_critic_loss_fn(
     advantages, 
 ):
     """Calculates the MSE loss for the critic using PPO."""
-    v_t = critic_model(observations)
+    v_t = critic_model(observations)[:, :-1, 0] # shape (NUM_ENVS, BATCH_SIZE, 1)
+    
+    # values --> (NUM_ENVS, BATCH_SIZE)
+    # advantages --> (NUM_ENVS, BATCH_SIZE -1 )
 
-    target_values = values + advantages
-    value_loss = jnp.square(v_t[:-1] - target_values)
-     
-    loss = jnp.mean(value_loss)
-    return loss
+    target_values = values[:, :-1] + advantages
+
+    critic_loss = jnp.mean((v_t - target_values) ** 2)
+    return critic_loss
