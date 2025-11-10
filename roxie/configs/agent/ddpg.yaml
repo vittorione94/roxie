@@ -39,4 +39,4 @@ memory:
   min_length: 1_000
   sample_batch_size: 256
   add_sequences: False
-  add_batch_size: 400
+  add_batch_size: ${env.parallel_envs}

@@ -2,19 +2,14 @@ import os
 import time
 
 import click
-import hydra
 import jax
 import jax.numpy as jnp
 import mujoco
 import mujoco.viewer
-import numpy as np
-from flax import nnx
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 
 from roxie.agents import agents
 from roxie.environment.loader import load_playground_env
-from roxie.utils.trainer import Trainer
 
 
 @click.command()
@@ -43,7 +38,10 @@ def main(checkpoint_path):
     if "noise" in cfg:
         agent_args["noise_config"] = cfg.noise
 
-    agent = agents[cfg.agent.name].load(path=checkpoint_path, **agent_args)
+    agent = agents[cfg.agent.name].load(path=checkpoint_path, 
+                                        env_obs_size=env.observation_size, 
+                                        env_act_size=env.action_size, 
+                                        **agent_args)
 
     # Get the standard MuJoCo model and data from the MJX-based environment
     model = env.mj_model
@@ -96,7 +94,7 @@ def main(checkpoint_path):
             # Sync the viewer with the new data
             viewer.sync()
 
-            time_until_next_step = model.opt.timestep - (time.time() - step_start)
+            time_until_next_step = model.opt.timestep * 5 - (time.time() - step_start)
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
 

@@ -1,6 +1,5 @@
 import copy
 import functools
-from typing import Any
 
 import hydra
 import jax
@@ -267,7 +266,7 @@ class DDPG(Agent):
 
         return self.last_action
 
-    def update(self, prev_states, states, steps, agent_rng):
+    def add(self, prev_states, states):
         # prev_states.obs.shape   (num_envs, obs_dim)
         # states.reward.shape     (num_envs,)
         # states.done.shape       (num_envs,)
@@ -293,6 +292,7 @@ class DDPG(Agent):
                 self.state.obs_stats, obs_batch
             )
 
+    def update(self, steps, agent_rng):
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
         # Conditionally call the JIT-compiled gradient step

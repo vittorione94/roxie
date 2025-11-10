@@ -2,12 +2,11 @@ import abc
 import functools
 import inspect
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import flax.struct as struct
 import jax
 import jax.numpy as jnp
-import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 
@@ -191,7 +190,7 @@ class Agent(abc.ABC):
 
             # ocp.PyTreeCheckpointer().save(path, payload)
             checkpointer.save(path, payload)
-            
+
             print(f"[Agent.save] Saved to {path}")
         except Exception as e:
             print(
@@ -203,10 +202,12 @@ class Agent(abc.ABC):
     def load(
         cls,
         path: str | Path,
+        env_obs_size: int,
+        env_act_size: int, 
         actor_config: dict,
         critic_config: dict,
         memory_config: dict,
-        noise_config: dict,
+        noise_config: dict = None,
     ):
         path = Path(path).resolve()
         loaded = ocp.PyTreeCheckpointer().restore(path)
@@ -217,13 +218,23 @@ class Agent(abc.ABC):
 
         valid_params = set(inspect.signature(cls.__init__).parameters.keys())
         filtered_hyper = {k: v for k, v in (hyper or {}).items() if k in valid_params}
-        agent = cls(
-            actor_config=actor_config,
-            critic_config=critic_config,
-            memory_config=memory_config,
-            noise_config=noise_config,
-            **(filtered_hyper or {}),
-        )
+        if noise_config:
+            agent = cls(
+                actor_config=actor_config,
+                critic_config=critic_config,
+                memory_config=memory_config,
+                noise_config=noise_config,
+                **(filtered_hyper or {}),
+            )
+        else:
+            agent = cls(
+                env_obs_size=env_obs_size,
+                env_action_size=env_act_size,
+                actor_config=actor_config,
+                critic_config=critic_config,
+                memory_config=memory_config,
+                **(filtered_hyper or {}),
+            )
 
         # Minimal fields commonly used at play time
         hyper = ckpt_state.get("hyperparams", {}) or {}

@@ -8,7 +8,6 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
 from roxie.agents import agents
-from roxie.agents.utils import Transition
 from roxie.environment.loader import load_playground_env
 from roxie.utils.trainer import Trainer
 
@@ -20,17 +19,13 @@ def main(cfg: DictConfig):
     print("JAX devices:", jax.devices())
     print("JAX platform:", jax.default_backend())
 
-    # Test array placement
-    test_array = jnp.ones(3)
-    print("Test array device:", test_array.devices())
-
     env, env_cfg = load_playground_env(cfg.env.env_name)
     print("Environment configuration:", env_cfg)
 
     output_dir = HydraConfig.get().runtime.output_dir
 
     # Create RNGs for agent initialization
-    training_rngs = nnx.Rngs(envs=2, agent=3)  # Use your seed from cfg.seed
+    training_rngs = nnx.Rngs(envs=cfg.env.seed, agent=3)  # Use your seed from cfg.seed
 
     # Agent handles all component instantiation internally
     ctrl_range = jnp.array(env.mj_model.actuator_ctrlrange)  # shape (action_dim, 2)
@@ -67,7 +62,7 @@ def main(cfg: DictConfig):
     trainer.initialize(
         agent=agent, environment=env, test_environment=copy.deepcopy(env)
     )
-    trainer.run(cfg.parallel_envs, training_rngs)
+    trainer.run(cfg.env.parallel_envs, training_rngs)
 
     return
 

@@ -120,13 +120,21 @@ class Trainer:
                 new_wrapped_states.env_state)
 
             gradient_steps = 0
-            
-            if self.agent.replay.can_sample(self.agent.state.buffer_state):
+
+            replay = getattr(self.agent, "replay", None)
+            can_sample = getattr(replay, "can_sample", None)
+
+            should_update = False
+            if replay is None or not callable(can_sample):
+                should_update = True
+            elif can_sample(self.agent.state.buffer_state):
+                should_update = True
+
+            if should_update:
                 gradient_steps, actor_loss, critic_loss = self.agent.update(
-                    steps=self.steps, 
+                    steps=self.steps,
                     agent_rng=update_key,
                 )
-
                 actor_losses.append(actor_loss)
                 critic_losses.append(critic_loss)
 

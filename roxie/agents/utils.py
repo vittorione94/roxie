@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterable, Optional
+from typing import Optional
 
 import flax.struct as struct
 import jax
