@@ -85,16 +85,16 @@ def _grad_step(
             entropy_coef=entropy_coef,
             key=key
         )
-    state.actor_optimizer.update(actor_grads)
+    state.actor_optimizer.update(state.actor, actor_grads)
 
     # Critic update
     critic_loss, critic_grads = nnx.value_and_grad(ppo_critic_loss_fn)(
-            state.critic, 
-            observations=norm_obs, 
-            values=re_packed_samples["values"], 
+            state.critic,
+            observations=norm_obs,
+            values=re_packed_samples["values"],
             advantages=adv_t,
         )
-    state.critic_optimizer.update(critic_grads)
+    state.critic_optimizer.update(state.critic, critic_grads)
 
     # 5. Return the new, updated state object
     return (

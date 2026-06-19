@@ -11,7 +11,7 @@ import orbax.checkpoint as ocp
 from flax import nnx
 
 
-class TrainState(nnx.Module):
+class TrainState(nnx.Module, pytree=False):
     def __init__(
         self,
         *,
@@ -24,12 +24,6 @@ class TrainState(nnx.Module):
         buffer_state: Any,
         obs_stats: Any,
     ):
-        """Initializes the training state.
-
-        The state components are defined as attributes of the module.
-        `nnx.Module` will automatically know how to handle them for
-        JAX transformations.
-        """
         self.actor = actor
         self.critic = critic
         self.target_actor = target_actor
@@ -39,7 +33,7 @@ class TrainState(nnx.Module):
         self.critic_optimizer = critic_optimizer
 
         self.buffer_state = buffer_state
-        self.obs_stats = obs_stats  # Stores observation statistics for normalization
+        self.obs_stats = obs_stats
 
 
 @struct.dataclass

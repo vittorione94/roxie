@@ -8,18 +8,23 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
 from roxie.agents import agents
-from roxie.environment.loader import load_playground_env
+from roxie.environment.loader import load_mocap_env, load_playground_env
 from roxie.utils.trainer import Trainer
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="roxie")
+@hydra.main(version_base=None, config_path="configs", config_name="experiment/walker_ddpg")
 def main(cfg: DictConfig):
     print(cfg.agent.name)
 
     print("JAX devices:", jax.devices())
     print("JAX platform:", jax.default_backend())
 
-    env, env_cfg = load_playground_env(cfg.env.env_name)
+    env_type = cfg.env.get("env_type", "playground")
+    if env_type == "mocap":
+        env = load_mocap_env(cfg.env.xml_path, cfg.env.clip_path)
+        env_cfg = None
+    else:
+        env, env_cfg = load_playground_env(cfg.env.env_name)
     print("Environment configuration:", env_cfg)
 
     output_dir = HydraConfig.get().runtime.output_dir
@@ -52,12 +57,12 @@ def main(cfg: DictConfig):
 
     trainer = Trainer(
         output_dir=output_dir,
-        steps=int(1e9),
-        epoch_steps=int(1e5),
-        save_steps=int(5e5),
-        test_episodes=5,
-        show_progress=True,
-        replace_checkpoint=False,
+        steps=int(cfg.trainer.steps),
+        epoch_steps=int(cfg.trainer.epoch_steps),
+        save_steps=int(cfg.trainer.save_steps),
+        test_episodes=int(cfg.trainer.test_episodes),
+        show_progress=cfg.trainer.show_progress,
+        replace_checkpoint=cfg.trainer.replace_checkpoint,
     )
     trainer.initialize(
         agent=agent, environment=env, test_environment=copy.deepcopy(env)

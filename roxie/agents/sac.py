@@ -80,7 +80,7 @@ def _sac_grad_step(
         obs_std,
         obs_clip,
     )
-    state.critic_optimizer.update(critic_grads)
+    state.critic_optimizer.update(state.critic, critic_grads)
 
     # 2. Actor update
     (actor_loss, log_probs), actor_grads = nnx.value_and_grad(
@@ -97,7 +97,7 @@ def _sac_grad_step(
         action_low,
         action_high,
     )
-    state.actor_optimizer.update(actor_grads)
+    state.actor_optimizer.update(state.actor, actor_grads)
 
     # 3. Alpha update
     if auto_alpha:
@@ -106,7 +106,7 @@ def _sac_grad_step(
             jax.lax.stop_gradient(log_probs),
             target_entropy,
         )
-        alpha_optimizer.update(alpha_grads)
+        alpha_optimizer.update(log_alpha_module, alpha_grads)
 
     # 4. Soft update target critics
     new_critic_tensors = nnx.state(state.critic, nnx.Param)

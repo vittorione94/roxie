@@ -102,3 +102,11 @@ def load_playground_env(env_name: str):
     env_cfg = registry.get_default_config(env_name)
     wrapped_env = TerminationWrapper(env)
     return wrapped_env, env_cfg
+
+
+def load_mocap_env(xml_path: str, clip_path: str):
+    from roxie.environment.mocap_tracking import MocapTrackingEnv
+
+    env = MocapTrackingEnv(xml_path=xml_path, clip_path=clip_path)
+    wrapped_env = TerminationWrapper(env)
+    return wrapped_env

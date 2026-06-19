@@ -63,7 +63,7 @@ def _grad_step(
         obs_std,
         obs_clip,
     )
-    state.critic_optimizer.update(critic_grads)
+    state.critic_optimizer.update(state.critic, critic_grads)
 
     # 3. Actor update (use scaled actions)
     actor_loss, actor_grads = nnx.value_and_grad(ddpg_actor_loss_fn)(
@@ -76,7 +76,7 @@ def _grad_step(
         action_low,
         action_high,
     )
-    state.actor_optimizer.update(actor_grads)
+    state.actor_optimizer.update(state.actor, actor_grads)
 
     # 4. Update target networks using soft updates
     new_actor_tensors = nnx.state(state.actor, nnx.Param)  # Use updated_actor
