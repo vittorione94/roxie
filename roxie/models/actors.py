@@ -23,17 +23,20 @@ class DeterministicActor(nnx.Module):
         self.action_dim = action_dim
 
         # --- Define stateful layers ---
-        self.hidden_layers = []
-        if self.use_layer_norm:
-            self.norm_layers = []
+        hidden_layers = []
+        norm_layers = []
 
         # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
-            self.hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
+            hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
             if self.use_layer_norm:
-                self.norm_layers.append(nnx.LayerNorm(feat, rngs=rngs))
+                norm_layers.append(nnx.LayerNorm(feat, rngs=rngs))
             current_features = feat
+
+        self.hidden_layers = nnx.List(hidden_layers)
+        if self.use_layer_norm:
+            self.norm_layers = nnx.List(norm_layers)
 
         # Dropout and output layers
         # self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
@@ -76,17 +79,20 @@ class StochasticActor(nnx.Module):
         self.std_max = std_max
 
         # --- Define stateful layers ---
-        self.hidden_layers = []
-        if self.use_layer_norm:
-            self.norm_layers = []
+        hidden_layers = []
+        norm_layers = []
 
         # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
-            self.hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
+            hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
             if self.use_layer_norm:
-                self.norm_layers.append(nnx.LayerNorm(feat, rngs=rngs))
+                norm_layers.append(nnx.LayerNorm(feat, rngs=rngs))
             current_features = feat
+
+        self.hidden_layers = nnx.List(hidden_layers)
+        if self.use_layer_norm:
+            self.norm_layers = nnx.List(norm_layers)
 
         # Output layers for mean and log_std
         self.output_layer = nnx.Linear(current_features, action_dim, rngs=rngs)

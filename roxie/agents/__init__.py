@@ -1,8 +1,9 @@
 from .basic import Constant, NormalRandom, OrnsteinUhlenbeck, UniformRandom
 from .ddpg import DDPG
 from .ppo import PPO
+from .sac import SAC
 
-__all__ = [Constant, NormalRandom, OrnsteinUhlenbeck, UniformRandom, DDPG, PPO]
+__all__ = [Constant, NormalRandom, OrnsteinUhlenbeck, UniformRandom, DDPG, PPO, SAC]
 
 agents = {
     "constant": Constant,
@@ -11,4 +12,5 @@ agents = {
     "ou": OrnsteinUhlenbeck,
     "ddpg": DDPG,
     "ppo": PPO,
+    "sac": SAC,
 }

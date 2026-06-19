@@ -28,7 +28,7 @@ actor:
 
 critic:
   # Path to the Critic class
-  _target_: roxie.models.critics.DeterministicCritic
+  _target_: roxie.models.critics.QCritic
   features: [256, 256]
   use_layer_norm: false 
   dropout_rate: 0.   

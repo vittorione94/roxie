@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 from flax import nnx
 
@@ -81,3 +82,36 @@ def ppo_loss_fn(
     # Per-step loss minus entropy term, then average across all dims
     per_step_loss = pg_loss - entropy_coef * entropy_t
     return jnp.mean(per_step_loss)
+
+
+@nnx.jit
+def sac_actor_loss_fn(
+    actor_model,
+    twin_critic,
+    alpha,
+    samples,
+    key,
+    obs_mean,
+    obs_std,
+    obs_clip,
+    action_low,
+    action_high,
+):
+    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    distribution = actor_model(obs)
+    u = distribution.sample(seed=key)
+    actions = jnp.tanh(u)
+    log_probs = distribution.log_prob(u) - jnp.sum(
+        jnp.log(1.0 - actions ** 2 + 1e-6), axis=-1
+    )
+    actions_scaled = Agent.scale_to_env(actions, action_low, action_high)
+    q1, q2 = twin_critic(obs, actions_scaled)
+    min_q = jnp.minimum(jnp.squeeze(q1), jnp.squeeze(q2))
+    actor_loss = jnp.mean(alpha * log_probs - min_q)
+    return actor_loss, log_probs
+
+
+@nnx.jit
+def sac_alpha_loss_fn(log_alpha_module, log_probs, target_entropy):
+    alpha = jnp.exp(log_alpha_module.log_alpha.value)
+    return -jnp.mean(alpha * (jax.lax.stop_gradient(log_probs) + target_entropy))

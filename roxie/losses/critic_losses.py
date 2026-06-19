@@ -73,3 +73,53 @@ def ppo_critic_loss_fn(
 
     critic_loss = jnp.mean((v_t - target_values) ** 2)
     return critic_loss
+
+
+@nnx.jit
+def sac_critic_loss_fn(
+    twin_critic,
+    actor_model,
+    target_twin_critic,
+    samples,
+    gamma,
+    alpha,
+    key,
+    action_low,
+    action_high,
+    obs_mean,
+    obs_std,
+    obs_clip,
+):
+    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    next_obs = Agent.normalize_obs(
+        samples["next_observations"], obs_mean, obs_std, obs_clip
+    )
+
+    # Sample next actions from current policy with tanh squashing
+    next_dist = actor_model(next_obs)
+    next_u = next_dist.sample(seed=key)
+    next_actions = jnp.tanh(next_u)
+    next_log_probs = next_dist.log_prob(next_u) - jnp.sum(
+        jnp.log(1.0 - next_actions ** 2 + 1e-6), axis=-1
+    )
+
+    next_actions_scaled = Agent.scale_to_env(next_actions, action_low, action_high)
+
+    # Target Q values with entropy regularization
+    target_q1, target_q2 = target_twin_critic(next_obs, next_actions_scaled)
+    target_q = jnp.minimum(jnp.squeeze(target_q1), jnp.squeeze(target_q2))
+    target_q = target_q - alpha * next_log_probs
+
+    # Bellman target
+    reward = jnp.squeeze(samples["rewards"])
+    terminal = samples["terminals"].astype(jnp.float32)
+    target = reward + gamma * (1.0 - terminal) * target_q
+    target = jax.lax.stop_gradient(target)
+
+    # Current Q values from both critics
+    q1, q2 = twin_critic(obs, samples["actions"])
+    critic_loss = 0.5 * (
+        jnp.mean((jnp.squeeze(q1) - target) ** 2)
+        + jnp.mean((jnp.squeeze(q2) - target) ** 2)
+    )
+    return critic_loss

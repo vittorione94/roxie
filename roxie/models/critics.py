@@ -4,14 +4,8 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-class DeterministicCritic(nnx.Module):
-    """
-    A deterministic critic network implemented using Flax NNX.
-
-    This network takes a state-action representation as input and outputs a
-    single Q-value. It's composed of a series of dense layers with optional
-    layer normalization and dropout.
-    """
+class QCritic(nnx.Module):
+    """Q-value critic: maps (state, action) → Q(s, a)."""
 
     def __init__(
         self,
@@ -24,33 +18,26 @@ class DeterministicCritic(nnx.Module):
         dropout_rate: float = 0.0,
     ):
         """
-        Initializes the DeterministicCritic module.
-
-        Args:
-            in_features: The number of input features (e.g., state_dim + action_dim).
-            features: A sequence of integers defining the number of units in each hidden layer.
-            rngs: The random number generators for initializing weights and for dropout.
-            activation_fn: The activation function to use for hidden layers.
-            use_layer_norm: If True, adds a LayerNorm layer after each hidden dense layer.
-            dropout_rate: The dropout rate to apply after activation in hidden layers.
-                          If 0.0, no dropout is applied.
-        """
+"""
         # --- Store static configuration ---
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
 
         # --- Define stateful layers ---
-        self.hidden_layers = []
-        if self.use_layer_norm:
-            self.norm_layers = []
+        hidden_layers = []
+        norm_layers = []
 
         # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
-            self.hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
+            hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
             if self.use_layer_norm:
-                self.norm_layers.append(nnx.LayerNorm(feat, rngs=rngs))
+                norm_layers.append(nnx.LayerNorm(feat, rngs=rngs))
             current_features = feat
+
+        self.hidden_layers = nnx.List(hidden_layers)
+        if self.use_layer_norm:
+            self.norm_layers = nnx.List(norm_layers)
 
         # Dropout and output layers
         self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
@@ -59,20 +46,7 @@ class DeterministicCritic(nnx.Module):
     def __call__(
         self, observations: jnp.ndarray, actions: jnp.ndarray, training: bool = False
     ) -> jnp.ndarray:
-        """
-        Performs the forward pass of the critic network.
-
-        Args:
-            x: The input tensor, typically a concatenation of observations and actions.
-            training: If True, dropout layers are active. Otherwise, they are in
-                   inference mode (deterministic).
-
-        Returns:
-            The scalar Q-value for the input, with shape (batch_size,).
-        """
-        # Concatenate observations and actions to form the input to the network
         x = jnp.concatenate([observations, actions], axis=-1)
-        # Use the layers defined in __init__
         for i, layer in enumerate(self.hidden_layers):
             x = layer(x)
             if self.use_layer_norm:
@@ -84,7 +58,20 @@ class DeterministicCritic(nnx.Module):
         return x
 
 
-class StochasticCritic(nnx.Module):
+class TwinCritic(nnx.Module):
+    def __init__(self, critic1: nnx.Module, critic2: nnx.Module):
+        self.critic1 = critic1
+        self.critic2 = critic2
+
+    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray, **kwargs) -> tuple:
+        q1 = self.critic1(observations, actions, **kwargs)
+        q2 = self.critic2(observations, actions, **kwargs)
+        return q1, q2
+
+
+class VCritic(nnx.Module):
+    """State-value critic: maps observations → V(s)."""
+
     def __init__(self,
         in_features: int,
         features: Sequence[int],
@@ -93,53 +80,32 @@ class StochasticCritic(nnx.Module):
         activation_fn: Callable = nnx.relu,
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,):
-        """
-        Initializes the StochasticCritic module.
-
-        Args:
-            in_features: The number of input features (e.g., state_dim + action_dim).
-            features: A sequence of integers defining the number of units in each hidden layer.
-            rngs: The random number generators for initializing weights and for dropout.
-            activation_fn: The activation function to use for hidden layers.
-            use_layer_norm: If True, adds a LayerNorm layer after each hidden dense layer.
-            dropout_rate: The dropout rate to apply after activation in hidden layers.
-                            If 0.0, no dropout is applied.
-        """
         # --- Store static configuration ---
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
 
         # --- Define stateful layers ---
-        self.hidden_layers = []
-        if self.use_layer_norm:
-            self.norm_layers = []
+        hidden_layers = []
+        norm_layers = []
 
         # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
-            self.hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
+            hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
             if self.use_layer_norm:
-                self.norm_layers.append(nnx.LayerNorm(feat, rngs=rngs))
+                norm_layers.append(nnx.LayerNorm(feat, rngs=rngs))
             current_features = feat
+
+        self.hidden_layers = nnx.List(hidden_layers)
+        if self.use_layer_norm:
+            self.norm_layers = nnx.List(norm_layers)
 
         # Dropout and output layers
         self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.output_layer = nnx.Linear(current_features, 1, rngs=rngs)
 
     def __call__(self, observations: jnp.ndarray, training: bool = False) -> jnp.ndarray:
-        """
-        Performs the forward pass of the critic network.
-
-        Args:
-            x: The input tensor, typically a concatenation of observations and actions.
-            training: If True, dropout layers are active. Otherwise, they are in
-                   inference mode (deterministic).
-
-        Returns:
-            The scalar Q-value for the input, with shape (batch_size,).
-        """
         x = observations
-        # Use the layers defined in __init__
         for i, layer in enumerate(self.hidden_layers):
             x = layer(x)
             if self.use_layer_norm:
