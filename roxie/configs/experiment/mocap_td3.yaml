@@ -1,0 +1,32 @@
+# @package _global_
+
+defaults:
+  - /agent: td3
+  - /noise: ou
+  - _self_
+
+env:
+  seed: 0
+  parallel_envs: 4000
+  env_type: mocap
+  env_name: null
+  list_envs: false
+  clip_ids: []
+  gpu_clip_budget: 200
+  # Physics backend: "jax" (MJX) or "warp" (mujoco_warp). Requires warp-lang
+  # <1.13 (see pyproject); verify with `uv run python scripts/check_warp.py`.
+  impl: warp
+  naconmax: null
+  njmax: null
+
+trainer:
+  steps: 1_000_000_000
+  epoch_steps: 1_000_000
+  save_steps: 10_000_000
+  test_episodes: 5
+  show_progress: true
+  replace_checkpoint: false
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}

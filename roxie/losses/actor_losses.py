@@ -25,6 +25,26 @@ def ddpg_actor_loss_fn(
 
 
 @nnx.jit
+def td3_actor_loss_fn(
+    actor_model,
+    twin_critic,
+    samples,
+    obs_mean,
+    obs_std,
+    obs_clip,
+    action_low,
+    action_high,
+):
+    """Deterministic policy gradient through the first critic head (TD3)."""
+    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    actions = actor_model(obs)  # [-1, 1]
+    actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
+    q1, _ = twin_critic(obs, actions)
+    actor_loss = -jnp.mean(q1)
+    return actor_loss
+
+
+@nnx.jit
 def ppo_loss_fn(
     actor_model,
     observations,

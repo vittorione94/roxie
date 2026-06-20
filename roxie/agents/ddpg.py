@@ -180,7 +180,6 @@ class DDPG(Agent):
     ):
 
         actor_rngs = nnx.Rngs(params=0, dropout=1)
-        critic_rngs = nnx.Rngs(params=0, dropout=1)
 
         # Instantiate actor
         actor = hydra.utils.instantiate(
@@ -190,10 +189,8 @@ class DDPG(Agent):
             rngs=actor_rngs,
         )
 
-        # Instantiate critic
-        critic = hydra.utils.instantiate(
-            critic_config, in_features=env_obs_size + env_action_size, rngs=critic_rngs
-        )
+        # Instantiate critic (overridable so TD3 can swap in a TwinCritic)
+        critic = self._make_critic(critic_config, env_obs_size, env_action_size)
 
         # Instantiate replay buffer
         prototype = Transition(
@@ -275,9 +272,18 @@ class DDPG(Agent):
         self.obs_clip = float(obs_norm_clip)
         self.obs_eps = float(obs_norm_eps)
 
-        print("DDPG agent initialized.")
+        print(f"{type(self).__name__} agent initialized.")
         print("Noise module hyperparameters:", self.noise_module.hyperparameters())
         print("Hyper Params:", self._export_hyperparams())
+
+    def _make_critic(self, critic_config, env_obs_size, env_action_size):
+        """Build the critic network. Overridden by TD3 to return a TwinCritic."""
+        critic_rngs = nnx.Rngs(params=0, dropout=1)
+        return hydra.utils.instantiate(
+            critic_config,
+            in_features=env_obs_size + env_action_size,
+            rngs=critic_rngs,
+        )
 
     def step(
         self,

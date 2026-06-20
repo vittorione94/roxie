@@ -1,0 +1,35 @@
+name: "td3"
+
+args:
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  target_policy_noise: 0.2        # TD3 default target smoothing (env-unit fraction)
+  target_noise_clip: 0.5
+  policy_delay: 2                 # actor + target updates every 2 critic steps
+  memory_warmup: 30_000
+  steps_before_learning: 30_000
+  steps_between_updates: 400
+  learning_steps: 100
+  max_grad_norm: 1
+
+actor:
+  _target_: roxie.models.actors.DeterministicActor
+  features: [256, 256]
+  use_layer_norm: false
+  dropout_rate: 0.
+
+critic:
+  _target_: roxie.models.critics.QCritic
+  features: [256, 256]
+  use_layer_norm: true            # strong stabilizer against value divergence
+  dropout_rate: 0.
+
+memory:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 1_000
+  sample_batch_size: 256
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
