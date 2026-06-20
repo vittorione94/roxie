@@ -6,11 +6,11 @@ args:
   actor_learning_rate: 5e-4
   critic_learning_rate: 1e-3
   target_policy_noise: 0.05       # target smoothing noise
-  target_noise_clip: 0.1
+  target_noise_clip: 0.05
   memory_warmup: 30_000            # start updates after 30k transitions (~75 loops @ 400 envs)
   steps_before_learning: 30_000    # same as warmup (can differ if desired)
   steps_between_updates: 400      # update every 400 new transitions (~once per trainer loop)
-  learning_steps: 20              # gradient steps per update trigger
+  learning_steps: 100              # gradient steps per update trigger
   max_grad_norm: 1
 
 actor:
@@ -35,7 +35,7 @@ critic:
 
 memory:
   _target_: flashbax.buffers.make_flat_buffer
-  max_length: 1_000_000
+  max_length: 500_000   # ~1.53 GB obs field @ obs=764 (look_ahead=5); 1M OOMs on 15 GB w/ Warp
   min_length: 1_000
   sample_batch_size: 256
   add_sequences: False

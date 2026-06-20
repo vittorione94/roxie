@@ -13,8 +13,8 @@ from roxie.losses.actor_losses import ddpg_actor_loss_fn
 from roxie.losses.critic_losses import ddpg_critic_loss_fn
 
 
-# This is the core computational kernel that will be JIT-compiled.
-@functools.partial(nnx.jit, static_argnames=("gamma", "tau", "replay_sample_fn"))
+# Pure single gradient step. Not jitted on its own — it is called inside the
+# jitted `_grad_steps` below so that N steps fuse into one compiled program.
 def _grad_step(
     state: TrainState,
     key: jax.random.PRNGKey,
@@ -110,6 +110,45 @@ def _grad_step(
         actor_loss,
         critic_loss,
     )
+
+
+# Fused N-step update. `n_steps` is static, so the Python loop unrolls at trace
+# time into a single compiled program — one dispatch instead of N, with no
+# per-step Python / nnx graph-traversal overhead and no GPU idling between steps.
+@functools.partial(
+    nnx.jit, static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps")
+)
+def _grad_steps(
+    state: TrainState,
+    key: jax.random.PRNGKey,
+    n_steps: int,
+    gamma: float,
+    tau: float,
+    replay_sample_fn,
+    target_policy_noise: float,
+    target_noise_clip: float,
+    action_low: float,
+    action_high: float,
+    obs_eps: float,
+    obs_clip: float,
+):
+    actor_loss = critic_loss = 0.0
+    for i in range(n_steps):
+        key, step_key = jax.random.split(key)
+        state, actor_loss, critic_loss = _grad_step(
+            state,
+            step_key,
+            gamma,
+            tau,
+            replay_sample_fn,
+            target_policy_noise,
+            target_noise_clip,
+            action_low,
+            action_high,
+            obs_eps,
+            obs_clip,
+        )
+    return state, actor_loss, critic_loss
 
 
 class DDPG(Agent):
@@ -278,7 +317,12 @@ class DDPG(Agent):
             action=self.last_action,
             reward=states.reward,
             # next_observation=states.obs,
-            terminal=states.done,
+            # Use the true termination signal, NOT `done` (= termination OR
+            # truncation). A time-limit truncation must still bootstrap the
+            # next-state value in the Bellman target; marking it terminal zeroes
+            # the bootstrap and collapses Q at the cutoff. With all envs hitting
+            # the time limit in lockstep this floods the buffer at once.
+            terminal=states.info["termination"],
         )
 
         # store in memory
@@ -300,21 +344,20 @@ class DDPG(Agent):
             steps >= self.steps_before_learning
             and (steps - self.steps_before_learning) % self.steps_between_updates == 0
         ):
-            for _ in range(self.learning_steps):
-                agent_rng, key = jax.random.split(agent_rng, 2)
-                self.state, actor_loss, critic_loss = _grad_step(
-                    self.state,
-                    key,
-                    self.gamma,
-                    self.tau,
-                    self.replay.sample,  # Pass the sample method itself,
-                    self.target_policy_noise,  # Use target_policy_noise
-                    self.target_noise_clip,
-                    self.action_low,
-                    self.action_high,
-                    self.obs_eps,
-                    self.obs_clip,
-                )
+            self.state, actor_loss, critic_loss = _grad_steps(
+                self.state,
+                agent_rng,
+                self.learning_steps,
+                self.gamma,
+                self.tau,
+                self.replay.sample,  # Pass the sample method itself,
+                self.target_policy_noise,  # Use target_policy_noise
+                self.target_noise_clip,
+                self.action_low,
+                self.action_high,
+                self.obs_eps,
+                self.obs_clip,
+            )
             gradient_steps += self.learning_steps
 
         return gradient_steps, actor_loss, critic_loss

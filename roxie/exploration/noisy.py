@@ -48,8 +48,12 @@ class NoiseModule(nnx.Module):
         current_scale = self.get_current_scale()
         noise = self.sample_noise(key, shape=actions.shape) * current_scale
 
-        # Increment step counter
-        self.step_count.value += 1
+        # Advance the decay clock by the number of environment frames collected
+        # this call (the batch / env dimension), not by 1 per iteration. This
+        # measures the schedule in env steps -- the same unit as the trainer's
+        # `steps`/`memory_warmup` budgets -- so `decay_steps` is independent of
+        # how many parallel envs are used (same behaviour at 1 env or 4000).
+        self.step_count.value += actions.shape[0] if actions.ndim > 1 else 1
 
         return actions + noise
 
@@ -236,9 +240,13 @@ class CompositeNoise(NoiseModule):
         if evaluation:
             return actions
 
-        # Update step count for all modules
+        # Advance every submodule's decay clock (and our own) by the number of
+        # environment frames in this call, so the schedule is measured in env
+        # steps and stays independent of the parallel env count.
+        inc = actions.shape[0] if actions.ndim > 1 else 1
         for module in self.noise_modules:
-            module.step_count.value += 1
+            module.step_count.value += inc
+        self.step_count.value += inc
 
         current_scale = self.get_current_scale()
         noise = self.sample_noise(key) * current_scale

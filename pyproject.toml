@@ -3,7 +3,7 @@ name = "roxie"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "chex>=0.1.90",
     "distrax>=0.1.5",
@@ -13,12 +13,19 @@ dependencies = [
     "jax[cuda12]>=0.4.30",
     "numpy>=2.0.2",
     "optax>=0.2.4",
-    "playground>=0.0.2",
+    "playground>=0.2.0",
     "rlax>=0.1.7",
     "termcolor>=3.1.0",
     "etils>=1.13.0",
     "pytest>=9.1.1",
-    "warp-lang>=1.14.0",
+    # mujoco's warp bridge imports warp._src.jax_experimental.ffi.GraphMode and
+    # reads public warp.types.warp_type_to_np_dtype. Warp 1.13 dropped the latter
+    # from the public API and 1.14 graduated jax_experimental (NVIDIA/warp#1370),
+    # moving both out from under the bridge. 1.12.x is the newest that has both.
+    "warp-lang>=1.11,<1.13",
+    "dm-control>=1.0.41",
+    "h5py>=3.16.0",
+    "mujoco-mjx>=3.9.0",
 ]
 
 [build-system]

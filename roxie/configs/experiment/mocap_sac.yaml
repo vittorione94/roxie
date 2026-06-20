@@ -11,8 +11,14 @@ env:
   env_type: mocap
   env_name: null
   list_envs: false
-  xml_path: roxie/data/assets/humanoid_suite.xml
-  clip_path: roxie/data/clips/standing.npz
+  clip_ids: []
+  gpu_clip_budget: 100
+  # Physics backend: "jax" (MJX) or "warp" (mujoco_warp). For warp, tune the
+  # contact/constraint budgets in the viewer and scale by parallel_envs; null
+  # lets mujoco_warp pick defaults.
+  impl: jax
+  naconmax: null
+  njmax: null
 
 trainer:
   steps: 1_000_000_000

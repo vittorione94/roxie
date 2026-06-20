@@ -7,17 +7,22 @@ defaults:
 
 env:
   seed: 0
-  parallel_envs: 800
+  parallel_envs: 4000
   env_type: playground
   env_name: WalkerWalk
   list_envs: false
   xml_path: null
   clip_path: null
+  # Physics backend: "warp" (mujoco_warp) or "jax" (MJX). null naconmax/njmax
+  # keeps the playground env's own Warp budgets.
+  impl: warp
+  naconmax: null
+  njmax: null
 
 trainer:
   steps: 1_000_000_000
-  epoch_steps: 100_000
-  save_steps: 500_000
+  epoch_steps: 1_000_000
+  save_steps: 10_000_000
   test_episodes: 5
   show_progress: true
   replace_checkpoint: false

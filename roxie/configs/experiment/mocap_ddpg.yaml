@@ -7,17 +7,25 @@ defaults:
 
 env:
   seed: 0
-  parallel_envs: 800
+  parallel_envs: 4000
   env_type: mocap
   env_name: null
   list_envs: false
-  xml_path: roxie/data/assets/humanoid_suite.xml
-  clip_path: roxie/data/clips/standing.npz
+  clip_ids: []
+  gpu_clip_budget: 200
+  # Physics backend: "jax" (MJX) or "warp" (mujoco_warp). Requires warp-lang
+  # <1.13 (see pyproject); verify with `uv run python scripts/check_warp.py`.
+  # naconmax = global contact buffer across ALL vmapped worlds (scales with
+  # parallel_envs); njmax = per-world constraint budget. null => auto-sized in
+  # train.py (parallel_envs*16 and 128). Watch for "overflow" warnings and bump.
+  impl: warp
+  naconmax: null
+  njmax: null
 
 trainer:
   steps: 1_000_000_000
-  epoch_steps: 100_000
-  save_steps: 500_000
+  epoch_steps: 1_000_000
+  save_steps: 10_000_000
   test_episodes: 5
   show_progress: true
   replace_checkpoint: false

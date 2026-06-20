@@ -13,6 +13,11 @@ env:
   list_envs: false
   xml_path: null
   clip_path: null
+  # Physics backend: "warp" (mujoco_warp) or "jax" (MJX). null naconmax/njmax
+  # keeps the playground env's own Warp budgets.
+  impl: warp
+  naconmax: null
+  njmax: null
 
 trainer:
   steps: 1_000_000_000

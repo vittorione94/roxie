@@ -184,6 +184,11 @@ class Agent(abc.ABC):
 
             # ocp.PyTreeCheckpointer().save(path, payload)
             checkpointer.save(path, payload)
+            # save() returns before the background write finishes. Block here so
+            # the write completes while the checkpointer is still alive; otherwise
+            # it can be torn down mid-write at exit ("cannot schedule new futures
+            # after shutdown").
+            checkpointer.wait_until_finished()
 
             print(f"[Agent.save] Saved to {path}")
         except Exception as e:

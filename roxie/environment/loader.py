@@ -97,16 +97,91 @@ class TerminationWrapper(wrapper.Wrapper):
         return WrapperState(env_state=final_env_state, step_count=new_step_count)
 
 
-def load_playground_env(env_name: str):
-    env = registry.load(env_name)
+def resolve_loaded_impl(env: Any) -> str:
+    """Read the physics backend actually used by a (possibly wrapped) env.
+
+    Reads the value off the constructed env rather than echoing config, so the
+    banner reflects what really loaded. The mocap env stores ``_impl``; the
+    playground envs store it on ``_config.impl``.
+    """
+    base = env
+    while hasattr(base, "env"):
+        base = base.env
+    impl = getattr(base, "_impl", None)
+    if impl is None:
+        cfg = getattr(base, "_config", None)
+        if cfg is not None and "impl" in cfg:
+            impl = cfg["impl"]
+    return impl or "unknown"
+
+
+def log_loaded_backend(env: Any, requested_impl: str | None = None) -> None:
+    """Print a loud banner reporting the loaded physics backend."""
+    actual = resolve_loaded_impl(env)
+    mismatch = requested_impl is not None and actual != requested_impl
+
+    bar = "=" * 70
+    lines = [
+        "",
+        bar,
+        f"  PHYSICS BACKEND LOADED:  impl = {actual.upper()}",
+    ]
+    if requested_impl is not None:
+        if mismatch:
+            lines.append(
+                f"  !!! MISMATCH !!!  requested {requested_impl!r} "
+                f"but env loaded {actual!r}"
+            )
+        else:
+            lines.append(f"  OK - matches requested impl = {requested_impl!r}")
+    lines += [bar, ""]
+    print("\n".join(lines), flush=True)
+
+
+def load_playground_env(
+    env_name: str,
+    impl: str | None = None,
+    naconmax: int | None = None,
+    njmax: int | None = None,
+):
+    """Load a mujoco_playground env, optionally forcing the physics backend.
+
+    The playground env configs expose ``impl`` (``"jax"``/``"warp"``) plus the
+    Warp contact/constraint budgets (``naconmax``/``njmax``). We override them
+    only when explicitly provided so each env keeps its upstream-tuned default
+    otherwise (e.g. Warp's per-env ``naconmax``).
+    """
     env_cfg = registry.get_default_config(env_name)
+    if impl is not None and "impl" in env_cfg:
+        env_cfg.impl = impl
+    if naconmax is not None and "naconmax" in env_cfg:
+        env_cfg.naconmax = naconmax
+    if njmax is not None and "njmax" in env_cfg:
+        env_cfg.njmax = njmax
+
+    env = registry.load(env_name, config=env_cfg)
     wrapped_env = TerminationWrapper(env)
     return wrapped_env, env_cfg
 
 
-def load_mocap_env(xml_path: str, clip_path: str):
+def load_mocap_env(
+    clip_ids: list[str] | None = None,
+    ctrl_dt: float = 0.025,
+    gpu_clip_budget: int = 0,
+    impl: str = "jax",
+    naconmax: int | None = None,
+    njmax: int | None = None,
+):
+    from roxie.data.cmu_mocap_data import build_cmu_humanoid, load_cmu_clips
     from roxie.environment.mocap_tracking import MocapTrackingEnv
 
-    env = MocapTrackingEnv(xml_path=xml_path, clip_path=clip_path)
-    wrapped_env = TerminationWrapper(env)
-    return wrapped_env
+    mj_model, xml_path = build_cmu_humanoid()
+    dataset = load_cmu_clips(mj_model, clip_ids=clip_ids, ctrl_dt=ctrl_dt)
+    env = MocapTrackingEnv(
+        mj_model=mj_model, dataset=dataset, gpu_clip_budget=gpu_clip_budget,
+        impl=impl, naconmax=naconmax, njmax=njmax,
+    )
+    env._xml_path = xml_path
+    train_wrapper = TerminationWrapper(env)
+    test_wrapper = TerminationWrapper(env)
+    return train_wrapper, test_wrapper, xml_path

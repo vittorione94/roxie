@@ -1,5 +1,10 @@
-import copy
 import os
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+# The warp backend (impl=warp) allocates GPU memory outside JAX's pool. Cap JAX
+# to a fraction of the device so warp has headroom (see train.py for rationale).
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
+
+import copy
 import time
 import xml.etree.ElementTree as ET
 
@@ -12,7 +17,11 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from roxie.agents import agents
-from roxie.environment.loader import load_mocap_env, load_playground_env
+from roxie.environment.loader import (
+    load_mocap_env,
+    load_playground_env,
+    log_loaded_backend,
+)
 
 
 def _build_ghost_model(xml_path):
@@ -26,7 +35,7 @@ def _build_ghost_model(xml_path):
     })
 
     worldbody = root.find("worldbody")
-    torso = worldbody.find("body[@name='torso']")
+    torso = worldbody.find("body[@name='root']")
     ghost = copy.deepcopy(torso)
 
     def _process(elem):
@@ -36,6 +45,8 @@ def _build_ghost_model(xml_path):
             elem.attrib["contype"] = "0"
             elem.attrib["conaffinity"] = "0"
             elem.attrib["material"] = "ghost"
+        if elem.tag == "freejoint":
+            elem.attrib["name"] = "ghost/" + elem.attrib.get("name", "freejoint")
         to_remove = [c for c in elem if c.tag in ("site", "camera", "light")]
         for c in to_remove:
             elem.remove(c)
@@ -59,10 +70,28 @@ def main(checkpoint_path):
 
     env_type = cfg.env.get("env_type", "playground")
     if env_type == "mocap":
-        env = load_mocap_env(cfg.env.xml_path, cfg.env.clip_path)
+        clip_ids = list(cfg.env.clip_ids) if cfg.env.get("clip_ids") else None
+        # Playback is single-env; loading all clips bakes the full reference
+        # arrays into the jitted step as constants and can exhaust GPU memory.
+        # Keep only a small pool on the GPU (the env still resets across them).
+        gpu_clip_budget = cfg.env.get("gpu_clip_budget", 0) or 32
+        env, _, xml_path = load_mocap_env(
+            clip_ids,
+            gpu_clip_budget=gpu_clip_budget,
+            impl=cfg.env.get("impl", "jax"),
+            naconmax=cfg.env.get("naconmax", None),
+            njmax=cfg.env.get("njmax", None),
+        )
         env_cfg = None
     else:
-        env, env_cfg = load_playground_env(cfg.env.env_name)
+        env, env_cfg = load_playground_env(
+            cfg.env.env_name,
+            impl=cfg.env.get("impl", "jax"),
+            naconmax=cfg.env.get("naconmax", None),
+            njmax=cfg.env.get("njmax", None),
+        )
+
+    log_loaded_backend(env, requested_impl=cfg.env.get("impl", "jax"))
 
     agent_args = {}
     if "actor" in cfg.agent:
@@ -83,10 +112,10 @@ def main(checkpoint_path):
 
     has_ghost = env_type == "mocap"
     if has_ghost:
-        model = _build_ghost_model(cfg.env.xml_path)
-        ref_clip = np.load(cfg.env.clip_path)
-        ref_qpos = ref_clip["qpos"]
-        ref_qvel = ref_clip["qvel"]
+        model = _build_ghost_model(xml_path)
+        mocap_env = env.env
+        ref_qpos = np.array(mocap_env._ref_qpos)
+        ref_qvel = np.array(mocap_env._ref_qvel)
         nq = env.mj_model.nq
         nv = env.mj_model.nv
     else:
@@ -114,11 +143,12 @@ def main(checkpoint_path):
             wrapped_state = jit_step(wrapped_state, action[0])
 
             if has_ghost:
-                phase_idx = int(wrapped_state.env_state.info["phase_idx"])
+                info = wrapped_state.env_state.info
+                abs_idx = int(info["clip_start"]) + int(info["phase_idx"])
                 data.qpos[:nq] = wrapped_state.env_state.data.qpos
                 data.qvel[:nv] = wrapped_state.env_state.data.qvel
-                data.qpos[nq:] = ref_qpos[phase_idx]
-                data.qvel[nv:] = ref_qvel[phase_idx]
+                data.qpos[nq:] = ref_qpos[abs_idx]
+                data.qvel[nv:] = ref_qvel[abs_idx]
             else:
                 data.qpos = wrapped_state.env_state.data.qpos
                 data.qvel = wrapped_state.env_state.data.qvel

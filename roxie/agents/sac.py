@@ -285,7 +285,9 @@ class SAC(Agent):
             observation=prev_states.obs,
             action=self.last_action,
             reward=states.reward,
-            terminal=states.done,
+            # True termination only, not `done` (termination OR truncation): a
+            # time-limit truncation must still bootstrap the next-state value.
+            terminal=states.info["termination"],
         )
 
         self.state.buffer_state = self.replay.add(self.state.buffer_state, experiences)

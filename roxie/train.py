@@ -1,4 +1,10 @@
-import copy
+import os
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+# The warp backend (impl=warp) allocates GPU memory outside JAX's pool. Rather
+# than disable preallocation (which fragments and OOMs on large contiguous
+# allocations like the replay buffer), cap JAX to a fraction of the device so
+# warp has headroom for its solver/collision scratch.
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
 
 import hydra
 import jax
@@ -8,7 +14,11 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
 from roxie.agents import agents
-from roxie.environment.loader import load_mocap_env, load_playground_env
+from roxie.environment.loader import (
+    load_mocap_env,
+    load_playground_env,
+    log_loaded_backend,
+)
 from roxie.utils.trainer import Trainer
 
 
@@ -20,11 +30,39 @@ def main(cfg: DictConfig):
     print("JAX platform:", jax.default_backend())
 
     env_type = cfg.env.get("env_type", "playground")
+    # Physics backend selection is shared across env types: "warp" routes the
+    # sim through mujoco_warp. naconmax is Warp's global contact arena (shared
+    # across all vmapped worlds, so it scales with parallel_envs); njmax is the
+    # per-world constraint budget.
+    impl = cfg.env.get("impl", "jax")
+    naconmax = cfg.env.get("naconmax", None)
+    njmax = cfg.env.get("njmax", None)
+
     if env_type == "mocap":
-        env = load_mocap_env(cfg.env.xml_path, cfg.env.clip_path)
+        clip_ids = list(cfg.env.clip_ids) if cfg.env.get("clip_ids") else None
+        gpu_clip_budget = cfg.env.get("gpu_clip_budget", 0)
+        # The mocap env has no built-in Warp budgets, so auto-size when unset.
+        if impl == "warp":
+            if naconmax is None:
+                naconmax = int(cfg.env.parallel_envs) * 16
+            if njmax is None:
+                njmax = 128
+        env, test_env, _ = load_mocap_env(
+            clip_ids,
+            gpu_clip_budget=gpu_clip_budget,
+            impl=impl,
+            naconmax=naconmax,
+            njmax=njmax,
+        )
         env_cfg = None
     else:
-        env, env_cfg = load_playground_env(cfg.env.env_name)
+        # Playground envs ship their own Warp budgets; pass through only what the
+        # experiment overrides (None leaves the upstream default in place).
+        env, env_cfg = load_playground_env(
+            cfg.env.env_name, impl=impl, naconmax=naconmax, njmax=njmax,
+        )
+        test_env = None
+    log_loaded_backend(env, requested_impl=impl)
     print("Environment configuration:", env_cfg)
 
     output_dir = HydraConfig.get().runtime.output_dir
@@ -64,8 +102,9 @@ def main(cfg: DictConfig):
         show_progress=cfg.trainer.show_progress,
         replace_checkpoint=cfg.trainer.replace_checkpoint,
     )
+    test_environment = test_env if test_env is not None else env
     trainer.initialize(
-        agent=agent, environment=env, test_environment=copy.deepcopy(env)
+        agent=agent, environment=env, test_environment=test_environment
     )
     trainer.run(cfg.env.parallel_envs, training_rngs)
 
