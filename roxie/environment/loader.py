@@ -162,26 +162,3 @@ def load_playground_env(
     env = registry.load(env_name, config=env_cfg)
     wrapped_env = TerminationWrapper(env)
     return wrapped_env, env_cfg
-
-
-def load_mocap_env(
-    clip_ids: list[str] | None = None,
-    ctrl_dt: float = 0.025,
-    gpu_clip_budget: int = 0,
-    impl: str = "jax",
-    naconmax: int | None = None,
-    njmax: int | None = None,
-):
-    from roxie.data.cmu_mocap_data import build_cmu_humanoid, load_cmu_clips
-    from roxie.environment.mocap_tracking import MocapTrackingEnv
-
-    mj_model, xml_path = build_cmu_humanoid()
-    dataset = load_cmu_clips(mj_model, clip_ids=clip_ids, ctrl_dt=ctrl_dt)
-    env = MocapTrackingEnv(
-        mj_model=mj_model, dataset=dataset, gpu_clip_budget=gpu_clip_budget,
-        impl=impl, naconmax=naconmax, njmax=njmax,
-    )
-    env._xml_path = xml_path
-    train_wrapper = TerminationWrapper(env)
-    test_wrapper = TerminationWrapper(env)
-    return train_wrapper, test_wrapper, xml_path

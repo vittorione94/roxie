@@ -2,7 +2,7 @@ _target_: roxie.exploration.noisy.OrnsteinUhlenbeckNoise
 initial_noise_scale: 0.1
 decay_schedule:
   _target_: roxie.exploration.schedulers.LinearDecay
-  decay_steps: 10_000_000
+  decay_steps: 1_000_000_000
   final_value: 0.01
 damping: 0.15
 mu: 0.0

@@ -30,16 +30,16 @@ For GPU-accelerated training, install the appropriate [JAX CUDA build](https://j
 
 ### Training
 
-Every training run is defined by an experiment config in `roxie/configs/experiment/`. Run one with:
+Every training run is defined by an experiment config in the top-level `experiments/` directory. Run one with:
 
 ```bash
-python -m roxie.train --config-name experiment/walker_ddpg
+python -m roxie.train --config-name walker_ddpg
 ```
 
 Override any parameter from the command line:
 
 ```bash
-python -m roxie.train --config-name experiment/walker_sac env.parallel_envs=400 trainer.save_steps=100_000
+python -m roxie.train --config-name walker_sac env.parallel_envs=400 trainer.save_steps=100_000
 ```
 
 ### Evaluation
@@ -52,17 +52,17 @@ python roxie/play.py --checkpoint-path outputs/2025-01-15/14-30-00/checkpoints/s
 
 ## Experiments
 
-Each YAML in `roxie/configs/experiment/` is a complete experiment definition &mdash; it selects an agent, noise strategy, environment, and trainer settings.
+Each YAML in `experiments/` is a complete experiment definition &mdash; it selects an agent, noise strategy, environment, and trainer settings. The mocap-tracking task is a self-contained example: its env, loader, and configs live under [`examples/mocap/`](examples/mocap/), and its experiment configs are picked up from `examples/mocap/configs/` by the same `--config-name` flag.
 
 | Experiment | Agent | Environment | Description |
 |---|---|---|---|
 | `walker_ddpg` | DDPG | WalkerWalk | Locomotion with deterministic policy |
 | `walker_ppo` | PPO | WalkerWalk | Locomotion with on-policy learning |
 | `walker_sac` | SAC | WalkerWalk | Locomotion with entropy-regularized policy |
-| `mocap_ddpg` | DDPG | Humanoid (mocap) | Motion-capture tracking with DDPG |
-| `mocap_sac` | SAC | Humanoid (mocap) | Motion-capture tracking with tuned SAC |
+| `mocap_ddpg` | DDPG | Humanoid (mocap) | Motion-capture tracking with DDPG (example) |
+| `mocap_sac` | SAC | Humanoid (mocap) | Motion-capture tracking with tuned SAC (example) |
 
-To create a new experiment, add a YAML to `roxie/configs/experiment/`. It composes agent and noise configs from the corresponding subdirectories:
+To create a new experiment, add a YAML to `experiments/`. It composes agent and noise configs from `roxie/configs/`:
 
 ```yaml
 # @package _global_

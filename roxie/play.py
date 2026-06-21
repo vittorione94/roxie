@@ -5,6 +5,7 @@ os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
 
 import copy
+import sys
 import time
 import xml.etree.ElementTree as ET
 
@@ -18,10 +19,14 @@ from omegaconf import OmegaConf
 
 from roxie.agents import agents
 from roxie.environment.loader import (
-    load_mocap_env,
     load_playground_env,
     log_loaded_backend,
 )
+from roxie.utils import hydra_searchpath
+
+# examples/ is not part of the installed roxie package; put the repo root on the
+# path so the mocap example (imported lazily for mocap checkpoints) is importable.
+sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 
 def _build_ghost_model(xml_path):
@@ -70,6 +75,8 @@ def main(checkpoint_path):
 
     env_type = cfg.env.get("env_type", "playground")
     if env_type == "mocap":
+        from examples.mocap.loader import load_mocap_env
+
         clip_ids = list(cfg.env.clip_ids) if cfg.env.get("clip_ids") else None
         # Playback is single-env; loading all clips bakes the full reference
         # arrays into the jitted step as constants and can exhaust GPU memory.
