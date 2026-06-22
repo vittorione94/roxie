@@ -9,7 +9,7 @@ A reinforcement learning framework built on JAX for continuous control in MuJoCo
 ## Features
 
 - **Massively parallel training** via JAX's `vmap`/`jit` over MJX environments (800+ parallel envs by default)
-- **Multiple RL algorithms** &mdash; DDPG, SAC, PPO out of the box
+- **Multiple RL algorithms** &mdash; DDPG, TD3, SAC, MPO, PPO out of the box
 - **Experiment-driven configuration** &mdash; each experiment is a self-contained YAML, managed by Hydra
 - **Modular actor/critic networks** built with Flax NNX, configurable per-experiment
 - **Exploration noise modules** &mdash; Ornstein-Uhlenbeck, Gaussian, composite, and adaptive
@@ -98,6 +98,7 @@ hydra:
 | **DDPG** | Off-policy | Deterministic | Q(s,a) | Flat replay buffer |
 | **TD3** | Off-policy | Deterministic | Twin Q(s,a) | Flat replay buffer |
 | **SAC** | Off-policy | Stochastic (squashed Gaussian) | Twin Q(s,a) | Flat replay buffer |
+| **MPO** | Off-policy | Stochastic (Gaussian) | Q(s,a) | Flat replay buffer |
 | **PPO** | On-policy | Stochastic (Gaussian) | V(s) | Trajectory queue |
 
 All agents share a common base class (`roxie.agents.agent.Agent`) that handles observation normalization, checkpointing, and the step/add/update interface consumed by the trainer.
