@@ -25,10 +25,15 @@ def _grad_step(
     target_noise_clip: float,
     action_low: float,
     action_high: float,
-    obs_eps: float,
+    obs_mean: jnp.ndarray,
+    obs_std: jnp.ndarray,
     obs_clip: float,
 ):
-    """Performs one full gradient update step and returns the new state."""
+    """Performs one full gradient update step and returns the new state.
+
+    `obs_mean`/`obs_std` are passed in (not recomputed): `obs_stats` is constant
+    across the update loop, so they are hoisted out by `_grad_steps`.
+    """
     # 1. Sample from the replay buffer
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
@@ -43,9 +48,6 @@ def _grad_step(
         "next_observations": samples.experience.second.observation,
         "terminals": samples.experience.first.terminal,
     }
-
-    # 1.1 Compute current normalization parameters
-    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
     # 2. Critic update
     critic_loss, critic_grads = nnx.value_and_grad(ddpg_critic_loss_fn)(
@@ -112,11 +114,19 @@ def _grad_step(
     )
 
 
-# Fused N-step update. `n_steps` is static, so the Python loop unrolls at trace
-# time into a single compiled program — one dispatch instead of N, with no
-# per-step Python / nnx graph-traversal overhead and no GPU idling between steps.
+# Fused N-step update. The body is compiled once and run `n_steps` times on-device
+# via `lax.scan` (instead of unrolling the Python loop, which at large `n_steps`
+# blows up compile time and the HLO graph). Only the trainable graph state is
+# carried; `buffer_state` and the observation normalization params are constant
+# across the loop and closed over.
 @functools.partial(
-    nnx.jit, static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps")
+    nnx.jit,
+    static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps"),
+    # Donate the train state (arg 0): its large read-only replay buffer is
+    # threaded unchanged through the scan, so without donation XLA allocates a
+    # full second copy of the buffer (~1.4GB for 500k obs) every update. The
+    # caller reassigns self.state from the result, so donating is safe.
+    donate_argnums=(0,),
 )
 def _grad_steps(
     state: TrainState,
@@ -132,11 +142,20 @@ def _grad_steps(
     obs_eps: float,
     obs_clip: float,
 ):
-    actor_loss = critic_loss = 0.0
-    for i in range(n_steps):
-        key, step_key = jax.random.split(key)
-        state, actor_loss, critic_loss = _grad_step(
-            state,
+    # Hoist the (loop-constant) normalization params out of the scan body.
+    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
+
+    # Pre-split all per-step keys so they can be scanned over as `xs`.
+    keys = jax.random.split(key, n_steps)
+
+    # Split into a static graph definition + the trainable pytree state. Only the
+    # state is carried through the scan; the graphdef is closed over.
+    graphdef, scan_state = nnx.split(state)
+
+    def body(scan_state, step_key):
+        st = nnx.merge(graphdef, scan_state)
+        st, actor_loss, critic_loss = _grad_step(
+            st,
             step_key,
             gamma,
             tau,
@@ -145,10 +164,18 @@ def _grad_steps(
             target_noise_clip,
             action_low,
             action_high,
-            obs_eps,
+            obs_mean,
+            obs_std,
             obs_clip,
         )
-    return state, actor_loss, critic_loss
+        _, scan_state = nnx.split(st)
+        return scan_state, (actor_loss, critic_loss)
+
+    scan_state, (actor_losses, critic_losses) = jax.lax.scan(body, scan_state, keys)
+    state = nnx.merge(graphdef, scan_state)
+
+    # Average over the update steps for less noisy logging (was: last step only).
+    return state, jnp.mean(actor_losses), jnp.mean(critic_losses)
 
 
 class DDPG(Agent):

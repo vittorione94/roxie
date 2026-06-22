@@ -8,7 +8,9 @@ defaults:
 env:
   seed: 0
   parallel_envs: 800
-  env_type: playground
+  # Env factory resolved by train.py/play.py (see hydra.utils.get_method).
+  # This is also the default, so it may be omitted for playground envs.
+  builder: roxie.environment.loader.build_playground_env
   env_name: WalkerWalk
   list_envs: false
   xml_path: null

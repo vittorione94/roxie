@@ -87,11 +87,15 @@ class OrnsteinUhlenbeckNoise(NoiseModule):
         action_shape: tuple,
         initial_noise_scale: float = 0.1,
         decay_schedule: Optional[DecaySchedule] = None,
-        damping: float = 0.15,
+        theta: float = 0.15,
+        dt: float = 1.0,
+        clip: float = 2.0,
         mu: float = 0.0,
     ):
         super().__init__(action_shape, initial_noise_scale, decay_schedule)
-        self.damping = damping
+        self.theta = theta
+        self.dt = dt
+        self.clip = clip
         self.mu = mu
         # Initialize the noise state
         self.noise_state = nnx.Variable(jnp.zeros(action_shape))
@@ -100,15 +104,19 @@ class OrnsteinUhlenbeckNoise(NoiseModule):
         self, key: jax.random.PRNGKey, shape: Optional[tuple] = None
     ) -> jnp.ndarray:
         # OU process: dx = theta * (mu - x) * dt + sigma * dW
-        # Discretized: x_t = x_{t-1} + theta * (mu - x_{t-1}) + sigma * noise
+        # Discretized: x_t = x_{t-1} + theta * (mu - x_{t-1}) * dt + sqrt(dt) * noise
+        # Same parameterization as roxie.agents.basic.OrnsteinUhlenbeck, so
+        # `theta` is the continuous-time mean-reversion rate in both.
         current_noise = self.noise_state.value
 
         # Mean reversion term
-        mean_reversion = self.damping * (self.mu - current_noise)
+        mean_reversion = self.theta * self.dt * (self.mu - current_noise)
 
-        # Random component
+        # Random component (gaussian sample clipped per step, then scaled by
+        # sqrt(dt) -- same order as roxie.agents.basic.OrnsteinUhlenbeck).
         shape = shape or self.action_shape
-        random_component = jax.random.normal(key, shape)
+        gaussian = jnp.clip(jax.random.normal(key, shape), -self.clip, self.clip)
+        random_component = jnp.sqrt(self.dt) * gaussian
 
         # Update noise state
         new_noise = current_noise + mean_reversion + random_component
@@ -127,7 +135,9 @@ class OrnsteinUhlenbeckNoise(NoiseModule):
             "initial_noise_scale": self.initial_noise_scale,
             "decay_schedule": self.decay_schedule.__class__.__name__,
             "action_shape": self.action_shape,
-            "damping": self.damping,
+            "theta": self.theta,
+            "dt": self.dt,
+            "clip": self.clip,
             "mu": self.mu,
         }
 

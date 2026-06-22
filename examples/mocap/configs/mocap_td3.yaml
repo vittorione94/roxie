@@ -8,16 +8,40 @@ defaults:
 env:
   seed: 0
   parallel_envs: 4000
-  env_type: mocap
+  # Experiment-injected env factory + viewer hook (resolved by train.py /
+  # play.py via hydra.utils.get_method), so the core loops never branch on
+  # an env-type string.
+  builder: examples.mocap.loader.build_mocap_env
+  viewer: examples.mocap.loader.mocap_viewer_extras
   env_name: null
   list_envs: false
   clip_ids: []
-  gpu_clip_budget: 200
+  gpu_clip_budget: 0 
   # Physics backend: "jax" (MJX) or "warp" (mujoco_warp). Requires warp-lang
   # <1.13 (see pyproject); verify with `uv run python scripts/check_warp.py`.
   impl: warp
   naconmax: null
   njmax: null
+  # naccdmax = GJK/EPA convex-narrowphase budget. Defaults (mujoco_warp) to the
+  # full naconmax, whose EPA scratch reserves ~90MB/buffer and OOMs at high
+  # parallel_envs. Only the 2 hand ellipsoids use this path (max ~2/world), so
+  # build_mocap_env caps it at parallel_envs*4. null => that auto-cap.
+  naccdmax: null
+  # Full humanoid self-collision (limbs collide with each other, not just the
+  # floor). ~15 actual contacts/world but broadphase candidates peak ~48/world
+  # (so naconmax auto-sizes at parallel_envs*64). Memory stays bounded by the
+  # budgets. Set false for ground-only contacts.
+  self_collisions: true
+  # Early-termination curriculum (DeepMimic-style). Terminates an episode when
+  # the joint-pose or root (pos+orientation) tracking error exceeds a bound that
+  # widens with training progress (steps/trainer.steps, so independent of
+  # parallel_envs): tight at step 0 -> loose at relax_fraction of training, after
+  # which the tracking-error check is off (only head-height/NaN remain). Errors
+  # are in _get_reward units. Omit this block to use the env's default_config.
+  termination_curriculum:
+    enabled: true
+    pose: 5.0
+    root: 0.1
 
 trainer:
   steps: 1_000_000_000

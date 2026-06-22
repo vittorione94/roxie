@@ -17,7 +17,7 @@ args:
 actor:
   _target_: roxie.models.actors.DeterministicActor
   features: [256, 256]
-  use_layer_norm: false
+  use_layer_norm: true
   dropout_rate: 0.
 
 critic:
@@ -30,6 +30,6 @@ memory:
   _target_: flashbax.buffers.make_flat_buffer
   max_length: 500_000
   min_length: 1_000
-  sample_batch_size: 256
+  sample_batch_size: 512
   add_sequences: False
   add_batch_size: ${env.parallel_envs}

@@ -46,7 +46,7 @@ def build_cmu_humanoid() -> tuple[mujoco.MjModel, str]:
     Returns ``(mj_model, xml_path)`` where *xml_path* points to a cached
     compiled XML that can be reused for ghost-model building, etc.
     """
-    cache_path = os.path.join(_CACHE_DIR, "cmu_humanoid_v2020.xml")
+    cache_path = os.path.join(_CACHE_DIR, "cmu_humanoid_v2020_grid.xml")
 
     if os.path.exists(cache_path):
         model = mujoco.MjModel.from_xml_path(cache_path)
@@ -55,10 +55,27 @@ def build_cmu_humanoid() -> tuple[mujoco.MjModel, str]:
     tree = ET.parse(_WALKER_XML)
     root = tree.getroot()
 
+    # Classic dm_control blue checkered floor (texture + material).
+    asset = root.find("asset")
+    if asset is None:
+        asset = ET.SubElement(root, "asset")
+    ET.SubElement(
+        asset, "texture",
+        {"name": "grid", "type": "2d", "builtin": "checker",
+         "rgb1": ".1 .2 .3", "rgb2": ".2 .3 .4",
+         "width": "512", "height": "512"},
+    )
+    ET.SubElement(
+        asset, "material",
+        {"name": "grid", "texture": "grid", "texrepeat": "1 1",
+         "texuniform": "true", "reflectance": ".2"},
+    )
+
     worldbody = root.find("worldbody")
     ET.SubElement(
         worldbody, "geom",
-        {"name": "floor", "type": "plane", "size": "100 100 0.2"},
+        {"name": "floor", "type": "plane", "size": "100 100 0.2",
+         "material": "grid"},
     )
     ET.SubElement(
         worldbody, "light",

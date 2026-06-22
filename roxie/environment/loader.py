@@ -1,4 +1,4 @@
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 import jax.numpy as jnp
 from flax import struct
@@ -162,3 +162,38 @@ def load_playground_env(
     env = registry.load(env_name, config=env_cfg)
     wrapped_env = TerminationWrapper(env)
     return wrapped_env, env_cfg
+
+
+class EnvBundle(NamedTuple):
+    """Normalized result of an env builder.
+
+    ``test_env`` is the env used for evaluation rollouts (None means "reuse the
+    training env"); ``env_cfg`` is the resolved env config when one exists (the
+    playground registry returns one; bespoke example envs may not).
+    """
+
+    env: Any
+    test_env: Any
+    env_cfg: Any
+
+
+def build_playground_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
+    """Builder for mujoco_playground envs.
+
+    This is the default builder: experiments that don't set ``env.builder`` get
+    a playground env loaded by ``env.env_name``. ``mode`` is part of the builder
+    protocol (train.py passes "train", play.py "play") but playground envs load
+    identically for both. Override semantics for ``naconmax``/``njmax`` match
+    ``load_playground_env``: ``None`` leaves the env's upstream Warp budget.
+    """
+    env, env_cfg = load_playground_env(
+        cfg_env.env_name,
+        impl=cfg_env.get("impl", "jax"),
+        naconmax=cfg_env.get("naconmax", None),
+        njmax=cfg_env.get("njmax", None),
+    )
+    return EnvBundle(env=env, test_env=None, env_cfg=env_cfg)
+
+
+# Dotted path of the default builder, used when ``env.builder`` is unset.
+DEFAULT_BUILDER = "roxie.environment.loader.build_playground_env"

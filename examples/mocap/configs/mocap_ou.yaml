@@ -1,0 +1,52 @@
+# @package _global_
+
+# Ornstein-Uhlenbeck baseline on the mocap tracking task. This is a
+# non-learning agent (no actor/critic/replay/noise groups): it just drives the
+# humanoid with temporally correlated random actions. Handy as a sanity check
+# for the env wiring and a floor for the learned agents' scores.
+#
+#   train: uv run python -m roxie.train --config-name mocap_ou
+#   play:  uv run python -m roxie.play --checkpoint-path <run>/checkpoints/step_<N>
+
+defaults:
+  - /agent: ou
+  - _self_
+
+env:
+  seed: 0
+  parallel_envs: 800
+  # Experiment-injected env factory + viewer hook (resolved by train.py /
+  # play.py via hydra.utils.get_method), so the core loops never branch on
+  # an env-type string.
+  builder: examples.mocap.loader.build_mocap_env
+  viewer: examples.mocap.loader.mocap_viewer_extras
+  env_name: null
+  list_envs: false
+  clip_ids: []
+  gpu_clip_budget: 100
+  # Physics backend: "jax" (MJX) or "warp" (mujoco_warp). See mocap_sac.yaml /
+  # mocap_ddpg.yaml for the budget-tuning notes when switching to warp.
+  impl: warp
+  naconmax: null
+  njmax: null
+  # Full humanoid self-collision (limbs collide with each other, not just the
+  # floor). Set false for ground-only contacts if memory-constrained.
+  self_collisions: true
+  # Non-learning baseline: keep the termination curriculum OFF so the OU process
+  # is measured against the true task (head-height/NaN termination only). The
+  # learned configs (sac/ddpg/td3) enable it. See default_config() for the fields.
+  termination_curriculum:
+    enabled: false
+
+trainer:
+  # No learning happens, so this is just how long to roll the baseline for.
+  steps: 10_000_000
+  epoch_steps: 100_000
+  save_steps: 100_000
+  test_episodes: 5
+  show_progress: true
+  replace_checkpoint: false
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}

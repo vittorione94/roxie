@@ -27,10 +27,15 @@ def _grad_step(
     target_noise_clip: float,
     action_low: float,
     action_high: float,
-    obs_eps: float,
+    obs_mean: jnp.ndarray,
+    obs_std: jnp.ndarray,
     obs_clip: float,
-    update_actor: bool,
+    update_actor,
 ):
+    """One TD3 step. `obs_mean`/`obs_std` are hoisted in by `_grad_steps` (the
+    stats are loop-constant). `update_actor` is a *traced* boolean here: the actor
+    and target updates run under `nnx.cond` so the delayed-policy-update trick
+    survives the `lax.scan` (where the step index is no longer static)."""
     # 1. Sample from the replay buffer
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
@@ -42,8 +47,6 @@ def _grad_step(
         "next_observations": samples.experience.second.observation,
         "terminals": samples.experience.first.terminal,
     }
-
-    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
     # 2. Critic update (twin critic, clipped double-Q target) — every step
     critic_loss, critic_grads = nnx.value_and_grad(td3_critic_loss_fn)(
@@ -63,9 +66,10 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # 3. Delayed actor + target updates — only every `policy_delay` steps
-    actor_loss = 0.0
-    if update_actor:
+    # 3. Delayed actor + target updates — only on steps where `update_actor` is
+    # True. Under `lax.scan` the step index is traced, so this must be a runtime
+    # branch (`nnx.cond`) rather than a Python `if`.
+    def _actor_update(state):
         actor_loss, actor_grads = nnx.value_and_grad(td3_actor_loss_fn)(
             state.actor,
             state.critic,
@@ -95,6 +99,12 @@ def _grad_step(
 
         nnx.update(state.target_actor, new_target_actor_tensors)
         nnx.update(state.target_critic, new_target_critic_tensors)
+        return actor_loss
+
+    def _skip_actor_update(state):
+        return jnp.array(0.0, dtype=critic_loss.dtype)
+
+    actor_loss = nnx.cond(update_actor, _actor_update, _skip_actor_update, state)
 
     return (
         TrainState(
@@ -112,12 +122,19 @@ def _grad_step(
     )
 
 
-# Fused N-step update. `n_steps` and `policy_delay` are static, so the Python
-# loop unrolls at trace time into a single compiled program with the delayed
-# actor updates baked in.
+# Fused N-step update. The body is compiled once and run `n_steps` times on-device
+# via `lax.scan` (instead of unrolling, which blows up compile time / HLO size at
+# large `n_steps`). The delayed-policy-update schedule is precomputed as a boolean
+# mask scanned over alongside the per-step keys. Only the trainable graph state is
+# carried; `buffer_state` and the normalization params are loop-constant.
 @functools.partial(
     nnx.jit,
     static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps", "policy_delay"),
+    # Donate the train state (arg 0): its large read-only replay buffer is
+    # threaded unchanged through the scan, so without donation XLA allocates a
+    # full second copy of the buffer (~1.4GB for 500k obs) every update. The
+    # caller reassigns self.state from the result, so donating is safe.
+    donate_argnums=(0,),
 )
 def _grad_steps(
     state: TrainState,
@@ -134,12 +151,20 @@ def _grad_steps(
     obs_clip: float,
     policy_delay: int,
 ):
-    actor_loss = critic_loss = 0.0
-    for i in range(n_steps):
-        key, step_key = jax.random.split(key)
-        update_actor = (i % policy_delay) == 0
-        state, step_actor_loss, critic_loss = _grad_step(
-            state,
+    # Hoist the (loop-constant) normalization params out of the scan body.
+    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
+
+    # Pre-split per-step keys and precompute the delayed-update schedule.
+    keys = jax.random.split(key, n_steps)
+    update_mask = (jnp.arange(n_steps) % policy_delay) == 0
+
+    graphdef, scan_state = nnx.split(state)
+
+    def body(scan_state, xs):
+        step_key, update_actor = xs
+        st = nnx.merge(graphdef, scan_state)
+        st, actor_loss, critic_loss = _grad_step(
+            st,
             step_key,
             gamma,
             tau,
@@ -148,13 +173,22 @@ def _grad_steps(
             target_noise_clip,
             action_low,
             action_high,
-            obs_eps,
+            obs_mean,
+            obs_std,
             obs_clip,
             update_actor,
         )
-        if update_actor:
-            actor_loss = step_actor_loss
-    return state, actor_loss, critic_loss
+        _, scan_state = nnx.split(st)
+        return scan_state, (actor_loss, critic_loss)
+
+    scan_state, (actor_losses, critic_losses) = jax.lax.scan(
+        body, scan_state, (keys, update_mask)
+    )
+    state = nnx.merge(graphdef, scan_state)
+
+    # Actor loss only on update steps → average over those; critic over all steps.
+    actor_loss = jnp.sum(actor_losses) / jnp.maximum(jnp.sum(update_mask), 1)
+    return state, actor_loss, jnp.mean(critic_losses)
 
 
 class TD3(DDPG):

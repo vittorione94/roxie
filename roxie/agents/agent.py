@@ -215,25 +215,42 @@ class Agent(abc.ABC):
         hyper = loaded.get("hyperparams", {})
         print(hyper)
 
-        valid_params = set(inspect.signature(cls.__init__).parameters.keys())
-        filtered_hyper = {k: v for k, v in (hyper or {}).items() if k in valid_params}
-        if noise_config:
-            agent = cls(
-                actor_config=actor_config,
-                critic_config=critic_config,
-                memory_config=memory_config,
-                noise_config=noise_config,
-                **(filtered_hyper or {}),
-            )
-        else:
-            agent = cls(
-                env_obs_size=env_obs_size,
-                env_action_size=env_act_size,
-                actor_config=actor_config,
-                critic_config=critic_config,
-                memory_config=memory_config,
-                **(filtered_hyper or {}),
-            )
+        # Collect accepted __init__ params across the whole MRO. Subclasses like
+        # TD3 forward via ``*args, **kwargs``, so inspecting only ``cls.__init__``
+        # would miss the parent's hyperparams (action_low/high, gamma, tau, ...)
+        # and silently drop them from ``filtered_hyper``.
+        valid_params = set()
+        for klass in cls.__mro__:
+            init = klass.__dict__.get("__init__")
+            if init is not None:
+                valid_params |= set(inspect.signature(init).parameters.keys())
+        # Keys we set explicitly below must not also come from the checkpoint,
+        # or cls(**...) would receive duplicate keyword arguments.
+        explicit_keys = {
+            "env_obs_size",
+            "env_action_size",
+            "actor_config",
+            "critic_config",
+            "memory_config",
+            "noise_config",
+        }
+        filtered_hyper = {
+            k: v
+            for k, v in (hyper or {}).items()
+            if k in valid_params and k not in explicit_keys
+        }
+
+        init_kwargs = dict(
+            env_obs_size=env_obs_size,
+            env_action_size=env_act_size,
+            actor_config=actor_config,
+            critic_config=critic_config,
+            memory_config=memory_config,
+            **(filtered_hyper or {}),
+        )
+        if noise_config is not None:
+            init_kwargs["noise_config"] = noise_config
+        agent = cls(**init_kwargs)
 
         # Minimal fields commonly used at play time
         hyper = ckpt_state.get("hyperparams", {}) or {}

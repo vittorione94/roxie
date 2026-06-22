@@ -12,6 +12,8 @@ noise_modules:
       _target_: exploration.schedulers.LinearDecay
       decay_steps: 100000
       final_value: 0.005
-    damping: 0.15
+    theta: 0.15
+    dt: 1e-2
+    clip: 2.0
     mu: 0.0
 weights: [0.3, 0.7]

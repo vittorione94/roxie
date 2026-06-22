@@ -15,9 +15,11 @@ from flax import nnx
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
+from hydra.utils import get_method
+
 from roxie.agents import agents
 from roxie.environment.loader import (
-    load_playground_env,
+    DEFAULT_BUILDER,
     log_loaded_backend,
 )
 from roxie.utils import hydra_searchpath
@@ -39,41 +41,15 @@ def main(cfg: DictConfig):
     print("JAX devices:", jax.devices())
     print("JAX platform:", jax.default_backend())
 
-    env_type = cfg.env.get("env_type", "playground")
-    # Physics backend selection is shared across env types: "warp" routes the
-    # sim through mujoco_warp. naconmax is Warp's global contact arena (shared
-    # across all vmapped worlds, so it scales with parallel_envs); njmax is the
-    # per-world constraint budget.
+    # Each experiment names the callable that builds its env via ``env.builder``
+    # (a dotted path); the default builds a mujoco_playground env. The builder
+    # owns all env-specific setup (clip selection, Warp budget sizing, ...) and
+    # returns a normalized EnvBundle, so this loop stays env-agnostic. ``impl``
+    # selects the physics backend ("warp" routes through mujoco_warp) and is read
+    # here only for the load banner — the builder reads it off cfg.env itself.
     impl = cfg.env.get("impl", "jax")
-    naconmax = cfg.env.get("naconmax", None)
-    njmax = cfg.env.get("njmax", None)
-
-    if env_type == "mocap":
-        from examples.mocap.loader import load_mocap_env
-
-        clip_ids = list(cfg.env.clip_ids) if cfg.env.get("clip_ids") else None
-        gpu_clip_budget = cfg.env.get("gpu_clip_budget", 0)
-        # The mocap env has no built-in Warp budgets, so auto-size when unset.
-        if impl == "warp":
-            if naconmax is None:
-                naconmax = int(cfg.env.parallel_envs) * 16
-            if njmax is None:
-                njmax = 128
-        env, test_env, _ = load_mocap_env(
-            clip_ids,
-            gpu_clip_budget=gpu_clip_budget,
-            impl=impl,
-            naconmax=naconmax,
-            njmax=njmax,
-        )
-        env_cfg = None
-    else:
-        # Playground envs ship their own Warp budgets; pass through only what the
-        # experiment overrides (None leaves the upstream default in place).
-        env, env_cfg = load_playground_env(
-            cfg.env.env_name, impl=impl, naconmax=naconmax, njmax=njmax,
-        )
-        test_env = None
+    build_env = get_method(cfg.env.get("builder", DEFAULT_BUILDER))
+    env, test_env, env_cfg = build_env(cfg.env, mode="train")
     log_loaded_backend(env, requested_impl=impl)
     print("Environment configuration:", env_cfg)
 

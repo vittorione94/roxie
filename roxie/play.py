@@ -4,22 +4,21 @@ os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 # to a fraction of the device so warp has headroom (see train.py for rationale).
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
 
-import copy
 import sys
 import time
-import xml.etree.ElementTree as ET
 
 import click
 import jax
 import jax.numpy as jnp
 import mujoco
 import mujoco.viewer
-import numpy as np
 from omegaconf import OmegaConf
+
+from hydra.utils import get_method
 
 from roxie.agents import agents
 from roxie.environment.loader import (
-    load_playground_env,
+    DEFAULT_BUILDER,
     log_loaded_backend,
 )
 from roxie.utils import hydra_searchpath
@@ -27,42 +26,6 @@ from roxie.utils import hydra_searchpath
 # examples/ is not part of the installed roxie package; put the repo root on the
 # path so the mocap example (imported lazily for mocap checkpoints) is importable.
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
-
-
-def _build_ghost_model(xml_path):
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-
-    asset = root.find("asset")
-    ET.SubElement(asset, "material", {
-        "name": "ghost",
-        "rgba": "0.2 0.8 0.2 0.3",
-    })
-
-    worldbody = root.find("worldbody")
-    torso = worldbody.find("body[@name='root']")
-    ghost = copy.deepcopy(torso)
-
-    def _process(elem):
-        if "name" in elem.attrib:
-            elem.attrib["name"] = "ghost/" + elem.attrib["name"]
-        if elem.tag == "geom":
-            elem.attrib["contype"] = "0"
-            elem.attrib["conaffinity"] = "0"
-            elem.attrib["material"] = "ghost"
-        if elem.tag == "freejoint":
-            elem.attrib["name"] = "ghost/" + elem.attrib.get("name", "freejoint")
-        to_remove = [c for c in elem if c.tag in ("site", "camera", "light")]
-        for c in to_remove:
-            elem.remove(c)
-        for child in elem:
-            _process(child)
-
-    _process(ghost)
-    worldbody.append(ghost)
-
-    xml_string = ET.tostring(root, encoding="unicode")
-    return mujoco.MjModel.from_xml_string(xml_string)
 
 
 @click.command()
@@ -73,30 +36,11 @@ def main(checkpoint_path):
 
     key = jax.random.PRNGKey(seed=0)
 
-    env_type = cfg.env.get("env_type", "playground")
-    if env_type == "mocap":
-        from examples.mocap.loader import load_mocap_env
-
-        clip_ids = list(cfg.env.clip_ids) if cfg.env.get("clip_ids") else None
-        # Playback is single-env; loading all clips bakes the full reference
-        # arrays into the jitted step as constants and can exhaust GPU memory.
-        # Keep only a small pool on the GPU (the env still resets across them).
-        gpu_clip_budget = cfg.env.get("gpu_clip_budget", 0) or 32
-        env, _, xml_path = load_mocap_env(
-            clip_ids,
-            gpu_clip_budget=gpu_clip_budget,
-            impl=cfg.env.get("impl", "jax"),
-            naconmax=cfg.env.get("naconmax", None),
-            njmax=cfg.env.get("njmax", None),
-        )
-        env_cfg = None
-    else:
-        env, env_cfg = load_playground_env(
-            cfg.env.env_name,
-            impl=cfg.env.get("impl", "jax"),
-            naconmax=cfg.env.get("naconmax", None),
-            njmax=cfg.env.get("njmax", None),
-        )
+    # Same builder protocol as train.py: ``env.builder`` names the env factory;
+    # ``mode="play"`` lets it apply playback-specific tweaks (the mocap builder
+    # shrinks its GPU clip pool here).
+    build_env = get_method(cfg.env.get("builder", DEFAULT_BUILDER))
+    env, _, env_cfg = build_env(cfg.env, mode="play")
 
     log_loaded_backend(env, requested_impl=cfg.env.get("impl", "jax"))
 
@@ -117,16 +61,12 @@ def main(checkpoint_path):
         **agent_args,
     )
 
-    has_ghost = env_type == "mocap"
-    if has_ghost:
-        model = _build_ghost_model(xml_path)
-        mocap_env = env.env
-        ref_qpos = np.array(mocap_env._ref_qpos)
-        ref_qvel = np.array(mocap_env._ref_qvel)
-        nq = env.mj_model.nq
-        nv = env.mj_model.nv
-    else:
-        model = env.mj_model
+    # Optional per-env viewer overrides, injected via ``env.viewer`` (a dotted
+    # path). The mocap example uses this to render a reference "ghost" alongside
+    # the policy; envs that don't set it just render their own model.
+    viewer_path = cfg.env.get("viewer", None)
+    ghost = get_method(viewer_path)(env) if viewer_path else None
+    model = ghost.model if ghost is not None else env.mj_model
 
     data = mujoco.MjData(model)
 
@@ -149,13 +89,13 @@ def main(checkpoint_path):
 
             wrapped_state = jit_step(wrapped_state, action[0])
 
-            if has_ghost:
+            if ghost is not None:
                 info = wrapped_state.env_state.info
                 abs_idx = int(info["clip_start"]) + int(info["phase_idx"])
-                data.qpos[:nq] = wrapped_state.env_state.data.qpos
-                data.qvel[:nv] = wrapped_state.env_state.data.qvel
-                data.qpos[nq:] = ref_qpos[abs_idx]
-                data.qvel[nv:] = ref_qvel[abs_idx]
+                data.qpos[:ghost.nq] = wrapped_state.env_state.data.qpos
+                data.qvel[:ghost.nv] = wrapped_state.env_state.data.qvel
+                data.qpos[ghost.nq:] = ghost.ref_qpos[abs_idx]
+                data.qvel[ghost.nv:] = ghost.ref_qvel[abs_idx]
             else:
                 data.qpos = wrapped_state.env_state.data.qpos
                 data.qvel = wrapped_state.env_state.data.qvel
