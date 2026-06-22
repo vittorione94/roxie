@@ -25,16 +25,17 @@ from roxie.environment.loader import (
 from roxie.utils import hydra_searchpath, logger
 from roxie.utils.trainer import Trainer
 
-# The launchable experiment configs live in top-level experiments/ and the mocap
-# example under examples/mocap/configs/ — register them on Hydra's search path so
-# `--config-name <name>` resolves there while groups stay in roxie/configs.
+# The launchable experiment configs live in top-level experiments/, grouped by
+# env into ant/, walker/, mocap/ subfolders — register that dir on Hydra's search
+# path so `--config-name <env>/<name>` resolves there while groups stay in
+# roxie/configs.
 hydra_searchpath.register()
 # examples/ is not part of the installed roxie package; put the repo root on the
 # path so the mocap example (imported lazily below) is importable from anywhere.
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="walker_ddpg")
+@hydra.main(version_base=None, config_path="configs", config_name="walker/walker_ddpg")
 def main(cfg: DictConfig):
     print(cfg.agent.name)
 

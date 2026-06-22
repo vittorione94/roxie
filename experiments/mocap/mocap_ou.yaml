@@ -1,8 +1,15 @@
 # @package _global_
 
+# Ornstein-Uhlenbeck baseline on the mocap tracking task. This is a
+# non-learning agent (no actor/critic/replay/noise groups): it just drives the
+# humanoid with temporally correlated random actions. Handy as a sanity check
+# for the env wiring and a floor for the learned agents' scores.
+#
+#   train: uv run python -m roxie.train --config-name mocap/mocap_ou
+#   play:  uv run python -m roxie.play --checkpoint-path <run>/checkpoints/step_<N>
+
 defaults:
-  - /agent: sac_mocap
-  - /noise: ou
+  - /agent: ou
   - _self_
 
 env:
@@ -17,34 +24,25 @@ env:
   list_envs: false
   clip_ids: []
   gpu_clip_budget: 100
-  # Physics backend: "jax" (MJX) or "warp" (mujoco_warp). For warp, tune the
-  # contact/constraint budgets in the viewer and scale by parallel_envs; null
-  # lets mujoco_warp pick defaults.
-  impl: jax
+  # Physics backend: "jax" (MJX) or "warp" (mujoco_warp). See mocap_sac.yaml /
+  # mocap_ddpg.yaml for the budget-tuning notes when switching to warp.
+  impl: warp
   naconmax: null
   njmax: null
   # Full humanoid self-collision (limbs collide with each other, not just the
-  # floor). NOTE: the impl=jax (MJX) backend statically sizes its contact arrays
-  # to all potential geom pairs (~980) rather than the ~15 active at peak, so
-  # this is much heavier on memory than on the warp backend. Set false for
-  # ground-only contacts if memory-constrained.
+  # floor). Set false for ground-only contacts if memory-constrained.
   self_collisions: true
-  # Early-termination curriculum (DeepMimic-style). Terminates an episode when
-  # the joint-pose or root (pos+orientation) tracking error exceeds a bound that
-  # widens with training progress (steps/trainer.steps, so independent of
-  # parallel_envs): tight at step 0 -> loose at relax_fraction of training, after
-  # which the tracking-error check is off (only head-height/NaN remain). Errors
-  # are in _get_reward units. Omit this block to use the env's default_config.
+  # Non-learning baseline: keep the termination curriculum OFF so the OU process
+  # is measured against the true task (head-height/NaN termination only). The
+  # learned configs (sac/ddpg/td3) enable it. See default_config() for the fields.
   termination_curriculum:
-    enabled: true
-    pose: 5.0
-    root: 0.1
-
+    enabled: false
 
 trainer:
-  steps: 1_000_000_000
+  # No learning happens, so this is just how long to roll the baseline for.
+  steps: 10_000_000
   epoch_steps: 100_000
-  save_steps: 500_000
+  save_steps: 100_000
   test_episodes: 5
   show_progress: true
   replace_checkpoint: false
