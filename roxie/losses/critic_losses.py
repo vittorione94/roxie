@@ -131,6 +131,60 @@ def ppo_critic_loss_fn(
     return critic_loss
 
 
+def mpo_critic_loss_fn(
+    critic_model,
+    target_actor_model,
+    target_critic_model,
+    samples,
+    gamma,
+    key,
+    num_action_samples,
+    action_low,
+    action_high,
+    obs_mean,
+    obs_std,
+    obs_clip,
+):
+    """MSE critic loss for MPO (policy evaluation).
+
+    The bootstrap value is the expected Q of the *target* (old) policy at the
+    next state, estimated by averaging the target critic over a handful of
+    actions sampled from the target policy. This is the standard MPO policy
+    evaluation step; we keep a single Q critic (as in the original paper) rather
+    than a distributional one.
+
+    `num_action_samples` is static at trace time (it sets the sample shape), so
+    this is called from inside the already-jitted grad step rather than jitted on
+    its own.
+    """
+    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    next_obs = Agent.normalize_obs(
+        samples["next_observations"], obs_mean, obs_std, obs_clip
+    )
+
+    # Sample N next actions from the target policy: [S, B, A] (Gaussian, no
+    # squashing — bounded by clipping, consistent with action selection).
+    next_dist = target_actor_model(next_obs)
+    next_actions = next_dist.sample(seed=key, sample_shape=(num_action_samples,))
+    next_actions = jnp.clip(next_actions, -1.0, 1.0)
+    next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
+
+    # Broadcast next_obs over the sample axis to match [S, B, A].
+    next_obs_tiled = jnp.broadcast_to(next_obs, (num_action_samples,) + next_obs.shape)
+    next_q = target_critic_model(next_obs_tiled, next_actions)  # [S, B, 1]
+    next_q = jnp.mean(jnp.squeeze(next_q, axis=-1), axis=0)  # [B]
+
+    reward = jnp.squeeze(samples["rewards"])
+    term = samples["terminals"].astype(jnp.float32)
+    target_q = reward + gamma * (1.0 - term) * next_q
+    target_q = jax.lax.stop_gradient(target_q)
+
+    # Stored actions are already in env scale (see DDPG/SAC `add`).
+    current_q = critic_model(obs, samples["actions"])
+    critic_loss = jnp.mean((jnp.squeeze(current_q) - target_q) ** 2)
+    return critic_loss
+
+
 @nnx.jit
 def sac_critic_loss_fn(
     twin_critic,

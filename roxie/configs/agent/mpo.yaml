@@ -1,0 +1,41 @@
+name: "mpo"
+
+args:
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  dual_learning_rate: 1e-2
+  num_action_samples: 20          # actions sampled per state for the E-step
+  epsilon: 0.1                    # E-step temperature KL bound
+  epsilon_mean: 1e-3             # M-step KL bound on the policy mean
+  epsilon_stddev: 1e-5          # M-step KL bound on the policy covariance
+  init_temperature: 1.0
+  init_alpha_mean: 1.0
+  init_alpha_stddev: 1.0
+  memory_warmup: 30_000
+  steps_before_learning: 30_000
+  steps_between_updates: 400
+  learning_steps: 20
+  max_grad_norm: 1
+
+actor:
+  _target_: roxie.models.actors.StochasticActor
+  features: [256, 256]
+  use_layer_norm: false
+  std_min: 1e-4
+  std_max: 10.0
+
+critic:
+  _target_: roxie.models.critics.QCritic
+  features: [256, 256]
+  use_layer_norm: false
+  dropout_rate: 0.
+
+memory:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 1_000_000
+  min_length: 1_000
+  sample_batch_size: 256
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
