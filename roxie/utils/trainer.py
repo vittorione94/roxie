@@ -323,19 +323,29 @@ class Trainer:
                     epoch_score = float(jnp.mean(scores))
                     epoch_length = float(jnp.mean(lengths))
 
-                print(
-                    f"\nEpoch {epochs} | steps {self.steps:,} | "
-                    f"episodes {ep_n} (tot {int(episodes)}) | "
-                    f"time {time.time() - start_time:.0f}s | "
-                    f"epoch {time.time() - last_epoch_time:.1f}s | "
-                    f"SPS {sps:.0f} | "
-                    f"score {epoch_score:.2f} | "
-                    f"length {epoch_length:.1f} | "
-                    f"grad_steps {tot_gradient_steps} | "
-                    f"a_loss {np.mean(actor_losses) if actor_losses else 0:.4f} | "
-                    f"c_loss {np.mean(critic_losses) if critic_losses else 0:.6f}",
-                    flush=True,
+                # Feed the epoch stats through the logger so every configured
+                # backend (console table, CSV, wandb, ...) records them. Keyed
+                # by env steps so the wandb x-axis matches training progress.
+                logger.store("epoch", epochs)
+                logger.store("steps", self.steps)
+                logger.store("episodes/epoch", ep_n)
+                logger.store("episodes/total", int(episodes))
+                logger.store("time/total_s", time.time() - start_time)
+                logger.store("time/epoch_s", time.time() - last_epoch_time)
+                logger.store("sps", sps)
+                logger.store("score", epoch_score)
+                logger.store("length", epoch_length)
+                logger.store("gradient_steps", tot_gradient_steps)
+                logger.store(
+                    "loss/actor",
+                    float(np.mean(actor_losses)) if actor_losses else 0.0,
                 )
+                logger.store(
+                    "loss/critic",
+                    float(np.mean(critic_losses)) if critic_losses else 0.0,
+                )
+                logger.dump(step=self.steps)
+
                 actor_losses = []
                 critic_losses = []
                 ep_return_sum = jnp.zeros(())
@@ -444,9 +454,8 @@ class Trainer:
 
         scores_np = np.array(scores)
         lengths_np = np.array(lengths)
-        print(
-            f"\nTest | score {np.mean(scores_np):.2f} | "
-            f"length {np.mean(lengths_np):.1f} | "
-            f"scores {scores_np.tolist()}",
-            flush=True,
-        )
+        # Stored (not printed) so the eval stats land in the same epoch dump as
+        # the training stats and reach every backend. The epoch loop calls
+        # _test just before logger.dump().
+        logger.store("test/score", float(np.mean(scores_np)))
+        logger.store("test/length", float(np.mean(lengths_np)))

@@ -26,6 +26,7 @@ dependencies = [
     "dm-control>=1.0.41",
     "h5py>=3.16.0",
     "mujoco-mjx>=3.9.0",
+    "wandb>=0.18.0",
 ]
 
 [build-system]

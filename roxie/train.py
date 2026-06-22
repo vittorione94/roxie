@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import get_method
 
@@ -22,7 +22,7 @@ from roxie.environment.loader import (
     DEFAULT_BUILDER,
     log_loaded_backend,
 )
-from roxie.utils import hydra_searchpath
+from roxie.utils import hydra_searchpath, logger
 from roxie.utils.trainer import Trainer
 
 # The launchable experiment configs live in top-level experiments/ and the mocap
@@ -54,6 +54,28 @@ def main(cfg: DictConfig):
     print("Environment configuration:", env_cfg)
 
     output_dir = HydraConfig.get().runtime.output_dir
+
+    # Initialize the logger up front so trainer stats fan out to all backends.
+    # Console + CSV (in output_dir) are always on; wandb is opt-in via the
+    # `logging.wandb` config block so runs don't require the dependency.
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    backends = logger.default_backends(output_dir)
+    wandb_cfg = (cfg.get("logging") or {}).get("wandb") if "logging" in cfg else None
+    if wandb_cfg and wandb_cfg.get("enabled", False):
+        backends.append(
+            logger.WandbBackend(
+                project=wandb_cfg.get("project"),
+                entity=wandb_cfg.get("entity"),
+                name=wandb_cfg.get("name"),
+                group=wandb_cfg.get("group"),
+                tags=wandb_cfg.get("tags"),
+                mode=wandb_cfg.get("mode", "online"),
+                relogin=wandb_cfg.get("relogin", True),
+                config=cfg_dict,
+                dir=output_dir,
+            )
+        )
+    logger.initialize(path=output_dir, config=cfg_dict, backends=backends)
 
     # Create RNGs for agent initialization
     training_rngs = nnx.Rngs(envs=cfg.env.seed, agent=3)  # Use your seed from cfg.seed
@@ -94,7 +116,10 @@ def main(cfg: DictConfig):
     trainer.initialize(
         agent=agent, environment=env, test_environment=test_environment
     )
-    trainer.run(cfg.env.parallel_envs, training_rngs)
+    try:
+        trainer.run(cfg.env.parallel_envs, training_rngs)
+    finally:
+        logger.close()
 
     return
 

@@ -96,6 +96,7 @@ hydra:
 | Agent | Type | Policy | Critic | Buffer |
 |---|---|---|---|---|
 | **DDPG** | Off-policy | Deterministic | Q(s,a) | Flat replay buffer |
+| **TD3** | Off-policy | Deterministic | Twin Q(s,a) | Flat replay buffer |
 | **SAC** | Off-policy | Stochastic (squashed Gaussian) | Twin Q(s,a) | Flat replay buffer |
 | **PPO** | On-policy | Stochastic (Gaussian) | V(s) | Trajectory queue |
 

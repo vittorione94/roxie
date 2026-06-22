@@ -47,6 +47,23 @@ trainer:
   show_progress: true
   replace_checkpoint: false
 
+# Metric logging backends. Console + CSV (in the run's output dir) are always
+# on. Set logging.wandb.enabled: true to also stream metrics to Weights &
+# Biases (requires the `wandb` package; run `wandb login` once).
+logging:
+  wandb:
+    enabled: false
+    project: roxie
+    entity: null
+    name: null
+    group: null
+    tags: []
+    mode: online   # online | offline | disabled
+    # Re-prompt for the wandb API key on every run so a multi-account desktop
+    # never logs to the wrong account by reusing cached credentials. Set false
+    # to trust the existing login (or set WANDB_API_KEY, which also skips it).
+    relogin: true
+
 hydra:
   run:
     dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
