@@ -1,13 +1,13 @@
 # @package _global_
 
 defaults:
-  - /agent: td3
+  - agent: td3_mocap
   - /noise: ou
   - _self_
 
 env:
   seed: 0
-  parallel_envs: 4000
+  parallel_envs: 2000
   # Experiment-injected env factory + viewer hook (resolved by train.py /
   # play.py via hydra.utils.get_method), so the core loops never branch on
   # an env-type string.
@@ -32,21 +32,11 @@ env:
   # (so naconmax auto-sizes at parallel_envs*64). Memory stays bounded by the
   # budgets. Set false for ground-only contacts.
   self_collisions: true
-  # Early-termination curriculum (DeepMimic-style). Terminates an episode when
-  # the joint-pose or root (pos+orientation) tracking error exceeds a bound that
-  # widens with training progress (steps/trainer.steps, so independent of
-  # parallel_envs): tight at step 0 -> loose at relax_fraction of training, after
-  # which the tracking-error check is off (only head-height/NaN remain). Errors
-  # are in _get_reward units. Omit this block to use the env's default_config.
-  termination_curriculum:
-    enabled: true
-    pose: 5.0
-    root: 0.1
 
 trainer:
   steps: 1_000_000_000
   epoch_steps: 1_000_000
-  save_steps: 10_000_000
+  save_steps: 100_000_000
   test_episodes: 5
   show_progress: true
   replace_checkpoint: false

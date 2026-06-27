@@ -41,30 +41,6 @@ def default_config() -> config_dict.ConfigDict:
             sigma_root=0.5,
         ),
         min_head_height=0.7,
-        # Early-termination curriculum (DeepMimic-style). When enabled, an
-        # episode is also terminated as soon as the joint-pose error or the root
-        # (position + orientation) error exceeds a threshold. Each threshold
-        # widens LINEARLY with training progress, from a tight start (``*_tight``,
-        # at progress 0 -- forcing the policy to stay glued to the reference
-        # early, which gives dense high-quality signal and faster learning) to a
-        # loose bound (``*_loose``) reached at ``relax_fraction`` of training,
-        # past which the tracking-error check is turned OFF entirely and only the
-        # head-height / NaN checks remain. Progress in [0, 1] is fed in via the
-        # env state (``info["progress"]``); it defaults to 1.0 (curriculum off)
-        # so evaluation and playback measure the true task.
-        #
-        # Errors are in the same units as ``_get_reward``'s ``pose_err`` /
-        # ``root_err``. Calibrated against random-action rollouts on this
-        # humanoid: pose_err grows ~2/step (≈5 by step ~3, ≈25-30 near the
-        # natural head-height fall at ~step 17); root_err is far smaller
-        # (≈0.03 early, ~0.25-0.8 by the fall). So ``pose_tight=5`` terminates a
-        # diverging episode within a few steps while ``pose_loose=30`` (≈p90-99)
-        # barely fires before the fall -- a smooth handoff to "off".
-        termination_curriculum=config_dict.create(
-            enabled=True,
-            pose=5.0,
-            root=0.1
-        ),
     )
 
 
@@ -280,10 +256,10 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             "clip_start": clip_start,
             "clip_len": clip_len,
             "last_act": jp.zeros(self.mjx_model.nu),
-            # Training progress in [0, 1] driving the termination curriculum.
-            # Overwritten each iteration by the trainer; defaults to 1.0 so the
-            # curriculum is OFF for evaluation / playback (true-task behaviour).
-            "progress": jp.float32(1.0),
+            # Clip-end truncation flag (see step). False at reset; kept in the
+            # info pytree so reset/step states share an identical structure (the
+            # trainer's auto-reset selects between them leaf-by-leaf).
+            "truncation": jp.bool_(False),
         }
 
         metrics = {
@@ -311,18 +287,24 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         abs_idx = state.info["clip_start"] + phase_idx
         reward_val = self._get_reward(data, abs_idx, state.metrics)
 
-        done = self._get_termination(data, abs_idx)
+        # Genuine termination: fall / NaN.
+        terminated = self._get_termination(data)
 
-        # For a non-cyclic clip, terminate `look_ahead` frames early: the obs
-        # references frames up to phase_idx + look_ahead, so stopping at the
-        # last frame would let the horizon run off the clip end (and wrap via
-        # the modulo in _get_obs). look_ahead=1 reduces to the last frame.
-        clip_ended = jp.where(
+        # For a non-cyclic clip, end `look_ahead` frames before the last frame:
+        # the obs references frames up to phase_idx + look_ahead, so stopping at
+        # the final frame would let the horizon run off the clip end (and wrap
+        # via the modulo in _get_obs). This is a TRUNCATION -- the reference
+        # trajectory simply ran out, not a failure -- so it is reported via
+        # info["truncation"] and kept OUT of the termination signal, letting the
+        # critic bootstrap the cut-off state's value instead of zeroing it.
+        # look_ahead=1 reduces to the last frame.
+        clip_truncated = jp.where(
             self._config.cyclic,
-            jp.float32(0),
-            jp.float32(phase_idx >= clip_len - self._config.look_ahead),
+            jp.bool_(False),
+            phase_idx >= clip_len - self._config.look_ahead,
         )
-        done = jp.maximum(done, clip_ended)
+
+        done = jp.logical_or(terminated, clip_truncated)
 
         info = {
             "rng": rng,
@@ -330,9 +312,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             "clip_start": state.info["clip_start"],
             "clip_len": clip_len,
             "last_act": action,
-            # Carry progress across steps (the trainer refreshes it each
-            # iteration; eval/playback keep the reset default).
-            "progress": state.info["progress"],
+            "truncation": clip_truncated,
         }
 
         obs = self._get_obs(data, info)
@@ -416,38 +396,14 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             + cfg.w_alive
         )
 
-    def _get_termination(
-        self, data: mjx.Data, abs_idx: jax.Array
-    ) -> jax.Array:
+    def _get_termination(self, data: mjx.Data) -> jax.Array:
         head_height = data.xpos[self._head_body_id, 2]
         fall = head_height < self._config.min_head_height
         nan_check = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
-        # DeepMimic-style tracking-error termination, with thresholds that widen
-        # as training progresses (see ``termination_curriculum`` in the config).
-        # ``progress`` defaults to 1.0 at reset, which puts both schedules at
-        # their "off" value -> diverged is never True for eval / playback.
-        tc = self._config.termination_curriculum
-        if tc.enabled:
-            ref_qpos = self._ref_qpos[abs_idx]
-            pose_err = jp.sum(jp.square(data.qpos[7:] - ref_qpos[7:]))
-            root_pos_err = jp.sum(jp.square(data.qpos[:3] - ref_qpos[:3]))
-            quat_dot = jp.dot(data.qpos[3:7], ref_qpos[3:7])
-            root_err = root_pos_err + (1.0 - jp.square(quat_dot))
-
-            # Linear ramp on normalized training progress: w goes 0 -> 1 over
-            # [0, relax_fraction], so each bound widens tight -> loose. Progress
-            # is the fraction of the total env-step budget consumed
-            # (steps / max_steps), so the schedule is independent of the number
-            # of parallel envs. Past relax_fraction the tracking-error check is
-            # turned fully OFF (only the head-height / NaN backstop remains).
-            diverged = ((pose_err > tc.pose) | (root_err > tc.root))
-        else:
-            diverged = jp.bool_(False)
-
         return jp.where(
             self._config.early_termination,
-            fall | nan_check | diverged,
+            fall | nan_check,
             nan_check,
         )
 

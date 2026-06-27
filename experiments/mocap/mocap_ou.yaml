@@ -32,11 +32,6 @@ env:
   # Full humanoid self-collision (limbs collide with each other, not just the
   # floor). Set false for ground-only contacts if memory-constrained.
   self_collisions: true
-  # Non-learning baseline: keep the termination curriculum OFF so the OU process
-  # is measured against the true task (head-height/NaN termination only). The
-  # learned configs (sac/ddpg/td3) enable it. See default_config() for the fields.
-  termination_curriculum:
-    enabled: false
 
 trainer:
   # No learning happens, so this is just how long to roll the baseline for.

@@ -12,7 +12,6 @@ reverse. ``train.py``/``play.py`` reach this lazily through the ``env.builder``
 from typing import Any, NamedTuple
 
 import numpy as np
-from omegaconf import OmegaConf
 
 from examples.mocap.cmu_mocap_data import build_cmu_humanoid, load_cmu_clips
 from roxie.environment.loader import EnvBundle, TerminationWrapper
@@ -115,18 +114,6 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
 
     clip_ids = list(cfg_env.clip_ids) if cfg_env.get("clip_ids") else None
 
-    # Optional per-experiment overrides for the env's own config_dict. Only the
-    # termination curriculum is exposed for now: a nested ``termination_curriculum``
-    # mapping under ``env`` is flattened to dotted keys
-    # (``termination_curriculum.<field>``) for ml_collections'
-    # ``update_from_flattened_dict``. Partial overrides are fine; omitting the
-    # block entirely leaves the env's default_config() values untouched.
-    config_overrides = None
-    tc = cfg_env.get("termination_curriculum", None)
-    if tc is not None:
-        tc = OmegaConf.to_container(tc, resolve=True)
-        config_overrides = {f"termination_curriculum.{k}": v for k, v in tc.items()}
-
     env, test_env, _ = load_mocap_env(
         clip_ids,
         gpu_clip_budget=gpu_clip_budget,
@@ -135,7 +122,6 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         njmax=njmax,
         naccdmax=naccdmax,
         self_collisions=self_collisions,
-        config_overrides=config_overrides,
     )
     return EnvBundle(env=env, test_env=test_env, env_cfg=None)
 

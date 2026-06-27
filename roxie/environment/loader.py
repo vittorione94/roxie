@@ -72,16 +72,31 @@ class TerminationWrapper(wrapper.Wrapper):
         # Increment the step count from the input state
         new_step_count = state.step_count + 1
 
-        # Determine truncation based on the new step count
-        truncated = new_step_count >= self.max_episode_steps
+        # Wrapper-level truncation: the fixed step-limit time-out.
+        step_truncated = new_step_count >= self.max_episode_steps
 
-        # The episode is done if the base environment terminates OR if it's truncated.
-        # next_env_state.done is the termination signal from the base env.
-        done = jnp.logical_or(next_env_state.done, truncated)
+        # The base env may fold its own truncation into `done` (e.g. the mocap
+        # clip-end cutoff, surfaced via info["truncation"]). Pull it back out so
+        # it does NOT count as termination: a truncated transition must still
+        # bootstrap the next-state value in the Bellman target, whereas marking
+        # it terminal zeroes the bootstrap and collapses Q at the cutoff. Envs
+        # that don't distinguish truncation default to False -> unchanged.
+        env_truncation = next_env_state.info.get(
+            "truncation", jnp.array(False, dtype=jnp.bool_)
+        )
+
+        # Genuine termination = base env done with any env-internal truncation
+        # removed. Truncation = step-limit OR env-internal. Done = either, so
+        # the trainer still auto-resets at the cutoff.
+        terminated = jnp.logical_and(
+            next_env_state.done, jnp.logical_not(env_truncation)
+        )
+        truncated = jnp.logical_or(step_truncated, env_truncation)
+        done = jnp.logical_or(next_env_state.done, step_truncated)
 
         # Normalize flags to 0-d jnp.bool_
         trunc_b = jnp.asarray(truncated, dtype=jnp.bool_)
-        term_b = jnp.asarray(next_env_state.done, dtype=jnp.bool_)
+        term_b = jnp.asarray(terminated, dtype=jnp.bool_)
         done_b = jnp.asarray(done, dtype=jnp.bool_)
 
         # Update the info dictionary for observation purposes

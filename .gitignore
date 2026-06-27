@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.pdf
 
 # Distribution / packaging
 build/

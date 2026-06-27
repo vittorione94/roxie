@@ -10,7 +10,39 @@ from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import Transition, serialize_bound
 from roxie.losses.actor_losses import ppo_loss_fn
 from roxie.losses.critic_losses import ppo_critic_loss_fn
-import rlax 
+
+
+def _compute_gae(rewards, values, termination, truncation, gamma, gae_lambda):
+    """GAE for one trajectory that distinguishes termination from truncation.
+
+    ``rewards``/``termination``/``truncation`` have length T-1 (steps 0..T-2);
+    ``values`` has length T (V(s_0..s_{T-1}), with ``values[-1]`` the bootstrap).
+
+    A genuine termination zeroes the next-state bootstrap via ``(1 - termination)``
+    (the episode truly ended). A truncation (time-limit / clip-end) is NOT a
+    terminal: its delta is zeroed and the backward recursion is stopped at the
+    cut, so the next episode's return never leaks across the boundary and no
+    false ``V(s')=0`` target is injected. Mirrors Brax's ``compute_gae``. The
+    bootstrap and the step before each boundary use ``values[t+1]``, which is the
+    true continuation everywhere except at a boundary step -- where it is the
+    reset state's value but is always masked out (by ``trunc_mask`` for a
+    truncation, by ``1 - termination`` for a termination).
+    """
+    v_t = values[:-1]
+    v_tp1 = values[1:]
+    cont = 1.0 - termination           # value-bootstrap mask
+    trunc_mask = 1.0 - truncation      # drop truncated step + stop recursion
+    deltas = (rewards + gamma * cont * v_tp1 - v_t) * trunc_mask
+
+    def scan_fn(acc, x):
+        delta, cont_t, trunc_mask_t = x
+        acc = delta + gamma * gae_lambda * cont_t * trunc_mask_t * acc
+        return acc, acc
+
+    _, adv = jax.lax.scan(
+        scan_fn, jnp.zeros(()), (deltas, cont, trunc_mask), reverse=True
+    )
+    return adv
 
 
 # This is the core computational kernel that will be JIT-compiled.
@@ -54,22 +86,29 @@ def _grad_step(
         "log_probs": data.log_probs, # (NUM_ENVS, BATCH_SIZE)
         "rewards": data.reward, # (NUM_ENVS, BATCH_SIZE)
         "values": data.value, # (NUM_ENVS, BATCH_SIZE)
-        "terminals": data.terminal, # (NUM_ENVS, BATCH_SIZE)
+        "terminations": data.terminal,   # genuine termination only (NUM_ENVS, BATCH_SIZE)
+        "truncations": data.truncation,  # time-limit / clip-end truncation
     }
 
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
     norm_obs = Agent.normalize_obs(re_packed_samples["observations"], obs_mean, obs_std, obs_clip)
 
-    # 4. Compute Actor and Critic Gradients
-    discounts = gamma * (1.0 - re_packed_samples["terminals"])
-    # adv_t = rlax.truncated_generalized_advantage_estimation(re_packed_samples["rewards"], discounts, gae_lambda, re_packed_samples["values"], True)
-    # With this:
+    # 4. Generalized advantage estimation, distinguishing termination from
+    # truncation (see _compute_gae): a terminal zeroes the value bootstrap; a
+    # truncation merely cuts the trajectory (drop the step, stop the recursion)
+    # rather than being treated as a hard terminal that collapses the target.
+    term = re_packed_samples["terminations"].astype(jnp.float32)
+    trunc = re_packed_samples["truncations"].astype(jnp.float32)
     gae_fn = jax.vmap(
-        lambda r, d, v: rlax.truncated_generalized_advantage_estimation(r, d, gae_lambda, v, True),
-        in_axes=(0, 0, 0)  # Batch over first dimension
+        lambda r, v, te, tr: _compute_gae(r, v, te, tr, gamma, gae_lambda),
+        in_axes=(0, 0, 0, 0),  # Batch over envs (first dimension)
     )
-
-    adv_t = gae_fn(re_packed_samples["rewards"][:, :-1], discounts[:, :-1], re_packed_samples["values"])
+    adv_t = gae_fn(
+        re_packed_samples["rewards"][:, :-1],
+        re_packed_samples["values"],
+        term[:, :-1],
+        trunc[:, :-1],
+    )
     adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
     # Actor update
@@ -162,6 +201,7 @@ class PPO(Agent):
             terminal=jnp.zeros((), dtype=jnp.bool_),
             log_probs=jnp.zeros((), dtype=jnp.float32),
             value=jnp.zeros((), dtype=jnp.float32),
+            truncation=jnp.zeros((), dtype=jnp.bool_),
         )
         replay = hydra.utils.instantiate(memory_config)
         self.add_sequence_length = memory_config.add_sequence_length
@@ -254,9 +294,14 @@ class PPO(Agent):
             observation=prev_states.obs[:, None, :],  # (NUM_ENVS,) -> (NUM_ENVS, 1, obs_dim)
             action=self.last_action[:, None, :],      # (NUM_ENVS, act_dim) -> (NUM_ENVS, 1, act_dim)
             reward=states.reward[:, None],            # (NUM_ENVS,) -> (NUM_ENVS, 1)
-            terminal=states.done[:, None],            # (NUM_ENVS,) -> (NUM_ENVS, 1)
+            # Store termination and truncation separately, NOT `done` (= either):
+            # GAE bootstraps the value at a truncation but zeroes it at a true
+            # termination (see _compute_gae). Folding them into one `done` would
+            # treat a time-limit/clip-end cut as a hard terminal and bias returns.
+            terminal=states.info["termination"][:, None],   # (NUM_ENVS,) -> (NUM_ENVS, 1)
             log_probs=self.last_log_prob[:, None],    # (NUM_ENVS,) -> (NUM_ENVS, 1)
             value=self.last_values,          # (NUM_ENVS, 1)
+            truncation=states.info["truncation"][:, None],  # (NUM_ENVS,) -> (NUM_ENVS, 1)
         )
         # store in memory
         self.state.buffer_state = self.replay.add(

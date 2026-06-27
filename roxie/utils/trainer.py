@@ -226,20 +226,6 @@ class Trainer:
         while True:
             loop_rng, action_key, step_key = jax.random.split(loop_rng, 3)
 
-            # Feed training progress into envs that drive a curriculum off it
-            # (e.g. the mocap termination curriculum). Generic: keyed on the
-            # presence of an ``info["progress"]`` field, so the loop stays
-            # env-agnostic. It's a traced state input, so changing it every
-            # iteration costs no recompile; envs without the field are untouched.
-            if "progress" in wrapped_states.env_state.info:
-                frac = jnp.float32(min(self.steps / self.max_steps, 1.0))
-                es = wrapped_states.env_state
-                wrapped_states = wrapped_states.replace(
-                    env_state=es.replace(
-                        info={**es.info, "progress": jnp.broadcast_to(frac, (NUM_ENVS,))}
-                    )
-                )
-
             use_agent_policy = (
                 not hasattr(agent, "memory_warmup")
                 or self.steps > getattr(agent, "memory_warmup", 0)

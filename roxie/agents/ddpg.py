@@ -349,7 +349,6 @@ class DDPG(Agent):
             observation=prev_states.obs,
             action=self.last_action,
             reward=states.reward,
-            # next_observation=states.obs,
             # Use the true termination signal, NOT `done` (= termination OR
             # truncation). A time-limit truncation must still bootstrap the
             # next-state value in the Bellman target; marking it terminal zeroes

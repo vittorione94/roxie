@@ -27,6 +27,7 @@ dependencies = [
     "h5py>=3.16.0",
     "mujoco-mjx>=3.9.0",
     "wandb>=0.18.0",
+    "pandas>=3.0.3",
 ]
 
 [build-system]
