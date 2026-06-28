@@ -27,7 +27,7 @@ import os
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 # Match train.py/play.py: cap JAX's pool so the warp backend (if used) has
 # headroom. Harmless for the default JAX backend.
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.4")
 
 import sys
 
@@ -61,7 +61,7 @@ def _make_reward_fn(menv):
             "reward/ee": jp.zeros(()),
             "reward/root": jp.zeros(()),
         }
-        total = menv._get_reward(data, abs_idx, components)
+        total, _ = menv._get_reward(data, abs_idx, components)
         return total, components
 
     return jax.jit(jax.vmap(reward_fn, in_axes=(0, 0, 0)))

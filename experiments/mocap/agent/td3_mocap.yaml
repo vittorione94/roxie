@@ -11,7 +11,7 @@ args:
   memory_warmup: 30_000
   steps_before_learning: 30_000
   steps_between_updates: 64       
-  learning_steps: 128
+  learning_steps: 256
   max_grad_norm: 1
 
 actor:

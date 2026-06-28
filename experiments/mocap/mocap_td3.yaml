@@ -3,6 +3,7 @@
 defaults:
   - agent: td3_mocap
   - /noise: ou
+  - reward: cmu_tracking
   - _self_
 
 env:

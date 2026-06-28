@@ -1,5 +1,6 @@
 import datetime
 import os
+import subprocess
 import time
 
 import numpy as np
@@ -7,6 +8,75 @@ import termcolor
 import yaml
 
 current_logger = None
+
+# nvidia-smi GPU telemetry. Probed lazily and disabled after the first failure
+# (no GPU / no nvidia-smi / driver error) so a CPU run or a missing binary
+# doesn't pay a subprocess cost — or spam errors — every epoch.
+_gpu_stats_enabled = True
+_GPU_QUERY_FIELDS = (
+    "utilization.gpu",
+    "temperature.gpu",
+    "memory.used",
+    "memory.total",
+    "power.draw",
+)
+
+
+def gpu_stats(prefix="gpu"):
+    """Sample per-GPU telemetry via ``nvidia-smi`` as a flat metric dict.
+
+    Returns ``{}`` when no NVIDIA GPU is queryable (and disables itself so later
+    calls are free). Cheap enough to call once per epoch. Keys are nested under
+    ``prefix`` (and the GPU index when more than one device is present) so the
+    logger backends group them: e.g. ``gpu/util_pct``, ``gpu/temp_c``, or
+    ``gpu/0/util_pct`` on multi-GPU hosts.
+    """
+    global _gpu_stats_enabled
+    if not _gpu_stats_enabled:
+        return {}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             f"--query-gpu={','.join(_GPU_QUERY_FIELDS)}",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        _gpu_stats_enabled = False
+        return {}
+    if out.returncode != 0:
+        _gpu_stats_enabled = False
+        return {}
+
+    lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    multi = len(lines) > 1
+    stats = {}
+    for i, line in enumerate(lines):
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != len(_GPU_QUERY_FIELDS):
+            continue
+
+        def _f(x):
+            # nvidia-smi reports e.g. "[N/A]" for power on some cards.
+            try:
+                return float(x)
+            except ValueError:
+                return None
+
+        util, temp, mem_used, mem_total, power = (_f(p) for p in parts)
+        base = f"{prefix}/{i}" if multi else prefix
+        fields = {
+            "util_pct": util,
+            "temp_c": temp,
+            "mem_used_mb": mem_used,
+            "mem_pct": (100.0 * mem_used / mem_total
+                        if mem_used is not None and mem_total else None),
+            "power_w": power,
+        }
+        for name, val in fields.items():
+            if val is not None:
+                stats[f"{base}/{name}"] = val
+    return stats
 
 
 def log(msg, color="green"):

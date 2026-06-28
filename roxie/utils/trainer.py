@@ -220,6 +220,14 @@ class Trainer:
         ep_return_sum = jnp.zeros(())
         ep_len_sum = jnp.zeros(())
         ep_count = jnp.zeros(())
+        # Per-epoch accumulators for the env's own metrics dict (e.g. the mocap
+        # env's `reward/pose`, `reward/vel`, ... tracking-reward components). The
+        # env populates `env_state.metrics` with a scalar per env each step; we
+        # sum the per-step env-mean and divide by the iteration count at dump
+        # time to report the epoch-mean of each component. Keys are discovered
+        # lazily so this stays generic across envs (empty dict -> nothing logged).
+        metric_sums = {}
+        metric_iters = 0
         bench_t0 = time.time()
         bench_steps = 0
 
@@ -262,6 +270,11 @@ class Trainer:
             tot_gradient_steps += gradient_steps
             scores += new_wrapped_states.env_state.reward
             lengths += 1
+            # Accumulate the env's reward-component metrics (kept on-device; only
+            # reduced to host floats at the epoch dump to avoid per-step syncs).
+            for k, v in new_wrapped_states.env_state.metrics.items():
+                metric_sums[k] = metric_sums.get(k, jnp.zeros(())) + jnp.mean(v)
+            metric_iters += 1
             self.steps += NUM_ENVS
             epoch_steps += NUM_ENVS
             steps_since_save += NUM_ENVS
@@ -330,6 +343,16 @@ class Trainer:
                     "loss/critic",
                     float(np.mean(critic_losses)) if critic_losses else 0.0,
                 )
+                # Epoch-mean of each env reward component (and any other metric
+                # the env exposes), keyed by its own name so the console/CSV/wandb
+                # backends nest it (e.g. under `reward/`).
+                if metric_iters > 0:
+                    for k, total in metric_sums.items():
+                        logger.store(k, float(total / metric_iters))
+                # GPU telemetry (utilization / temperature / memory / power).
+                # Sampled once per epoch; a no-op on hosts without nvidia-smi.
+                for k, v in logger.gpu_stats().items():
+                    logger.store(k, v)
                 logger.dump(step=self.steps)
 
                 actor_losses = []
@@ -337,6 +360,8 @@ class Trainer:
                 ep_return_sum = jnp.zeros(())
                 ep_len_sum = jnp.zeros(())
                 ep_count = jnp.zeros(())
+                metric_sums = {}
+                metric_iters = 0
 
                 # Regenerate the reset pool (fresh random starts for auto-reset)
                 # and reshuffle the GPU clip subset if the env supports it. Only a

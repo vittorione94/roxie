@@ -1,0 +1,31 @@
+# @package env
+#
+# Reward shaping for the CMU mocap-tracking task. These override the env's
+# `reward_config` defaults (in examples/mocap/mocap_tracking.py) via Hydra so a
+# run's reward landscape lives in config, not code, and is captured in the saved
+# run config. build_mocap_env flattens this block into `reward_config.<key>`
+# overrides for the ml_collections config.
+#
+# Each tracking term is an exp kernel `exp(-err / sigma)` over a *sum* of
+# squared errors across all DOFs / end-effectors. The sigmas are tuned so each
+# component sits in an informative mid-range at the errors actually seen in
+# training, rather than saturating at 0 (no gradient) or 1 (trivially maxed):
+#   - sigma_vel was 0.1, which underflowed `reward/vel` to ~0 (float32
+#     denormals) — the velocity term gave zero signal. Widened ~100x.
+#   - sigma_pose was 2.0, pinning `reward/pose` at ~0.03 deep in the saturated
+#     tail despite carrying the largest weight. Widened so pose actually drives
+#     learning.
+#   - sigma_ee widened off 0.04; sigma_root tightened off 0.5 so root tracking
+#     (previously ~0.83 and dominating) no longer trivially maxes out.
+reward:
+  # Component weights (the alive bonus is constant; the rest weight the kernels).
+  w_pose: 0.5
+  w_vel: 0.1
+  w_ee: 0.15
+  w_root: 0.2
+  w_alive: 0.05
+  # Exp-kernel bandwidths (larger = more forgiving / more gradient signal).
+  sigma_pose: 8.0
+  sigma_vel: 10.0
+  sigma_ee: 0.15
+  sigma_root: 0.3

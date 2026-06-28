@@ -10,6 +10,7 @@
 
 defaults:
   - /agent: ou
+  - reward: cmu_tracking
   - _self_
 
 env:

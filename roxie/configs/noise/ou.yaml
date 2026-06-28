@@ -1,5 +1,5 @@
 _target_: roxie.exploration.noisy.OrnsteinUhlenbeckNoise
-initial_noise_scale: 0.5
+initial_noise_scale: 0.1
 decay_schedule:
   _target_: roxie.exploration.schedulers.LinearDecay
   decay_steps: 1_000_000_000

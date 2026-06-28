@@ -47,6 +47,23 @@ def load_mocap_env(
     return train_wrapper, test_wrapper, xml_path
 
 
+def _reward_overrides(reward_cfg: Any) -> dict | None:
+    """Flatten a Hydra `env.reward` block into ml_collections config overrides.
+
+    The env's reward params live under `reward_config` in its config_dict, and
+    ``update_from_flattened_dict`` keys are dotted, so each `reward.<k>` becomes
+    `reward_config.<k>`. Values are coerced to plain Python scalars (the config
+    is locked, so OmegaConf nodes wouldn't compare/assign cleanly). Returns None
+    when no reward block is set, leaving the env's built-in defaults in place.
+    """
+    if not reward_cfg:
+        return None
+    from omegaconf import OmegaConf
+
+    flat = OmegaConf.to_container(reward_cfg, resolve=True)
+    return {f"reward_config.{k}": v for k, v in flat.items()}
+
+
 def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     """Builder for the CMU mocap-tracking env (see ``env.builder`` in configs).
 
@@ -114,6 +131,12 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
 
     clip_ids = list(cfg_env.clip_ids) if cfg_env.get("clip_ids") else None
 
+    # Reward shaping is owned by Hydra (env.reward group), not hard-coded in the
+    # env. Flatten the block into `reward_config.<key>` overrides that the env's
+    # ml_collections config applies on top of its defaults. Absent -> env keeps
+    # its own defaults.
+    config_overrides = _reward_overrides(cfg_env.get("reward", None))
+
     env, test_env, _ = load_mocap_env(
         clip_ids,
         gpu_clip_budget=gpu_clip_budget,
@@ -122,6 +145,7 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         njmax=njmax,
         naccdmax=naccdmax,
         self_collisions=self_collisions,
+        config_overrides=config_overrides,
     )
     return EnvBundle(env=env, test_env=test_env, env_cfg=None)
 

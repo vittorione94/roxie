@@ -29,18 +29,38 @@ def default_config() -> config_dict.ConfigDict:
         random_start=True,
         look_ahead=5,
         reset_noise_scale=1e-3,
+        # Reward shaping. For Hydra-launched runs these are overridden by the
+        # `env.reward` config group (experiments/mocap/reward/) via
+        # config_overrides — that group, not this block, is the source of truth
+        # for experiments. The values here are the schema + a sane standalone
+        # default (the sigmas are tuned so no component saturates at 0/1; see the
+        # reward group for the rationale).
         reward_config=config_dict.create(
             w_pose=0.5,
             w_vel=0.1,
             w_ee=0.15,
             w_root=0.2,
             w_alive=0.05,
-            sigma_pose=2.0,
-            sigma_vel=0.1,
-            sigma_ee=0.04,
-            sigma_root=0.5,
+            sigma_pose=8.0,
+            sigma_vel=10.0,
+            sigma_ee=0.15,
+            sigma_root=0.3,
         ),
         min_head_height=0.7,
+        # Tracking-collapse early termination. End the episode when the weighted
+        # tracking reward (the four components, excluding the alive bonus) falls
+        # below `min_tracking_frac` of its theoretical maximum (= sum of the
+        # component weights). This is deliberately a single, lenient criterion
+        # rather than a per-component cutoff: a strong component can compensate a
+        # momentarily weak one, and the low default (10%) means only a genuine
+        # loss of tracking ends the episode, leaving the agent room to recover
+        # from transient drift early in training. Only applied when
+        # `early_termination` is also True. Raise it to demand tighter tracking,
+        # set `enabled=False` to fall back to fall/NaN termination only.
+        reward_termination=config_dict.create(
+            enabled=True,
+            min_tracking_frac=0.1,
+        ),
     )
 
 
@@ -285,10 +305,10 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         phase_idx = (state.info["phase_idx"] + 1) % clip_len
 
         abs_idx = state.info["clip_start"] + phase_idx
-        reward_val = self._get_reward(data, abs_idx, state.metrics)
+        reward_val, tracking = self._get_reward(data, abs_idx, state.metrics)
 
-        # Genuine termination: fall / NaN.
-        terminated = self._get_termination(data)
+        # Genuine termination: fall / NaN / tracking collapse.
+        terminated = self._get_termination(data, tracking)
 
         # For a non-cyclic clip, end `look_ahead` frames before the last frame:
         # the obs references frames up to phase_idx + look_ahead, so stopping at
@@ -388,22 +408,38 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         metrics["reward/ee"] = r_ee
         metrics["reward/root"] = r_root
 
-        return (
+        # Weighted tracking reward (everything but the constant alive bonus).
+        # Returned alongside the total so termination can gate on it without
+        # recomputing the components.
+        tracking = (
             cfg.w_pose * r_pose
             + cfg.w_vel * r_vel
             + cfg.w_ee * r_ee
             + cfg.w_root * r_root
-            + cfg.w_alive
         )
+        return tracking + cfg.w_alive, tracking
 
-    def _get_termination(self, data: mjx.Data) -> jax.Array:
+    def _get_termination(
+        self, data: mjx.Data, tracking: jax.Array
+    ) -> jax.Array:
         head_height = data.xpos[self._head_body_id, 2]
         fall = head_height < self._config.min_head_height
         nan_check = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
+        # Tracking collapse: terminate once the weighted tracking reward drops
+        # below a fraction of its max (= sum of component weights). Weights and
+        # the fraction are static config, so this floor is a trace-time constant.
+        cfg = self._config.reward_config
+        rt = self._config.reward_termination
+        if rt.enabled:
+            max_track = cfg.w_pose + cfg.w_vel + cfg.w_ee + cfg.w_root
+            low_track = tracking < rt.min_tracking_frac * max_track
+        else:
+            low_track = jp.bool_(False)
+
         return jp.where(
             self._config.early_termination,
-            fall | nan_check,
+            fall | nan_check | low_track,
             nan_check,
         )
 
