@@ -228,6 +228,11 @@ class Trainer:
         # lazily so this stays generic across envs (empty dict -> nothing logged).
         metric_sums = {}
         metric_iters = 0
+        # Exploration-noise accumulator (deterministic agents only). Tracked
+        # separately from metric_sums: noise is added only on policy steps (not
+        # during the random warmup), so it has its own iteration count.
+        noise_abs_sum = jnp.zeros(())
+        noise_iters = 0
         bench_t0 = time.time()
         bench_steps = 0
 
@@ -242,6 +247,13 @@ class Trainer:
                 actions = agent.step(
                     wrapped_states.env_state.obs, evaluate=False, key=action_key,
                 )
+                # Mean absolute exploration noise per joint (normalized action
+                # units), averaged over envs + joints. Deterministic agents
+                # (DDPG/TD3) expose last_noise; others simply don't contribute.
+                last_noise = getattr(agent, "last_noise", None)
+                if last_noise is not None:
+                    noise_abs_sum = noise_abs_sum + jnp.mean(jnp.abs(last_noise))
+                    noise_iters += 1
             else:
                 actions = _random_actions(action_key)
                 agent.last_action = actions
@@ -349,10 +361,27 @@ class Trainer:
                 if metric_iters > 0:
                     for k, total in metric_sums.items():
                         logger.store(k, float(total / metric_iters))
+                # Average exploration noise added per joint this epoch (post-clip,
+                # normalized [-1, 1] action units). Compare against the noise
+                # module's scheduled scale to see how much clipping eats.
+                if noise_iters > 0:
+                    logger.store("noise/per_joint_abs", float(noise_abs_sum / noise_iters))
                 # GPU telemetry (utilization / temperature / memory / power).
                 # Sampled once per epoch; a no-op on hosts without nvidia-smi.
                 for k, v in logger.gpu_stats().items():
                     logger.store(k, v)
+                # Host-memory watch. Checkpoint saves once OOM-killed the process
+                # mid-write (host RAM exhausted); track resident set + the number
+                # of live JAX buffers each epoch so any baseline creep is visible
+                # in the logs well before it hits the ceiling. /proc is Linux-only;
+                # guarded so non-Linux hosts just skip it.
+                try:
+                    page = os.sysconf("SC_PAGE_SIZE")
+                    rss_pages = int(open("/proc/self/statm").read().split()[1])
+                    logger.store("mem/rss_gb", rss_pages * page / 1e9)
+                    logger.store("mem/live_arrays", len(jax.live_arrays()))
+                except (OSError, ValueError):
+                    pass
                 logger.dump(step=self.steps)
 
                 actor_losses = []
@@ -362,6 +391,8 @@ class Trainer:
                 ep_count = jnp.zeros(())
                 metric_sums = {}
                 metric_iters = 0
+                noise_abs_sum = jnp.zeros(())
+                noise_iters = 0
 
                 # Regenerate the reset pool (fresh random starts for auto-reset)
                 # and reshuffle the GPU clip subset if the env supports it. Only a

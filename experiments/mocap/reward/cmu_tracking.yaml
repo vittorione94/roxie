@@ -9,14 +9,25 @@
 # Each tracking term is an exp kernel `exp(-err / sigma)` over a *sum* of
 # squared errors across all DOFs / end-effectors. The sigmas are tuned so each
 # component sits in an informative mid-range at the errors actually seen in
-# training, rather than saturating at 0 (no gradient) or 1 (trivially maxed):
-#   - sigma_vel was 0.1, which underflowed `reward/vel` to ~0 (float32
-#     denormals) — the velocity term gave zero signal. Widened ~100x.
+# training, rather than saturating at 0 (no gradient) or 1 (trivially maxed).
+# Verify with `python examples/mocap/check_mocap_reward.py`, but note that its
+# noise sweep only probes near the reference — `sigma_vel` below was set from
+# the *training* error regime (see note), which that sweep does not reach.
+#   - sigma_vel: the kernel is correct AT the reference (perfect tracking gives
+#     vel=1.0), but the policy's actual joint-velocity errors are large
+#     (vel_err ~ sum-of-squares ~150-350 over ~28 DOFs, i.e. ~2.4 rad/s RMS per
+#     joint). At sigma_vel=10 that gave exp(-161/10) ~ 1e-7 = a flat-zero kernel
+#     everywhere the policy operates, so `reward/vel` provided no gradient to
+#     learn velocity tracking at all. Set to 200 so r_vel ~ 0.2-0.6 across the
+#     errors actually seen, giving real signal. (The earlier 0.1->10 widening
+#     was ~20x short of the operating regime.)
 #   - sigma_pose was 2.0, pinning `reward/pose` at ~0.03 deep in the saturated
 #     tail despite carrying the largest weight. Widened so pose actually drives
 #     learning.
 #   - sigma_ee widened off 0.04; sigma_root tightened off 0.5 so root tracking
-#     (previously ~0.83 and dominating) no longer trivially maxes out.
+#     (previously ~0.83 and dominating) no longer trivially maxes out. NOTE: ee
+#     is now the steepest term (collapses fastest away from the reference), so
+#     it carries most of the near-reference gradient.
 reward:
   # Component weights (the alive bonus is constant; the rest weight the kernels).
   w_pose: 0.5
@@ -24,8 +35,13 @@ reward:
   w_ee: 0.15
   w_root: 0.2
   w_alive: 0.05
+  # Torque penalty: weights mean-squared actuator command (ctrl in [-1, 1]), so
+  # the term sits in [-w_torque, 0]. Discourages needless action power without
+  # fighting tracking (max tracking reward is ~1.0, so 0.01 is a ~1% nudge).
+  # Raise to demand smoother/cheaper motion; set 0 to disable.
+  w_torque: 0.01
   # Exp-kernel bandwidths (larger = more forgiving / more gradient signal).
-  sigma_pose: 8.0
-  sigma_vel: 10.0
+  sigma_pose: 6.0
+  sigma_vel: 200.0
   sigma_ee: 0.15
-  sigma_root: 0.3
+  sigma_root: 0.2

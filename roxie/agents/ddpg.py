@@ -335,6 +335,11 @@ class DDPG(Agent):
         )
 
         self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
+        # Effective exploration noise actually applied this step (post-clip), in
+        # normalized [-1, 1] action units -- one value per env per joint. Kept on
+        # device; the trainer reduces it to a per-joint epoch mean for logging.
+        # Zero when evaluating (add_noise is a no-op there).
+        self.last_noise = noise
 
         return self.last_action
 

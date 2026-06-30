@@ -11,7 +11,7 @@ args:
   memory_warmup: 30_000
   steps_before_learning: 30_000
   steps_between_updates: 64       
-  learning_steps: 256
+  learning_steps: 128
   max_grad_norm: 1
 
 actor:
@@ -28,8 +28,8 @@ critic:
 
 memory:
   _target_: flashbax.buffers.make_flat_buffer
-  max_length: 500_000
+  max_length: 1_000_000
   min_length: 10_000
-  sample_batch_size: 1024
+  sample_batch_size: 512
   add_sequences: False
   add_batch_size: ${env.parallel_envs}

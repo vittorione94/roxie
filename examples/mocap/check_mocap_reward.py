@@ -60,8 +60,12 @@ def _make_reward_fn(menv):
             "reward/vel": jp.zeros(()),
             "reward/ee": jp.zeros(()),
             "reward/root": jp.zeros(()),
+            "reward/torque": jp.zeros(()),
         }
-        total, _ = menv._get_reward(data, abs_idx, components)
+        # ctrl=0: the torque penalty is not part of the tracking diagnostic, and
+        # a zero command keeps `total` equal to the pure tracking + alive reward.
+        ctrl = jp.zeros((menv.action_size,))
+        total, _ = menv._get_reward(data, abs_idx, ctrl, components)
         return total, components
 
     return jax.jit(jax.vmap(reward_fn, in_axes=(0, 0, 0)))
@@ -115,7 +119,7 @@ def main(clip_ids, clip_index, noise_scales, num_seeds, impl, seed):
     clip_id_list = [c.strip() for c in clip_ids.split(",")] if clip_ids else None
     scales = [float(s) for s in noise_scales.split(",")]
 
-    env, _, _ = load_mocap_env(clip_id_list, impl=impl)
+    env, _, _ = load_mocap_env(clip_ids=clip_id_list, impl=impl)
     menv = env.env  # unwrap TerminationWrapper
 
     starts = np.asarray(menv._clip_starts)

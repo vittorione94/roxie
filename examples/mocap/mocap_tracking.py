@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Union
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jp
@@ -11,57 +11,9 @@ from mujoco_playground._src import mjx_env
 from mujoco_playground._src import reward
 
 CMU_BODY_NAMES = {
-    "head": "head",
     "torso": "thorax",
     "end_effectors": ["lhand", "rhand", "lfoot", "rfoot"],
 }
-
-
-def default_config() -> config_dict.ConfigDict:
-    return config_dict.create(
-        ctrl_dt=0.025,
-        sim_dt=0.005,
-        episode_length=1000,
-        early_termination=True,
-        action_repeat=1,
-        action_scale=1.0,
-        cyclic=False,
-        random_start=True,
-        look_ahead=5,
-        reset_noise_scale=1e-3,
-        # Reward shaping. For Hydra-launched runs these are overridden by the
-        # `env.reward` config group (experiments/mocap/reward/) via
-        # config_overrides — that group, not this block, is the source of truth
-        # for experiments. The values here are the schema + a sane standalone
-        # default (the sigmas are tuned so no component saturates at 0/1; see the
-        # reward group for the rationale).
-        reward_config=config_dict.create(
-            w_pose=0.5,
-            w_vel=0.1,
-            w_ee=0.15,
-            w_root=0.2,
-            w_alive=0.05,
-            sigma_pose=8.0,
-            sigma_vel=10.0,
-            sigma_ee=0.15,
-            sigma_root=0.3,
-        ),
-        min_head_height=0.7,
-        # Tracking-collapse early termination. End the episode when the weighted
-        # tracking reward (the four components, excluding the alive bonus) falls
-        # below `min_tracking_frac` of its theoretical maximum (= sum of the
-        # component weights). This is deliberately a single, lenient criterion
-        # rather than a per-component cutoff: a strong component can compensate a
-        # momentarily weak one, and the low default (10%) means only a genuine
-        # loss of tracking ends the episode, leaving the agent room to recover
-        # from transient drift early in training. Only applied when
-        # `early_termination` is also True. Raise it to demand tighter tracking,
-        # set `enabled=False` to fall back to fall/NaN termination only.
-        reward_termination=config_dict.create(
-            enabled=True,
-            min_tracking_frac=0.1,
-        ),
-    )
 
 
 GROUND_CONTACT_GEOMS = {
@@ -110,8 +62,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         self,
         mj_model: mujoco.MjModel,
         dataset: dict,
-        config: config_dict.ConfigDict = default_config(),
-        config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
+        config: config_dict.ConfigDict,
         body_names: Optional[dict] = None,
         gpu_clip_budget: int = 0,
         impl: str = "jax",
@@ -119,8 +70,9 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         njmax: Optional[int] = None,
         naccdmax: Optional[int] = None,
         self_collisions: bool = True,
+        graph_mode: Optional[str] = None,
     ):
-        super().__init__(config, config_overrides)
+        super().__init__(config)
 
         self._mj_model = mj_model
         self._mj_model.opt.timestep = self.sim_dt
@@ -137,7 +89,22 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         self._naconmax = naconmax
         self._njmax = njmax
         self._naccdmax = naccdmax
-        self._mjx_model = mjx.put_model(self._mj_model, impl=impl)
+        # CUDA-graph capture mode for the Warp backend. mjx defaults to
+        # GraphMode.WARP, whose capture cache is keyed on per-step input/output
+        # buffer addresses; under JAX those addresses change every step, so a new
+        # CUDA graph is captured each step (slow CPU graph-instantiate) and the
+        # evicted ones' native host descriptors are never reclaimed — a steady
+        # host-RAM leak (~0.25GB per 1M steps here) that OOM-kills long runs.
+        # GraphMode.WARP_STAGED_EX captures the graph ONCE on fixed staging
+        # buffers and replays it every step (+ a cheap device→staging memcpy):
+        # graph-replay speed, no per-step recapture, no leak. GraphMode.JAX/NONE
+        # also avoid the leak but launch kernels eagerly — far slower for this
+        # many-kernel step. Ignored by the classic "jax" backend.
+        put_kwargs = {}
+        if impl == "warp" and graph_mode is not None:
+            from warp._src.jax_experimental.ffi import GraphMode
+            put_kwargs["graph_mode"] = getattr(GraphMode, graph_mode.upper())
+        self._mjx_model = mjx.put_model(self._mj_model, impl=impl, **put_kwargs)
 
         self._cpu_qpos = np.asarray(dataset["qpos"])
         self._cpu_qvel = np.asarray(dataset["qvel"])
@@ -160,7 +127,6 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
 
     def _post_init(self) -> None:
         bn = self._body_names
-        self._head_body_id = self._mj_model.body(bn["head"]).id
         self._torso_body_id = self._mj_model.body(bn["torso"]).id
 
         self._ee_body_ids = jp.array(
@@ -287,6 +253,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             "reward/vel": jp.zeros(()),
             "reward/ee": jp.zeros(()),
             "reward/root": jp.zeros(()),
+            "reward/torque": jp.zeros(()),
         }
 
         reward_val, done = jp.zeros(2)
@@ -305,7 +272,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         phase_idx = (state.info["phase_idx"] + 1) % clip_len
 
         abs_idx = state.info["clip_start"] + phase_idx
-        reward_val, tracking = self._get_reward(data, abs_idx, state.metrics)
+        reward_val, tracking = self._get_reward(data, abs_idx, ctrl, state.metrics)
 
         # Genuine termination: fall / NaN / tracking collapse.
         terminated = self._get_termination(data, tracking)
@@ -379,6 +346,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         self,
         data: mjx.Data,
         abs_idx: jax.Array,
+        ctrl: jax.Array,
         metrics: dict[str, Any],
     ) -> jax.Array:
         cfg = self._config.reward_config
@@ -403,27 +371,34 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         root_err = root_pos_err + root_quat_err
         r_root = jp.exp(-root_err / cfg.sigma_root)
 
+        # Torque penalty: discourage needless control effort. ``ctrl`` is the
+        # clipped actuator command in [-1, 1] (the normalized torque command, the
+        # gear maps it to physical N·m), so mean-square keeps this O(1) and its
+        # weight directly comparable to the tracking kernels. This is a penalty
+        # (negative), kept OUT of `tracking` below so it never feeds the
+        # tracking-collapse termination — only fall/NaN/loss-of-tracking do.
+        r_torque = -cfg.w_torque * jp.mean(jp.square(ctrl))
+
         metrics["reward/pose"] = r_pose
         metrics["reward/vel"] = r_vel
         metrics["reward/ee"] = r_ee
         metrics["reward/root"] = r_root
+        metrics["reward/torque"] = r_torque
 
-        # Weighted tracking reward (everything but the constant alive bonus).
-        # Returned alongside the total so termination can gate on it without
-        # recomputing the components.
+        # Weighted tracking reward (everything but the constant alive bonus and
+        # the torque penalty). Returned alongside the total so termination can
+        # gate on it without recomputing the components.
         tracking = (
             cfg.w_pose * r_pose
             + cfg.w_vel * r_vel
             + cfg.w_ee * r_ee
             + cfg.w_root * r_root
         )
-        return tracking + cfg.w_alive, tracking
+        return tracking + cfg.w_alive + r_torque, tracking
 
     def _get_termination(
         self, data: mjx.Data, tracking: jax.Array
     ) -> jax.Array:
-        head_height = data.xpos[self._head_body_id, 2]
-        fall = head_height < self._config.min_head_height
         nan_check = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
         # Tracking collapse: terminate once the weighted tracking reward drops
@@ -439,7 +414,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
 
         return jp.where(
             self._config.early_termination,
-            fall | nan_check | low_track,
+            nan_check | low_track,
             nan_check,
         )
 

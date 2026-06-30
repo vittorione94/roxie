@@ -106,6 +106,16 @@ def main(checkpoint_path):
             score += wrapped_state.env_state.reward
             actions.append(action)
 
+            # Print the per-component rewards (envs expose these under
+            # ``metrics["reward/*"]``) alongside the total step reward.
+            metrics = wrapped_state.env_state.metrics
+            components = " ".join(
+                f"{k.split('/', 1)[1]}={float(v):+.3f}"
+                for k, v in metrics.items()
+                if k.startswith("reward/")
+            )
+            print(f"reward={float(wrapped_state.env_state.reward):+.3f} {components}")
+
             if wrapped_state.env_state.done:
                 print(f"Total score: {score}")
                 print(f"Actions mean: {jnp.mean(jnp.array(actions)):.2f}")

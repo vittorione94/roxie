@@ -12,9 +12,11 @@ reverse. ``train.py``/``play.py`` reach this lazily through the ``env.builder``
 from typing import Any, NamedTuple
 
 import numpy as np
+from ml_collections import config_dict
 
 from examples.mocap.cmu_mocap_data import build_cmu_humanoid, load_cmu_clips
 from roxie.environment.loader import EnvBundle, TerminationWrapper
+from roxie.utils import hydra_searchpath
 import xml.etree.ElementTree as ET
 
 import mujoco
@@ -22,46 +24,81 @@ import mujoco
 import copy
 from examples.mocap.mocap_tracking import MocapTrackingEnv
 
+# The env has no hard-coded defaults: its config_dict is assembled from the
+# Hydra config groups under experiments/mocap/ — the env.config block (core
+# params) and the env.reward block (reward shaping). These two files are the
+# single source of truth, used both by Hydra-launched runs (via build_mocap_env)
+# and by standalone scripts (via load_default_config).
+_MOCAP_CONFIG_DIR = hydra_searchpath.REPO_ROOT / "experiments" / "mocap"
+_DEFAULT_ENV_CONFIG = _MOCAP_CONFIG_DIR / "env_config" / "cmu.yaml"
+_DEFAULT_REWARD_CONFIG = _MOCAP_CONFIG_DIR / "reward" / "cmu_tracking.yaml"
+
+
+def _assemble_config(config_block: Any, reward_block: Any) -> config_dict.ConfigDict:
+    """Assemble the env's ml_collections config from the two Hydra blocks.
+
+    ``config_block`` is the env.config group (core params + nested
+    ``reward_termination``); ``reward_block`` is the env.reward group, which the
+    env reads under ``reward_config``. Both are OmegaConf nodes; we resolve them
+    to plain Python containers and hand them to ``config_dict.ConfigDict``, which
+    recursively wraps the nested dicts (so ``cfg.reward_config.w_pose`` etc.
+    work). The env locks this in its constructor.
+    """
+    from omegaconf import OmegaConf
+
+    raw = OmegaConf.to_container(config_block, resolve=True)
+    raw["reward_config"] = OmegaConf.to_container(reward_block, resolve=True)
+    return config_dict.ConfigDict(raw)
+
+
+def build_env_config(cfg_env: Any) -> config_dict.ConfigDict:
+    """Build the env config from a composed Hydra ``cfg.env`` (the run config)."""
+    return _assemble_config(cfg_env.config, cfg_env.reward)
+
+
+def load_default_config() -> config_dict.ConfigDict:
+    """Build the env config straight from the YAML defaults, without Hydra.
+
+    For standalone scripts (e.g. check_mocap_reward.py) that construct the env
+    outside a Hydra run but still want the canonical, config-owned defaults —
+    not a duplicate hard-coded in Python. Reads the same env_config/cmu.yaml and
+    reward/cmu_tracking.yaml that the experiments compose.
+    """
+    from omegaconf import OmegaConf
+
+    env_cfg = OmegaConf.load(_DEFAULT_ENV_CONFIG)
+    reward_cfg = OmegaConf.load(_DEFAULT_REWARD_CONFIG)
+    return _assemble_config(env_cfg.config, reward_cfg.reward)
+
 
 def load_mocap_env(
+    config: config_dict.ConfigDict | None = None,
     clip_ids: list[str] | None = None,
-    ctrl_dt: float = 0.025,
     gpu_clip_budget: int = 0,
     impl: str = "jax",
     naconmax: int | None = None,
     njmax: int | None = None,
     naccdmax: int | None = None,
     self_collisions: bool = True,
-    config_overrides: dict | None = None,
+    graph_mode: str | None = None,
 ):
+    # No Python default schema: fall back to the YAML-owned defaults so callers
+    # outside a Hydra run still get the canonical config.
+    if config is None:
+        config = load_default_config()
+
     mj_model, xml_path = build_cmu_humanoid()
-    dataset = load_cmu_clips(mj_model, clip_ids=clip_ids, ctrl_dt=ctrl_dt)
+    dataset = load_cmu_clips(mj_model, clip_ids=clip_ids, ctrl_dt=config.ctrl_dt)
     env = MocapTrackingEnv(
-        mj_model=mj_model, dataset=dataset, gpu_clip_budget=gpu_clip_budget,
+        mj_model=mj_model, dataset=dataset, config=config,
+        gpu_clip_budget=gpu_clip_budget,
         impl=impl, naconmax=naconmax, njmax=njmax, naccdmax=naccdmax,
-        self_collisions=self_collisions, config_overrides=config_overrides,
+        self_collisions=self_collisions, graph_mode=graph_mode,
     )
     env._xml_path = xml_path
-    train_wrapper = TerminationWrapper(env)
-    test_wrapper = TerminationWrapper(env)
+    train_wrapper = TerminationWrapper(env, max_episode_steps=config.episode_length)
+    test_wrapper = TerminationWrapper(env, max_episode_steps=config.episode_length)
     return train_wrapper, test_wrapper, xml_path
-
-
-def _reward_overrides(reward_cfg: Any) -> dict | None:
-    """Flatten a Hydra `env.reward` block into ml_collections config overrides.
-
-    The env's reward params live under `reward_config` in its config_dict, and
-    ``update_from_flattened_dict`` keys are dotted, so each `reward.<k>` becomes
-    `reward_config.<k>`. Values are coerced to plain Python scalars (the config
-    is locked, so OmegaConf nodes wouldn't compare/assign cleanly). Returns None
-    when no reward block is set, leaving the env's built-in defaults in place.
-    """
-    if not reward_cfg:
-        return None
-    from omegaconf import OmegaConf
-
-    flat = OmegaConf.to_container(reward_cfg, resolve=True)
-    return {f"reward_config.{k}": v for k, v in flat.items()}
 
 
 def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
@@ -129,23 +166,35 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     if mode == "play":
         gpu_clip_budget = gpu_clip_budget or 32
 
+    # Warp CUDA-graph mode. mjx's GraphMode.WARP default recaptures a graph every
+    # step under JAX (buffer addresses change), which is both slow and leaks host
+    # RAM (evicted graphs' native descriptors are never freed). WARP_STAGED_EX
+    # captures the graph ONCE on fixed staging buffers and replays it every step
+    # (a cheap device→staging memcpy per step), keeping graph-replay speed with no
+    # per-step recapture and no leak. JAX/NONE avoid the leak too but run kernels
+    # eagerly — far slower for this many-kernel step. Default warp to STAGED_EX.
+    graph_mode = cfg_env.get("graph_mode", None)
+    if impl == "warp" and graph_mode is None:
+        graph_mode = "WARP_STAGED_EX"
+
     clip_ids = list(cfg_env.clip_ids) if cfg_env.get("clip_ids") else None
 
-    # Reward shaping is owned by Hydra (env.reward group), not hard-coded in the
-    # env. Flatten the block into `reward_config.<key>` overrides that the env's
-    # ml_collections config applies on top of its defaults. Absent -> env keeps
-    # its own defaults.
-    config_overrides = _reward_overrides(cfg_env.get("reward", None))
+    # The env's config_dict is owned entirely by Hydra (env.config + env.reward
+    # groups), not hard-coded in the env. Assemble it here; ctrl_dt and
+    # episode_length, read off it inside load_mocap_env, also drive clip
+    # resampling and the episode-length wrapper.
+    config = build_env_config(cfg_env)
 
     env, test_env, _ = load_mocap_env(
-        clip_ids,
+        config=config,
+        clip_ids=clip_ids,
         gpu_clip_budget=gpu_clip_budget,
         impl=impl,
         naconmax=naconmax,
         njmax=njmax,
         naccdmax=naccdmax,
         self_collisions=self_collisions,
-        config_overrides=config_overrides,
+        graph_mode=graph_mode,
     )
     return EnvBundle(env=env, test_env=test_env, env_cfg=None)
 

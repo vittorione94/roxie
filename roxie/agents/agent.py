@@ -171,24 +171,40 @@ class Agent(abc.ABC):
                 raise AttributeError("Agent must define `self.state` (an nnx.Module).")
 
             path = Path(path).resolve()
-            graphdef, state_tree = nnx.split(self.state)
 
-            payload = {
-                "format_version": format_version,
-                "trainstate_graphdef": graphdef,  # serialized topology
-                "trainstate_state": jax.device_get(state_tree),  # numeric pytree
-                "hyperparams": self._export_hyperparams(),
-                "metadata": (extra_metadata or {}),
-            }
-            checkpointer = ocp.StandardCheckpointer()
+            # The replay buffer (`self.state.buffer_state`) dominates the state —
+            # ~1.4GB for 500k transitions. `device_get`'ing it to host on every
+            # save spikes host RAM (orbax holds its own serialization copies on
+            # top), and on long runs that spike, stacked on a creeping baseline,
+            # OOM-kills the process mid-write. It is not needed to resume these
+            # runs, so detach it for the duration of the save; `load()` already
+            # treats `buffer_state` as optional. `_export_hyperparams` reads the
+            # buffer's obs/action shapes, so call it *before* detaching.
+            hyperparams = self._export_hyperparams()
+            saved_buffer = getattr(self.state, "buffer_state", None)
+            self.state.buffer_state = None
+            try:
+                graphdef, state_tree = nnx.split(self.state)
 
-            # ocp.PyTreeCheckpointer().save(path, payload)
-            checkpointer.save(path, payload)
-            # save() returns before the background write finishes. Block here so
-            # the write completes while the checkpointer is still alive; otherwise
-            # it can be torn down mid-write at exit ("cannot schedule new futures
-            # after shutdown").
-            checkpointer.wait_until_finished()
+                payload = {
+                    "format_version": format_version,
+                    "trainstate_graphdef": graphdef,  # serialized topology
+                    "trainstate_state": jax.device_get(state_tree),  # numeric pytree
+                    "hyperparams": hyperparams,
+                    "metadata": (extra_metadata or {}),
+                }
+                checkpointer = ocp.StandardCheckpointer()
+
+                # ocp.PyTreeCheckpointer().save(path, payload)
+                checkpointer.save(path, payload)
+                # save() returns before the background write finishes. Block here
+                # so the write completes while the checkpointer is still alive;
+                # otherwise it can be torn down mid-write at exit ("cannot schedule
+                # new futures after shutdown").
+                checkpointer.wait_until_finished()
+            finally:
+                # Restore the live buffer so training continues uninterrupted.
+                self.state.buffer_state = saved_buffer
 
             print(f"[Agent.save] Saved to {path}")
         except Exception as e:

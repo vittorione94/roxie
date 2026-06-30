@@ -5,7 +5,6 @@ import time
 
 import numpy as np
 import termcolor
-import yaml
 
 current_logger = None
 
@@ -285,8 +284,7 @@ class Logger:
     backends — by default a :class:`ConsoleBackend` and a :class:`CSVBackend`.
     """
 
-    def __init__(self, path=None, width=60, script_path=None, config=None,
-                 backends=None):
+    def __init__(self, path=None, width=60, script_path=None, backends=None):
         self.path = path or str(time.time())
 
         # Save the launch script.
@@ -302,16 +300,10 @@ class Logger:
                     config_file.write(script)
                 log(f"Script file saved to {script_path}")
 
-        # Save the configuration.
-        if config:
-            try:
-                os.makedirs(self.path, exist_ok=True)
-            except Exception:
-                pass
-            config_path = os.path.join(self.path, "config.yaml")
-            with open(config_path, "w") as config_file:
-                yaml.dump(config, config_file)
-            log(f"Config file saved to {config_path}")
+        # The run config is NOT dumped here: Hydra already writes the fully
+        # composed, resolved config to ``<run>/.hydra/config.yaml`` (which is
+        # what play.py reads). Writing a second top-level ``config.yaml`` made
+        # two near-identical files that silently diverged when edited.
 
         self.stat_keys = set()
         self.epoch_dict = {}

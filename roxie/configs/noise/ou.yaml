@@ -5,6 +5,6 @@ decay_schedule:
   decay_steps: 1_000_000_000
   final_value: 0.01
 theta: 0.15
-dt: 5e-3
+dt: 0.025
 clip: 2.0
 mu: 0.0

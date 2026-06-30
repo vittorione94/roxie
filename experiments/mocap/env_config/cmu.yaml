@@ -1,0 +1,32 @@
+# @package env
+#
+# Core env config_dict for the CMU mocap-tracking task. Mirrors the schema of
+# default_config() in examples/mocap/mocap_tracking.py and overrides it via
+# Hydra (build_mocap_env flattens this block into dotted config_overrides), so a
+# run's full env configuration lives in config — not code — and is captured in
+# the saved run config.
+#
+# NOTE: reward shaping (reward_config.*) lives in its own `reward` group
+# (experiments/mocap/reward/), which is the source of truth for it — keep it
+# there, not here.
+config:
+  # Control vs. physics timestep (n_substeps = ctrl_dt / sim_dt). ctrl_dt also
+  # drives mocap-clip resampling, so it is threaded through clip loading too.
+  ctrl_dt: 0.025
+  sim_dt: 0.005
+  # Episode length (steps); also sizes the episode-length termination wrapper.
+  episode_length: 1000
+  early_termination: true
+  action_scale: 1.0
+  cyclic: false
+  random_start: true
+  look_ahead: 2
+  reset_noise_scale: 0.001
+  # Tracking-collapse early termination. End the episode when the weighted
+  # tracking reward (the four components, excluding the alive bonus) falls below
+  # `min_tracking_frac` of its theoretical maximum. Only applied when
+  # `early_termination` is also true; set enabled=false to fall back to
+  # fall/NaN termination only. See default_config() for the full rationale.
+  reward_termination:
+    enabled: true
+    min_tracking_frac: 0.5

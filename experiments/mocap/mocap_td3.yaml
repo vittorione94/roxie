@@ -3,12 +3,13 @@
 defaults:
   - agent: td3_mocap
   - /noise: ou
+  - env_config: cmu
   - reward: cmu_tracking
   - _self_
 
 env:
   seed: 0
-  parallel_envs: 2000
+  parallel_envs: 500
   # Experiment-injected env factory + viewer hook (resolved by train.py /
   # play.py via hydra.utils.get_method), so the core loops never branch on
   # an env-type string.
@@ -28,6 +29,15 @@ env:
   # parallel_envs. Only the 2 hand ellipsoids use this path (max ~2/world), so
   # build_mocap_env caps it at parallel_envs*4. null => that auto-cap.
   naccdmax: null
+  # Warp CUDA-graph capture mode:
+  #   WARP_STAGED_EX (default for warp): capture once on fixed staging buffers,
+  #     replay every step (+ a cheap memcpy) — fast, no leak.
+  #   WARP: mjx's default — recaptures a graph EVERY step under JAX; slow AND
+  #     leaks host RAM (~0.25GB/1M steps), OOMs long runs. Avoid.
+  #   JAX / NONE: no recapture (no leak) but run kernels eagerly — much slower
+  #     for this many-kernel step. Fallback only if STAGED_EX errors.
+  # Leave unset to get WARP_STAGED_EX. Ignored by impl=jax.
+  graph_mode: WARP_STAGED_EX
   # Full humanoid self-collision (limbs collide with each other, not just the
   # floor). ~15 actual contacts/world but broadphase candidates peak ~48/world
   # (so naconmax auto-sizes at parallel_envs*64). Memory stays bounded by the
@@ -37,8 +47,8 @@ env:
 trainer:
   steps: 1_000_000_000
   epoch_steps: 1_000_000
-  save_steps: 100_000_000
-  test_episodes: 5
+  save_steps: 10_000_000
+  test_episodes: 50
   show_progress: true
   replace_checkpoint: false
 

@@ -5,6 +5,7 @@ defaults:
   # experiment's local agent variant), not the shared roxie/configs/agent group.
   - agent: sac_mocap
   - /noise: ou
+  - env_config: cmu
   - reward: cmu_tracking
   - _self_
 

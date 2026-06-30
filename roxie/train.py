@@ -76,7 +76,7 @@ def main(cfg: DictConfig):
                 dir=output_dir,
             )
         )
-    logger.initialize(path=output_dir, config=cfg_dict, backends=backends)
+    logger.initialize(path=output_dir, backends=backends)
 
     # Create RNGs for agent initialization
     training_rngs = nnx.Rngs(envs=cfg.env.seed, agent=3)  # Use your seed from cfg.seed

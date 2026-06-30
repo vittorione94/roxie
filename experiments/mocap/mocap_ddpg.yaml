@@ -3,6 +3,7 @@
 defaults:
   - /agent: ddpg
   - /noise: ou
+  - env_config: cmu
   - reward: cmu_tracking
   - _self_
 
