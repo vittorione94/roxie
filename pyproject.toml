@@ -10,7 +10,6 @@ dependencies = [
     "flashbax>=0.1.3",
     "flax>=0.8.5",
     "hydra-core>=1.3.2",
-    "jax[cuda12]>=0.4.30",
     "numpy>=2.0.2",
     "optax>=0.2.4",
     "playground>=0.2.0",
@@ -18,16 +17,24 @@ dependencies = [
     "termcolor>=3.1.0",
     "etils>=1.13.0",
     "pytest>=9.1.1",
-    # mujoco's warp bridge imports warp._src.jax_experimental.ffi.GraphMode and
-    # reads public warp.types.warp_type_to_np_dtype. Warp 1.13 dropped the latter
-    # from the public API and 1.14 graduated jax_experimental (NVIDIA/warp#1370),
-    # moving both out from under the bridge. 1.12.x is the newest that has both.
-    "warp-lang>=1.11,<1.13",
     "dm-control>=1.0.41",
     "h5py>=3.16.0",
     "mujoco-mjx>=3.9.0",
     "wandb>=0.18.0",
     "pandas>=3.0.3",
+    "labmaze>=1.0.6",
+    "envpool>=1.2.5",
+]
+
+[dependency-groups]
+# Linux (NVIDIA): uv sync --group cuda
+# mujocos warp bridge imports warp._src.jax_experimental.ffi.GraphMode and
+# reads public warp.types.warp_type_to_np_dtype. Warp 1.13 dropped the latter
+# from the public API and 1.14 graduated jax_experimental (NVIDIA/warp#1370),
+# moving both out from under the bridge. 1.12.x is the newest that has both.
+cuda = [
+    "jax[cuda12]>=0.4.30",
+    "warp-lang>=1.11,<1.13",
 ]
 
 [build-system]

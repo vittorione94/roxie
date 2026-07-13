@@ -1,12 +1,24 @@
 import os
-os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
-# The warp backend (impl=warp) allocates GPU memory outside JAX's pool. Rather
-# than disable preallocation (which fragments and OOMs on large contiguous
-# allocations like the replay buffer), cap JAX to a fraction of the device so
-# warp has headroom for its solver/collision scratch.
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
-
 import sys
+
+# These flags exist solely for the Warp backend: Warp allocates GPU memory
+# outside JAX's pool, so we cap JAX's preallocation fraction and disable
+# XLA autotuning (which can OOM when it races Warp for scratch space).
+# On CPU or pure-JAX (MJX) runs neither flag is needed.
+_using_warp = any("impl=warp" in arg for arg in sys.argv[1:])
+if _using_warp:
+    os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
+
+# device=<cpu|gpu> overrides JAX platform selection. Must be parsed from
+# sys.argv before JAX is imported — JAX_PLATFORMS is read at import time.
+_device = next(
+    (arg.split("=", 1)[1] for arg in sys.argv[1:] if arg.startswith("device=")),
+    None,
+)
+if _device:
+    os.environ["JAX_PLATFORMS"] = _device
+
 
 import hydra
 import jax
@@ -41,6 +53,8 @@ def main(cfg: DictConfig):
 
     print("JAX devices:", jax.devices())
     print("JAX platform:", jax.default_backend())
+    if _device:
+        print(f"JAX platform override: device={_device}")
 
     # Each experiment names the callable that builds its env via ``env.builder``
     # (a dotted path); the default builds a mujoco_playground env. The builder
@@ -48,7 +62,7 @@ def main(cfg: DictConfig):
     # returns a normalized EnvBundle, so this loop stays env-agnostic. ``impl``
     # selects the physics backend ("warp" routes through mujoco_warp) and is read
     # here only for the load banner — the builder reads it off cfg.env itself.
-    impl = cfg.env.get("impl", "jax")
+    impl = cfg.env.get("impl", None)
     build_env = get_method(cfg.env.get("builder", DEFAULT_BUILDER))
     env, test_env, env_cfg = build_env(cfg.env, mode="train")
     log_loaded_backend(env, requested_impl=impl)
@@ -81,10 +95,15 @@ def main(cfg: DictConfig):
     # Create RNGs for agent initialization
     training_rngs = nnx.Rngs(envs=cfg.env.seed, agent=3)  # Use your seed from cfg.seed
 
-    # Agent handles all component instantiation internally
-    ctrl_range = jnp.array(env.mj_model.actuator_ctrlrange)  # shape (action_dim, 2)
-    action_low = ctrl_range[:, 0]
-    action_high = ctrl_range[:, 1]
+    # Action bounds: MuJoCo/Playground envs expose mj_model.actuator_ctrlrange;
+    # EnvPool and other non-MuJoCo envs provide action_low/action_high directly.
+    if hasattr(env, "mj_model"):
+        ctrl_range = jnp.array(env.mj_model.actuator_ctrlrange)  # shape (action_dim, 2)
+        action_low = ctrl_range[:, 0]
+        action_high = ctrl_range[:, 1]
+    else:
+        action_low = env.action_low
+        action_high = env.action_high
 
     agent_args = {
         "env_obs_size": env.observation_size,

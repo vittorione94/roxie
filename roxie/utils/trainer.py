@@ -38,6 +38,14 @@ class Trainer:
         return out
 
     def run(self, NUM_ENVS, rngs):
+        """Dispatch to the appropriate training loop based on env backend."""
+        from roxie.environment.envpool_adapter import EnvPoolWrapper
+        if isinstance(self.environment, EnvPoolWrapper):
+            self._run_envpool(NUM_ENVS, rngs)
+        else:
+            self._run_jax(NUM_ENVS, rngs)
+
+    def _run_jax(self, NUM_ENVS, rngs):
 
         start_time = last_epoch_time = time.time()
         agent = self.agent
@@ -147,7 +155,6 @@ class Trainer:
 
         if warmup_iters > 0:
             print(f"Warmup: {warmup_iters} iters ({memory_warmup:,} steps)...", flush=True)
-            t0 = time.time()
 
             @jax.jit
             def warmup_rollout(state, rng, reset_pool):
@@ -167,13 +174,20 @@ class Trainer:
                     return (auto_states, rng), (transition, new_states.env_state.obs)
                 return jax.lax.scan(body, (state, rng), None, length=warmup_iters)
 
-            (wrapped_states, loop_rng), (transitions, next_obs) = warmup_rollout(
+            print("Compiling warmup rollout...", flush=True)
+            t0 = time.time()
+            _compiled_warmup = warmup_rollout.lower(
+                wrapped_states, loop_rng, reset_pool,
+            ).compile()
+            print(f"  {time.time() - t0:.1f}s", flush=True)
+
+            print("Running warmup rollout...", flush=True)
+            t0 = time.time()
+            (wrapped_states, loop_rng), (transitions, next_obs) = _compiled_warmup(
                 wrapped_states, loop_rng, reset_pool,
             )
             wrapped_states.env_state.obs.block_until_ready()
-            print(f"  Rollout: {time.time() - t0:.1f}s", flush=True)
-
-            t0 = time.time()
+            print(f"  {time.time() - t0:.1f}s", flush=True)
 
             @jax.jit
             def batch_add(buffer_state, transitions):
@@ -182,9 +196,20 @@ class Trainer:
                 bs, _ = jax.lax.scan(add_one, buffer_state, transitions)
                 return bs
 
-            agent.state.buffer_state = batch_add(agent.state.buffer_state, transitions)
+            print("Compiling replay fill...", flush=True)
+            t0 = time.time()
+            _compiled_batch_add = batch_add.lower(
+                agent.state.buffer_state, transitions,
+            ).compile()
+            print(f"  {time.time() - t0:.1f}s", flush=True)
+
+            print("Running replay fill...", flush=True)
+            t0 = time.time()
+            agent.state.buffer_state = _compiled_batch_add(
+                agent.state.buffer_state, transitions,
+            )
             jax.block_until_ready(jax.tree.leaves(agent.state.buffer_state))
-            print(f"  Replay fill: {time.time() - t0:.1f}s", flush=True)
+            print(f"  {time.time() - t0:.1f}s", flush=True)
 
             if agent.normalize_observations:
                 all_obs = jnp.concatenate([
@@ -282,23 +307,27 @@ class Trainer:
             tot_gradient_steps += gradient_steps
             scores += new_wrapped_states.env_state.reward
             lengths += 1
-            # Accumulate the env's reward-component metrics (kept on-device; only
-            # reduced to host floats at the epoch dump to avoid per-step syncs).
+            # Accumulate the env's reward-component metrics as per-env vectors
+            # (deferred mean to epoch boundary to avoid one dispatch per
+            # metric per step).
             for k, v in new_wrapped_states.env_state.metrics.items():
-                metric_sums[k] = metric_sums.get(k, jnp.zeros(())) + jnp.mean(v)
+                metric_sums[k] = metric_sums.get(k, jnp.zeros_like(v)) + v
             metric_iters += 1
             self.steps += NUM_ENVS
             epoch_steps += NUM_ENVS
             steps_since_save += NUM_ENVS
             bench_steps += NUM_ENVS
             done = new_wrapped_states.env_state.done.astype(jnp.float32)
-            episodes = episodes + jnp.sum(done)
+            # Compute jnp.sum(done) once — reused for both `episodes` and
+            # `ep_count` to avoid a duplicate reduction dispatch each step.
+            done_sum = jnp.sum(done)
+            episodes = episodes + done_sum
             # Capture return/length of episodes terminating this step. `scores`
             # and `lengths` already include the terminal transition (updated
             # above), and are zeroed for done envs further down.
             ep_return_sum = ep_return_sum + jnp.sum(scores * done)
             ep_len_sum = ep_len_sum + jnp.sum(lengths.astype(jnp.float32) * done)
-            ep_count = ep_count + jnp.sum(done)
+            ep_count = ep_count + done_sum
 
             if bench_steps == NUM_ENVS * 20:
                 wrapped_states.env_state.obs.block_until_ready()
@@ -360,7 +389,7 @@ class Trainer:
                 # backends nest it (e.g. under `reward/`).
                 if metric_iters > 0:
                     for k, total in metric_sums.items():
-                        logger.store(k, float(total / metric_iters))
+                        logger.store(k, float(jnp.mean(total) / metric_iters))
                 # Average exploration noise added per joint this epoch (post-clip,
                 # normalized [-1, 1] action units). Compare against the noise
                 # module's scheduled scale to see how much clipping eats.
@@ -501,3 +530,257 @@ class Trainer:
         # _test just before logger.dump().
         logger.store("test/score", float(np.mean(scores_np)))
         logger.store("test/length", float(np.mean(lengths_np)))
+
+    # ------------------------------------------------------------------
+    # EnvPool (CPU) training path
+    # ------------------------------------------------------------------
+
+    def _run_envpool(self, NUM_ENVS, rngs):
+        """Training loop for EnvPool (CPU) environments.
+
+        EnvPool handles batching and auto-reset in C++, so no jax.vmap/jit
+        wrapping of the env step is needed. The agent (actor, critic, replay
+        buffer, gradient updates) still runs in JAX on whatever device is
+        active (CPU by default, or GPU if one is present and JAX_PLATFORMS is
+        not overridden).
+        """
+        start_time = last_epoch_time = time.time()
+        env = self.environment
+        agent = self.agent
+        action_size = env.action_size
+        action_low = agent.action_low
+        action_high = agent.action_high
+
+        loop_rng = rngs.envs()
+        agent_key = rngs.agent()
+
+        def _random_actions(key):
+            u = jax.random.uniform(key, (NUM_ENVS, action_size))
+            return action_low + (action_high - action_low) * u
+
+        # --- Reset and compile agent step ---
+
+        print("Resetting environment...", flush=True)
+        t0 = time.time()
+        state = env.reset()
+        print(f"  {time.time() - t0:.1f}s", flush=True)
+
+        print("Compiling agent step...", flush=True)
+        t0 = time.time()
+        _ = agent.step(state.env_state.obs, evaluate=False, key=loop_rng)
+        jax.block_until_ready(_)
+        print(f"  {time.time() - t0:.1f}s", flush=True)
+
+        # --- Warmup: fill replay buffer with random actions ---
+
+        memory_warmup = getattr(agent, "memory_warmup", 0)
+        warmup_iters = memory_warmup // NUM_ENVS
+        self.steps = 0
+        epoch_steps = 0
+        epochs = 0
+        episodes = 0
+        tot_gradient_steps = 0
+        steps_since_save = 0
+        actor_losses = []
+        critic_losses = []
+
+        if warmup_iters > 0:
+            print(f"Warmup: {warmup_iters} iters ({memory_warmup:,} steps)...", flush=True)
+            t0 = time.time()
+            for _ in range(warmup_iters):
+                loop_rng, act_key = jax.random.split(loop_rng)
+                actions = _random_actions(act_key)
+                agent.last_action = actions
+                old_state = state
+                state = env.step(old_state, actions)
+                agent.add(old_state.env_state, state.env_state)
+            jax.block_until_ready(jax.tree.leaves(agent.state.buffer_state))
+            self.steps = warmup_iters * NUM_ENVS
+            epoch_steps = self.steps % self.epoch_steps
+            steps_since_save = self.steps % self.save_steps
+            print(f"  {time.time() - t0:.1f}s — {self.steps:,} steps", flush=True)
+
+        # Precompile gradient step (buffer is now populated).
+        if hasattr(agent, "update") and hasattr(agent, "steps_before_learning"):
+            print("Compiling gradient step...", flush=True)
+            t0 = time.time()
+            agent_key, warm_key = jax.random.split(agent_key)
+            agent.update(steps=agent.steps_before_learning, agent_rng=warm_key)
+            jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
+            print(f"  {time.time() - t0:.1f}s", flush=True)
+
+        # --- Training loop ---
+
+        print("Training...", flush=True)
+        scores = np.zeros(NUM_ENVS)
+        lengths = np.zeros(NUM_ENVS, dtype=np.int32)
+        ep_return_sum = 0.0
+        ep_len_sum = 0.0
+        ep_count = 0
+        metric_sums = {}
+        metric_iters = 0
+        noise_abs_sum = 0.0
+        noise_iters = 0
+        bench_t0 = time.time()
+        bench_steps = 0
+
+        while True:
+            loop_rng, action_key = jax.random.split(loop_rng)
+
+            actions = agent.step(state.env_state.obs, evaluate=False, key=action_key)
+            last_noise = getattr(agent, "last_noise", None)
+            if last_noise is not None:
+                noise_abs_sum += float(jnp.mean(jnp.abs(last_noise)))
+                noise_iters += 1
+
+            old_state = state
+            state = env.step(old_state, actions)
+
+            agent_key, update_key = jax.random.split(agent_key)
+            agent.add(old_state.env_state, state.env_state)
+
+            gradient_steps, actor_loss, critic_loss = agent.update(
+                steps=self.steps, agent_rng=update_key,
+            )
+            if gradient_steps > 0:
+                actor_losses.append(actor_loss)
+                critic_losses.append(critic_loss)
+            tot_gradient_steps += gradient_steps
+
+            done_np = np.array(state.env_state.done)
+            reward_np = np.array(state.env_state.reward)
+            scores += reward_np
+            lengths += 1
+            for k, v in state.env_state.metrics.items():
+                metric_sums[k] = metric_sums.get(k, 0.0) + float(np.mean(np.array(v)))
+            metric_iters += 1
+
+            done_sum = int(np.sum(done_np))
+            episodes += done_sum
+            ep_return_sum += float(np.sum(scores * done_np))
+            ep_len_sum += float(np.sum(lengths * done_np))
+            ep_count += done_sum
+
+            self.steps += NUM_ENVS
+            epoch_steps += NUM_ENVS
+            steps_since_save += NUM_ENVS
+            bench_steps += NUM_ENVS
+
+            if bench_steps == NUM_ENVS * 20:
+                elapsed = time.time() - bench_t0
+                print(
+                    f"\n  Speed: {bench_steps / elapsed:.0f} steps/s "
+                    f"({elapsed / 20 * 1000:.1f}ms/iter)",
+                    flush=True,
+                )
+
+            if self.show_progress:
+                logger.show_progress(self.steps, self.epoch_steps, self.max_steps)
+
+            if epoch_steps >= self.epoch_steps:
+                if hasattr(agent, "noise_module"):
+                    agent.noise_module.reset_noise()
+
+                if self.test_environment and hasattr(agent, "state"):
+                    self._test_envpool()
+
+                epochs += 1
+                epoch_steps = 0
+                sps = self.steps / (time.time() - start_time)
+
+                ep_n = ep_count
+                if ep_n > 0:
+                    epoch_score = ep_return_sum / ep_count
+                    epoch_length = ep_len_sum / ep_count
+                else:
+                    epoch_score = float(np.mean(scores))
+                    epoch_length = float(np.mean(lengths))
+
+                logger.store("epoch", epochs)
+                logger.store("steps", self.steps)
+                logger.store("episodes/epoch", ep_n)
+                logger.store("episodes/total", int(episodes))
+                logger.store("time/total_s", time.time() - start_time)
+                logger.store("time/epoch_s", time.time() - last_epoch_time)
+                logger.store("sps", sps)
+                logger.store("score", epoch_score)
+                logger.store("length", epoch_length)
+                logger.store("gradient_steps", tot_gradient_steps)
+                logger.store(
+                    "loss/actor",
+                    float(np.mean([float(x) for x in actor_losses])) if actor_losses else 0.0,
+                )
+                logger.store(
+                    "loss/critic",
+                    float(np.mean([float(x) for x in critic_losses])) if critic_losses else 0.0,
+                )
+                if metric_iters > 0:
+                    for k, total in metric_sums.items():
+                        logger.store(k, total / metric_iters)
+                if noise_iters > 0:
+                    logger.store("noise/per_joint_abs", noise_abs_sum / noise_iters)
+                for k, v in logger.gpu_stats().items():
+                    logger.store(k, v)
+                logger.dump(step=self.steps)
+
+                actor_losses = []
+                critic_losses = []
+                ep_return_sum = 0.0
+                ep_len_sum = 0.0
+                ep_count = 0
+                metric_sums = {}
+                metric_iters = 0
+                noise_abs_sum = 0.0
+                noise_iters = 0
+                last_epoch_time = time.time()
+
+            scores = np.where(done_np, 0.0, scores)
+            lengths = np.where(done_np, 0, lengths)
+
+            stop_training = self.steps >= self.max_steps
+            if stop_training or steps_since_save >= self.save_steps:
+                path = os.path.join(self.output_dir, "checkpoints")
+                if os.path.isdir(path) and self.replace_checkpoint:
+                    for file in os.listdir(path):
+                        if file.startswith("step_"):
+                            os.remove(os.path.join(path, file))
+                save_path = os.path.join(path, f"step_{self.steps}")
+                agent.save(save_path)
+                steps_since_save = self.steps % self.save_steps
+
+            if stop_training:
+                break
+
+    def _test_envpool(self):
+        """Eval loop for EnvPool environments.
+
+        Runs a Python loop (no jax.lax.while_loop) against the test pool until
+        all test episodes are done or max_episode_steps is reached.
+        """
+        test_env = self.test_environment
+        agent = self.agent
+        num_tests = self.test_episodes
+        max_steps = int(getattr(test_env, "max_episode_steps", 1000))
+
+        state = test_env.reset()
+        scores = np.zeros(num_tests, dtype=np.float32)
+        lengths = np.zeros(num_tests, dtype=np.int32)
+        dones = np.zeros(num_tests, dtype=bool)
+
+        # Use a fixed key for eval (noise is bypassed when evaluate=True).
+        eval_key = jax.random.PRNGKey(0)
+
+        for _ in range(max_steps):
+            if np.all(dones):
+                break
+            actions = agent.step(state.env_state.obs, evaluate=True, key=eval_key)
+            state = test_env.step(state, actions)
+            new_done = np.array(state.env_state.done)
+            reward = np.array(state.env_state.reward)
+            active = ~dones
+            scores += reward * active
+            lengths += active.astype(np.int32)
+            dones |= new_done
+
+        logger.store("test/score", float(np.mean(scores)))
+        logger.store("test/length", float(np.mean(lengths)))
