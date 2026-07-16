@@ -56,6 +56,68 @@ def _configure_collisions(m: mujoco.MjModel, self_collisions: bool) -> None:
             m.geom_contype[gid] = 1
 
 
+def _configure_actuation(
+    m: mujoco.MjModel, mode: str, kp_scale: float = 1.0, kv_ratio: float = 0.1
+) -> None:
+    """Rewrite the model's actuators in place for the requested control mode.
+
+    ``torque`` (the raw dm_control CMU model): leave the plain motors —
+    force = ctrl * gear, ctrl in [-1, 1].
+
+    ``position``: convert every motor into MuJoCo's scaled position servo
+    (PD-target control), replicating dm_control's CMUHumanoidPositionControlled
+    exactly (scaled_actuators.add_position_actuator + the _POSITION_ACTUATORS
+    per-joint kp/forcerange table), but applied to the compiled MjModel so no
+    second XML is needed. ctrl stays in [-1, 1] and maps affinely onto the
+    joint's range — so the policy/noise/action pipeline is untouched; actions
+    just *mean* "target pose" instead of "torque":
+        force = kp*slope*ctrl + kp*(q_lo + slope) - kp*q      (slope = range/2)
+    i.e. force = kp * (target(ctrl) - q), with the joint's own damping as the
+    D-term and dm_control's forcerange as the strength limit (gear folds to 1).
+
+    Deliberate deviation: dm_control's V2020 variant also puts a 30 ms
+    first-order activation filter on the targets. Activation states must exist
+    at model COMPILE time, so a post-compile conversion cannot add it — we run
+    direct PD targets (the DeepMimic-standard setup) with explicit rate
+    damping in the actuator instead: biasprm[2] = -kp * kv_ratio. Without it
+    the serial high-kp spine joints resonate (measured 0.18 rad sustained
+    oscillation); swept 2026-07-16, kv/kp = 0.1 (the DeepMimic-conventional
+    kd) minimizes oscillation (0.047 rad) with the best target closure.
+    `kp_scale` remains the knob if the dm_control gains prove hot/soft.
+    """
+    if mode == "torque":
+        return
+    if mode != "position":
+        raise ValueError(f"unknown actuation mode: {mode!r}")
+
+    from dm_control.locomotion.walkers.cmu_humanoid import _POSITION_ACTUATORS
+
+    params = {p.name: p for p in _POSITION_ACTUATORS}
+    for i in range(m.nu):
+        name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+        p = params[name]  # KeyError => model/table mismatch: fail loudly
+        jid = m.actuator_trnid[i, 0]
+        assert m.jnt_limited[jid], f"joint for actuator {name} has no range"
+        q_lo, q_hi = m.jnt_range[jid]
+        kp = float(p.kp) * kp_scale
+        slope = (q_hi - q_lo) / 2.0
+
+        m.actuator_gaintype[i] = mujoco.mjtGain.mjGAIN_FIXED
+        m.actuator_gainprm[i, :] = 0.0
+        m.actuator_gainprm[i, 0] = kp * slope
+        m.actuator_biastype[i] = mujoco.mjtBias.mjBIAS_AFFINE
+        m.actuator_biasprm[i, :] = 0.0
+        m.actuator_biasprm[i, 0] = kp * (q_lo + slope)
+        m.actuator_biasprm[i, 1] = -kp
+        m.actuator_biasprm[i, 2] = -kp * kv_ratio
+        m.actuator_gear[i, :] = 0.0
+        m.actuator_gear[i, 0] = 1.0
+        m.actuator_forcerange[i, :] = p.forcerange
+        m.actuator_forcelimited[i] = 1
+        m.actuator_ctrlrange[i, :] = (-1.0, 1.0)
+        m.actuator_ctrllimited[i] = 1
+
+
 class MocapTrackingEnv(mjx_env.MjxEnv):
 
     def __init__(
@@ -71,6 +133,11 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         naccdmax: Optional[int] = None,
         self_collisions: bool = True,
         graph_mode: Optional[str] = None,
+        clip_swap: bool = True,
+        clip_seed: int = 0,
+        actuation: str = "torque",
+        actuation_kp_scale: float = 1.0,
+        actuation_kv_ratio: float = 0.1,
     ):
         super().__init__(config)
 
@@ -80,6 +147,11 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         # Full self-collision by default; set self_collisions=False to fall back
         # to ground-only contacts for memory-constrained runs.
         _configure_collisions(self._mj_model, self_collisions)
+        # "torque" (raw motors) or "position" (PD-target servos, dm_control
+        # tuned gains). Must run before put_model — it rewrites actuator arrays.
+        _configure_actuation(
+            self._mj_model, actuation, actuation_kp_scale, actuation_kv_ratio
+        )
 
         # Physics backend: "jax" is the classic MJX implementation; "warp" is
         # the NVIDIA-Warp backend (mujoco_warp). Both are dispatched through the
@@ -118,8 +190,13 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             if gpu_clip_budget > 0
             else self._total_clips
         )
+        # When False, the initial `gpu_clip_budget`-sized subset is kept for the
+        # whole run (swap_clips() no-ops) — a fixed-subset/curriculum knob rather
+        # than a VRAM-rotation one. The initial pick is seeded by `clip_seed` so
+        # the same subset is reproducible across runs (e.g. algorithm A/Bs).
+        self._clip_swap = bool(clip_swap)
 
-        self._load_gpu_chunk()
+        self._load_gpu_chunk(seed=clip_seed)
 
         self._xml_path = None
         self._body_names = body_names or CMU_BODY_NAMES
@@ -136,12 +213,25 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         self._lowers = self._mj_model.actuator_ctrlrange[:, 0]
         self._uppers = self._mj_model.actuator_ctrlrange[:, 1]
 
-    def _load_gpu_chunk(self, clip_indices=None):
+        # Per-actuator effort normalizer for the reward's effort penalty:
+        # the force limit in position mode (forcerange), the motor strength
+        # (|gear|) in torque mode — so |actuator_force| / limit is ~[0, 1]
+        # under either actuation and the penalty keeps one meaning.
+        self._force_limit = jp.array(
+            np.where(
+                self._mj_model.actuator_forcelimited.astype(bool),
+                self._mj_model.actuator_forcerange[:, 1],
+                np.abs(self._mj_model.actuator_gear[:, 0]),
+            ),
+            dtype=jp.float32,
+        )
+
+    def _load_gpu_chunk(self, clip_indices=None, seed=None):
         if clip_indices is None:
             if self._gpu_clip_budget >= self._total_clips:
                 clip_indices = np.arange(self._total_clips)
             else:
-                clip_indices = np.random.choice(
+                clip_indices = np.random.default_rng(seed).choice(
                     self._total_clips, self._gpu_clip_budget, replace=False
                 )
 
@@ -169,8 +259,10 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
     def swap_clips(self, seed=None):
         """Reshuffle the on-GPU clip subset. Returns True if clips actually
         changed (callers must reset in-progress envs, whose stored clip
-        indices reference the previous chunk), False for a no-op swap."""
-        if self._gpu_clip_budget >= self._total_clips:
+        indices reference the previous chunk), False for a no-op swap.
+        No-ops when `clip_swap=False`: the initial subset is pinned for the
+        whole run (fixed-subset training / coverage diagnostics)."""
+        if not self._clip_swap or self._gpu_clip_budget >= self._total_clips:
             return False
         rng = np.random.default_rng(seed)
         clip_indices = rng.choice(
@@ -254,6 +346,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             "reward/ee": jp.zeros(()),
             "reward/root": jp.zeros(()),
             "reward/torque": jp.zeros(()),
+            "root_dist": jp.zeros(()),
         }
 
         reward_val, done = jp.zeros(2)
@@ -272,10 +365,12 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         phase_idx = (state.info["phase_idx"] + 1) % clip_len
 
         abs_idx = state.info["clip_start"] + phase_idx
-        reward_val, tracking = self._get_reward(data, abs_idx, ctrl, state.metrics)
+        reward_val, tracking, root_dist = self._get_reward(
+            data, abs_idx, ctrl, state.metrics
+        )
 
-        # Genuine termination: fall / NaN / tracking collapse.
-        terminated = self._get_termination(data, tracking)
+        # Genuine termination: fall / NaN / tracking collapse / root drift.
+        terminated = self._get_termination(data, tracking, root_dist)
 
         # For a non-cyclic clip, end `look_ahead` frames before the last frame:
         # the obs references frames up to phase_idx + look_ahead, so stopping at
@@ -371,33 +466,43 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         root_err = root_pos_err + root_quat_err
         r_root = jp.exp(-root_err / cfg.sigma_root)
 
-        # Torque penalty: discourage needless control effort. ``ctrl`` is the
-        # clipped actuator command in [-1, 1] (the normalized torque command, the
-        # gear maps it to physical N·m), so mean-square keeps this O(1) and its
-        # weight directly comparable to the tracking kernels. This is a penalty
-        # (negative), kept OUT of `tracking` below so it never feeds the
-        # tracking-collapse termination — only fall/NaN/loss-of-tracking do.
-        r_torque = -cfg.w_torque * jp.mean(jp.square(ctrl))
+        # Euclidean root drift (metres) from the reference root position, for
+        # the geometric root-drift termination and threshold tuning: the exp
+        # kernel above barely discriminates drift (15 cm costs ~6% of r_root),
+        # so the raw distance is logged as its own metric.
+        root_dist = jp.sqrt(root_pos_err)
+
+        # Effort penalty: discourage needless actuation power. Uses the ACTUAL
+        # actuator force normalized by each actuator's strength limit, so it
+        # means "effort" under both actuation modes: in torque mode
+        # actuator_force = gear * ctrl, so force/limit == ctrl and this equals
+        # the old mean-square-ctrl penalty exactly; in position mode ctrl is a
+        # target pose, so penalizing it would be wrong — the servo's realized
+        # force is the effort. Penalty (negative), kept OUT of `tracking` below
+        # so it never feeds the tracking-collapse termination.
+        effort = data.actuator_force / self._force_limit
+        r_torque = -cfg.w_torque * jp.mean(jp.square(effort))
 
         metrics["reward/pose"] = r_pose
         metrics["reward/vel"] = r_vel
         metrics["reward/ee"] = r_ee
         metrics["reward/root"] = r_root
         metrics["reward/torque"] = r_torque
+        metrics["root_dist"] = root_dist
 
         # Weighted tracking reward (everything but the constant alive bonus and
-        # the torque penalty). Returned alongside the total so termination can
-        # gate on it without recomputing the components.
+        # the torque penalty). Returned alongside the total (with the root
+        # drift) so termination can gate on both without recomputing.
         tracking = (
             cfg.w_pose * r_pose
             + cfg.w_vel * r_vel
             + cfg.w_ee * r_ee
             + cfg.w_root * r_root
         )
-        return tracking + cfg.w_alive + r_torque, tracking
+        return tracking + cfg.w_alive + r_torque, tracking, root_dist
 
     def _get_termination(
-        self, data: mjx.Data, tracking: jax.Array
+        self, data: mjx.Data, tracking: jax.Array, root_dist: jax.Array
     ) -> jax.Array:
         nan_check = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
@@ -412,9 +517,21 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         else:
             low_track = jp.bool_(False)
 
+        # Root-drift termination: end the episode once the root wanders more
+        # than `max_dist` metres from the reference root position (position
+        # only; orientation stays the reward's job). Geometric, so unlike the
+        # tracking-fraction rule it is decoupled from reward shaping — sigma/
+        # weight retunes don't silently move this floor. `root_dist` comes from
+        # _get_reward, which already holds the phase-indexed reference frame.
+        rrt = self._config.root_termination
+        if rrt.enabled:
+            root_too_far = root_dist > rrt.max_dist
+        else:
+            root_too_far = jp.bool_(False)
+
         return jp.where(
             self._config.early_termination,
-            nan_check | low_track,
+            nan_check | low_track | root_too_far,
             nan_check,
         )
 

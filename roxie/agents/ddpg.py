@@ -1,6 +1,7 @@
 import copy
 import functools
 
+import flashbax
 import hydra
 import jax
 import jax.numpy as jnp
@@ -8,7 +9,7 @@ import optax
 from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
-from roxie.agents.utils import Transition, serialize_bound
+from roxie.agents.utils import Transition, repack_samples, serialize_bound
 from roxie.losses.actor_losses import ddpg_actor_loss_fn
 from roxie.losses.critic_losses import ddpg_critic_loss_fn
 
@@ -28,26 +29,21 @@ def _grad_step(
     obs_mean: jnp.ndarray,
     obs_std: jnp.ndarray,
     obs_clip: float,
+    n_step: int = 1,
 ):
     """Performs one full gradient update step and returns the new state.
 
     `obs_mean`/`obs_std` are passed in (not recomputed): `obs_stats` is constant
     across the update loop, so they are hoisted out by `_grad_steps`.
+    `n_step` is the TD horizon (NOT the scan length `n_steps` in _grad_steps).
     """
-    # 1. Sample from the replay buffer
+    # 1. Sample from the replay buffer. `repack_samples` folds the Bellman
+    # target ingredients (n-step return, per-sample bootstrap coefficient,
+    # bootstrap observation) into the dict for both buffer layouts, so the
+    # critic loss no longer sees gamma/terminals directly.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
-
-    # type(samples)  flashbax.buffers.flat_buffer.TransitionSample
-    # type(samples.experience) flashbax.buffers.flat_buffer.ExperiencePair
-    # type(samples.experience.first) roxie.replays.buffer.Transition
-    re_packed_samples = {
-        "observations": samples.experience.first.observation,
-        "actions": samples.experience.first.action,
-        "rewards": samples.experience.first.reward,
-        "next_observations": samples.experience.second.observation,
-        "terminals": samples.experience.first.terminal,
-    }
+    re_packed_samples = repack_samples(samples, gamma, n_step)
 
     # 2. Critic update
     critic_loss, critic_grads = nnx.value_and_grad(ddpg_critic_loss_fn)(
@@ -55,7 +51,6 @@ def _grad_step(
         state.target_actor,
         state.target_critic,
         re_packed_samples,
-        gamma,
         noise_key,
         target_policy_noise,
         target_noise_clip,
@@ -121,7 +116,7 @@ def _grad_step(
 # across the loop and closed over.
 @functools.partial(
     nnx.jit,
-    static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps"),
+    static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps", "n_step"),
     # Donate the train state (arg 0): its large read-only replay buffer is
     # threaded unchanged through the scan, so without donation XLA allocates a
     # full second copy of the buffer (~1.4GB for 500k obs) every update. The
@@ -141,6 +136,7 @@ def _grad_steps(
     action_high: float,
     obs_eps: float,
     obs_clip: float,
+    n_step: int = 1,
 ):
     # Hoist the (loop-constant) normalization params out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
@@ -167,6 +163,7 @@ def _grad_steps(
             obs_mean,
             obs_std,
             obs_clip,
+            n_step,
         )
         _, scan_state = nnx.split(st)
         return scan_state, (actor_loss, critic_loss)
@@ -198,6 +195,7 @@ class DDPG(Agent):
         steps_between_updates: int = 10,
         learning_steps: int = 5,
         memory_warmup: int = 100,
+        n_step: int = 1,
         target_noise_clip: float = 0.1,
         target_policy_noise: float = 0.1,
         max_grad_norm: float = 1.0,
@@ -219,15 +217,35 @@ class DDPG(Agent):
         # Instantiate critic (overridable so TD3 can swap in a TwinCritic)
         critic = self._make_critic(critic_config, env_obs_size, env_action_size)
 
-        # Instantiate replay buffer
+        # Instantiate replay buffer. `truncation` is stored alongside `terminal`
+        # so n-step windows can stop at episode boundaries the terminal flag
+        # doesn't mark (clip-end / time-limit truncations).
         prototype = Transition(
             observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
             action=jnp.zeros(env_action_size, dtype=jnp.float32),
             reward=jnp.zeros((), dtype=jnp.float32),
-            # next_observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
             terminal=jnp.zeros((), dtype=jnp.bool_),
+            truncation=jnp.zeros((), dtype=jnp.bool_),
         )
-        replay = hydra.utils.instantiate(memory_config)
+        self.n_step = int(n_step)
+        if self.n_step > 1:
+            # n-step targets need n_step+1 consecutive items per sample: use a
+            # trajectory buffer (period=1 = windows at every offset). The yaml
+            # keeps the flat-buffer schema (max_length/min_length are TOTAL
+            # transitions); convert to flashbax's per-row time-axis lengths.
+            add_batch = int(memory_config.add_batch_size)
+            replay = flashbax.make_trajectory_buffer(
+                add_batch_size=add_batch,
+                sample_batch_size=int(memory_config.sample_batch_size),
+                sample_sequence_length=self.n_step + 1,
+                period=1,
+                min_length_time_axis=max(
+                    self.n_step + 1, int(memory_config.min_length) // add_batch
+                ),
+                max_length_time_axis=int(memory_config.max_length) // add_batch,
+            )
+        else:
+            replay = hydra.utils.instantiate(memory_config)
         self.batch_size = memory_config.sample_batch_size
         self.buffer_size = memory_config.max_length
 
@@ -312,6 +330,18 @@ class DDPG(Agent):
             rngs=critic_rngs,
         )
 
+    def replay_add(self, buffer_state, transitions):
+        """Add one env-step batch of transitions (leaves shaped (B, ...)).
+
+        The trajectory buffer (n_step > 1) expects an explicit time axis on
+        every leaf — (B, T=1, ...) for per-step adds — while the flat buffer
+        takes the batch as-is. Callers (self.add, the trainer's warmup fill)
+        go through here so they never need to know which layout is active.
+        """
+        if self.n_step > 1:
+            transitions = jax.tree.map(lambda x: x[:, None], transitions)
+        return self.replay.add(buffer_state, transitions)
+
     def step(
         self,
         observation: jnp.ndarray,
@@ -360,10 +390,14 @@ class DDPG(Agent):
             # the bootstrap and collapses Q at the cutoff. With all envs hitting
             # the time limit in lockstep this floods the buffer at once.
             terminal=states.info["termination"],
+            # Stored separately so n-step windows can stop at truncations too —
+            # in the flat stream the item after ANY done is the next episode's
+            # reset state, so a window must never accumulate across one.
+            truncation=states.info["truncation"],
         )
 
         # store in memory
-        self.state.buffer_state = self.replay.add(self.state.buffer_state, experiences)
+        self.state.buffer_state = self.replay_add(self.state.buffer_state, experiences)
 
         # Update observation normalization stats with both current and next observations
         if self.normalize_observations:
@@ -394,6 +428,7 @@ class DDPG(Agent):
                 self.action_high,
                 self.obs_eps,
                 self.obs_clip,
+                n_step=self.n_step,
             )
             gradient_steps += self.learning_steps
 
@@ -416,6 +451,7 @@ class DDPG(Agent):
             "steps_before_learning": int(self.steps_before_learning),
             "steps_between_updates": int(self.steps_between_updates),
             "learning_steps": int(self.learning_steps),
+            "n_step": int(self.n_step),
             "memory_warmup": int(self.memory_warmup),
             "memory_capacity": int(self.buffer_size),
             "memory_batch_size": int(self.batch_size),

@@ -1,0 +1,85 @@
+# @package _global_
+#
+# CPU EnvPool-style mirror of the mocap TD3 experiment: identical task
+# (obs/reward/termination and the shared env_config/reward groups) to
+# mocap_td3_warp.yaml / mocap_td3_jax.yaml, but the physics runs on native
+# MuJoCo across CPU threads (examples/mocap/mocap_envpool.py) while the agent
+# still trains in JAX on the default device. Use it to compare CPU vs GPU
+# physics throughput and learning curves under the same agent config.
+#
+# Playback: `play.py --config-name mocap/mocap_td3_envpool` works — the builder
+# delegates to the MJX (impl=jax) env in play mode; checkpoints are agent-side
+# and replay identically on any backend.
+
+defaults:
+  - agent: td3_mocap
+  - /noise: ou
+  - env_config: cmu
+  - reward: cmu_tracking
+  - _self_
+
+env:
+  seed: 0
+  # CPU pool size. Unlike the GPU backends (where throughput keeps scaling to
+  # hundreds of worlds), CPU physics saturates near the physical core count —
+  # beyond that, extra envs only add latency per trainer iteration.
+  parallel_envs: 20
+  # Stepping threads. null = min(parallel_envs, cpu cores). Leave a core or two
+  # free for the JAX learner's host thread if the machine is fully loaded.
+  num_threads: null
+  # Eval pool size — must match trainer.test_episodes (the trainer scores that
+  # many episodes against this pool).
+  test_episodes: 50
+  # Experiment-injected env factory + viewer hook (resolved by train.py /
+  # play.py via hydra.utils.get_method), so the core loops never branch on
+  # an env-type string.
+  builder: examples.mocap.mocap_envpool.build_mocap_envpool_env
+  viewer: examples.mocap.loader.mocap_viewer_extras
+  env_name: null
+  list_envs: false
+  clip_ids: []
+  # Label only (shown in the startup banner): physics is native MuJoCo inside
+  # the pool. The Warp/MJX knobs (gpu_clip_budget, naconmax/njmax/naccdmax,
+  # graph_mode) do not apply — native MuJoCo allocates contacts dynamically and
+  # the full clip dataset lives in host RAM.
+  impl: envpool
+  # Full humanoid self-collision, same as the GPU configs. On CPU this has no
+  # memory-budget implications, only per-step collision cost.
+  self_collisions: true
+
+# Exploration-noise overrides on top of /noise: ou — kept identical to
+# mocap_td3_warp.yaml so learning-curve comparisons isolate the backend.
+noise:
+  initial_noise_scale: 0.05
+  decay_schedule:
+    decay_steps: 200_000_000
+    final_value: 0.02
+
+trainer:
+  steps: 1_000_000_000
+  epoch_steps: 1_000_000
+  save_steps: 10_000_000
+  test_episodes: 50
+  show_progress: true
+  replace_checkpoint: false
+
+# Metric logging backends. Console + CSV (in the run's output dir) are always
+# on. Set logging.wandb.enabled: true to also stream metrics to Weights &
+# Biases (requires the `wandb` package; run `wandb login` once).
+logging:
+  wandb:
+    enabled: false
+    project: roxie
+    entity: null
+    name: null
+    group: null
+    tags: []
+    mode: online   # online | offline | disabled
+    # Re-prompt for the wandb API key on every run so a multi-account desktop
+    # never logs to the wrong account by reusing cached credentials. Set false
+    # to trust the existing login (or set WANDB_API_KEY, which also skips it).
+    relogin: true
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}

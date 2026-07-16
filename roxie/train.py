@@ -1,15 +1,6 @@
 import os
 import sys
 
-# These flags exist solely for the Warp backend: Warp allocates GPU memory
-# outside JAX's pool, so we cap JAX's preallocation fraction and disable
-# XLA autotuning (which can OOM when it races Warp for scratch space).
-# On CPU or pure-JAX (MJX) runs neither flag is needed.
-_using_warp = any("impl=warp" in arg for arg in sys.argv[1:])
-if _using_warp:
-    os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
-    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
-
 # device=<cpu|gpu> overrides JAX platform selection. Must be parsed from
 # sys.argv before JAX is imported — JAX_PLATFORMS is read at import time.
 _device = next(
@@ -50,6 +41,21 @@ sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 @hydra.main(version_base=None, config_path="configs", config_name="walker/walker_ddpg")
 def main(cfg: DictConfig):
     print(cfg.agent.name)
+
+    # Backend env vars are decided here, from the COMPOSED config, not at module
+    # import from sys.argv: `env.impl: warp` set in an experiment yaml never
+    # appears in argv, so an argv sniff misses it (JAX then preallocates its
+    # default 75% of VRAM and warp/reset constants OOM). This works because
+    # JAX's CUDA client initializes lazily at the first jax.* call below — the
+    # vars just have to be set before that, not before `import jax`.
+    if cfg.env.get("impl", None) == "warp":
+        # Warp allocates GPU memory outside JAX's pool: cap JAX so Warp has
+        # headroom for its solver/collision scratch. Don't disable preallocation
+        # instead — that fragments and OOMs the large replay-buffer alloc.
+        os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
+    # XLA GPU autotuning hangs this machine's RTX 5080 (Blackwell) — required
+    # for EVERY GPU run regardless of physics backend; unused/harmless on CPU.
+    os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 
     print("JAX devices:", jax.devices())
     print("JAX platform:", jax.default_backend())

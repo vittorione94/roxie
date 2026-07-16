@@ -72,6 +72,9 @@ class EnvPoolWrapper:
     """
 
     _backend: str = "envpool"
+    # Reported by loader.resolve_loaded_impl (the startup banner): pools have
+    # no MJX backend, the "physics impl" is the pool itself.
+    _impl: str = "envpool"
 
     def __init__(self, pool: Any, max_episode_steps: int = 1000):
         self._pool = pool
@@ -99,8 +102,13 @@ class EnvPoolWrapper:
         )
 
     def step(self, state: EnvPoolWrapperState, action: Any) -> EnvPoolWrapperState:
-        obs, reward, terminated, truncated, _ = self._pool.step(np.asarray(action))
+        obs, reward, terminated, truncated, info = self._pool.step(np.asarray(action))
         done = np.logical_or(terminated, truncated)
+        # Pools may report per-step env metrics (e.g. the mocap pool's reward
+        # components) under info["metrics"]; surface them on the state so the
+        # trainer logs them exactly like the JAX path does. Kept as numpy —
+        # the trainer reduces them host-side.
+        metrics = info.get("metrics", {}) if isinstance(info, dict) else {}
         return EnvPoolWrapperState(
             EnvPoolEnvState(
                 obs=jnp.array(obs, dtype=jnp.float32),
@@ -110,6 +118,7 @@ class EnvPoolWrapper:
                     "termination": jnp.array(terminated, dtype=jnp.bool_),
                     "truncation": jnp.array(truncated, dtype=jnp.bool_),
                 },
+                metrics=metrics,
             )
         )
 

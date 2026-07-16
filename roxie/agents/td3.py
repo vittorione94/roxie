@@ -8,6 +8,7 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.ddpg import DDPG
+from roxie.agents.utils import repack_samples
 from roxie.losses.actor_losses import td3_actor_loss_fn
 from roxie.losses.critic_losses import td3_critic_loss_fn
 from roxie.models.critics import TwinCritic
@@ -31,22 +32,19 @@ def _grad_step(
     obs_std: jnp.ndarray,
     obs_clip: float,
     update_actor,
+    n_step: int = 1,
 ):
     """One TD3 step. `obs_mean`/`obs_std` are hoisted in by `_grad_steps` (the
     stats are loop-constant). `update_actor` is a *traced* boolean here: the actor
     and target updates run under `nnx.cond` so the delayed-policy-update trick
-    survives the `lax.scan` (where the step index is no longer static)."""
-    # 1. Sample from the replay buffer
+    survives the `lax.scan` (where the step index is no longer static).
+    `n_step` is the TD horizon (NOT the scan length)."""
+    # 1. Sample from the replay buffer. `repack_samples` folds the n-step
+    # return, bootstrap coefficient, and bootstrap obs into the dict, so the
+    # critic loss no longer sees gamma/terminals directly.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
-
-    re_packed_samples = {
-        "observations": samples.experience.first.observation,
-        "actions": samples.experience.first.action,
-        "rewards": samples.experience.first.reward,
-        "next_observations": samples.experience.second.observation,
-        "terminals": samples.experience.first.terminal,
-    }
+    re_packed_samples = repack_samples(samples, gamma, n_step)
 
     # 2. Critic update (twin critic, clipped double-Q target) — every step
     critic_loss, critic_grads = nnx.value_and_grad(td3_critic_loss_fn)(
@@ -54,7 +52,6 @@ def _grad_step(
         state.target_actor,
         state.target_critic,
         re_packed_samples,
-        gamma,
         noise_key,
         target_policy_noise,
         target_noise_clip,
@@ -129,7 +126,9 @@ def _grad_step(
 # carried; `buffer_state` and the normalization params are loop-constant.
 @functools.partial(
     nnx.jit,
-    static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps", "policy_delay"),
+    static_argnames=(
+        "gamma", "tau", "replay_sample_fn", "n_steps", "policy_delay", "n_step",
+    ),
     # Donate the train state (arg 0): its large read-only replay buffer is
     # threaded unchanged through the scan, so without donation XLA allocates a
     # full second copy of the buffer (~1.4GB for 500k obs) every update. The
@@ -150,6 +149,7 @@ def _grad_steps(
     obs_eps: float,
     obs_clip: float,
     policy_delay: int,
+    n_step: int = 1,
 ):
     # Hoist the (loop-constant) normalization params out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
@@ -177,6 +177,7 @@ def _grad_steps(
             obs_std,
             obs_clip,
             update_actor,
+            n_step,
         )
         _, scan_state = nnx.split(st)
         return scan_state, (actor_loss, critic_loss)
@@ -240,6 +241,7 @@ class TD3(DDPG):
                 self.obs_eps,
                 self.obs_clip,
                 self.policy_delay,
+                n_step=self.n_step,
             )
             gradient_steps += self.learning_steps
 

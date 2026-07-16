@@ -81,6 +81,11 @@ def load_mocap_env(
     naccdmax: int | None = None,
     self_collisions: bool = True,
     graph_mode: str | None = None,
+    clip_swap: bool = True,
+    clip_seed: int = 0,
+    actuation: str = "torque",
+    actuation_kp_scale: float = 1.0,
+    actuation_kv_ratio: float = 0.1,
 ):
     # No Python default schema: fall back to the YAML-owned defaults so callers
     # outside a Hydra run still get the canonical config.
@@ -94,6 +99,9 @@ def load_mocap_env(
         gpu_clip_budget=gpu_clip_budget,
         impl=impl, naconmax=naconmax, njmax=njmax, naccdmax=naccdmax,
         self_collisions=self_collisions, graph_mode=graph_mode,
+        clip_swap=clip_swap, clip_seed=clip_seed,
+        actuation=actuation, actuation_kp_scale=actuation_kp_scale,
+        actuation_kv_ratio=actuation_kv_ratio,
     )
     env._xml_path = xml_path
     train_wrapper = TerminationWrapper(env, max_episode_steps=config.episode_length)
@@ -195,6 +203,16 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         naccdmax=naccdmax,
         self_collisions=self_collisions,
         graph_mode=graph_mode,
+        # clip_swap=False pins the initial gpu_clip_budget subset for the whole
+        # run (fixed-subset training); the pick is seeded by env.seed so the
+        # same subset recurs across runs.
+        clip_swap=bool(cfg_env.get("clip_swap", True)),
+        clip_seed=int(cfg_env.get("seed", 0) or 0),
+        # "position" = PD-target servos (dm_control tuned gains, ctrl stays
+        # [-1,1] mapped onto joint ranges); "torque" = the raw motors.
+        actuation=str(cfg_env.get("actuation", "torque")),
+        actuation_kp_scale=float(cfg_env.get("actuation_kp_scale", 1.0)),
+        actuation_kv_ratio=float(cfg_env.get("actuation_kv_ratio", 0.1)),
     )
     return EnvBundle(env=env, test_env=test_env, env_cfg=None)
 

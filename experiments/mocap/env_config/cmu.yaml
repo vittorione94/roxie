@@ -20,7 +20,7 @@ config:
   action_scale: 1.0
   cyclic: false
   random_start: true
-  look_ahead: 2
+  look_ahead: 5
   reset_noise_scale: 0.001
   # Tracking-collapse early termination. End the episode when the weighted
   # tracking reward (the four components, excluding the alive bonus) falls below
@@ -30,3 +30,15 @@ config:
   reward_termination:
     enabled: true
     min_tracking_frac: 0.5
+  # Geometric root-drift termination: end the episode when the root is more
+  # than max_dist metres from the reference root position (position only).
+  # Complements reward_termination: the exp root kernel barely discriminates
+  # drift (15 cm costs ~6% of r_root, ~1% of total reward), and unlike the
+  # tracking-fraction floor this rule doesn't move when reward sigmas/weights
+  # are retuned. 0.3 bites the drift tail without executing the median policy
+  # (which lives at ~10-13 cm root error) — tighten toward 0.15 as tracking
+  # improves, guided by the logged `root_dist` per-step metric. Only applied
+  # when early_termination is true.
+  root_termination:
+    enabled: true
+    max_dist: 0.25

@@ -1,3 +1,5 @@
+import dataclasses
+import functools
 import os
 import time
 
@@ -8,6 +10,16 @@ from flax import nnx
 from roxie.utils import logger
 from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
+
+
+def _agent_replay_add(agent, buffer_state, transitions):
+    """Add a (B, ...) batch through the agent's `replay_add` when it has one
+    (DDPG/TD3 insert the time axis their trajectory buffer expects when
+    n_step > 1); fall back to the raw flat-buffer add otherwise (SAC)."""
+    fn = getattr(agent, "replay_add", None)
+    if fn is not None:
+        return fn(buffer_state, transitions)
+    return agent.replay.add(buffer_state, transitions)
 
 
 class Trainer:
@@ -125,13 +137,14 @@ class Trainer:
         if getattr(agent, "memory_warmup", 0) > 0:
             print("Compiling replay add...", flush=True)
             t0 = time.time()
-            dummy_t = Transition(
-                observation=wrapped_states.env_state.obs,
-                action=jnp.zeros((NUM_ENVS, action_size)),
-                reward=jnp.zeros(NUM_ENVS),
-                terminal=jnp.zeros(NUM_ENVS, dtype=jnp.bool_),
+            # Build the dummy from the agent's OWN buffer prototype (leaves are
+            # (add_batch, time, ...)) so this stays correct across per-agent
+            # Transition layouts (e.g. DDPG/TD3 store `truncation`, SAC not).
+            dummy_t = jax.tree.map(
+                lambda leaf: jnp.zeros((NUM_ENVS,) + leaf.shape[2:], leaf.dtype),
+                agent.state.buffer_state.experience,
             )
-            _ = agent.replay.add(agent.state.buffer_state, dummy_t)
+            _ = _agent_replay_add(agent, agent.state.buffer_state, dummy_t)
             jax.block_until_ready(jax.tree.leaves(_))
             print(f"  {time.time() - t0:.1f}s", flush=True)
 
@@ -170,6 +183,10 @@ class Trainer:
                         action=actions,
                         reward=new_states.env_state.reward,
                         terminal=new_states.env_state.info["termination"],
+                        # Only stored by agents whose prototype carries it
+                        # (DDPG/TD3 n-step); harmless extra field otherwise —
+                        # batch_add below prunes to the buffer's own layout.
+                        truncation=new_states.env_state.info["truncation"],
                     )
                     return (auto_states, rng), (transition, new_states.env_state.obs)
                 return jax.lax.scan(body, (state, rng), None, length=warmup_iters)
@@ -189,10 +206,28 @@ class Trainer:
             wrapped_states.env_state.obs.block_until_ready()
             print(f"  {time.time() - t0:.1f}s", flush=True)
 
-            @jax.jit
+            # Donate the buffer state: without donation XLA keeps the input
+            # buffer alive AND allocates a full output copy — a transient 2x
+            # of the largest array in the program (the buffer's obs store:
+            # ~3GB per copy at look_ahead=5), which OOMs the pool right here.
+            # The input is dead after the reassignment below — same pattern
+            # as _grad_steps' donate_argnums in the agents.
+            # Prune the rollout transitions to the fields the agent's buffer
+            # actually stores (SAC's prototype has no `truncation`; DDPG/TD3's
+            # does) so the pytree structures match at add time.
+            proto = agent.state.buffer_state.experience
+            transitions = Transition(**{
+                f.name: (
+                    getattr(transitions, f.name)
+                    if getattr(proto, f.name) is not None else None
+                )
+                for f in dataclasses.fields(Transition)
+            })
+
+            @functools.partial(jax.jit, donate_argnums=(0,))
             def batch_add(buffer_state, transitions):
                 def add_one(bs, t):
-                    return agent.replay.add(bs, t), None
+                    return _agent_replay_add(agent, bs, t), None
                 bs, _ = jax.lax.scan(add_one, buffer_state, transitions)
                 return bs
 
@@ -290,6 +325,19 @@ class Trainer:
 
             agent_key, update_key = jax.random.split(agent_key)
             agent.add(old_wrapped_states.env_state, new_wrapped_states.env_state)
+
+            # Keep the obs-normalization running stats tracking the CURRENT
+            # policy's state distribution. Stats were previously accumulated only
+            # from the random-action warmup and then frozen, so velocity- and
+            # ref-delta-scale features stayed normalized to the flailing-policy
+            # regime for the whole run. Obs are stored raw in the replay buffer
+            # and normalized at sample time, so continuously-updated stats stay
+            # consistent for old and new data alike. Pure device op — no host
+            # sync, same async-pipeline rules as the metric accumulation below.
+            if getattr(agent, "normalize_observations", False):
+                agent.state.obs_stats = Agent.update_obs_stats(
+                    agent.state.obs_stats, new_wrapped_states.env_state.obs,
+                )
 
             # Let the agent gate its own updates. Every agent.update() decides
             # internally whether to run gradient steps (DDPG/SAC via Python step

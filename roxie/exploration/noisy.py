@@ -103,20 +103,25 @@ class OrnsteinUhlenbeckNoise(NoiseModule):
     def sample_noise(
         self, key: jax.random.PRNGKey, shape: Optional[tuple] = None
     ) -> jnp.ndarray:
-        # OU process: dx = theta * (mu - x) * dt + sigma * dW
-        # Discretized: x_t = x_{t-1} + theta * (mu - x_{t-1}) * dt + sqrt(dt) * noise
-        # Same parameterization as roxie.agents.basic.OrnsteinUhlenbeck, so
-        # `theta` is the continuous-time mean-reversion rate in both.
+        # OU process: dx = theta * (mu - x) * dt + sqrt(2*theta) * dW
+        # Discretized: x_t = x_{t-1} + theta*dt*(mu - x_{t-1}) + sqrt(2*theta*dt)*noise
+        # The sqrt(2*theta*dt) increment makes the STATIONARY std of the process
+        # ~1.0 for any theta/dt, so `initial_noise_scale` (applied outside by
+        # add_noise) is the actual stationary noise std. A bare sqrt(dt)
+        # increment gives std = sqrt(1/(2*theta)) — e.g. 1.7x the scale at
+        # theta=0.15 — silently coupling amplitude to the mean-reversion rate.
+        # NOTE: this differs from roxie.agents.basic.OrnsteinUhlenbeck (the
+        # OU-as-policy agent), which keeps the unnormalized sqrt(dt) increment.
         current_noise = self.noise_state.value
 
         # Mean reversion term
         mean_reversion = self.theta * self.dt * (self.mu - current_noise)
 
-        # Random component (gaussian sample clipped per step, then scaled by
-        # sqrt(dt) -- same order as roxie.agents.basic.OrnsteinUhlenbeck).
+        # Random component (gaussian sample clipped per step, then scaled to
+        # unit stationary variance).
         shape = shape or self.action_shape
         gaussian = jnp.clip(jax.random.normal(key, shape), -self.clip, self.clip)
-        random_component = jnp.sqrt(self.dt) * gaussian
+        random_component = jnp.sqrt(2.0 * self.theta * self.dt) * gaussian
 
         # Update noise state
         new_noise = current_noise + mean_reversion + random_component

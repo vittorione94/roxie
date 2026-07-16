@@ -11,7 +11,6 @@ def ddpg_critic_loss_fn(
     target_actor_model,
     target_critic_model,
     samples,
-    gamma,
     noise_key,
     target_policy_noise,
     target_noise_clip,
@@ -44,10 +43,12 @@ def ddpg_critic_loss_fn(
 
     next_q = target_critic_model(next_obs, next_actions)
 
-    term = samples["terminals"].astype(jnp.float32)
+    # `rewards` is the (n-step) return and `bootstrap` the per-sample
+    # coefficient gamma^b * (0 if terminal in window) — both precomputed by
+    # repack_samples, which owns all gamma/terminal/truncation handling.
     reward = jnp.squeeze(samples["rewards"])
     next_q = jnp.squeeze(next_q)
-    target_q = reward + gamma * (1.0 - term) * next_q
+    target_q = reward + samples["bootstrap"] * next_q
     target_q = jax.lax.stop_gradient(target_q)
 
     current_q = critic_model(obs, samples["actions"])
@@ -62,7 +63,6 @@ def td3_critic_loss_fn(
     target_actor_model,
     target_twin_critic,
     samples,
-    gamma,
     noise_key,
     target_policy_noise,
     target_noise_clip,
@@ -100,9 +100,11 @@ def td3_critic_loss_fn(
     target_q1, target_q2 = target_twin_critic(next_obs, next_actions)
     next_q = jnp.minimum(jnp.squeeze(target_q1), jnp.squeeze(target_q2))
 
-    term = samples["terminals"].astype(jnp.float32)
+    # `rewards` is the (n-step) return and `bootstrap` the per-sample
+    # coefficient gamma^b * (0 if terminal in window) — both precomputed by
+    # repack_samples, which owns all gamma/terminal/truncation handling.
     reward = jnp.squeeze(samples["rewards"])
-    target_q = reward + gamma * (1.0 - term) * next_q
+    target_q = reward + samples["bootstrap"] * next_q
     target_q = jax.lax.stop_gradient(target_q)
 
     q1, q2 = twin_critic(obs, samples["actions"])

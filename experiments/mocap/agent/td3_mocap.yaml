@@ -5,13 +5,24 @@ args:
   tau: 0.005
   actor_learning_rate: 3e-4
   critic_learning_rate: 3e-4
-  target_policy_noise: 0.2        # TD3 default target smoothing (env-unit fraction)
-  target_noise_clip: 0.5
+  # Target policy smoothing. TD3's default 0.2 blurs the target-Q over a ±0.2
+  # action neighbourhood — right for locomotion benchmarks, hostile to precision
+  # tracking, where optimal actions live on sharp Q-ridges that 0.2-smoothing
+  # systematically undervalues. 0.05 keeps the overestimation guard while
+  # respecting the precision the task demands (clip scaled to ~3x sigma).
+  target_policy_noise: 0.05
+  target_noise_clip: 0.15
   policy_delay: 2                 # actor + target updates every 2 critic steps
   memory_warmup: 30_000
   steps_before_learning: 30_000
-  steps_between_updates: 64       
+  steps_between_updates: 8_000
   learning_steps: 128
+  # n-step TD horizon. >1 switches replay to a flashbax trajectory buffer
+  # (windows of n_step+1 consecutive items, truncation-aware masking in
+  # roxie/agents/utils.py repack_samples) so value information propagates n
+  # steps per update instead of one. Effective bootstrap discount is gamma^n.
+  # The memory block below keeps its flat-buffer schema either way.
+  n_step: 3
   max_grad_norm: 1
 
 actor:
@@ -28,8 +39,11 @@ critic:
 
 memory:
   _target_: flashbax.buffers.make_flat_buffer
-  max_length: 1_000_000
+  max_length: 750_000
   min_length: 10_000
+  # Keep 512: learner cost is linear in batch, so at fixed FLOPs more scan
+  # steps at 512 beat fewer at 1024 (same replay ratio, 2x optimizer steps).
+  # Measured on RTX 5080: ~1.16ms/grad-step at batch 512.
   sample_batch_size: 512
   add_sequences: False
   add_batch_size: ${env.parallel_envs}

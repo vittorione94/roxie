@@ -14,13 +14,14 @@
 # noise sweep only probes near the reference — `sigma_vel` below was set from
 # the *training* error regime (see note), which that sweep does not reach.
 #   - sigma_vel: the kernel is correct AT the reference (perfect tracking gives
-#     vel=1.0), but the policy's actual joint-velocity errors are large
-#     (vel_err ~ sum-of-squares ~150-350 over ~28 DOFs, i.e. ~2.4 rad/s RMS per
-#     joint). At sigma_vel=10 that gave exp(-161/10) ~ 1e-7 = a flat-zero kernel
-#     everywhere the policy operates, so `reward/vel` provided no gradient to
-#     learn velocity tracking at all. Set to 200 so r_vel ~ 0.2-0.6 across the
-#     errors actually seen, giving real signal. (The earlier 0.1->10 widening
-#     was ~20x short of the operating regime.)
+#     vel=1.0), but the policy's actual joint-velocity errors are large. Third
+#     retune: 10 -> 200 -> 800. The 200 setting assumed vel_err ~150-350, but
+#     measured training-regime errors are ~500-900 (r_vel logged 0.013 early,
+#     0.09 after 200M steps — deep in the saturated tail, so ~no gradient AND
+#     the dead term tightened the tracking-termination floor from 50% to ~56%
+#     of achievable). At 800, r_vel ~ 0.34 at err ~870 and ~0.7 at err ~300.
+#     If it saturates high late in training, tighten again — or cut w_vel
+#     instead: reference qvel is finite-differenced, hence a noisy target.
 #   - sigma_pose was 2.0, pinning `reward/pose` at ~0.03 deep in the saturated
 #     tail despite carrying the largest weight. Widened so pose actually drives
 #     learning.
@@ -42,6 +43,6 @@ reward:
   w_torque: 0.01
   # Exp-kernel bandwidths (larger = more forgiving / more gradient signal).
   sigma_pose: 6.0
-  sigma_vel: 200.0
+  sigma_vel: 800.0
   sigma_ee: 0.15
   sigma_root: 0.2

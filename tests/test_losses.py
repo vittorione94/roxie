@@ -69,6 +69,10 @@ def ddpg_samples():
         "actions": jax.random.normal(k2, (BATCH, ACT_DIM)),
         "rewards": jax.random.normal(k3, (BATCH,)),
         "next_observations": jax.random.normal(k4, (BATCH, OBS_DIM)),
+        # Per-sample bootstrap coefficient (gamma^b, 0 at terminals) — the
+        # DDPG/TD3 critic losses consume this instead of gamma + terminal
+        # flags. SAC still reads `terminals`; both keys coexist here.
+        "bootstrap": 0.99 * jnp.ones(BATCH),
         "terminals": jnp.zeros(BATCH, dtype=jnp.bool_),
     }
 
@@ -128,7 +132,6 @@ class TestDDPGCriticLoss:
             target_actor,
             target_critic,
             ddpg_samples,
-            0.99,
             key,
             0.1,
             0.1,
@@ -149,7 +152,6 @@ class TestDDPGCriticLoss:
             target_actor,
             target_critic,
             ddpg_samples,
-            0.99,
             key,
             0.1,
             0.1,

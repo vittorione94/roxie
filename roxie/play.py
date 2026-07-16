@@ -128,7 +128,7 @@ def main(checkpoint_path):
 
             viewer.sync()
 
-            time_until_next_step = model.opt.timestep * 5 - (time.time() - step_start)
+            time_until_next_step = model.opt.timestep * 15 - (time.time() - step_start)
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
 

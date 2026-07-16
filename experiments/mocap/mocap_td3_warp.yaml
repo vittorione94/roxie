@@ -2,7 +2,7 @@
 
 defaults:
   - agent: td3_mocap
-  - /noise: ou
+  - noise: noise_mocap
   - env_config: cmu
   - reward: cmu_tracking
   - _self_
@@ -19,6 +19,25 @@ env:
   list_envs: false
   clip_ids: []
   gpu_clip_budget: 0 
+  # Actuation mode: "position" = PD-target servos (policy commands target
+  # poses in [-1,1] of each joint's range; dm_control's tuned per-joint kp +
+  # forcerange; MuJoCo runs the PD at sim rate = 200Hz local feedback).
+  # "torque" = the raw dm_control motors (force = ctrl * gear) — the mode all
+  # runs used up to 2026-07-16. Exploration noise semantics improve under
+  # position mode: perturbed actions are coherent postures, not random forces.
+  # kp_scale exists because dm_control tuned kp WITH a 30ms activation filter
+  # we can't add post-compile; instead explicit rate damping kv = kv_ratio*kp
+  # is baked into the servos (0.1 swept best against spine resonance).
+  actuation: position
+  actuation_kp_scale: 1.0
+  actuation_kv_ratio: 0.1
+  # When gpu_clip_budget < total clips, the trainer rotates the on-GPU subset
+  # every epoch (VRAM-saving behaviour). Set clip_swap: false to PIN the initial
+  # subset for the whole run instead — fixed-subset training / coverage
+  # diagnostics (e.g. gpu_clip_budget=50 clip_swap=false = train on the same 50
+  # clips throughout). The pick is seeded by env.seed, so a given seed always
+  # selects the same subset. Ignored when the budget covers all clips.
+  clip_swap: true
   # Physics backend: "jax" (MJX) or "warp" (mujoco_warp). Requires warp-lang
   # <1.13 (see pyproject); verify with `uv run python scripts/check_warp.py`.
   impl: warp
