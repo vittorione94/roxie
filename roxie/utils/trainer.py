@@ -12,6 +12,29 @@ from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
 
 
+def _default_eval_action_fn(agent):
+    """Greedy action for agents whose evaluation is a plain actor forward pass.
+
+    Matches the signature of the optional `agent.eval_action_fn()` hook so the
+    eval rollout has a single code path: `critic` and `carry` are ignored here,
+    and `carry` is threaded back unchanged. Model-based agents (TD-MPC) override
+    the hook because evaluating their bare actor would score a different, much
+    weaker policy than the one being trained.
+    """
+
+    def act(actor, critic, obs_stats, obs, carry, key):
+        if agent.normalize_observations:
+            mean, std = Agent.obs_mean_std(obs_stats, agent.obs_eps)
+            obs = Agent.normalize_obs(obs, mean, std, agent.obs_clip)
+        # Deterministic eval: actor output (in [-1, 1]) scaled to env units. No
+        # noise module (its stateful update can't be mutated across the
+        # while_loop trace level).
+        action = jnp.clip(actor(obs), -1.0, 1.0)
+        return Agent.scale_to_env(action, agent.action_low, agent.action_high), carry
+
+    return act
+
+
 def _agent_replay_add(agent, buffer_state, transitions):
     """Add a (B, ...) batch through the agent's `replay_add` when it has one
     (DDPG/TD3 insert the time axis their trajectory buffer expects when
@@ -549,37 +572,45 @@ class Trainer:
         termination check (``~all(dones)``) is evaluated on-device — no per-step
         host sync, full GPU pipelining — unlike a Python ``while`` that drags a
         device array back to the host every step. A static ``max_steps`` cap
-        bounds compute and guarantees termination. Actor / obs-stats are passed
-        as traced args so the same compiled fn is reused every epoch.
+        bounds compute and guarantees termination. Actor / critic / obs-stats
+        are passed as traced args so the same compiled fn is reused every epoch
+        while always scoring the *current* weights.
+
+        How an action is chosen comes from the agent: agents that plan (TD-MPC)
+        supply an ``eval_action_fn`` plus a carry (their warm-started plan),
+        threaded through the loop; every other agent gets the plain actor pass.
         """
         agent = self.agent
-        normalize = agent.normalize_observations
+        act = (
+            agent.eval_action_fn()
+            if hasattr(agent, "eval_action_fn")
+            else _default_eval_action_fn(agent)
+        )
 
         @nnx.jit
-        def eval_fn(actor, obs_stats, states):
+        def eval_fn(actor, critic, obs_stats, states, act_carry, key):
             def cond(carry):
-                i, _states, dones, _scores, _lengths = carry
+                i, _states, dones, _scores, _lengths, _act = carry
                 return (i < max_steps) & (~jnp.all(dones))
 
             def body(carry):
-                i, states, dones, scores, lengths = carry
+                i, states, dones, scores, lengths, act_carry = carry
 
-                obs = states.env_state.obs
-                if normalize:
-                    mean, std = Agent.obs_mean_std(obs_stats, agent.obs_eps)
-                    obs = Agent.normalize_obs(obs, mean, std, agent.obs_clip)
-                # Deterministic eval: actor output (in [-1, 1]) scaled to env
-                # units. No noise module (its stateful update can't be mutated
-                # across the while_loop trace level).
-                action = jnp.clip(actor(obs), -1.0, 1.0)
-                action = Agent.scale_to_env(action, agent.action_low, agent.action_high)
+                action, act_carry = act(
+                    actor,
+                    critic,
+                    obs_stats,
+                    states.env_state.obs,
+                    act_carry,
+                    jax.random.fold_in(key, i),
+                )
 
                 next_states = v_step(states, action)
                 not_done = ~dones
                 scores = scores + next_states.env_state.reward * not_done.astype(jnp.float32)
                 lengths = lengths + not_done.astype(jnp.int32)
                 dones = jnp.logical_or(dones, next_states.env_state.done)
-                return (i + 1, next_states, dones, scores, lengths)
+                return (i + 1, next_states, dones, scores, lengths, act_carry)
 
             init = (
                 jnp.int32(0),
@@ -587,8 +618,9 @@ class Trainer:
                 jnp.zeros((num_tests,), dtype=bool),
                 jnp.zeros((num_tests,), dtype=jnp.float32),
                 jnp.zeros((num_tests,), dtype=jnp.int32),
+                act_carry,
             )
-            _, _, _, scores, lengths = jax.lax.while_loop(cond, body, init)
+            _, _, _, scores, lengths, _ = jax.lax.while_loop(cond, body, init)
             return scores, lengths
 
         return eval_fn
@@ -603,8 +635,19 @@ class Trainer:
         if getattr(self, "_eval_fn", None) is None:
             self._eval_fn = self._make_eval_fn(v_step, num_tests, max_steps)
 
+        # Planning agents start each eval rollout from a blank plan (a warm
+        # start carried over from an unrelated rollout would bias its first
+        # steps). Agents without a carry pass None, an empty pytree.
+        initial_carry = getattr(self.agent, "initial_plan_mean", None)
+        act_carry = initial_carry(num_tests) if initial_carry is not None else None
+
         scores, lengths = self._eval_fn(
-            self.agent.state.actor, self.agent.state.obs_stats, states,
+            self.agent.state.actor,
+            self.agent.state.critic,
+            self.agent.state.obs_stats,
+            states,
+            act_carry,
+            rng,
         )
 
         scores_np = np.array(scores)
@@ -954,6 +997,11 @@ class Trainer:
         test_env = self.test_environment
         agent = self.agent
         max_steps = int(getattr(test_env, "max_episode_steps", 1000))
+
+        # Planning agents carry a plan between steps; drop the one left over
+        # from the previous eval so this rollout starts cold.
+        if hasattr(agent, "reset_plan"):
+            agent.reset_plan(evaluate=True)
 
         state = test_env.reset()
         # Size the eval buffers from the pool the reset actually returns, not

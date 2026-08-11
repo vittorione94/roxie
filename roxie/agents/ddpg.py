@@ -205,15 +205,9 @@ class DDPG(Agent):
         obs_norm_eps: float = 1e-8,
     ):
 
-        actor_rngs = nnx.Rngs(params=0, dropout=1)
-
-        # Instantiate actor
-        actor = hydra.utils.instantiate(
-            actor_config,
-            in_features=env_obs_size,
-            action_dim=env_action_size,
-            rngs=actor_rngs,
-        )
+        # Instantiate actor (overridable so TD-MPC can build a policy over
+        # latents rather than observations)
+        actor = self._make_actor(actor_config, env_obs_size, env_action_size)
 
         # Instantiate critic (overridable so TD3 can swap in a TwinCritic)
         critic = self._make_critic(critic_config, env_obs_size, env_action_size)
@@ -321,6 +315,17 @@ class DDPG(Agent):
         print(f"{type(self).__name__} agent initialized.")
         print("Noise module hyperparameters:", self.noise_module.hyperparameters())
         print("Hyper Params:", self._export_hyperparams())
+
+    def _make_actor(self, actor_config, env_obs_size, env_action_size):
+        """Build the actor network. Overridden by TD-MPC, whose policy prior
+        maps a *latent* to an action rather than an observation."""
+        actor_rngs = nnx.Rngs(params=0, dropout=1)
+        return hydra.utils.instantiate(
+            actor_config,
+            in_features=env_obs_size,
+            action_dim=env_action_size,
+            rngs=actor_rngs,
+        )
 
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
         """Build the critic network. Overridden by TD3 to return a TwinCritic."""

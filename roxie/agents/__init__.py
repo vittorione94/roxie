@@ -6,6 +6,7 @@ from .ppo import PPO
 from .sac import SAC
 from .td3 import TD3
 from .td4 import TD4
+from .tdmpc import TDMPC
 
 __all__ = [
     Constant,
@@ -19,6 +20,7 @@ __all__ = [
     SAC,
     TD3,
     TD4,
+    TDMPC,
 ]
 
 agents = {
@@ -33,4 +35,5 @@ agents = {
     "sac": SAC,
     "td3": TD3,
     "td4": TD4,
+    "tdmpc": TDMPC,
 }

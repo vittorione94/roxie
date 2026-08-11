@@ -82,6 +82,75 @@ def repack_samples(samples, gamma: float, n_step: int) -> dict:
     }
 
 
+def unpack_sequence(samples, gamma: float, horizon: int) -> dict:
+    """Unpack trajectory-buffer samples into a *sequence* dict for model-based
+    agents (TD-MPC), keeping the time axis that `repack_samples` collapses.
+
+    Both read the same trajectory buffer, but for opposite purposes:
+    `repack_samples` folds a window into a single n-step Bellman target;
+    here every step of the window is a supervised training target in its own
+    right (predicted reward, TD target, next latent), so the window is returned
+    intact alongside the masks that say which steps are trainable.
+
+    The masking follows the same rule as `repack_samples`: the item AFTER a done
+    is the next episode's reset state, so nothing may read past the first done.
+    With e_j = terminal, u_j = truncation (terminal wins when both fire) and
+    alive_j = 1 up to AND INCLUDING the first done, three masks fall out —
+    they differ only in how much of step j they trust:
+
+    * `reward_mask` = alive. The transition (o_j, a_j, r_j) is genuine even on
+      the step that ends the episode, so the reward head trains on it.
+    * `value_mask` = alive * (1 - u). The TD target needs o_{j+1}; at a
+      truncation the stored successor is a reset state and the true one is
+      gone, so that step is dropped rather than bootstrapped from garbage. At a
+      terminal the step is kept — `bootstrap` is 0 there, so the target is just
+      r_j and the (meaningless) successor is never read.
+    * `consistency_mask` = alive * (1 - e) * (1 - u). The latent consistency
+      term regresses the *predicted* next latent onto the encoding of the real
+      successor, so it needs o_{j+1} to genuinely follow o_j — true only
+      strictly before the first done.
+
+    Returns leaves with the time axis intact: observations (B, H+1, D),
+    actions/rewards/masks (B, H, ...).
+    """
+    exp = samples.experience
+    if hasattr(exp, "first"):
+        raise ValueError(
+            "unpack_sequence needs a trajectory buffer (leaves shaped "
+            "(B, T, ...)); got a flat pair buffer. Sequence-model agents must "
+            "configure a trajectory buffer with sample_sequence_length "
+            "= horizon + 1."
+        )
+
+    h = int(horizon)
+    available = exp.reward.shape[1]
+    if available < h + 1:
+        raise ValueError(
+            f"horizon {h} needs sample_sequence_length >= {h + 1}, "
+            f"but the buffer samples windows of {available}."
+        )
+
+    r = exp.reward[:, :h].astype(jnp.float32)                    # (B, H)
+    e = exp.terminal[:, :h].astype(jnp.float32)
+    u = exp.truncation[:, :h].astype(jnp.float32) * (1.0 - e)
+    stop = (1.0 - e) * (1.0 - u)
+    # alive_j = prod_{i<j} stop_i: 1 up to AND INCLUDING the first done step.
+    survived = jnp.cumprod(stop, axis=1)                         # (B, H)
+    alive = jnp.concatenate([jnp.ones_like(stop[:, :1]), survived[:, :-1]], axis=1)
+
+    return {
+        "observations": exp.observation[:, : h + 1],             # (B, H+1, D)
+        "actions": exp.action[:, :h],                            # (B, H, A)
+        "rewards": r,
+        "reward_mask": alive,
+        "value_mask": alive * (1.0 - u),
+        "consistency_mask": alive * stop,
+        # Per-step bootstrap coefficient for the 1-step TD target at j:
+        # target = r_j + bootstrap_j * Q(o_{j+1}, pi(o_{j+1})), zero at terminals.
+        "bootstrap": gamma * (1.0 - e),
+    }
+
+
 # Helpers to serialize/deserialize bounds minimally
 def serialize_bound(x):
     x = jax.device_get(x)

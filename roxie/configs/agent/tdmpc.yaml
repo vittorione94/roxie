@@ -1,0 +1,76 @@
+name: "tdmpc"
+
+args:
+  gamma: 0.99
+  tau: 0.01                       # EMA rate for the target world model
+  actor_learning_rate: 1e-3       # policy prior
+  critic_learning_rate: 1e-3      # world model (encoder + dynamics + reward + Q)
+  horizon: 5                      # imagination + planning horizon; also sets the
+                                  # replay window (horizon + 1 items per sample)
+  latent_dim: 50
+
+  # --- Planner (MPPI / CEM) ---
+  # num_samples x num_iterations forward passes of the latent dynamics per env
+  # step: this is the dominant cost of acting, far above a policy forward pass.
+  # Lower num_samples first if throughput is the problem.
+  num_samples: 256
+  num_elites: 32
+  num_policy_trajectories: 24
+  num_iterations: 6
+  temperature: 0.5
+  momentum: 0.1
+  min_std: 0.05
+  max_std: 2.0
+
+  # --- Loss weights ---
+  rho: 0.5                        # per-horizon-step loss discount
+  reward_coef: 0.5
+  value_coef: 0.1
+  consistency_coef: 2.0
+
+  memory_warmup: 5_000
+  steps_before_learning: 5_000
+  steps_between_updates: 100
+  learning_steps: 25
+  max_grad_norm: 10               # TD-MPC clips harder than the DDPG family
+
+# The policy prior. `in_features` is injected as latent_dim (not the obs size):
+# pi acts on latents, and only seeds the planner's candidate set.
+actor:
+  _target_: roxie.models.actors.DeterministicActor
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+# The world model. Nested under `critic:` because that is the config train.py
+# already forwards; TDMPC._make_critic assembles these four into a TOLD.
+critic:
+  encoder:
+    _target_: roxie.models.world.Encoder
+    features: [256]
+    use_layer_norm: true
+    # simnorm_group: 8            # TD-MPC2 simplicial latent; must divide latent_dim
+  dynamics:
+    _target_: roxie.models.world.LatentDynamics
+    features: [512, 512]
+    use_layer_norm: true
+  reward:
+    _target_: roxie.models.world.RewardPredictor
+    features: [512, 512]
+    use_layer_norm: true
+  q:
+    _target_: roxie.models.critics.QCritic
+    features: [512, 512]
+    use_layer_norm: true
+    dropout_rate: 0.
+
+# Sequence replay. `horizon` above drives sample_sequence_length, so the
+# trajectory buffer is built by DDPG's existing n_step > 1 path; max_length /
+# min_length stay TOTAL transitions, as in the other agent configs.
+memory:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 1_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
