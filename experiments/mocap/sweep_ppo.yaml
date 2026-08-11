@@ -1,0 +1,26 @@
+# @package _global_
+
+# CMU_006_13 single-clip overfit sweep — PPO arm.
+#   uv run python roxie/train.py --config-name mocap/sweep_ppo
+#
+# env_config, reward and the whole sweep/overfit_cmu_006_13 block (env, trainer,
+# logging) are shared VERBATIM with every other sweep_*.yaml; agent/ppo_sweep
+# holds the only differences.
+#
+# No `noise` group here: PPO explores from its own stochastic policy and its
+# constructor takes no noise_config — adding one raises a TypeError in train.py.
+defaults:
+  - agent: ppo_sweep
+  - env_config: cmu
+  - reward: cmu_tracking
+  - backend: warp
+  - sweep: overfit_cmu_006_13
+  - _self_
+
+logging:
+  wandb:
+    name: ppo
+
+hydra:
+  run:
+    dir: outputs/sweep_cmu_006_13/ppo/${now:%Y-%m-%d_%H-%M-%S}

@@ -50,6 +50,7 @@ from examples.mocap.mocap_tracking import MocapTrackingEnv  # noqa: E402
 
 _COMPONENT_KEYS = (
     "reward/pose", "reward/vel", "reward/ee", "reward/root", "reward/torque",
+    "reward/action_rate", "root_dist",
 )
 
 
@@ -75,13 +76,19 @@ def _sample_state(pool, rng, noise):
     return clip_start, clip_len, phase_idx, abs_idx, qpos, qvel
 
 
-def _place_pool_env(pool, i, clip_start, clip_len, phase_idx, qpos, qvel, last_act):
+def _place_pool_env(
+    pool, i, clip_start, clip_len, phase_idx, qpos, qvel, last_act, ctrl=None
+):
     import mujoco
 
     d = pool._datas[i]
     mujoco.mj_resetData(pool._model, d)
     d.qpos[:] = qpos
     d.qvel[:] = qvel
+    # Set the applied ctrl before forwarding so d.actuator_force reflects it —
+    # the reward's effort term reads actuator_force, not the raw command.
+    if ctrl is not None:
+        d.ctrl[:] = ctrl
     mujoco.mj_forward(pool._model, d)
     pool._clip_start[i] = clip_start
     pool._clip_len[i] = clip_len
@@ -124,22 +131,37 @@ def main(frames, noise, seed, clip_ids, check_physics):
     comp_max_diff = {k: 0.0 for k in _COMPONENT_KEYS}
     total_max_diff = 0.0
 
+    from mujoco import mjx  # forward mjx.Data with a ctrl for the effort term
+
     for f in range(frames):
         clip_start, clip_len, phase_idx, abs_idx, qpos, qvel = _sample_state(
             pool, rng, noise,
         )
+        # `last_act` is the obs's last-action field and the action-rate baseline;
+        # `action` is the current raw policy output; the applied ctrl is the
+        # scaled/clipped command that drives the effort (actuator_force) term.
         last_act = rng.uniform(-1, 1, nu)
-        ctrl = rng.uniform(-1, 1, nu)
+        action = rng.uniform(-1, 1, nu)
+        applied = np.clip(
+            action * config.action_scale, pool._lowers, pool._uppers
+        )
 
         # --- CPU side ---
         d = _place_pool_env(
             pool, 0, clip_start, clip_len, phase_idx, qpos, qvel, last_act,
+            ctrl=applied,
         )
         cpu_obs = pool._get_obs(0)
-        cpu_total, _, cpu_comps = pool._get_reward(d, abs_idx, ctrl)
+        cpu_total, _, _, cpu_comps = pool._get_reward(
+            d, abs_idx, action, last_act,
+        )
 
         # --- MJX side ---
         mdata = menv._init_data(jp.array(qpos, jp.float32), jp.array(qvel, jp.float32))
+        # Re-forward with the applied ctrl so mdata.actuator_force matches the
+        # CPU side's effort input (the initial forward runs at ctrl=0).
+        mdata = mdata.replace(ctrl=jp.array(applied, jp.float32))
+        mdata = mjx.forward(menv.mjx_model, mdata)
         info = {
             "clip_start": jp.int32(clip_start),
             "clip_len": jp.int32(clip_len),
@@ -148,8 +170,9 @@ def main(frames, noise, seed, clip_ids, check_physics):
         }
         mjx_obs = np.array(menv._get_obs(mdata, info))
         metrics = {k: jp.zeros(()) for k in _COMPONENT_KEYS}
-        mjx_total, _ = menv._get_reward(
-            mdata, jp.int32(abs_idx), jp.array(ctrl, jp.float32), metrics,
+        mjx_total, _, _ = menv._get_reward(
+            mdata, jp.int32(abs_idx), jp.array(applied, jp.float32),
+            jp.array(action, jp.float32), jp.array(last_act, jp.float32), metrics,
         )
 
         obs_max_diff = max(obs_max_diff, float(np.abs(cpu_obs - mjx_obs).max()))

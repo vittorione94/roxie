@@ -27,6 +27,7 @@ class Trainer:
     def __init__(
         self, output_dir, steps=int(1e7), epoch_steps=int(3e5), save_steps=int(1e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,
+        async_learner=False, learner_chunk=8,
     ):
         self.max_steps = steps
         self.epoch_steps = epoch_steps
@@ -35,6 +36,16 @@ class Trainer:
         self.show_progress = show_progress
         self.replace_checkpoint = replace_checkpoint
         self.output_dir = output_dir
+        # Overlap CPU env-stepping with GPU gradient bursts via a background
+        # learner thread (envpool loop only; see roxie.utils.async_learner).
+        # Opt-in: only pays off when the learner is the dominant cost and the
+        # env runs on CPU while the learner runs on GPU.
+        self.async_learner = async_learner
+        # Fused grad steps the async learner submits per GPU dispatch. Smaller =
+        # more acting/learning interleave (better overlap) but more per-chunk
+        # Python/dispatch overhead; larger = fewer, longer GPU submissions that
+        # stall acting. See roxie.utils.async_learner.
+        self.learner_chunk = int(learner_chunk)
 
     def initialize(self, agent, environment, test_environment=None):
         self.agent = agent
@@ -280,6 +291,12 @@ class Trainer:
         ep_return_sum = jnp.zeros(())
         ep_len_sum = jnp.zeros(())
         ep_count = jnp.zeros(())
+        # Sum-of-squares companions to the two accumulators above, used to
+        # recover the per-episode std at the epoch boundary via
+        # sqrt(E[x^2] - E[x]^2) — without keeping a host-side list of individual
+        # episode returns (which would force a device->host sync every step).
+        ep_return_sq_sum = jnp.zeros(())
+        ep_len_sq_sum = jnp.zeros(())
         # Per-epoch accumulators for the env's own metrics dict (e.g. the mocap
         # env's `reward/pose`, `reward/vel`, ... tracking-reward components). The
         # env populates `env_state.metrics` with a scalar per env each step; we
@@ -373,8 +390,14 @@ class Trainer:
             # Capture return/length of episodes terminating this step. `scores`
             # and `lengths` already include the terminal transition (updated
             # above), and are zeroed for done envs further down.
-            ep_return_sum = ep_return_sum + jnp.sum(scores * done)
-            ep_len_sum = ep_len_sum + jnp.sum(lengths.astype(jnp.float32) * done)
+            ep_returns_done = scores * done
+            ep_lengths_done = lengths.astype(jnp.float32) * done
+            ep_return_sum = ep_return_sum + jnp.sum(ep_returns_done)
+            ep_len_sum = ep_len_sum + jnp.sum(ep_lengths_done)
+            # Non-done envs contribute 0 here, so squaring keeps summing only
+            # completed episodes' returns/lengths.
+            ep_return_sq_sum = ep_return_sq_sum + jnp.sum(ep_returns_done ** 2)
+            ep_len_sq_sum = ep_len_sq_sum + jnp.sum(ep_lengths_done ** 2)
             ep_count = ep_count + done_sum
 
             if bench_steps == NUM_ENVS * 20:
@@ -407,9 +430,18 @@ class Trainer:
                 if ep_n > 0:
                     epoch_score = float(ep_return_sum / ep_count)
                     epoch_length = float(ep_len_sum / ep_count)
+                    # Population std across the epoch's completed episodes.
+                    # Clamp to guard against tiny negative variances from
+                    # float round-off in the E[x^2]-E[x]^2 subtraction.
+                    epoch_score_std = float(np.sqrt(max(
+                        float(ep_return_sq_sum / ep_count) - epoch_score ** 2, 0.0)))
+                    epoch_length_std = float(np.sqrt(max(
+                        float(ep_len_sq_sum / ep_count) - epoch_length ** 2, 0.0)))
                 else:
                     epoch_score = float(jnp.mean(scores))
                     epoch_length = float(jnp.mean(lengths))
+                    epoch_score_std = float(jnp.std(scores))
+                    epoch_length_std = float(jnp.std(lengths.astype(jnp.float32)))
 
                 # Feed the epoch stats through the logger so every configured
                 # backend (console table, CSV, wandb, ...) records them. Keyed
@@ -422,7 +454,9 @@ class Trainer:
                 logger.store("time/epoch_s", time.time() - last_epoch_time)
                 logger.store("sps", sps)
                 logger.store("score", epoch_score)
+                logger.store("score/std", epoch_score_std)
                 logger.store("length", epoch_length)
+                logger.store("length/std", epoch_length_std)
                 logger.store("gradient_steps", tot_gradient_steps)
                 logger.store(
                     "loss/actor",
@@ -465,6 +499,8 @@ class Trainer:
                 critic_losses = []
                 ep_return_sum = jnp.zeros(())
                 ep_len_sum = jnp.zeros(())
+                ep_return_sq_sum = jnp.zeros(())
+                ep_len_sq_sum = jnp.zeros(())
                 ep_count = jnp.zeros(())
                 metric_sums = {}
                 metric_iters = 0
@@ -577,7 +613,9 @@ class Trainer:
         # the training stats and reach every backend. The epoch loop calls
         # _test just before logger.dump().
         logger.store("test/score", float(np.mean(scores_np)))
+        logger.store("test/score/std", float(np.std(scores_np)))
         logger.store("test/length", float(np.mean(lengths_np)))
+        logger.store("test/length/std", float(np.std(lengths_np)))
 
     # ------------------------------------------------------------------
     # EnvPool (CPU) training path
@@ -657,6 +695,49 @@ class Trainer:
             jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
             print(f"  {time.time() - t0:.1f}s", flush=True)
 
+        # --- Optional async learner (overlap CPU acting + GPU learning) ---
+        # When enabled, a background thread owns agent.state and runs the
+        # gradient bursts, while this (main) thread acts from a behaviour-actor
+        # snapshot and hands transitions off through a queue. See
+        # roxie.utils.async_learner for the ownership/donation contract.
+        learner = None
+        behavior_actor = None
+        behavior_stats = None
+        behavior_version = -1
+        if self.async_learner and hasattr(agent, "learn"):
+            import copy
+
+            from roxie.utils.async_learner import AsyncLearner
+
+            agent_key, learner_key = jax.random.split(agent_key)
+            behavior_actor = copy.deepcopy(agent.state.actor)
+            behavior_stats = agent.state.obs_stats
+            # Trigger any behaviour-path compilation on THIS thread before the
+            # learner starts dispatching, so the two threads never race a first
+            # compile of the same program.
+            _warm_a, _ = agent.select_action(
+                behavior_actor, behavior_stats, state.env_state.obs,
+                loop_rng, evaluate=False,
+            )
+            jax.block_until_ready(_warm_a)
+            # Precompile the chunk-sized grad program here (the learner submits
+            # `learner_chunk` fused steps at a time, a different program from the
+            # full-burst precompile above) so the learner thread never pays a
+            # cold compile mid-run.
+            agent_key, chunk_key = jax.random.split(agent_key)
+            agent.learn(chunk_key, n_steps=self.learner_chunk)
+            jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
+            learner = AsyncLearner(
+                agent, learner_key, initial_steps=self.steps,
+                chunk=self.learner_chunk,
+            )
+            learner.start()
+            print(
+                "Async learner started "
+                "(CPU acting overlaps GPU gradient bursts).",
+                flush=True,
+            )
+
         # --- Training loop ---
 
         print("Training...", flush=True)
@@ -664,6 +745,9 @@ class Trainer:
         lengths = np.zeros(NUM_ENVS, dtype=np.int32)
         ep_return_sum = 0.0
         ep_len_sum = 0.0
+        # Sum-of-squares companions for the per-episode std (see the jax path).
+        ep_return_sq_sum = 0.0
+        ep_len_sq_sum = 0.0
         ep_count = 0
         metric_sums = {}
         metric_iters = 0
@@ -675,8 +759,23 @@ class Trainer:
         while True:
             loop_rng, action_key = jax.random.split(loop_rng)
 
-            actions = agent.step(state.env_state.obs, evaluate=False, key=action_key)
-            last_noise = getattr(agent, "last_noise", None)
+            if learner is not None:
+                # Act from the behaviour snapshot (decoupled from the learner's
+                # live, mutating networks); re-sync only when it advances.
+                ver, snap = learner.latest_snapshot()
+                if ver != behavior_version and snap is not None:
+                    nnx.update(behavior_actor, snap[0])
+                    behavior_stats = snap[1]
+                    behavior_version = ver
+                actions, last_noise = agent.select_action(
+                    behavior_actor, behavior_stats, state.env_state.obs,
+                    action_key, evaluate=False,
+                )
+            else:
+                actions = agent.step(
+                    state.env_state.obs, evaluate=False, key=action_key
+                )
+                last_noise = getattr(agent, "last_noise", None)
             if last_noise is not None:
                 noise_abs_sum += float(jnp.mean(jnp.abs(last_noise)))
                 noise_iters += 1
@@ -685,15 +784,31 @@ class Trainer:
             state = env.step(old_state, actions)
 
             agent_key, update_key = jax.random.split(agent_key)
-            agent.add(old_state.env_state, state.env_state)
 
-            gradient_steps, actor_loss, critic_loss = agent.update(
-                steps=self.steps, agent_rng=update_key,
-            )
-            if gradient_steps > 0:
-                actor_losses.append(actor_loss)
-                critic_losses.append(critic_loss)
-            tot_gradient_steps += gradient_steps
+            if learner is not None:
+                # Hand the transition to the learner thread; pull its progress.
+                learner.push(
+                    old_state.env_state.obs,
+                    actions,
+                    state.env_state.reward,
+                    state.env_state.info["termination"],
+                    state.env_state.info["truncation"],
+                    state.env_state.obs,
+                )
+                tot_gradient_steps, new_losses = learner.drain_metrics()
+                for a_loss, c_loss in new_losses:
+                    actor_losses.append(a_loss)
+                    critic_losses.append(c_loss)
+            else:
+                agent.add(old_state.env_state, state.env_state)
+
+                gradient_steps, actor_loss, critic_loss = agent.update(
+                    steps=self.steps, agent_rng=update_key,
+                )
+                if gradient_steps > 0:
+                    actor_losses.append(actor_loss)
+                    critic_losses.append(critic_loss)
+                tot_gradient_steps += gradient_steps
 
             done_np = np.array(state.env_state.done)
             reward_np = np.array(state.env_state.reward)
@@ -705,8 +820,12 @@ class Trainer:
 
             done_sum = int(np.sum(done_np))
             episodes += done_sum
-            ep_return_sum += float(np.sum(scores * done_np))
-            ep_len_sum += float(np.sum(lengths * done_np))
+            ep_returns_done = scores * done_np
+            ep_lengths_done = lengths * done_np
+            ep_return_sum += float(np.sum(ep_returns_done))
+            ep_len_sum += float(np.sum(ep_lengths_done))
+            ep_return_sq_sum += float(np.sum(ep_returns_done ** 2))
+            ep_len_sq_sum += float(np.sum(ep_lengths_done ** 2))
             ep_count += done_sum
 
             self.steps += NUM_ENVS
@@ -730,7 +849,14 @@ class Trainer:
                     agent.noise_module.reset_noise()
 
                 if self.test_environment and hasattr(agent, "state"):
+                    # Eval reads agent.state (via agent.step); pause the learner
+                    # so it observes a quiescent, consistent state and doesn't
+                    # contend for the GPU during scoring.
+                    if learner is not None:
+                        learner.pause()
                     self._test_envpool()
+                    if learner is not None:
+                        learner.resume()
 
                 epochs += 1
                 epoch_steps = 0
@@ -740,9 +866,17 @@ class Trainer:
                 if ep_n > 0:
                     epoch_score = ep_return_sum / ep_count
                     epoch_length = ep_len_sum / ep_count
+                    # Population std over the epoch's completed episodes,
+                    # clamped against float round-off (see the jax path).
+                    epoch_score_std = float(np.sqrt(max(
+                        ep_return_sq_sum / ep_count - epoch_score ** 2, 0.0)))
+                    epoch_length_std = float(np.sqrt(max(
+                        ep_len_sq_sum / ep_count - epoch_length ** 2, 0.0)))
                 else:
                     epoch_score = float(np.mean(scores))
                     epoch_length = float(np.mean(lengths))
+                    epoch_score_std = float(np.std(scores))
+                    epoch_length_std = float(np.std(lengths))
 
                 logger.store("epoch", epochs)
                 logger.store("steps", self.steps)
@@ -752,7 +886,9 @@ class Trainer:
                 logger.store("time/epoch_s", time.time() - last_epoch_time)
                 logger.store("sps", sps)
                 logger.store("score", epoch_score)
+                logger.store("score/std", epoch_score_std)
                 logger.store("length", epoch_length)
+                logger.store("length/std", epoch_length_std)
                 logger.store("gradient_steps", tot_gradient_steps)
                 logger.store(
                     "loss/actor",
@@ -775,6 +911,8 @@ class Trainer:
                 critic_losses = []
                 ep_return_sum = 0.0
                 ep_len_sum = 0.0
+                ep_return_sq_sum = 0.0
+                ep_len_sq_sum = 0.0
                 ep_count = 0
                 metric_sums = {}
                 metric_iters = 0
@@ -793,10 +931,18 @@ class Trainer:
                         if file.startswith("step_"):
                             os.remove(os.path.join(path, file))
                 save_path = os.path.join(path, f"step_{self.steps}")
+                # Checkpointing reads (and momentarily detaches) agent.state;
+                # pause the learner so it can't grad-step a half-detached state.
+                if learner is not None:
+                    learner.pause()
                 agent.save(save_path)
+                if learner is not None:
+                    learner.resume()
                 steps_since_save = self.steps % self.save_steps
 
             if stop_training:
+                if learner is not None:
+                    learner.stop()
                 break
 
     def _test_envpool(self):
@@ -807,10 +953,14 @@ class Trainer:
         """
         test_env = self.test_environment
         agent = self.agent
-        num_tests = self.test_episodes
         max_steps = int(getattr(test_env, "max_episode_steps", 1000))
 
         state = test_env.reset()
+        # Size the eval buffers from the pool the reset actually returns, not
+        # from self.test_episodes: the test pool's env count (env.test_episodes)
+        # and trainer.test_episodes are separate config keys, and a mismatch
+        # would otherwise fail the `reward * active` broadcast below.
+        num_tests = int(np.asarray(state.env_state.reward).shape[0])
         scores = np.zeros(num_tests, dtype=np.float32)
         lengths = np.zeros(num_tests, dtype=np.int32)
         dones = np.zeros(num_tests, dtype=bool)
@@ -831,4 +981,6 @@ class Trainer:
             dones |= new_done
 
         logger.store("test/score", float(np.mean(scores)))
+        logger.store("test/score/std", float(np.std(scores)))
         logger.store("test/length", float(np.mean(lengths)))
+        logger.store("test/length/std", float(np.std(lengths)))

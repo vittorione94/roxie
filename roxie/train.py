@@ -137,6 +137,8 @@ def main(cfg: DictConfig):
         test_episodes=int(cfg.trainer.test_episodes),
         show_progress=cfg.trainer.show_progress,
         replace_checkpoint=cfg.trainer.replace_checkpoint,
+        async_learner=bool(cfg.trainer.get("async_learner", False)),
+        learner_chunk=int(cfg.trainer.get("learner_chunk", 8)),
     )
     test_environment = test_env if test_env is not None else env
     trainer.initialize(

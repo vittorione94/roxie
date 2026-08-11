@@ -1,0 +1,25 @@
+# @package _global_
+
+# CMU_006_13 single-clip overfit sweep — TD3 arm.
+#   uv run python roxie/train.py --config-name mocap/sweep_td3
+#
+# env_config, reward and the whole sweep/overfit_cmu_006_13 block (env, trainer,
+# logging) are shared VERBATIM with every other sweep_*.yaml; agent/td3_sweep
+# holds the only differences. Nothing is overridden below on purpose — put any
+# ad-hoc tweak on the CLI so the file keeps recording the sweep condition.
+defaults:
+  - agent: td3_sweep
+  - noise: sweep_gaussian
+  - env_config: cmu
+  - reward: cmu_tracking
+  - backend: warp
+  - sweep: overfit_cmu_006_13
+  - _self_
+
+logging:
+  wandb:
+    name: td3
+
+hydra:
+  run:
+    dir: outputs/sweep_cmu_006_13/td3/${now:%Y-%m-%d_%H-%M-%S}

@@ -40,13 +40,97 @@ def _foot_geom_ids(mj_model: mujoco.MjModel) -> np.ndarray:
     return np.array([i for i in ids if i >= 0], dtype=np.int32)
 
 
+def _lowest_foot_surface_z(
+    mj_model: mujoco.MjModel, data: mujoco.MjData, foot_geom_ids: np.ndarray
+) -> float:
+    """Lowest world-z of the foot *collision surface* in the current pose.
+
+    ``geom_xpos`` is the geom ORIGIN; grounding on that leaves the collision
+    surface a full geom radius below the floor (the CMU feet are 25 mm-radius
+    capsules/spheres), so the reference has feet buried in the ground — an
+    infeasible target that fights every stance. We instead take the geom's
+    actual lowest surface point:
+
+      - sphere (toes): ``center_z - radius``.
+      - capsule (foot pads): the lower of the two end-cap centres
+        (``center ± half_len * local_z``) minus the radius, so a pitched foot
+        (heel-strike / toe-off) is measured at its lowest cap, not its centre.
+    """
+    lo = np.inf
+    for gid in foot_geom_ids:
+        z = float(data.geom_xpos[gid, 2])
+        r = float(mj_model.geom_size[gid, 0])
+        if mj_model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            half_len = float(mj_model.geom_size[gid, 1])
+            local_z_world_z = float(data.geom_xmat[gid].reshape(3, 3)[2, 2])
+            z -= abs(half_len * local_z_world_z)
+        lo = min(lo, z - r)
+    return lo
+
+
+# Bodies that carry a foot touch sensor, grouped by physical foot (the ankle
+# body plus its toe body). Consumed by MocapTrackingEnv for the binary
+# foot-contact observation; see _add_foot_touch_sensors.
+FOOT_TOUCH_BODIES = ("lfoot", "ltoes", "rfoot", "rtoes")
+
+
+def _add_foot_touch_sensors(root: ET.Element, probe_model: mujoco.MjModel) -> None:
+    """Add a MuJoCo ``touch`` sensor over each foot/toe body, in place.
+
+    A touch sensor sums the normal force of every contact whose point falls
+    inside a companion site's volume, so it needs a site that encloses the
+    body's collision geoms. We size each site as the body-local axis-aligned
+    box bounding those geoms (using each geom's bounding radius, then a small
+    margin so surface contact points land inside), taken from an already-
+    compiled ``probe_model``. Unlike the raw contact list, the resulting
+    ``sensordata`` is a per-world field on every backend (jax / warp / native),
+    which is why the env reads foot contact through it rather than by scanning
+    contacts (the Warp backend keeps contacts in a non-vmapped global arena).
+
+    The sites are transparent and in group 4 so they never render.
+    """
+    sensor_el = root.find("sensor")
+    if sensor_el is None:
+        sensor_el = ET.SubElement(root, "sensor")
+
+    margin = 0.01
+    for name in FOOT_TOUCH_BODIES:
+        bid = probe_model.body(name).id
+        gids = np.nonzero(probe_model.geom_bodyid == bid)[0]
+        if gids.size == 0:
+            raise ValueError(f"body {name!r} has no geoms to bound a touch site")
+        pos = probe_model.geom_pos[gids]            # (k, 3) body-local
+        rbound = probe_model.geom_rbound[gids]      # (k,)
+        lo = (pos - rbound[:, None]).min(axis=0)
+        hi = (pos + rbound[:, None]).max(axis=0)
+        center = (lo + hi) / 2.0
+        half = (hi - lo) / 2.0 + margin
+
+        body_el = root.find(f".//body[@name='{name}']")
+        if body_el is None:
+            raise ValueError(f"body {name!r} not found in walker XML")
+        ET.SubElement(
+            body_el, "site",
+            {"name": f"{name}_touch_site", "type": "box",
+             "pos": " ".join(f"{v:.5f}" for v in center),
+             "size": " ".join(f"{v:.5f}" for v in half),
+             "group": "4", "rgba": "0 0 0 0"},
+        )
+        ET.SubElement(
+            sensor_el, "touch",
+            {"name": f"{name}_touch", "site": f"{name}_touch_site"},
+        )
+
+
 def build_cmu_humanoid() -> tuple[mujoco.MjModel, str]:
     """Build the CMU humanoid MuJoCo model with a free joint and floor.
 
     Returns ``(mj_model, xml_path)`` where *xml_path* points to a cached
     compiled XML that can be reused for ghost-model building, etc.
     """
-    cache_path = os.path.join(_CACHE_DIR, "cmu_humanoid_v2020_grid.xml")
+    # Cache key bumped to ``_touch`` when per-foot touch sensors were added, so
+    # stale pre-sensor caches are rebuilt rather than silently reloaded.
+    cache_path = os.path.join(_CACHE_DIR, "cmu_humanoid_v2020_grid_touch.xml")
 
     if os.path.exists(cache_path):
         model = mujoco.MjModel.from_xml_path(cache_path)
@@ -85,6 +169,11 @@ def build_cmu_humanoid() -> tuple[mujoco.MjModel, str]:
     root_body = worldbody.find('body[@name="root"]')
     root_body.insert(0, ET.Element("freejoint", {"name": "rootjoint"}))
 
+    # Compile once to read foot-geom bounds, add per-foot touch sensors sized to
+    # those bounds, then recompile the sensor-bearing model.
+    probe_model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    _add_foot_touch_sensors(root, probe_model)
+
     xml_string = ET.tostring(root, encoding="unicode")
     model = mujoco.MjModel.from_xml_string(xml_string)
 
@@ -92,6 +181,85 @@ def build_cmu_humanoid() -> tuple[mujoco.MjModel, str]:
     mujoco.mj_saveLastXML(cache_path, model)
 
     return model, cache_path
+
+
+# MAD multiplier for the qpos spike detector: a sample is treated as a
+# retargeting glitch when its per-column second difference (curvature) exceeds
+# this many robust sigmas of that column's curvature. ~5 is conservative (only
+# clear single-frame outliers); lower it to clean more aggressively.
+DESPIKE_C = 5.0
+
+
+def _canonicalize_quat_sign(qpos: np.ndarray):
+    """Enforce sign continuity on the root quaternion (columns 3:7).
+
+    A quaternion and its negation encode the same rotation (double cover), but
+    retargeting can flip the sign between consecutive frames; linearly
+    resampling across such a flip corrupts the orientation. Flip ``q -> -q``
+    wherever it restores a non-negative dot with the previous frame. The flip
+    relationship telescopes over raw consecutive dots, so a cumulative product
+    of the per-pair signs gives the correct per-frame sign in one pass. Operates
+    on the RAW clip, before resampling. Returns ``(qpos, num_flips)``.
+    """
+    q = qpos[:, 3:7]
+    if q.shape[0] < 2:
+        return qpos, 0
+    dots = np.sum(q[1:] * q[:-1], axis=1)
+    signs = np.where(dots < 0.0, -1.0, 1.0)
+    cum = np.concatenate([[1.0], np.cumprod(signs)]).astype(qpos.dtype)
+    qpos[:, 3:7] = q * cum[:, None]
+    return qpos, int((signs < 0).sum())
+
+
+def _despike_hampel(arr: np.ndarray, C: float = DESPIKE_C, eps: float = 1e-9):
+    """Remove isolated single-frame spikes along time (axis 0), per column.
+
+    Retargeting glitches show up as an out-and-back excursion in one frame:
+    large curvature (second difference) that the neighbouring frames do not
+    share. We flag samples whose per-column second difference deviates from the
+    column median by more than ``C`` robust sigmas (MAD) and replace them with
+    the mean of their two temporal neighbours. A genuine fast transition is a
+    ramp (small curvature) and is left untouched.
+
+    Returns ``(cleaned, num_corrections)``. Only interior frames (1..T-2) can be
+    corrected, and only single-frame spikes -- 2+ consecutive bad frames need a
+    wider window or a second pass.
+    """
+    out = arr.copy()
+    T = out.shape[0]
+    if T < 3:
+        return out, 0
+    d2 = out[:-2] - 2.0 * out[1:-1] + out[2:]        # curvature, frames 1..T-2
+    med = np.median(d2, axis=0)
+    mad = np.median(np.abs(d2 - med), axis=0)
+    thresh = C * 1.4826 * mad + eps                  # ~C sigma per column
+    flag = np.abs(d2 - med) > thresh                 # (T-2, D)
+    neigh = 0.5 * (out[:-2] + out[2:])               # neighbour average
+    out[1:-1] = np.where(flag, neigh, out[1:-1])
+    return out, int(flag.sum())
+
+
+def _recompute_qvel(mj_model: mujoco.MjModel, qpos: np.ndarray,
+                    dt: float) -> np.ndarray:
+    """Re-derive reference qvel from (cleaned) qpos in MuJoCo's convention.
+
+    Uses ``mj_differentiatePos`` so the free-joint quaternion is mapped to an
+    angular velocity in exactly the frame the simulator/reward compare against
+    (``data.qvel``) -- unlike the retargeter's supplied velocity channels, whose
+    frame convention need not match. Central difference on the interior, one-
+    sided at the two ends.
+    """
+    T, nv = qpos.shape[0], mj_model.nv
+    qvel = np.zeros((T, nv), dtype=np.float32)
+    dq = np.zeros(nv)
+    for t in range(T):
+        lo, hi = max(t - 1, 0), min(t + 1, T - 1)
+        if hi == lo:
+            continue
+        mujoco.mj_differentiatePos(mj_model, dq, (hi - lo) * dt,
+                                   qpos[lo], qpos[hi])
+        qvel[t] = dq
+    return qvel
 
 
 def _load_single_clip(
@@ -110,12 +278,14 @@ def _load_single_clip(
     positions = traj_dict["walker/position"]
     quaternions = traj_dict["walker/quaternion"]
     joints = traj_dict["walker/joints"]
-    velocities = traj_dict["walker/velocity"]
-    ang_velocities = traj_dict["walker/angular_velocity"]
-    joints_vel = traj_dict["walker/joints_velocity"]
 
     qpos = np.concatenate([positions, quaternions, joints], axis=1).astype(np.float32)
-    qvel = np.concatenate([velocities, ang_velocities, joints_vel], axis=1).astype(np.float32)
+
+    # Canonicalise root-quaternion sign continuity BEFORE resampling: linearly
+    # interpolating across a double-cover sign flip corrupts the orientation.
+    qpos, n_quatflips = _canonicalize_quat_sign(qpos)
+    if n_quatflips:
+        print(f"Clip {clip_id}: canonicalised {n_quatflips} quaternion sign-flips")
 
     clip_dt = trajectory.dt
     if abs(clip_dt - ctrl_dt) > 1e-6:
@@ -126,34 +296,60 @@ def _load_single_clip(
         qpos = np.array(
             [np.interp(new_t, orig_t, qpos[:, i]) for i in range(qpos.shape[1])]
         ).T.astype(np.float32)
-        qvel = np.array(
-            [np.interp(new_t, orig_t, qvel[:, i]) for i in range(qvel.shape[1])]
-        ).T.astype(np.float32)
+
+    # Clean isolated retargeting spikes on qpos, then RE-DERIVE qvel from the
+    # cleaned positions. The retargeter's supplied velocity channels
+    # (walker/velocity, angular_velocity, joints_velocity) are discarded: they
+    # can be spiky and their frame convention need not match MuJoCo's qvel, so
+    # they were never comparable to data.qvel in the reward. mj_differentiatePos
+    # (in _recompute_qvel) guarantees the same convention.
+    qpos, n_despiked = _despike_hampel(qpos)
+    rq = qpos[:, 3:7]
+    qpos[:, 3:7] = rq / np.clip(np.linalg.norm(rq, axis=1, keepdims=True), 1e-8, None)
+    qvel = _recompute_qvel(mj_model, qpos, ctrl_dt)
+    if n_despiked:
+        print(f"Clip {clip_id}: despiked {n_despiked} qpos entries "
+              f"({100.0 * n_despiked / qpos.size:.3f}%)")
 
     data = mujoco.MjData(mj_model)
     body_pos = np.zeros((qpos.shape[0], mj_model.nbody, 3), dtype=np.float32)
-    min_foot_z = np.inf
+    min_surface_z = np.inf
     for t in range(qpos.shape[0]):
         data.qpos[:] = qpos[t]
         mujoco.mj_forward(mj_model, data)
         body_pos[t] = data.xpos.copy()
-        min_foot_z = min(min_foot_z, float(data.geom_xpos[foot_geom_ids, 2].min()))
+        lowest_body = min(data.xpos[2:, 2]) # discard the worldbody and floor
+        min_surface_z = max(min(
+            min_surface_z, lowest_body
+        ), 0)
 
-    # Ground the clip: the retargeted CMU data floats above the floor, which
-    # would force the policy to fly to track it. Shifting the root z (and every
-    # derived world position) down by the lowest foot height over the clip is a
-    # rigid vertical translation, so velocities are unchanged.
-    qpos[:, 2] -= min_foot_z
-    body_pos[:, :, 2] -= min_foot_z
+    min_surface_z += 0.1 # the CMU data is retargeted with a 10 cm offset above the floor, so we shift down to the lowest foot surface, not the lowest body position.
+    print(f"Clip {clip_id}: {qpos.shape[0]} frames, lowest foot surface z={min_surface_z:.3f}")
 
-    return {"qpos": qpos, "qvel": qvel, "body_pos": body_pos}
+    # Ground the clip: the retargeted CMU data floats above (and, at the lowest
+    # frame, would sink below) the floor, which forces the policy to fly / clip
+    # through the ground to track it. Shift the root z (and every derived world
+    # position) down so the lowest foot COLLISION SURFACE over the clip rests
+    # exactly on the floor. Using the surface (not the geom origin) is what keeps
+    # the reference physically feasible — origin-grounding buries the 25 mm feet
+    # a full radius deep, an unrecoverable delta that fights every stance. Rigid
+    # vertical translation, so velocities are unchanged.
+    qpos[:, 2] -= min_surface_z
+    body_pos[:, :, 2] -= min_surface_z
+
+    return {
+        "qpos": qpos,
+        "qvel": qvel,
+        "body_pos": body_pos,
+        "ground_offset": float(min_surface_z),
+    }
 
 
 def _cache_path(clip_ids: list[str] | None, ctrl_dt: float) -> str:
     import hashlib
     # Bump the version suffix whenever the on-disk layout/semantics change so
     # stale caches are not silently reused (e.g. the v2 grounding offset).
-    key = f"{sorted(clip_ids) if clip_ids else 'all'}_{ctrl_dt}_v2grounded"
+    key = f"{sorted(clip_ids) if clip_ids else 'all'}_{ctrl_dt}_v5canonquat"
     h = hashlib.md5(key.encode()).hexdigest()[:12]
     return os.path.join(_CACHE_DIR, f"cmu_dataset_{h}.npz")
 

@@ -1,5 +1,6 @@
 import copy
 import functools
+from typing import Any
 
 import flashbax
 import hydra
@@ -342,6 +343,30 @@ class DDPG(Agent):
             transitions = jax.tree.map(lambda x: x[:, None], transitions)
         return self.replay.add(buffer_state, transitions)
 
+    def select_action(
+        self,
+        actor: nnx.Module,
+        obs_stats: Any,
+        observation: jnp.ndarray,
+        key: jax.random.PRNGKey,
+        evaluate: bool = False,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Pure action selection from an EXPLICIT actor + obs stats.
+
+        Factored out of ``step`` so the async learner's acting thread can select
+        actions from a *behaviour* actor snapshot — decoupled from the learner's
+        live, mutating ``self.state.actor`` — through the exact same
+        normalization + noise path. Returns ``(scaled_action, applied_noise)``.
+        """
+        if self.normalize_observations:
+            mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
+            observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
+
+        action, noise = Agent.deterministic_step_fn(
+            actor, observation, key, self.noise_module, evaluate,
+        )
+        return Agent.scale_to_env(action, self.action_low, self.action_high), noise
+
     def step(
         self,
         observation: jnp.ndarray,
@@ -351,20 +376,9 @@ class DDPG(Agent):
         """
         Selects an action by calling the pure, JIT-compiled step function.
         """
-        # Call the standalone function, passing in the required parts from the agent's state.
-        if self.normalize_observations:
-            mean, std = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
-            observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
-
-        action, noise = Agent.deterministic_step_fn(
-            self.state.actor,
-            observation,
-            key,
-            self.noise_module,
-            evaluate,
+        self.last_action, noise = self.select_action(
+            self.state.actor, self.state.obs_stats, observation, key, evaluate,
         )
-
-        self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
         # Effective exploration noise actually applied this step (post-clip), in
         # normalized [-1, 1] action units -- one value per env per joint. Kept on
         # device; the trainer reduces it to a per-joint epoch mean for logging.
@@ -373,27 +387,31 @@ class DDPG(Agent):
 
         return self.last_action
 
-    def add(self, prev_states, states):
-        # prev_states.obs.shape   (num_envs, obs_dim)
-        # states.reward.shape     (num_envs,)
-        # states.done.shape       (num_envs,)
-        # self.last_action.shape  (num_envs, action_dim)
-        # states.obs.shape        (num_envs, obs_dim)
+    def add_transitions(
+        self, prev_obs, action, reward, termination, truncation, next_obs
+    ):
+        """Buffer one env-step batch given an EXPLICIT action.
 
+        Split out of ``add`` so the async learner (which owns ``self.state`` on
+        its own thread) can add transitions whose action travelled with them
+        through the hand-off queue, rather than reading ``self.last_action``
+        (which the acting thread overwrites every step). Mutates
+        ``self.state.buffer_state`` / ``self.state.obs_stats`` in place.
+        """
         experiences = Transition(
-            observation=prev_states.obs,
-            action=self.last_action,
-            reward=states.reward,
+            observation=prev_obs,
+            action=action,
+            reward=reward,
             # Use the true termination signal, NOT `done` (= termination OR
             # truncation). A time-limit truncation must still bootstrap the
             # next-state value in the Bellman target; marking it terminal zeroes
             # the bootstrap and collapses Q at the cutoff. With all envs hitting
             # the time limit in lockstep this floods the buffer at once.
-            terminal=states.info["termination"],
+            terminal=termination,
             # Stored separately so n-step windows can stop at truncations too —
             # in the flat stream the item after ANY done is the next episode's
             # reset state, so a window must never accumulate across one.
-            truncation=states.info["truncation"],
+            truncation=truncation,
         )
 
         # store in memory
@@ -401,11 +419,55 @@ class DDPG(Agent):
 
         # Update observation normalization stats with both current and next observations
         if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_states.obs, states.obs], axis=0)
+            obs_batch = jnp.concatenate([prev_obs, next_obs], axis=0)
             # obs_batch.shape --> (2 * num_envs, obs_dim)
             self.state.obs_stats = Agent.update_obs_stats(
                 self.state.obs_stats, obs_batch
             )
+
+    def add(self, prev_states, states):
+        # prev_states.obs.shape   (num_envs, obs_dim)
+        # states.reward.shape     (num_envs,)
+        # states.done.shape       (num_envs,)
+        # self.last_action.shape  (num_envs, action_dim)
+        # states.obs.shape        (num_envs, obs_dim)
+        self.add_transitions(
+            prev_states.obs,
+            self.last_action,
+            states.reward,
+            states.info["termination"],
+            states.info["truncation"],
+            states.obs,
+        )
+
+    def learn(self, agent_rng, n_steps=None):
+        """Run one unconditional burst of ``n_steps`` (default ``learning_steps``)
+        fused gradient steps, updating ``self.state`` in place; returns
+        ``(actor_loss, critic_loss)``.
+
+        Shared by the (gated) sync ``update`` and the async learner, which calls
+        it directly from its own thread — the sole owner of ``self.state`` there,
+        so the buffer-donating ``_grad_steps`` stays valid unchanged. The async
+        learner passes a small ``n_steps`` (chunk) so the GPU stream frees up
+        frequently for the acting thread's forward pass, letting the CPU physics
+        overlap the learning instead of stalling behind one large fused burst.
+        """
+        self.state, actor_loss, critic_loss = _grad_steps(
+            self.state,
+            agent_rng,
+            self.learning_steps if n_steps is None else int(n_steps),
+            self.gamma,
+            self.tau,
+            self.replay.sample,  # Pass the sample method itself,
+            self.target_policy_noise,  # Use target_policy_noise
+            self.target_noise_clip,
+            self.action_low,
+            self.action_high,
+            self.obs_eps,
+            self.obs_clip,
+            n_step=self.n_step,
+        )
+        return actor_loss, critic_loss
 
     def update(self, steps, agent_rng):
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
@@ -415,21 +477,7 @@ class DDPG(Agent):
             steps >= self.steps_before_learning
             and (steps - self.steps_before_learning) % self.steps_between_updates == 0
         ):
-            self.state, actor_loss, critic_loss = _grad_steps(
-                self.state,
-                agent_rng,
-                self.learning_steps,
-                self.gamma,
-                self.tau,
-                self.replay.sample,  # Pass the sample method itself,
-                self.target_policy_noise,  # Use target_policy_noise
-                self.target_noise_clip,
-                self.action_low,
-                self.action_high,
-                self.obs_eps,
-                self.obs_clip,
-                n_step=self.n_step,
-            )
+            actor_loss, critic_loss = self.learn(agent_rng)
             gradient_steps += self.learning_steps
 
         return gradient_steps, actor_loss, critic_loss

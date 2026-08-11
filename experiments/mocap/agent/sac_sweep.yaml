@@ -1,0 +1,49 @@
+# SAC arm of the CMU_006_13 overfit sweep: stochastic (tanh-Gaussian) policy,
+# twin Q critics, auto-tuned entropy temperature. Explores from its own policy
+# entropy, so its launchable carries NO noise group (the agent takes no
+# noise_config).
+#
+# SWEEP INVARIANTS (see ddpg_sweep.yaml): features [1024, 512, 256] + layer
+# norm, batch 512 x 128 grad steps / 8k env steps (replay ratio ~8), buffer
+# 500k, warmup 30k, gamma 0.99, tau 0.005, lr 3e-4.
+#
+# NOTE: sac.py has no `n_step` argument, so this arm learns on 1-step returns
+# while DDPG/TD3/TD4/D4PG use n_step 5. That is a capability gap in the agent,
+# not a tuning choice — factor it in when reading the ranking.
+name: "sac"
+
+args:
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  alpha_learning_rate: 3e-4
+  init_log_alpha: 0.0
+  auto_alpha: true
+  memory_warmup: 30_000
+  steps_before_learning: 30_000
+  steps_between_updates: 8_000
+  learning_steps: 128
+  max_grad_norm: 1
+
+actor:
+  _target_: roxie.models.actors.StochasticActor
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  std_min: 1e-4
+  std_max: 5.0
+
+critic:
+  # Instantiated twice behind a TwinCritic.
+  _target_: roxie.models.critics.QCritic
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 10_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}

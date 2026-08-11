@@ -54,6 +54,8 @@ python roxie/play.py --checkpoint-path outputs/2025-01-15/14-30-00/checkpoints/s
 
 Each YAML under `experiments/` is a complete experiment definition &mdash; it selects an agent, noise strategy, environment, and trainer settings &mdash; and is grouped into a per-env subfolder (`ant/`, `walker/`, `mocap/`), so the `--config-name` includes that folder (e.g. `walker/walker_ddpg`). The ant and mocap tasks are self-contained examples: their envs and loaders live under [`examples/`](examples/), wired in via the `env.builder` dotted path in each config.
 
+The `mocap/` folder additionally carries its own config groups: agent tunings (`agent/`), reward weights (`reward/`), env config (`env_config/`), and a **`backend/`** group (`warp` = mujoco_warp GPU, `envpool` = CPU native MuJoCo) that supplies the physics-backend mechanics (`env.builder`, `env.impl`, solver budgets). Each launchable picks a backend in its `defaults:` &mdash; e.g. `mocap/td3_warp` and `mocap/td3_envpool` are the same agent on the two backends, each keeping its own tuning.
+
 To create a new experiment, add a YAML under the matching `experiments/<env>/` folder. It composes agent and noise configs from `roxie/configs/`:
 
 ```yaml

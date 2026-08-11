@@ -1,0 +1,15 @@
+# @package _global_
+
+# CPU EnvPool-style physics backend (native MuJoCo, threaded stepping). Selected
+# by a mocap launchable via defaults: [ ..., backend: envpool ]. Throughput
+# saturates near the physical core count, so set parallel_envs accordingly in the
+# launchable. The Warp budgets (naconmax/njmax/naccdmax, graph_mode, gpu_clip_
+# budget) don't apply here and are simply omitted.
+env:
+  builder: examples.mocap.mocap_envpool.build_mocap_envpool_env
+  impl: envpool
+  # Stepping threads; null = min(parallel_envs, cpu cores).
+  num_threads: 16
+  # EnvPool eval pool size must equal trainer.test_episodes (see the builder
+  # docstring); bind it so the two can't drift.
+  test_episodes: ${trainer.test_episodes}

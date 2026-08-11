@@ -107,61 +107,139 @@ class Backend:
 
 
 class ConsoleBackend(Backend):
-    """Pretty-prints metrics to stdout as an indented, ``/``-nested table."""
+    """Pretty-prints metrics to stdout as an indented, ``/``-nested table.
+
+    Flat metric keys are first grouped into ordered sections — ``training`` /
+    ``test`` / ``system`` (with ``epoch`` and ``gradient_steps`` ungrouped on
+    top) — so the epoch dump reads as a clear hierarchy instead of one
+    alphabetical block. A ``mean``/``std`` pair (a key ``K`` stored alongside
+    ``K/std``) collapses onto a single ``mean +- std`` line. Keys not named in
+    the layout still appear — sorted after the known ones within their group —
+    so new metrics are never silently dropped.
+    """
+
+    INDENT = "  "
+
+    # Shown ungrouped at the top, in this order.
+    TOP_KEYS = ("epoch", "gradient_steps")
+    # A key is placed under ``system`` when its first ``/`` segment is one of
+    # these, or when it is named exactly in SYSTEM_KEYS. ``test/*`` keys keep
+    # their own section; everything else lands under ``training``.
+    SYSTEM_GROUPS = ("gpu", "mem", "time", "episodes")
+    SYSTEM_KEYS = ("sps", "steps")
+
+    # Display order of node paths (after remapping into sections). Any path not
+    # listed here sorts alphabetically after its listed siblings, so the layout
+    # degrades gracefully as new metrics appear.
+    ORDER = (
+        "epoch",
+        "gradient_steps",
+        "training",
+        "training/length",
+        "training/score",
+        "training/reward",
+        "training/root_dist",
+        "training/loss",
+        "training/noise",
+        "test",
+        "test/length",
+        "test/score",
+        "system",
+        "system/gpu",
+        "system/mem",
+        "system/time",
+        "system/episodes",
+        "system/sps",
+        "system/steps",
+    )
 
     def __init__(self, width=60):
         self.width = width
         self.known_keys = set()
-        self.final_keys = []
-        self.console_formats = []
+        # Rows to print, in order. Each is (label, base_key, std_key): a header
+        # row has base_key=None; a leaf row's value is data[base_key], rendered
+        # as ``mean +- std`` when std_key is set.
+        self.rows = []
 
-    def _rebuild_layout(self, new_keys):
-        first_row = len(self.known_keys) == 0
-        if not first_row:
-            print()
-            warning(f"Logging new keys {new_keys}")
-        for key in new_keys:
-            self.known_keys.add(key)
-        self.final_keys = list(sorted(self.known_keys))
-        self.console_formats = []
+    def _display_path(self, key):
+        """Remap a flat metric key to its sectioned display path."""
+        if key in self.TOP_KEYS:
+            return key
+        first = key.split("/", 1)[0]
+        if key in self.SYSTEM_KEYS or first in self.SYSTEM_GROUPS:
+            return "system/" + key
+        if first == "test":
+            return key
+        return "training/" + key
+
+    def _sort_key(self, path):
+        """Order path segments among siblings via ORDER, then alphabetically."""
+        segs = path.split("/")
+        key = []
+        for i in range(len(segs)):
+            prefix = "/".join(segs[: i + 1])
+            rank = self.ORDER.index(prefix) if prefix in self.ORDER else len(self.ORDER)
+            key.append((rank, segs[i]))
+        return key
+
+    def _rebuild_layout(self, keys):
+        keys = set(keys)
+        # Collapse mean/std pairs: a key K with a sibling K/std renders on one
+        # line, and K/std itself is not shown as its own row.
+        std_of = {k[:-4]: k for k in keys if k.endswith("/std") and k[:-4] in keys}
+        merged = set(std_of.values())
+
+        leaves = [k for k in keys if k not in merged]
+        display = {k: self._display_path(k) for k in leaves}
+        leaves.sort(key=lambda k: self._sort_key(display[k]))
+
+        self.rows = []
         seen = set()
-        for key in self.final_keys:
-            *left_keys, right_key = key.split("/")
-            for i, k in enumerate(left_keys):
-                left_key = "/".join(left_keys[: i + 1])
-                if left_key not in seen:
-                    left = "  " * i + k.replace("_", " ")
-                    self.console_formats.append((left, None))
-                    seen.add(left_key)
-            indent = "  " * len(left_keys)
-            right_key = right_key.replace("_", " ")
-            self.console_formats.append((indent + right_key, key))
+        for k in leaves:
+            *parents, leaf = display[k].split("/")
+            for i, name in enumerate(parents):
+                prefix = "/".join(parents[: i + 1])
+                if prefix not in seen:
+                    seen.add(prefix)
+                    self.rows.append((self.INDENT * i + name.replace("_", " "), None, None))
+            indent = self.INDENT * len(parents)
+            self.rows.append((indent + leaf.replace("_", " "), k, std_of.get(k)))
+
+    @staticmethod
+    def _fmt(val, pad=False):
+        if np.issubdtype(type(val), np.floating):
+            return f"{val:8.3g}" if pad else f"{val:.3g}"
+        if np.issubdtype(type(val), np.integer):
+            return f"{val:,}"
+        return str(val)
 
     def log(self, data, step):
         new_keys = [key for key in data if key not in self.known_keys]
         if new_keys:
-            self._rebuild_layout(new_keys)
+            first_row = len(self.known_keys) == 0
+            if not first_row:
+                print()
+                warning(f"Logging new keys {new_keys}")
+            self.known_keys.update(data.keys())
+            self._rebuild_layout(self.known_keys)
 
         print()
-        for left, key in self.console_formats:
-            if key:
-                val = data.get(key)
-                str_type = str(type(val))
-                if "tensorflow" in str_type:
-                    warning(f"Logging TensorFlow tensor {key}")
-                elif "torch" in str_type:
-                    warning(f"Logging Torch tensor {key}")
-                if np.issubdtype(type(val), np.floating):
-                    right = f"{val:8.3g}"
-                elif np.issubdtype(type(val), np.integer):
-                    right = f"{val:,}"
-                else:
-                    right = str(val)
-                spaces = " " * (self.width - len(left) - len(right))
-                print(left + spaces + right)
+        for label, key, std_key in self.rows:
+            if key is None:
+                print(label + " " * max(self.width - len(label), 0))
+                continue
+            val = data.get(key)
+            str_type = str(type(val))
+            if "tensorflow" in str_type:
+                warning(f"Logging TensorFlow tensor {key}")
+            elif "torch" in str_type:
+                warning(f"Logging Torch tensor {key}")
+            std_val = data.get(std_key) if std_key is not None else None
+            if std_val is not None:
+                right = f"{self._fmt(val)} +- {self._fmt(std_val)}"
             else:
-                spaces = " " * (self.width - len(left))
-                print(left + spaces)
+                right = self._fmt(val, pad=True)
+            print(label + " " * max(self.width - len(label) - len(right), 1) + right)
         print()
 
 

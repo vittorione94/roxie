@@ -10,6 +10,13 @@ from mujoco import mjx
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src import reward
 
+from roxie.utils.math import (
+    batched_quat_diff,
+    mat_to_rot6d,
+    quat_to_rot6d,
+    quaternion_distance,
+)
+
 CMU_BODY_NAMES = {
     "torso": "thorax",
     "end_effectors": ["lhand", "rhand", "lfoot", "rfoot"],
@@ -21,6 +28,16 @@ GROUND_CONTACT_GEOMS = {
     "rfoot", "rfoot_ch", "rtoes0", "rtoes1", "rtoes2",
     "lhand", "rhand", "head",
 }
+
+
+# Touch sensors (added in build_cmu_humanoid) whose reading defines the binary
+# foot-contact obs, grouped by physical foot. Order is (left, right); the toe
+# sensor is grouped with its ankle so a toe- or heel-only contact still reads
+# as that foot being planted.
+FOOT_TOUCH_SENSORS = (
+    ("lfoot_touch", "ltoes_touch"),
+    ("rfoot_touch", "rtoes_touch"),
+)
 
 
 def _configure_collisions(m: mujoco.MjModel, self_collisions: bool) -> None:
@@ -57,7 +74,7 @@ def _configure_collisions(m: mujoco.MjModel, self_collisions: bool) -> None:
 
 
 def _configure_actuation(
-    m: mujoco.MjModel, mode: str, kp_scale: float = 1.0, kv_ratio: float = 0.1
+    m: mujoco.MjModel, mode: str, kp_scale: float = 1.0, kv_ratio: float = 0.0
 ) -> None:
     """Rewrite the model's actuators in place for the requested control mode.
 
@@ -66,33 +83,44 @@ def _configure_actuation(
 
     ``position``: convert every motor into MuJoCo's scaled position servo
     (PD-target control), replicating dm_control's CMUHumanoidPositionControlled
-    exactly (scaled_actuators.add_position_actuator + the _POSITION_ACTUATORS
-    per-joint kp/forcerange table), but applied to the compiled MjModel so no
-    second XML is needed. ctrl stays in [-1, 1] and maps affinely onto the
+    V2020 (scaled_actuators.add_position_actuator + the _POSITION_ACTUATORS_V2020
+    per-joint kp/damping/forcerange table), but applied to the compiled MjModel
+    so no second XML is needed. ctrl stays in [-1, 1] and maps affinely onto the
     joint's range — so the policy/noise/action pipeline is untouched; actions
     just *mean* "target pose" instead of "torque":
         force = kp*slope*ctrl + kp*(q_lo + slope) - kp*q      (slope = range/2)
-    i.e. force = kp * (target(ctrl) - q), with the joint's own damping as the
-    D-term and dm_control's forcerange as the strength limit (gear folds to 1).
+    i.e. force = kp * (target(ctrl) - q), with dm_control's forcerange as the
+    strength limit (gear folds to 1).
 
-    Deliberate deviation: dm_control's V2020 variant also puts a 30 ms
-    first-order activation filter on the targets. Activation states must exist
-    at model COMPILE time, so a post-compile conversion cannot add it — we run
-    direct PD targets (the DeepMimic-standard setup) with explicit rate
-    damping in the actuator instead: biasprm[2] = -kp * kv_ratio. Without it
-    the serial high-kp spine joints resonate (measured 0.18 rad sustained
-    oscillation); swept 2026-07-16, kv/kp = 0.1 (the DeepMimic-conventional
-    kd) minimizes oscillation (0.047 rad) with the best target closure.
-    `kp_scale` remains the knob if the dm_control gains prove hot/soft.
+    D-term = JOINT damping, faithful to V2020: dm_control sets
+    `associated_joint.damping = params.damping` and builds the position servo
+    with biasprm[2] == 0 (see scaled_actuators.add_position_actuator, which
+    hardcodes b2 = 0). So the velocity-proportional force lives on the joint
+    (`dof_damping`), NOT in the actuator. That matters under the model's Euler
+    integrator: `dof_damping` is integrated implicitly (stable at large values)
+    and is exempt from the actuator forcerange, whereas an explicit actuator
+    `-kv*qvel` bias shares the force limit and resonates — MuJoCo itself advises
+    the implicit/implicitfast integrators for actuator kv. We therefore overwrite
+    the joint damping and keep the servo a pure P-term.
+
+    `kv_ratio` is an OPTIONAL extra explicit actuator-damping knob (kv =
+    kp*kv_ratio in biasprm[2]); 0.0 = pure V2020, its default. Only reach for it
+    if you also switch integrators. `kp_scale` remains the gain knob if the
+    dm_control gains prove hot/soft.
+
+    Deliberate deviation: V2020 also puts a 30 ms first-order activation filter
+    on the targets (dyntype='filter'). Activation states must exist at model
+    COMPILE time, so a post-compile conversion cannot add it — the env's
+    ctrl-rate EMA (`target_filter_tc`) is the 40 Hz stand-in for it.
     """
     if mode == "torque":
         return
     if mode != "position":
         raise ValueError(f"unknown actuation mode: {mode!r}")
 
-    from dm_control.locomotion.walkers.cmu_humanoid import _POSITION_ACTUATORS
+    from dm_control.locomotion.walkers.cmu_humanoid import _POSITION_ACTUATORS_V2020
 
-    params = {p.name: p for p in _POSITION_ACTUATORS}
+    params = {p.name: p for p in _POSITION_ACTUATORS_V2020}
     for i in range(m.nu):
         name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
         p = params[name]  # KeyError => model/table mismatch: fail loudly
@@ -102,6 +130,10 @@ def _configure_actuation(
         kp = float(p.kp) * kp_scale
         slope = (q_hi - q_lo) / 2.0
 
+        # V2020 damping is a JOINT property, integrated implicitly by the Euler
+        # integrator. Overwrite (not add) to match `associated_joint.damping`.
+        m.dof_damping[m.jnt_dofadr[jid]] = float(p.damping)
+
         m.actuator_gaintype[i] = mujoco.mjtGain.mjGAIN_FIXED
         m.actuator_gainprm[i, :] = 0.0
         m.actuator_gainprm[i, 0] = kp * slope
@@ -109,6 +141,8 @@ def _configure_actuation(
         m.actuator_biasprm[i, :] = 0.0
         m.actuator_biasprm[i, 0] = kp * (q_lo + slope)
         m.actuator_biasprm[i, 1] = -kp
+        # Pure P-term by default (b2 = 0, like V2020); kv_ratio > 0 opts into an
+        # extra explicit actuator D-term (use an implicit integrator if so).
         m.actuator_biasprm[i, 2] = -kp * kv_ratio
         m.actuator_gear[i, :] = 0.0
         m.actuator_gear[i, 0] = 1.0
@@ -137,12 +171,13 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         clip_seed: int = 0,
         actuation: str = "torque",
         actuation_kp_scale: float = 1.0,
-        actuation_kv_ratio: float = 0.1,
+        actuation_kv_ratio: float = 0.0,
     ):
         super().__init__(config)
 
         self._mj_model = mj_model
         self._mj_model.opt.timestep = self.sim_dt
+        self._actuation = actuation
 
         # Full self-collision by default; set self_collisions=False to fall back
         # to ground-only contacts for memory-constrained runs.
@@ -210,6 +245,32 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             [self._mj_model.body(name).id for name in bn["end_effectors"]]
         )
 
+        # Proprioception: every non-world body's frame relative to the root.
+        # `_root_body_id` is the body carrying the single free joint (the frame
+        # `data.qpos[:3]` positions), used to re-express body xpos root-relative.
+        # `_proprio_body_ids` is all bodies but the worldbody (id 0) — its frame
+        # is the fixed global origin and carries no proprioceptive signal.
+        free_jnts = np.nonzero(
+            self._mj_model.jnt_type == mujoco.mjtJoint.mjJNT_FREE
+        )[0]
+        assert len(free_jnts) == 1, "expected exactly one free (root) joint"
+        self._root_body_id = int(self._mj_model.jnt_bodyid[free_jnts[0]])
+        self._proprio_body_ids = jp.arange(1, self._mj_model.nbody)
+
+        # Foot ground-contact obs: the sensordata addresses of the per-foot
+        # touch sensors (ankle + toe), shape (2, 2), and the normal-force
+        # threshold that binarizes them. Read through sensordata rather than the
+        # contact list because sensordata is a per-world field on every backend,
+        # whereas the Warp backend keeps contacts in a non-vmapped global arena a
+        # per-world obs cannot index.
+        self._foot_sensor_adr = jp.array(
+            [[self._mj_model.sensor(s).adr[0] for s in foot]
+             for foot in FOOT_TOUCH_SENSORS]
+        )
+        self._foot_contact_force_thresh = float(
+            self._config.get("foot_contact_force_thresh", 1.0)
+        )
+
         self._lowers = self._mj_model.actuator_ctrlrange[:, 0]
         self._uppers = self._mj_model.actuator_ctrlrange[:, 1]
 
@@ -223,6 +284,26 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
                 self._mj_model.actuator_forcerange[:, 1],
                 np.abs(self._mj_model.actuator_gear[:, 0]),
             ),
+            dtype=jp.float32,
+        )
+
+        # First-order target filter (see step). dm_control's position-controlled
+        # CMU walker runs a 30 ms activation filter on the servos that our
+        # post-compile actuator conversion cannot replicate (activation states
+        # are sized at compile time); this ctrl-rate EMA is its 40 Hz stand-in.
+        # alpha = weight on the previous filtered command; 0 disables.
+        tc = float(self._config.get("target_filter_tc", 0.0))
+        self._filter_alpha = (
+            float(np.exp(-float(self._config.ctrl_dt) / tc)) if tc > 0 else 0.0
+        )
+        # ctrl -> joint-angle inverse map, for initializing the filter state to
+        # a pose-holding command at reset (position mode only): the actuated
+        # joint's qpos address, range low and half-range per actuator.
+        jid = self._mj_model.actuator_trnid[:, 0]
+        self._act_qadr = jp.array(self._mj_model.jnt_qposadr[jid])
+        self._act_q_lo = jp.array(self._mj_model.jnt_range[jid, 0], dtype=jp.float32)
+        self._act_slope = jp.array(
+            (self._mj_model.jnt_range[jid, 1] - self._mj_model.jnt_range[jid, 0]) / 2.0,
             dtype=jp.float32,
         )
 
@@ -328,12 +409,26 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         )
         data = self._init_data(qpos, qvel)
 
+        # Filter state starts at the command that HOLDS the reset pose (position
+        # mode), so the first filtered steps don't yank the character toward
+        # mid-range targets; torque mode starts at zero force. Carried in info
+        # so reset/step pytrees stay structurally identical.
+        if self._actuation == "position":
+            hold_ctrl = jp.clip(
+                (qpos[self._act_qadr] - self._act_q_lo) / self._act_slope - 1.0,
+                -1.0,
+                1.0,
+            )
+        else:
+            hold_ctrl = jp.zeros(self.mjx_model.nu)
+
         info = {
             "rng": rng,
             "phase_idx": start_idx,
             "clip_start": clip_start,
             "clip_len": clip_len,
             "last_act": jp.zeros(self.mjx_model.nu),
+            "filtered_ctrl": hold_ctrl,
             # Clip-end truncation flag (see step). False at reset; kept in the
             # info pytree so reset/step states share an identical structure (the
             # trainer's auto-reset selects between them leaf-by-leaf).
@@ -346,6 +441,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             "reward/ee": jp.zeros(()),
             "reward/root": jp.zeros(()),
             "reward/torque": jp.zeros(()),
+            "reward/action_rate": jp.zeros(()),
             "root_dist": jp.zeros(()),
         }
 
@@ -359,6 +455,15 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         ctrl = jp.clip(
             action * self._config.action_scale, self._lowers, self._uppers
         )
+        # First-order smoothing of the applied command (target_filter_tc > 0):
+        # high-frequency target chatter becomes physically inert, so the policy
+        # gains nothing from it. The filter state rides in info; alpha is a
+        # trace-time constant (0 = pass-through).
+        if self._filter_alpha > 0.0:
+            ctrl = (
+                self._filter_alpha * state.info["filtered_ctrl"]
+                + (1.0 - self._filter_alpha) * ctrl
+            )
         data = mjx_env.step(self.mjx_model, state.data, ctrl, self.n_substeps)
 
         clip_len = state.info["clip_len"]
@@ -366,7 +471,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
 
         abs_idx = state.info["clip_start"] + phase_idx
         reward_val, tracking, root_dist = self._get_reward(
-            data, abs_idx, ctrl, state.metrics
+            data, abs_idx, ctrl, action, state.info["last_act"], state.metrics
         )
 
         # Genuine termination: fall / NaN / tracking collapse / root drift.
@@ -394,12 +499,28 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             "clip_start": state.info["clip_start"],
             "clip_len": clip_len,
             "last_act": action,
+            "filtered_ctrl": ctrl,
             "truncation": clip_truncated,
         }
 
         obs = self._get_obs(data, info)
         done = done.astype(jp.float32)
         return mjx_env.State(data, obs, reward_val, done, state.metrics, info)
+
+    def _feet_contacts(self, data: mjx.Data) -> jax.Array:
+        """Binary ground-contact flag per foot, ordered (left, right).
+
+        Reads the per-foot ``touch`` sensors (each sums the normal force of
+        contacts under its foot/toe zone; ~0 when airborne): a foot reads as 1.0
+        when the summed force over its ankle and toe sensors exceeds
+        ``foot_contact_force_thresh`` newtons. Uses ``sensordata`` — a per-world
+        field on every backend (jax / warp / native MjData) — rather than the
+        raw contact list, which the Warp backend stores in a non-vmapped global
+        arena a per-world obs cannot demux. Returns float32 (2,).
+        """
+        touch = data.sensordata[self._foot_sensor_adr]  # (2, 2), >= 0
+        planted = jp.sum(touch, axis=-1) > self._foot_contact_force_thresh
+        return planted.astype(jp.float32)
 
     def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> jax.Array:
         clip_len = info["clip_len"]
@@ -417,21 +538,42 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
 
         d_joints = ref_qpos[:, 7:] - data.qpos[7:]
         d_jvel = ref_qvel[:, 6:] - data.qvel[6:]
-        d_quat = ref_qpos[:, 3:7] - data.qpos[3:7]
+
+        # Orientation delta as the 6D continuous rotation rep of the relative
+        # rotation (ref^-1 * current), not the raw quaternion diff: continuous
+        # network input, no double-cover discontinuity. (look_ahead, 6)
+        d_rot6d = quat_to_rot6d(batched_quat_diff(ref_qpos[:, 3:7], data.qpos[3:7]))
         d_height = ref_qpos[:, 2:3] - data.qpos[2:3]
 
         # Flatten frame-by-frame: [frame1 block, frame2 block, ...].
         ref_delta = jp.concatenate(
-            [d_joints, d_jvel, d_quat, d_height], axis=-1
+            [d_joints, d_jvel, d_rot6d, d_height], axis=-1
         ).reshape(-1)
+
+        # Proprioception: each body's global frame (xpos/xmat), re-expressed
+        # relative to the root. Positions are root-relative (root xpos subtracted,
+        # so the whole body drops out of the absolute world position the policy
+        # can't affect); orientations are the global xmat as a 6D continuous
+        # rotation rep. This hands the policy the end-effector / limb geometry
+        # directly instead of forcing it to reconstruct forward kinematics from
+        # qpos. (nbody-1, 3) and (nbody-1, 6) flattened.
+        root_pos = data.xpos[self._root_body_id]
+        body_pos = (data.xpos[self._proprio_body_ids] - root_pos).reshape(-1)
+        body_rot6d = mat_to_rot6d(data.xmat[self._proprio_body_ids]).reshape(-1)
 
         obs = jp.concatenate([
             data.qpos[7:],
             data.qvel[6:],
-            data.qpos[3:7],
+            quat_to_rot6d(data.qpos[3:7]),
             data.qvel[3:6],
             data.qpos[2:3],
             data.qvel[0:3],
+            # Binary (left, right) foot ground-contact flags — an explicit
+            # gait-phase cue the policy would otherwise have to infer from the
+            # full contact-rich dynamics.
+            self._feet_contacts(data),
+            body_pos,
+            body_rot6d,
             info["last_act"],
             ref_delta,
         ])
@@ -442,6 +584,8 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         data: mjx.Data,
         abs_idx: jax.Array,
         ctrl: jax.Array,
+        action: jax.Array,
+        last_action: jax.Array,
         metrics: dict[str, Any],
     ) -> jax.Array:
         cfg = self._config.reward_config
@@ -461,15 +605,11 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         r_ee = jp.exp(-ee_err / cfg.sigma_ee)
 
         root_pos_err = jp.sum(jp.square(data.qpos[:3] - ref_qpos[:3]))
-        quat_dot = jp.dot(data.qpos[3:7], ref_qpos[3:7])
-        root_quat_err = 1.0 - jp.square(quat_dot)
+        root_quat_err = quaternion_distance(data.qpos[3:7], ref_qpos[3:7])
+
         root_err = root_pos_err + root_quat_err
         r_root = jp.exp(-root_err / cfg.sigma_root)
 
-        # Euclidean root drift (metres) from the reference root position, for
-        # the geometric root-drift termination and threshold tuning: the exp
-        # kernel above barely discriminates drift (15 cm costs ~6% of r_root),
-        # so the raw distance is logged as its own metric.
         root_dist = jp.sqrt(root_pos_err)
 
         # Effort penalty: discourage needless actuation power. Uses the ACTUAL
@@ -483,11 +623,20 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         effort = data.actuator_force / self._force_limit
         r_torque = -cfg.w_torque * jp.mean(jp.square(effort))
 
+        # Action-rate penalty: temporal smoothness of the RAW policy output
+        # (pre-filter — penalize the source of chatter, not its filtered echo).
+        # Normalized [-1,1] units, so a persistent full-range flip costs
+        # w_action_rate * 4 per step. First step of an episode compares against
+        # last_act = 0 (reset init) — a mild, bounded artifact. Kept OUT of
+        # `tracking` so it never feeds the tracking-collapse termination.
+        r_action_rate = -cfg.w_action_rate * jp.mean(jp.square(action - last_action))
+
         metrics["reward/pose"] = r_pose
         metrics["reward/vel"] = r_vel
         metrics["reward/ee"] = r_ee
         metrics["reward/root"] = r_root
         metrics["reward/torque"] = r_torque
+        metrics["reward/action_rate"] = r_action_rate
         metrics["root_dist"] = root_dist
 
         # Weighted tracking reward (everything but the constant alive bonus and
@@ -499,7 +648,11 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             + cfg.w_ee * r_ee
             + cfg.w_root * r_root
         )
-        return tracking + cfg.w_alive + r_torque, tracking, root_dist
+        return (
+            tracking + cfg.w_alive + r_torque + r_action_rate,
+            tracking,
+            root_dist,
+        )
 
     def _get_termination(
         self, data: mjx.Data, tracking: jax.Array, root_dist: jax.Array
@@ -550,3 +703,92 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
     @property
     def mjx_model(self) -> mjx.Model:
         return self._mjx_model
+
+    # ------------------------------------------------------------------
+    # Native-CPU playback hooks (roxie.utils.native_player.NativePlayer)
+    #
+    # These let the env be stepped on native ``mujoco.mj_step`` for fast,
+    # GPU-free playback. They REUSE the MJX ``_get_obs``/``_get_reward``/
+    # ``_get_termination`` above (those read only qpos/qvel/xpos/actuator_force,
+    # which a native MjData also carries), so observation/reward/termination stay
+    # bit-for-bit identical to training — only the integrator differs. The
+    # generic player owns the MjData and mj_step; the task-specific reset,
+    # ctrl pipeline and phase bookkeeping live here.
+    # ------------------------------------------------------------------
+
+    @property
+    def native_n_substeps(self) -> int:
+        return int(self.n_substeps)
+
+    def native_reset(self, data: mujoco.MjData, key: jax.Array) -> dict[str, Any]:
+        # Deterministic playback: frame 0 of a clip (no random start, no reset
+        # noise), mirroring the eval env's reproducible reset. The clip is picked
+        # from `key` so successive episodes cycle through the pool.
+        clip_idx = int(jax.random.randint(key, (), 0, self._num_clips))
+        clip_start = int(self._clip_starts[clip_idx])
+        clip_len = int(self._clip_lengths[clip_idx])
+        abs_idx = clip_start  # phase_idx 0
+
+        mujoco.mj_resetData(self._mj_model, data)
+        data.qpos[:] = np.asarray(self._ref_qpos[abs_idx])
+        data.qvel[:] = np.asarray(self._ref_qvel[abs_idx])
+        mujoco.mj_forward(self._mj_model, data)
+
+        # Filter state holds the reset pose (position) / zero force (torque),
+        # mirroring reset() so the first filtered steps don't yank the character.
+        if self._actuation == "position":
+            filtered = np.clip(
+                (data.qpos[np.asarray(self._act_qadr)] - np.asarray(self._act_q_lo))
+                / np.asarray(self._act_slope) - 1.0,
+                -1.0, 1.0,
+            )
+        else:
+            filtered = np.zeros(self._mj_model.nu)
+
+        return {
+            "clip_start": clip_start,
+            "phase_idx": 0,
+            "clip_len": clip_len,
+            "last_act": np.zeros(self._mj_model.nu),
+            "filtered_ctrl": filtered,
+        }
+
+    def native_obs(self, data: mujoco.MjData, info: dict[str, Any]) -> np.ndarray:
+        return np.asarray(self._get_obs(data, info))
+
+    def native_control(
+        self, action: Any, info: dict[str, Any]
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        action = np.asarray(action, dtype=np.float64)
+        ctrl = np.clip(
+            action * self._config.action_scale,
+            np.asarray(self._lowers), np.asarray(self._uppers),
+        )
+        if self._filter_alpha > 0.0:
+            ctrl = (
+                self._filter_alpha * info["filtered_ctrl"]
+                + (1.0 - self._filter_alpha) * ctrl
+            )
+        info["filtered_ctrl"] = ctrl
+        return ctrl, info
+
+    def native_post(
+        self, data: mujoco.MjData, action: Any, ctrl: np.ndarray, info: dict[str, Any]
+    ) -> tuple[float, bool, dict[str, Any], dict[str, Any]]:
+        clip_len = info["clip_len"]
+        phase = (info["phase_idx"] + 1) % clip_len
+        abs_idx = info["clip_start"] + phase
+
+        metrics: dict[str, Any] = {}
+        reward, tracking, root_dist = self._get_reward(
+            data, abs_idx, ctrl, np.asarray(action), info["last_act"], metrics
+        )
+        terminated = bool(self._get_termination(data, tracking, root_dist))
+        clip_truncated = (not self._config.cyclic) and (
+            phase >= clip_len - self._config.look_ahead
+        )
+        done = terminated or clip_truncated
+
+        info["phase_idx"] = phase
+        info["last_act"] = np.asarray(action)
+        return float(reward), done, metrics, info

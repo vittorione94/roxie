@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import rlax
 from flax import nnx
 
 from roxie.agents.agent import Agent
@@ -110,6 +111,152 @@ def td3_critic_loss_fn(
     q1, q2 = twin_critic(obs, samples["actions"])
     critic_loss = jnp.mean((jnp.squeeze(q1) - target_q) ** 2) + jnp.mean(
         (jnp.squeeze(q2) - target_q) ** 2
+    )
+    return critic_loss
+
+
+@nnx.jit
+def d4pg_critic_loss_fn(
+    critic_model,
+    target_actor_model,
+    target_critic_model,
+    samples,
+    noise_key,
+    target_policy_noise,
+    target_noise_clip,
+    action_low,
+    action_high,
+    obs_mean,
+    obs_std,
+    obs_clip,
+    atoms,
+):
+    """Categorical distributional critic loss for D4PG (Barth-Maron et al. 2018).
+
+    The critic outputs logits over a fixed support `atoms`. The target
+    distribution is the target critic's categorical at (s', pi'(s')) with its
+    support shifted per sample to `rewards + bootstrap * atoms` (rewards is the
+    n-step return and bootstrap the precomputed gamma^b coefficient, 0 at
+    terminals — so a terminal collapses the target to a delta at the return),
+    then L2-projected back onto `atoms`. Loss is the cross-entropy between the
+    projected target and the online critic's categorical.
+
+    Target policy smoothing is kept for signature parity with the DDPG/TD3
+    losses; the paper doesn't smooth, so configs set the noise to 0.
+    """
+    # Normalize observations
+    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    next_obs = Agent.normalize_obs(
+        samples["next_observations"], obs_mean, obs_std, obs_clip
+    )
+
+    # Target actions in env scale
+    next_actions = target_actor_model(next_obs)  # [-1, 1]
+    next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
+
+    # Target smoothing noise in env units (no-op at the paper's noise = 0)
+    act_span = action_high - action_low
+    noise = jax.random.normal(noise_key, next_actions.shape) * (
+        target_policy_noise * act_span
+    )
+    noise_clip = target_noise_clip * act_span
+    noise = jnp.clip(noise, -noise_clip, noise_clip)
+    next_actions = jnp.clip(next_actions + noise, action_low, action_high)
+
+    # Target categorical over the shifted support, projected onto `atoms`
+    target_logits = target_critic_model(next_obs, next_actions)  # (B, num_atoms)
+    target_probs = jax.nn.softmax(target_logits, axis=-1)
+
+    reward = jnp.squeeze(samples["rewards"])
+    target_z = reward[:, None] + samples["bootstrap"][:, None] * atoms[None, :]
+
+    projected = jax.vmap(rlax.categorical_l2_project, in_axes=(0, 0, None))(
+        target_z, target_probs, atoms
+    )
+    projected = jax.lax.stop_gradient(projected)
+
+    # Cross-entropy between projected target and online categorical
+    logits = critic_model(obs, samples["actions"])
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    critic_loss = -jnp.mean(jnp.sum(projected * log_probs, axis=-1))
+    return critic_loss
+
+
+@nnx.jit
+def td4_critic_loss_fn(
+    twin_critic,
+    target_actor_model,
+    target_twin_critic,
+    samples,
+    noise_key,
+    target_policy_noise,
+    target_noise_clip,
+    action_low,
+    action_high,
+    obs_mean,
+    obs_std,
+    obs_clip,
+    atoms,
+):
+    """Categorical distributional loss for a twin critic with clipped double-Q.
+
+    Same construction as `d4pg_critic_loss_fn`, but the bootstrap distribution
+    comes from *one* of the two target critics — the pessimistic one. Taking an
+    elementwise minimum over the two atom probability vectors would not yield a
+    distribution (it doesn't sum to 1), so the selection is per sample: whichever
+    target head has the lower expected value contributes its *whole* categorical.
+    That keeps the target a valid distribution while preserving TD3's
+    underestimation bias.
+
+    Both online heads are then trained by cross-entropy against the same
+    projected target, and the two losses are summed (as in `td3_critic_loss_fn`).
+    """
+    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    next_obs = Agent.normalize_obs(
+        samples["next_observations"], obs_mean, obs_std, obs_clip
+    )
+
+    # Target actions in env scale
+    next_actions = target_actor_model(next_obs)  # [-1, 1]
+    next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
+
+    # Target policy smoothing noise in env units
+    act_span = action_high - action_low
+    noise = jax.random.normal(noise_key, next_actions.shape) * (
+        target_policy_noise * act_span
+    )
+    noise_clip = target_noise_clip * act_span
+    noise = jnp.clip(noise, -noise_clip, noise_clip)
+    next_actions = jnp.clip(next_actions + noise, action_low, action_high)
+
+    # Both target categoricals at (s', pi'(s')), then pick the pessimistic head
+    # per sample by comparing their expected values.
+    target_logits1, target_logits2 = target_twin_critic(next_obs, next_actions)
+    target_probs1 = jax.nn.softmax(target_logits1, axis=-1)  # (B, num_atoms)
+    target_probs2 = jax.nn.softmax(target_logits2, axis=-1)
+
+    target_q1 = jnp.sum(target_probs1 * atoms[None, :], axis=-1)  # (B,)
+    target_q2 = jnp.sum(target_probs2 * atoms[None, :], axis=-1)
+    take_first = (target_q1 <= target_q2)[:, None]
+    target_probs = jnp.where(take_first, target_probs1, target_probs2)
+
+    # Shift the support by the n-step return / bootstrap coefficient (0 at
+    # terminals → the target collapses to a delta at the return) and L2-project
+    # it back onto the fixed `atoms`.
+    reward = jnp.squeeze(samples["rewards"])
+    target_z = reward[:, None] + samples["bootstrap"][:, None] * atoms[None, :]
+
+    projected = jax.vmap(rlax.categorical_l2_project, in_axes=(0, 0, None))(
+        target_z, target_probs, atoms
+    )
+    projected = jax.lax.stop_gradient(projected)
+
+    # Cross-entropy of both online heads against the shared projected target
+    logits1, logits2 = twin_critic(obs, samples["actions"])
+    log_probs1 = jax.nn.log_softmax(logits1, axis=-1)
+    log_probs2 = jax.nn.log_softmax(logits2, axis=-1)
+    critic_loss = -jnp.mean(jnp.sum(projected * log_probs1, axis=-1)) - jnp.mean(
+        jnp.sum(projected * log_probs2, axis=-1)
     )
     return critic_loss
 

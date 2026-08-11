@@ -62,10 +62,11 @@ def _make_reward_fn(menv):
             "reward/root": jp.zeros(()),
             "reward/torque": jp.zeros(()),
         }
-        # ctrl=0: the torque penalty is not part of the tracking diagnostic, and
-        # a zero command keeps `total` equal to the pure tracking + alive reward.
+        # ctrl=0 / action=last_action=0: the effort and action-rate penalties
+        # are not part of the tracking diagnostic; zero commands keep `total`
+        # equal to the pure tracking + alive reward.
         ctrl = jp.zeros((menv.action_size,))
-        total, _ = menv._get_reward(data, abs_idx, ctrl, components)
+        total, _, _ = menv._get_reward(data, abs_idx, ctrl, ctrl, ctrl, components)
         return total, components
 
     return jax.jit(jax.vmap(reward_fn, in_axes=(0, 0, 0)))

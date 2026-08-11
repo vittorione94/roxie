@@ -7,17 +7,17 @@ import optax
 from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
-from roxie.agents.ddpg import DDPG
+from roxie.agents.d4pg import D4PG
 from roxie.agents.utils import repack_samples
-from roxie.losses.actor_losses import td3_actor_loss_fn
-from roxie.losses.critic_losses import td3_critic_loss_fn
+from roxie.losses.actor_losses import td4_actor_loss_fn
+from roxie.losses.critic_losses import td4_critic_loss_fn
 from roxie.models.critics import TwinCritic
 
 
-# Single TD3 gradient step. Not jitted on its own — called inside the jitted
-# `_grad_steps` below so N steps fuse into one compiled program. `update_actor`
-# is a Python bool (static at trace time): when False the actor and target
-# updates are simply not traced, implementing the delayed-policy-update trick.
+# Single TD4 gradient step. Not jitted on its own — called inside the jitted
+# `_grad_steps` below so N steps fuse into one compiled program. This is D4PG's
+# step (categorical critic on the fixed support `atoms`) with TD3's twin critic
+# and delayed policy update bolted on.
 def _grad_step(
     state: TrainState,
     key: jax.random.PRNGKey,
@@ -31,23 +31,25 @@ def _grad_step(
     obs_mean: jnp.ndarray,
     obs_std: jnp.ndarray,
     obs_clip: float,
+    atoms: jnp.ndarray,
     update_actor,
     n_step: int = 1,
 ):
-    """One TD3 step. `obs_mean`/`obs_std` are hoisted in by `_grad_steps` (the
-    stats are loop-constant). `update_actor` is a *traced* boolean here: the actor
-    and target updates run under `nnx.cond` so the delayed-policy-update trick
-    survives the `lax.scan` (where the step index is no longer static).
-    `n_step` is the TD horizon (NOT the scan length)."""
+    """One TD4 step. `obs_mean`/`obs_std` and `atoms` are hoisted in by
+    `_grad_steps` (all loop-constant). `update_actor` is a *traced* boolean: the
+    actor and target updates run under `nnx.cond` so the delayed-policy-update
+    trick survives the `lax.scan` (where the step index is no longer static).
+    `n_step` is the TD horizon (NOT the scan length `n_steps`)."""
     # 1. Sample from the replay buffer. `repack_samples` folds the n-step
-    # return, bootstrap coefficient, and bootstrap obs into the dict, so the
-    # critic loss no longer sees gamma/terminals directly.
+    # return, bootstrap coefficient, and bootstrap obs into the dict — exactly
+    # the ingredients the categorical projection needs to shift the support.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
 
-    # 2. Critic update (twin critic, clipped double-Q target) — every step
-    critic_loss, critic_grads = nnx.value_and_grad(td3_critic_loss_fn)(
+    # 2. Critic update (cross-entropy against the projected target categorical
+    # of the pessimistic target head) — every step
+    critic_loss, critic_grads = nnx.value_and_grad(td4_critic_loss_fn)(
         state.critic,
         state.target_actor,
         state.target_critic,
@@ -60,6 +62,7 @@ def _grad_step(
         obs_mean,
         obs_std,
         obs_clip,
+        atoms,
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
@@ -67,7 +70,7 @@ def _grad_step(
     # True. Under `lax.scan` the step index is traced, so this must be a runtime
     # branch (`nnx.cond`) rather than a Python `if`.
     def _actor_update(state):
-        actor_loss, actor_grads = nnx.value_and_grad(td3_actor_loss_fn)(
+        actor_loss, actor_grads = nnx.value_and_grad(td4_actor_loss_fn)(
             state.actor,
             state.critic,
             re_packed_samples,
@@ -76,6 +79,7 @@ def _grad_step(
             obs_clip,
             action_low,
             action_high,
+            atoms,
         )
         state.actor_optimizer.update(state.actor, actor_grads)
 
@@ -123,7 +127,7 @@ def _grad_step(
 # via `lax.scan` (instead of unrolling, which blows up compile time / HLO size at
 # large `n_steps`). The delayed-policy-update schedule is precomputed as a boolean
 # mask scanned over alongside the per-step keys. Only the trainable graph state is
-# carried; `buffer_state` and the normalization params are loop-constant.
+# carried; `buffer_state`, the normalization params, and `atoms` are loop-constant.
 @functools.partial(
     nnx.jit,
     static_argnames=(
@@ -148,6 +152,7 @@ def _grad_steps(
     action_high: float,
     obs_eps: float,
     obs_clip: float,
+    atoms: jnp.ndarray,
     policy_delay: int,
     n_step: int = 1,
 ):
@@ -176,6 +181,7 @@ def _grad_steps(
             obs_mean,
             obs_std,
             obs_clip,
+            atoms,
             update_actor,
             n_step,
         )
@@ -192,13 +198,24 @@ def _grad_steps(
     return state, actor_loss, jnp.mean(critic_losses)
 
 
-class TD3(DDPG):
-    """Twin Delayed DDPG.
+class TD4(D4PG):
+    """Twin Delayed D4PG — D4PG with TD3's twin critic and delayed updates.
 
-    Extends DDPG with the three TD3 stabilizers: clipped double-Q critics,
-    target policy smoothing (already present in DDPG's target construction),
-    and delayed policy/target updates. Everything else — action selection,
-    replay handling, observation normalization — is inherited unchanged.
+    Extends D4PG with two of TD3's three stabilizers: a *pair* of categorical
+    critics with a clipped double-Q bootstrap, and delayed policy/target
+    updates. (The third, target policy smoothing, already exists in the shared
+    target construction; D4PG configs just set the noise to 0 — TD4 turns it
+    back on by default.)
+
+    The clipped double-Q carries over to distributions by picking, per sample,
+    the target head with the lower *expected* value and using its whole
+    categorical as the bootstrap — an elementwise min over atom probabilities
+    would not be a distribution. Both heads are then fit to that same projected
+    target; the actor follows head 1's mean. See `td4_critic_loss_fn`.
+
+    Everything else — the support, action selection, replay handling,
+    observation normalization — is inherited from D4PG/DDPG unchanged, so
+    `v_min`/`v_max` must still bracket the achievable n-step-discounted return.
     """
 
     def __init__(self, *args, policy_delay: int = 2, **kwargs):
@@ -206,23 +223,30 @@ class TD3(DDPG):
         super().__init__(*args, **kwargs)
 
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
+        """Two categorical critics behind a TwinCritic. `num_atoms` is injected
+        from the agent args so the critic yaml doesn't have to repeat it; the
+        two heads get distinct seeds so they don't start identical (the double-Q
+        min is worthless if they are)."""
         critic_rngs_1 = nnx.Rngs(params=2, dropout=3)
         critic_rngs_2 = nnx.Rngs(params=4, dropout=5)
         critic1 = hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
+            num_atoms=self.num_atoms,
             rngs=critic_rngs_1,
         )
         critic2 = hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
+            num_atoms=self.num_atoms,
             rngs=critic_rngs_2,
         )
         return TwinCritic(critic1, critic2)
 
     def learn(self, agent_rng, n_steps=None):
-        """One unconditional burst (TD3 variant: threads `policy_delay` into the
-        fused grad step). See DDPG.learn for the sync/async sharing rationale."""
+        """One unconditional burst (TD4 variant: threads both the categorical
+        `atoms` support and `policy_delay` into the fused grad step). See
+        DDPG.learn for the sync/async sharing rationale."""
         self.state, actor_loss, critic_loss = _grad_steps(
             self.state,
             agent_rng,
@@ -236,22 +260,11 @@ class TD3(DDPG):
             self.action_high,
             self.obs_eps,
             self.obs_clip,
+            self.atoms,
             self.policy_delay,
             n_step=self.n_step,
         )
         return actor_loss, critic_loss
-
-    def update(self, steps, agent_rng):
-        gradient_steps, actor_loss, critic_loss = 0, 0, 0
-
-        if (
-            steps >= self.steps_before_learning
-            and (steps - self.steps_before_learning) % self.steps_between_updates == 0
-        ):
-            actor_loss, critic_loss = self.learn(agent_rng)
-            gradient_steps += self.learning_steps
-
-        return gradient_steps, actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
         params = super()._export_hyperparams()

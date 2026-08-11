@@ -26,6 +26,28 @@ def ddpg_actor_loss_fn(
 
 
 @nnx.jit
+def d4pg_actor_loss_fn(
+    actor_model,
+    critic_model,
+    samples,
+    obs_mean,
+    obs_std,
+    obs_clip,
+    action_low,
+    action_high,
+    atoms,
+):
+    """DPG through the distributional critic: maximize the categorical's mean."""
+    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    actions = actor_model(obs)  # [-1, 1]
+    actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
+    logits = critic_model(obs, actions)  # (B, num_atoms)
+    q_values = jnp.sum(jax.nn.softmax(logits, axis=-1) * atoms, axis=-1)
+    actor_loss = -jnp.mean(q_values)
+    return actor_loss
+
+
+@nnx.jit
 def td3_actor_loss_fn(
     actor_model,
     twin_critic,
@@ -42,6 +64,32 @@ def td3_actor_loss_fn(
     actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
     q1, _ = twin_critic(obs, actions)
     actor_loss = -jnp.mean(q1)
+    return actor_loss
+
+
+@nnx.jit
+def td4_actor_loss_fn(
+    actor_model,
+    twin_critic,
+    samples,
+    obs_mean,
+    obs_std,
+    obs_clip,
+    action_low,
+    action_high,
+    atoms,
+):
+    """DPG through the first distributional head's expected value (TD4).
+
+    The TD3 convention: the actor follows critic 1 only, so the pessimistic
+    min stays confined to the critic's bootstrap target.
+    """
+    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    actions = actor_model(obs)  # [-1, 1]
+    actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
+    logits1, _ = twin_critic(obs, actions)  # (B, num_atoms)
+    q_values = jnp.sum(jax.nn.softmax(logits1, axis=-1) * atoms, axis=-1)
+    actor_loss = -jnp.mean(q_values)
     return actor_loss
 
 

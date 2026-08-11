@@ -1,0 +1,52 @@
+# DDPG arm of the CMU_006_13 overfit sweep.
+#
+# SWEEP INVARIANTS (identical in every *_sweep.yaml — change them everywhere or
+# nowhere):
+#   actor/critic features [1024, 512, 256] + layer norm
+#   batch 512, learning_steps 128, steps_between_updates 8_000  => replay ratio
+#     ~8 samples per collected transition (the measured frontier; higher RR was
+#     falsified three times, it only costs wall-clock)
+#   buffer 500k, warmup 30k, gamma 0.99, tau 0.005, lr 3e-4, max_grad_norm 1
+#
+# DDPG-specific: single Q critic (TD3/TD4/SAC run twins, D4PG/MPO single) — the
+# critic-count difference is algorithmic, not a capacity knob, so per-network
+# width is what is held equal here.
+name: "ddpg"
+
+args:
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  # Mocap-tuned target smoothing (default 0.2/0.5 blurs the sharp
+  # precision-tracking Q ridges); same values as the TD3/TD4 arms.
+  target_policy_noise: 0.05
+  target_noise_clip: 0.15
+  memory_warmup: 30_000
+  steps_before_learning: 30_000
+  steps_between_updates: 8_000
+  learning_steps: 128
+  # n-step TD horizon. >1 switches replay to a flashbax trajectory buffer with
+  # truncation-aware masking (roxie/agents/utils.py repack_samples).
+  n_step: 5
+  max_grad_norm: 1
+
+actor:
+  _target_: roxie.models.actors.DeterministicActor
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+critic:
+  _target_: roxie.models.critics.QCritic
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 10_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}

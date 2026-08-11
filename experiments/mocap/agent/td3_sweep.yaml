@@ -1,3 +1,11 @@
+# TD3 arm of the CMU_006_13 overfit sweep. This is the reference arm — the
+# historical champion stack — so read the others against it.
+#
+# SWEEP INVARIANTS (see ddpg_sweep.yaml for the full list): features
+# [1024, 512, 256] + layer norm, batch 512 x 128 grad steps / 8k env steps
+# (replay ratio ~8), buffer 500k, warmup 30k, gamma 0.99, tau 0.005, lr 3e-4.
+#
+# TD3-specific: twin Q critics + delayed actor updates.
 name: "td3"
 
 args:
@@ -12,11 +20,6 @@ args:
   steps_before_learning: 30_000
   steps_between_updates: 8_000
   learning_steps: 128
-  # n-step TD horizon. >1 switches replay to a flashbax trajectory buffer
-  # (windows of n_step+1 consecutive items, truncation-aware masking in
-  # roxie/agents/utils.py repack_samples) so value information propagates n
-  # steps per update instead of one. Effective bootstrap discount is gamma^n.
-  # The memory block below keeps its flat-buffer schema either way.
   n_step: 5
   max_grad_norm: 1
 
@@ -27,6 +30,7 @@ actor:
   dropout_rate: 0.
 
 critic:
+  # Instantiated twice behind a TwinCritic.
   _target_: roxie.models.critics.QCritic
   features: [1024, 512, 256]
   use_layer_norm: true            # strong stabilizer against value divergence

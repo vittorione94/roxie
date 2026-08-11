@@ -1,39 +1,10 @@
 # @package env
-#
-# Reward shaping for the CMU mocap-tracking task. These override the env's
-# `reward_config` defaults (in examples/mocap/mocap_tracking.py) via Hydra so a
-# run's reward landscape lives in config, not code, and is captured in the saved
-# run config. build_mocap_env flattens this block into `reward_config.<key>`
-# overrides for the ml_collections config.
-#
-# Each tracking term is an exp kernel `exp(-err / sigma)` over a *sum* of
-# squared errors across all DOFs / end-effectors. The sigmas are tuned so each
-# component sits in an informative mid-range at the errors actually seen in
-# training, rather than saturating at 0 (no gradient) or 1 (trivially maxed).
-# Verify with `python examples/mocap/check_mocap_reward.py`, but note that its
-# noise sweep only probes near the reference — `sigma_vel` below was set from
-# the *training* error regime (see note), which that sweep does not reach.
-#   - sigma_vel: the kernel is correct AT the reference (perfect tracking gives
-#     vel=1.0), but the policy's actual joint-velocity errors are large. Third
-#     retune: 10 -> 200 -> 800. The 200 setting assumed vel_err ~150-350, but
-#     measured training-regime errors are ~500-900 (r_vel logged 0.013 early,
-#     0.09 after 200M steps — deep in the saturated tail, so ~no gradient AND
-#     the dead term tightened the tracking-termination floor from 50% to ~56%
-#     of achievable). At 800, r_vel ~ 0.34 at err ~870 and ~0.7 at err ~300.
-#     If it saturates high late in training, tighten again — or cut w_vel
-#     instead: reference qvel is finite-differenced, hence a noisy target.
-#   - sigma_pose was 2.0, pinning `reward/pose` at ~0.03 deep in the saturated
-#     tail despite carrying the largest weight. Widened so pose actually drives
-#     learning.
-#   - sigma_ee widened off 0.04; sigma_root tightened off 0.5 so root tracking
-#     (previously ~0.83 and dominating) no longer trivially maxes out. NOTE: ee
-#     is now the steepest term (collapses fastest away from the reference), so
-#     it carries most of the near-reference gradient.
+
 reward:
   # Component weights (the alive bonus is constant; the rest weight the kernels).
   w_pose: 0.5
-  w_vel: 0.1
-  w_ee: 0.15
+  w_vel: 0.05
+  w_ee: 0.2
   w_root: 0.2
   w_alive: 0.05
   # Torque penalty: weights mean-squared actuator command (ctrl in [-1, 1]), so
@@ -41,8 +12,15 @@ reward:
   # fighting tracking (max tracking reward is ~1.0, so 0.01 is a ~1% nudge).
   # Raise to demand smoother/cheaper motion; set 0 to disable.
   w_torque: 0.01
+  # Action-rate penalty: w * mean((a_t - a_{t-1})^2) on the RAW policy output
+  # (normalized [-1,1] target-pose units; pre-filter). Penalizes the source of
+  # motion jitter — without it nothing prices temporal smoothness and the
+  # deterministic policy chatters targets at 40 Hz. A persistent full-range
+  # flip costs w*4 per step; typical tremor (|delta| ~ 0.1 on some joints)
+  # costs ~0.001-0.01. Kept out of the tracking-termination sum.
+  w_action_rate: 0.1
   # Exp-kernel bandwidths (larger = more forgiving / more gradient signal).
-  sigma_pose: 6.0
-  sigma_vel: 800.0
+  sigma_pose: 5.0
+  sigma_vel: 200.0
   sigma_ee: 0.15
   sigma_root: 0.2

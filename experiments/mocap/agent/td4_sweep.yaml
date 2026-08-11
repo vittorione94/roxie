@@ -1,0 +1,53 @@
+# TD4 arm of the CMU_006_13 overfit sweep: TD3's twin critics + delayed policy,
+# with categorical (distributional) critic heads — i.e. the TD3 arm and the
+# D4PG arm crossed, so it isolates "distributional value" from "twin + delay".
+#
+# SWEEP INVARIANTS (see ddpg_sweep.yaml): features [1024, 512, 256] + layer
+# norm, batch 512 x 128 grad steps / 8k env steps (replay ratio ~8), buffer
+# 500k, warmup 30k, gamma 0.99, tau 0.005, lr 3e-4.
+name: "td4"
+
+args:
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  target_policy_noise: 0.05
+  target_noise_clip: 0.15
+  policy_delay: 2
+  n_step: 5
+  # Categorical support, sized to THIS task rather than the [-150, 150] library
+  # default: net reward is strictly positive at ~0.6/step, so the achievable
+  # discounted return sits in ~[0, 60] and a symmetric wide support wastes most
+  # atoms. Must bracket the real return or the edge atoms saturate and bias Q.
+  # Same support as the D4PG arm so the two are comparable.
+  v_min: -10.0
+  v_max: 100.0
+  num_atoms: 101
+  memory_warmup: 30_000
+  steps_before_learning: 30_000
+  steps_between_updates: 8_000
+  learning_steps: 128
+  max_grad_norm: 1
+
+actor:
+  _target_: roxie.models.actors.DeterministicActor
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+critic:
+  # Instantiated twice (one per head) behind a TwinCritic.
+  # num_atoms is injected by the agent from args.num_atoms — don't set it here.
+  _target_: roxie.models.critics.DistributionalQCritic
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 10_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}

@@ -1,0 +1,44 @@
+# PPO arm of the CMU_006_13 overfit sweep. The odd one out: on-policy, so there
+# is no replay buffer, no warmup, no target networks and no replay ratio to
+# match. Networks are still [1024, 512, 256] + layer norm so capacity stays the
+# controlled variable, and the env/reward come from the same shared block.
+#
+# What CANNOT be equalized against the off-policy arms:
+#   - sample efficiency: PPO discards each rollout after its update, so at equal
+#     env steps it sees far fewer gradient-relevant samples. Compare on
+#     score-vs-env-steps AND score-vs-wall-clock, and expect a different shape.
+#   - the critic is a V critic (state value), not Q(s, a).
+#   - GAE lambda 0.95 / clip 0.2 / entropy 0.01 are still hardcoded in ppo.py
+#     (see its TODO) — they are not settable from here.
+name: "ppo"
+
+args:
+  gamma: 0.99
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  learning_steps: 20              # epochs over each collected rollout
+  max_grad_norm: 1
+
+actor:
+  _target_: roxie.models.actors.StochasticActor
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  std_min: 1e-4
+  std_max: 5.0
+
+critic:
+  _target_: roxie.models.critics.VCritic
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory:
+  # On-policy trajectory queue: one timestep per env per step (add_sequence_
+  # length 1), update fires once `sample_sequence_length` steps are queued =>
+  # 32 x 1000 envs = 32k transitions per update, then the queue drains.
+  # sample_sequence_length must be <= max_length_time_axis (flashbax asserts).
+  _target_: flashbax.buffers.make_trajectory_queue
+  max_length_time_axis: 64
+  add_batch_size: ${env.parallel_envs}
+  add_sequence_length: 1
+  sample_sequence_length: 32

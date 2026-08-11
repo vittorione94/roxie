@@ -1,0 +1,54 @@
+# @package _global_
+
+# Shared env / trainer / logging block for the single-clip overfit sweep on
+# CMU_006_13. EVERY sweep_<agent>.yaml pulls this in unchanged, so the only
+# thing that differs between runs is the agent — do NOT override any key from
+# this file in a launchable, or the comparison stops being an A/B on the
+# algorithm. Pair it with `env_config: cmu` + `reward: cmu_tracking` (also
+# identical across the sweep) and `backend: warp`.
+#
+# Values are copied from the current champion setup (td3_warp.yaml): position
+# actuation, look_ahead 5 (env_config/cmu.yaml), self-collisions on, one pinned
+# clip with clip_swap off.
+env:
+  seed: 0
+  parallel_envs: 1000
+  # Viewer hook resolved by play.py via hydra.utils.get_method.
+  viewer: examples.mocap.loader.mocap_viewer_extras
+  env_name: null
+  # The single clip every agent has to overfit. gpu_clip_budget 0 + clip_swap
+  # false = the whole (only) clip stays resident, no reshuffling.
+  clip_ids: ["CMU_006_13"]
+  gpu_clip_budget: 0
+  clip_swap: False
+  # PD position servos (see td3_warp.yaml / mocap_tracking.py _configure_actuation).
+  actuation: position
+  actuation_kp_scale: 1.0
+  actuation_kv_ratio: 0.0
+  self_collisions: true
+
+trainer:
+  steps: 1_000_000_000
+  epoch_steps: 1_000_000
+  save_steps: 10_000_000
+  # Eval variance is the limiting factor when ranking agents (epoch-to-epoch
+  # std was +-2.7 at 50 episodes), so keep this high and rank on the back-half
+  # mean, not on a peak epoch.
+  test_episodes: 100
+  show_progress: true
+  replace_checkpoint: false
+
+# Metric logging backends. Console + CSV (in the run's output dir) are always
+# on. Set logging.wandb.enabled: true to also stream metrics to Weights &
+# Biases (requires the `wandb` package; run `wandb login` once). For the sweep,
+# wandb `group` is set per-launchable so the runs land in one comparison view.
+logging:
+  wandb:
+    enabled: false
+    project: roxie
+    entity: null
+    name: null
+    group: overfit_cmu_006_13
+    tags: [sweep, overfit, cmu_006_13]
+    mode: online   # online | offline | disabled
+    relogin: true

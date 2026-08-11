@@ -47,14 +47,80 @@ import mujoco
 import numpy as np
 from ml_collections import config_dict
 
-from examples.mocap.mocap_tracking import CMU_BODY_NAMES, _configure_collisions
+from examples.mocap.mocap_tracking import (
+    CMU_BODY_NAMES,
+    FOOT_TOUCH_SENSORS,
+    _configure_collisions,
+)
 from roxie.environment.envpool_adapter import EnvPoolWrapper
 from roxie.environment.loader import EnvBundle
 
+
+# Numpy mirrors of roxie.utils.math (the module is jax-only; this CPU path
+# stays numpy). Kept here so the envpool obs matches the MJX obs field-for-field.
+def _quat_diff_6d_np(q_from: np.ndarray, q_to: np.ndarray) -> np.ndarray:
+    """6D continuous rotation rep of the relative rotation q_from^-1 * q_to.
+
+    Mirrors quat_to_rot6d(batched_quat_diff(...)) in the MJX env. Broadcasts
+    over leading dims. See roxie/utils/math.py for the rationale (Zhou et al.
+    2019 continuous rotation representation).
+    """
+    conj = np.concatenate([q_from[..., :1], -q_from[..., 1:]], axis=-1)
+    q_inv = conj / np.sum(q_from * q_from, axis=-1, keepdims=True)
+    w1, x1, y1, z1 = q_inv[..., 0], q_inv[..., 1], q_inv[..., 2], q_inv[..., 3]
+    w2, x2, y2, z2 = q_to[..., 0], q_to[..., 1], q_to[..., 2], q_to[..., 3]
+    q = np.stack([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], axis=-1)
+    return _quat_to_rot6d_np(q)
+
+
+def _quat_to_rot6d_np(q: np.ndarray) -> np.ndarray:
+    """MuJoCo quat (w, x, y, z) -> 6D rep (first two rotation-matrix columns)."""
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return np.stack([
+        1.0 - 2.0 * (y * y + z * z),
+        2.0 * (x * y + w * z),
+        2.0 * (x * z - w * y),
+        2.0 * (x * y - w * z),
+        1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z + w * x),
+    ], axis=-1)
+
+
+def _mat_to_rot6d_np(mat: np.ndarray) -> np.ndarray:
+    """Row-major 3x3 rotation matrix -> 6D rep (first two columns).
+
+    Numpy mirror of roxie.utils.math.mat_to_rot6d. Native MjData stores each
+    body frame (`xmat`) row-major as 9 contiguous floats; the 6D rep is its
+    first two columns [c0x, c0y, c0z, c1x, c1y, c1z]. Batches over leading dims:
+    (..., 9) -> (..., 6).
+    """
+    r = mat.reshape(mat.shape[:-1] + (3, 3))
+    return np.concatenate([r[..., :, 0], r[..., :, 1]], axis=-1)
+
+
+def _quaternion_distance_np(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Angular geodesic distance (radians) between unit quaternions.
+
+    Numpy mirror of roxie.utils.math.quaternion_distance: 2 * arccos(|<q1, q2>|),
+    the double-cover-safe geodesic angle used by the root-orientation reward.
+    Batches over the leading dims (dot is taken over the last axis), so it works
+    on a single pair (returns a scalar) or a stack of (..., 4) quaternions.
+    """
+    dot = np.clip(np.abs(np.sum(q1 * q2, axis=-1)), -1.0, 1.0)
+    return 2.0 * np.arccos(dot)
+
 # Metric keys match the GPU env's `metrics` dict so epoch logs (CSV/wandb)
-# line up column-for-column across backends.
+# line up column-for-column across backends. Mirrors MocapTrackingEnv.reset's
+# `metrics` dict field-for-field (five reward kernels + action-rate penalty +
+# the root-drift diagnostic).
 _METRIC_KEYS = (
     "reward/pose", "reward/vel", "reward/ee", "reward/root", "reward/torque",
+    "reward/action_rate", "root_dist",
 )
 
 
@@ -90,6 +156,44 @@ class MocapCpuPool:
         self._lowers = mj_model.actuator_ctrlrange[:, 0].copy()
         self._uppers = mj_model.actuator_ctrlrange[:, 1].copy()
 
+        # -- proprioception + feet-contact + effort setup (mirror _post_init) --
+        # Binary foot ground-contact obs: per-foot touch-sensor addresses (2, 2)
+        # and the normal-force threshold that binarizes them.
+        self._foot_sensor_adr = np.array(
+            [[mj_model.sensor(s).adr[0] for s in foot]
+             for foot in FOOT_TOUCH_SENSORS]
+        )
+        self._foot_contact_force_thresh = float(
+            config.get("foot_contact_force_thresh", 1.0)
+        )
+
+        # Per-actuator effort normalizer for the torque penalty: forcerange when
+        # force-limited, else |gear| — so |actuator_force| / limit is ~[0, 1]
+        # under either actuation (identical to MocapTrackingEnv._force_limit).
+        self._force_limit = np.where(
+            mj_model.actuator_forcelimited.astype(bool),
+            mj_model.actuator_forcerange[:, 1],
+            np.abs(mj_model.actuator_gear[:, 0]),
+        ).astype(np.float64)
+
+        # Proprioception: every non-world body's frame relative to the root
+        # (see MocapTrackingEnv._post_init for the rationale).
+        free_jnts = np.nonzero(
+            mj_model.jnt_type == mujoco.mjtJoint.mjJNT_FREE
+        )[0]
+        assert len(free_jnts) == 1, "expected exactly one free (root) joint"
+        self._root_body_id = int(mj_model.jnt_bodyid[free_jnts[0]])
+        self._proprio_body_ids = np.arange(1, mj_model.nbody)
+
+        # First-order target-filter EMA weight (mirror _post_init): alpha =
+        # exp(-ctrl_dt / tc), the weight on the previous filtered command.
+        # This env runs torque actuation only, so the reset filter state is
+        # zero (the hold-pose command is only needed for position servos).
+        tc = float(config.get("target_filter_tc", 0.0))
+        self._filter_alpha = (
+            float(np.exp(-float(config.ctrl_dt) / tc)) if tc > 0 else 0.0
+        )
+
         # Reference data stays float32 to match the GPU env's on-device arrays.
         self._ref_qpos = np.asarray(dataset["qpos"], dtype=np.float32)
         self._ref_qvel = np.asarray(dataset["qvel"], dtype=np.float32)
@@ -99,9 +203,14 @@ class MocapCpuPool:
         self._num_clips = len(self._clip_starts)
 
         nq, nv, nu = mj_model.nq, mj_model.nv, mj_model.nu
+        # Root orientation is the 6D rep (6, not the raw 4-quat), plus the two
+        # binary foot-contact flags and the per-body proprioception block
+        # (nbody-1 bodies x [3 root-relative pos + 6 orientation-6d]). Each
+        # look-ahead frame carries the reference delta (joints, jvel, rot6d, h).
+        n_proprio = (mj_model.nbody - 1) * 9
         self._obs_size = (
-            (nq - 7) + (nv - 6) + 4 + 3 + 1 + 3 + nu
-            + int(config.look_ahead) * ((nq - 7) + (nv - 6) + 4 + 1)
+            (nq - 7) + (nv - 6) + 6 + 3 + 1 + 3 + 2 + n_proprio + nu
+            + int(config.look_ahead) * ((nq - 7) + (nv - 6) + 6 + 1)
         )
         # Minimal space stand-ins (shape/low/high are all the adapter reads);
         # avoids a gymnasium dependency for what is a pure-numpy pool.
@@ -131,6 +240,9 @@ class MocapCpuPool:
         self._clip_start = np.zeros(self._num_envs, dtype=np.int64)
         self._clip_len = np.ones(self._num_envs, dtype=np.int64)
         self._last_act = np.zeros((self._num_envs, nu), dtype=np.float64)
+        # Post-filter applied command carried across steps (mirror info
+        # ["filtered_ctrl"]); starts at zero force (torque-mode hold command).
+        self._filtered_ctrl = np.zeros((self._num_envs, nu), dtype=np.float64)
         self._step_count = np.zeros(self._num_envs, dtype=np.int64)
 
         if num_threads is None:
@@ -177,74 +289,125 @@ class MocapCpuPool:
         mujoco.mj_resetData(self._model, d)
         d.qpos[:] = qpos
         d.qvel[:] = qvel
-        # No mj_forward here: the reset obs reads only qpos/qvel, and native
-        # mj_forward would normalize the noisy root quat in place — MJX leaves
-        # it as sampled, so forwarding would make the two backends' reset obs
-        # differ by O(reset_noise_scale). mj_step runs the full pipeline anyway.
+        # The proprioception and foot-contact obs terms read forward-kinematics
+        # outputs (xpos/xmat/sensordata), so a forward pass is now required at
+        # reset. But native mj_forward normalizes the noisy root quat in place,
+        # while MJX (mjx.forward in reset) leaves qpos as sampled and only
+        # normalizes the derived xquat — so we restore the raw quat afterwards.
+        # This keeps the qpos-derived obs terms (root rot6d, ref deltas) bit-for
+        # -bit with MJX while xpos/xmat come from the same normalized xquat both
+        # backends' kinematics use.
+        q_root = d.qpos[3:7].copy()
+        mujoco.mj_forward(self._model, d)
+        d.qpos[3:7] = q_root
 
         self._phase_idx[i] = start_idx
         self._clip_start[i] = clip_start
         self._clip_len[i] = clip_len
         self._last_act[i] = 0.0
+        self._filtered_ctrl[i] = 0.0
         self._step_count[i] = 0
 
-    def _get_obs(self, i: int) -> np.ndarray:
-        d = self._datas[i]
-        qpos, qvel = d.qpos, d.qvel
-        clip_len = self._clip_len[i]
+    # -- vectorized obs/reward (batched over ALL envs at once) ---------------
+    #
+    # The heavy per-frame math (obs assembly, reward kernels) runs ONCE on
+    # stacked (num_envs, ...) arrays rather than in a per-env Python loop. This
+    # is the key to CPU scaling: the per-env loop held the GIL for every small
+    # numpy op x num_envs, so the thread pool could never exceed ~3 cores no
+    # matter how many threads. Only mj_step / mj_forward stay per-env in the
+    # worker threads (they release the GIL, so they parallelize); the batched
+    # numpy below collapses hundreds of GIL-held dispatches into a handful of
+    # large C ops. The results are bit-for-bit identical to the old per-env
+    # code, which is why the single-env adapters (`_get_obs` / `_get_reward`,
+    # used by check_envpool_parity.py) just call these with a 1-row slice.
 
-        steps = np.arange(1, int(self._config.look_ahead) + 1)
-        future_local = (self._phase_idx[i] + steps) % clip_len
-        future_abs = self._clip_start[i] + future_local
+    def _obs_batch(
+        self, qpos, qvel, xpos, xmat, sensordata,
+        phase_idx, clip_start, clip_len, last_act,
+    ) -> np.ndarray:
+        """Assemble the (N, obs_size) observation from stacked per-env state."""
+        n = qpos.shape[0]
+        steps = np.arange(1, int(self._config.look_ahead) + 1)  # (la,)
+        future_local = (phase_idx[:, None] + steps[None, :]) % clip_len[:, None]
+        future_abs = clip_start[:, None] + future_local          # (N, la)
 
-        ref_qpos = self._ref_qpos[future_abs]  # (look_ahead, nq)
-        ref_qvel = self._ref_qvel[future_abs]  # (look_ahead, nv)
+        ref_qpos = self._ref_qpos[future_abs]  # (N, la, nq)
+        ref_qvel = self._ref_qvel[future_abs]  # (N, la, nv)
 
-        d_joints = ref_qpos[:, 7:] - qpos[7:]
-        d_jvel = ref_qvel[:, 6:] - qvel[6:]
-        d_quat = ref_qpos[:, 3:7] - qpos[3:7]
-        d_height = ref_qpos[:, 2:3] - qpos[2:3]
-
+        d_joints = ref_qpos[:, :, 7:] - qpos[:, None, 7:]
+        d_jvel = ref_qvel[:, :, 6:] - qvel[:, None, 6:]
+        d_rot6d = _quat_diff_6d_np(ref_qpos[:, :, 3:7], qpos[:, None, 3:7])
+        d_height = ref_qpos[:, :, 2:3] - qpos[:, None, 2:3]
         ref_delta = np.concatenate(
-            [d_joints, d_jvel, d_quat, d_height], axis=-1
-        ).reshape(-1)
+            [d_joints, d_jvel, d_rot6d, d_height], axis=-1
+        ).reshape(n, -1)
+
+        # Proprioception: each non-world body's frame relative to the root.
+        root_pos = xpos[:, self._root_body_id]                   # (N, 3)
+        body_pos = (
+            xpos[:, self._proprio_body_ids] - root_pos[:, None, :]
+        ).reshape(n, -1)
+        body_rot6d = _mat_to_rot6d_np(
+            xmat[:, self._proprio_body_ids]
+        ).reshape(n, -1)
+
+        touch = sensordata[:, self._foot_sensor_adr]             # (N, 2, 2)
+        feet = (
+            np.sum(touch, axis=-1) > self._foot_contact_force_thresh
+        ).astype(np.float64)
 
         return np.concatenate([
-            qpos[7:],
-            qvel[6:],
-            qpos[3:7],
-            qvel[3:6],
-            qpos[2:3],
-            qvel[0:3],
-            self._last_act[i],
+            qpos[:, 7:],
+            qvel[:, 6:],
+            _quat_to_rot6d_np(qpos[:, 3:7]),
+            qvel[:, 3:6],
+            qpos[:, 2:3],
+            qvel[:, 0:3],
+            feet,
+            body_pos,
+            body_rot6d,
+            last_act,
             ref_delta,
-        ]).astype(np.float32)
+        ], axis=1).astype(np.float32)
 
-    def _get_reward(
-        self, d: mujoco.MjData, abs_idx: int, ctrl: np.ndarray
-    ) -> tuple[float, float, dict[str, float]]:
+    def _reward_batch(self, qpos, qvel, xpos, afrc, abs_idx, action, last_action):
+        """Reward + components for all envs from stacked per-env state.
+
+        Returns (total (N,), tracking (N,), root_dist (N,), components) where
+        each component is an (N,) array."""
         cfg = self._config.reward_config
-        ref_qpos = self._ref_qpos[abs_idx]
-        ref_qvel = self._ref_qvel[abs_idx]
-        ref_body_pos = self._ref_body_pos[abs_idx]
+        ref_qpos = self._ref_qpos[abs_idx]         # (N, nq)
+        ref_qvel = self._ref_qvel[abs_idx]         # (N, nv)
+        ref_body_pos = self._ref_body_pos[abs_idx]  # (N, nbody, 3)
 
-        pose_err = np.sum(np.square(d.qpos[7:] - ref_qpos[7:]))
+        pose_err = np.sum(np.square(qpos[:, 7:] - ref_qpos[:, 7:]), axis=1)
         r_pose = np.exp(-pose_err / cfg.sigma_pose)
 
-        vel_err = np.sum(np.square(d.qvel[6:] - ref_qvel[6:]))
+        vel_err = np.sum(np.square(qvel[:, 6:] - ref_qvel[:, 6:]), axis=1)
         r_vel = np.exp(-vel_err / cfg.sigma_vel)
 
-        ee_pos = d.xpos[self._ee_body_ids]
-        ref_ee_pos = ref_body_pos[self._ee_body_ids]
-        ee_err = np.sum(np.square(ee_pos - ref_ee_pos))
+        ee_pos = xpos[:, self._ee_body_ids]        # (N, n_ee, 3)
+        ref_ee_pos = ref_body_pos[:, self._ee_body_ids]
+        ee_err = np.sum(np.square(ee_pos - ref_ee_pos), axis=(1, 2))
         r_ee = np.exp(-ee_err / cfg.sigma_ee)
 
-        root_pos_err = np.sum(np.square(d.qpos[:3] - ref_qpos[:3]))
-        quat_dot = np.dot(d.qpos[3:7], ref_qpos[3:7])
-        root_err = root_pos_err + 1.0 - np.square(quat_dot)
+        root_pos_err = np.sum(np.square(qpos[:, :3] - ref_qpos[:, :3]), axis=1)
+        root_quat_err = _quaternion_distance_np(qpos[:, 3:7], ref_qpos[:, 3:7])
+        root_err = root_pos_err + root_quat_err
         r_root = np.exp(-root_err / cfg.sigma_root)
+        root_dist = np.sqrt(root_pos_err)
 
-        r_torque = -cfg.w_torque * np.mean(np.square(ctrl))
+        # Effort penalty on the ACTUAL actuator force normalized by each
+        # actuator's strength limit (mirror MocapTrackingEnv): in torque mode
+        # actuator_force = gear*ctrl and limit = |gear|, so this equals the
+        # mean-square applied command.
+        effort = afrc / self._force_limit
+        r_torque = -cfg.w_torque * np.mean(np.square(effort), axis=1)
+
+        # Action-rate penalty on the RAW policy output (pre-scale, pre-filter).
+        r_action_rate = -cfg.w_action_rate * np.mean(
+            np.square(action - last_action), axis=1
+        )
 
         tracking = (
             cfg.w_pose * r_pose
@@ -258,50 +421,57 @@ class MocapCpuPool:
             "reward/ee": r_ee,
             "reward/root": r_root,
             "reward/torque": r_torque,
+            "reward/action_rate": r_action_rate,
+            "root_dist": root_dist,
         }
-        return tracking + cfg.w_alive + r_torque, tracking, components
+        return (
+            tracking + cfg.w_alive + r_torque + r_action_rate,
+            tracking,
+            root_dist,
+            components,
+        )
 
-    def _step_env(self, i: int, action: np.ndarray):
+    # -- single-env adapters (used only by check_envpool_parity.py) ----------
+
+    def _get_obs(self, i: int) -> np.ndarray:
+        d = self._datas[i]
+        return self._obs_batch(
+            d.qpos[None], d.qvel[None], d.xpos[None], d.xmat[None],
+            d.sensordata[None], self._phase_idx[i:i + 1],
+            self._clip_start[i:i + 1], self._clip_len[i:i + 1],
+            self._last_act[i][None],
+        )[0]
+
+    def _get_reward(self, d, abs_idx, action, last_action):
+        total, tracking, root_dist, comps = self._reward_batch(
+            d.qpos[None], d.qvel[None], d.xpos[None], d.actuator_force[None],
+            np.array([abs_idx]), np.asarray(action)[None],
+            np.asarray(last_action)[None],
+        )
+        return (
+            float(total[0]), float(tracking[0]), float(root_dist[0]),
+            {k: float(v[0]) for k, v in comps.items()},
+        )
+
+    def _advance_env(self, i: int, action: np.ndarray) -> None:
+        """Apply the (filtered) command and step one env's physics + phase.
+
+        The only per-env work left in the hot path: mj_step releases the GIL, so
+        running this across the thread pool is what actually uses the cores."""
         cfg = self._config
         d = self._datas[i]
-
         ctrl = np.clip(action * cfg.action_scale, self._lowers, self._uppers)
+        # First-order target-filter smoothing (mirror MocapTrackingEnv.step):
+        # blend the previous applied command in, then carry the result forward.
+        if self._filter_alpha > 0.0:
+            ctrl = (
+                self._filter_alpha * self._filtered_ctrl[i]
+                + (1.0 - self._filter_alpha) * ctrl
+            )
+        self._filtered_ctrl[i] = ctrl
         d.ctrl[:] = ctrl
         mujoco.mj_step(self._model, d, nstep=self._n_substeps)
-
-        clip_len = self._clip_len[i]
-        self._phase_idx[i] = (self._phase_idx[i] + 1) % clip_len
-        abs_idx = int(self._clip_start[i] + self._phase_idx[i])
-
-        reward, tracking, components = self._get_reward(d, abs_idx, ctrl)
-
-        nan_check = bool(np.isnan(d.qpos).any() or np.isnan(d.qvel).any())
-        low_track = (
-            self._track_floor is not None and tracking < self._track_floor
-        )
-        terminated = (
-            (nan_check or low_track) if cfg.early_termination else nan_check
-        )
-
-        clip_truncated = (not cfg.cyclic) and (
-            self._phase_idx[i] >= clip_len - int(cfg.look_ahead)
-        )
-        self._step_count[i] += 1
-        step_truncated = self._step_count[i] >= int(cfg.episode_length)
-
-        # Mirror TerminationWrapper: env-internal (clip-end) truncation clears
-        # the termination flag; the step-limit does not (a genuine fall at the
-        # limit stays terminal).
-        terminated_final = terminated and not clip_truncated
-        truncated_final = clip_truncated or step_truncated
-
-        self._last_act[i] = action
-
-        if terminated or clip_truncated or step_truncated:
-            # Same-step auto-reset: the returned obs starts the next episode.
-            self._reset_env(i)
-
-        return self._get_obs(i), reward, terminated_final, truncated_final, components
+        self._phase_idx[i] = (self._phase_idx[i] + 1) % self._clip_len[i]
 
     # -- pool protocol (what EnvPoolWrapper consumes) ------------------------
 
@@ -313,38 +483,104 @@ class MocapCpuPool:
             # list() re-raises worker exceptions instead of dropping them.
             list(self._executor.map(worker, self._env_chunks))
 
-    def reset(self) -> tuple[np.ndarray, dict]:
-        obs = np.empty((self._num_envs, self._obs_size), dtype=np.float32)
+    def _reset_many(self, idxs: np.ndarray) -> None:
+        """Reset the given env indices (auto-reset of done envs), threaded."""
+        if len(idxs) == 0:
+            return
+        if self._executor is None or len(idxs) == 1:
+            for i in idxs:
+                self._reset_env(int(i))
+            return
+        chunks = [
+            c for c in np.array_split(idxs, min(len(idxs), self._num_threads))
+            if len(c)
+        ]
+        list(self._executor.map(
+            lambda ch: [self._reset_env(int(i)) for i in ch], chunks
+        ))
 
+    def _gather_obs(self) -> np.ndarray:
+        """Stack current per-env state and assemble the batched observation."""
+        d = self._datas
+        return self._obs_batch(
+            np.stack([x.qpos for x in d]),
+            np.stack([x.qvel for x in d]),
+            np.stack([x.xpos for x in d]),
+            np.stack([x.xmat for x in d]),
+            np.stack([x.sensordata for x in d]),
+            self._phase_idx, self._clip_start, self._clip_len, self._last_act,
+        )
+
+    def reset(self) -> tuple[np.ndarray, dict]:
         def worker(chunk):
             for i in chunk:
                 self._reset_env(i)
-                obs[i] = self._get_obs(i)
 
         self._run_chunked(worker)
-        return obs, {}
+        return self._gather_obs(), {}
 
     def step(self, actions: Any) -> tuple[np.ndarray, ...]:
         actions = np.asarray(actions, dtype=np.float64)
-        n = self._num_envs
-        obs = np.empty((n, self._obs_size), dtype=np.float32)
-        reward = np.empty(n, dtype=np.float32)
-        terminated = np.empty(n, dtype=bool)
-        truncated = np.empty(n, dtype=bool)
-        metrics = {k: np.empty(n, dtype=np.float32) for k in _METRIC_KEYS}
+        cfg = self._config
 
+        # 1. Physics + phase advance, per env across the thread pool (mj_step
+        #    releases the GIL, so this is where the cores get used).
         def worker(chunk):
             for i in chunk:
-                o, r, term, trunc, comps = self._step_env(i, actions[i])
-                obs[i] = o
-                reward[i] = r
-                terminated[i] = term
-                truncated[i] = trunc
-                for k in _METRIC_KEYS:
-                    metrics[k][i] = comps[k]
+                self._advance_env(i, actions[i])
 
         self._run_chunked(worker)
-        return obs, reward, terminated, truncated, {"metrics": metrics}
+
+        # 2. Reward + termination from the post-step state, batched over envs.
+        d = self._datas
+        qpos = np.stack([x.qpos for x in d])
+        qvel = np.stack([x.qvel for x in d])
+        xpos = np.stack([x.xpos for x in d])
+        afrc = np.stack([x.actuator_force for x in d])
+        abs_idx = self._clip_start + self._phase_idx
+        reward, tracking, root_dist, comps = self._reward_batch(
+            qpos, qvel, xpos, afrc, abs_idx, actions, self._last_act,
+        )
+
+        nan_check = np.isnan(qpos).any(axis=1) | np.isnan(qvel).any(axis=1)
+        low_track = (
+            tracking < self._track_floor if self._track_floor is not None
+            else np.zeros(self._num_envs, dtype=bool)
+        )
+        rrt = self._config.root_termination
+        root_too_far = (
+            root_dist > rrt.max_dist if rrt.enabled
+            else np.zeros(self._num_envs, dtype=bool)
+        )
+        terminated = (
+            (nan_check | low_track | root_too_far) if cfg.early_termination
+            else nan_check
+        )
+        clip_truncated = (
+            (self._phase_idx >= self._clip_len - int(cfg.look_ahead))
+            if not cfg.cyclic else np.zeros(self._num_envs, dtype=bool)
+        )
+        self._step_count += 1
+        step_truncated = self._step_count >= int(cfg.episode_length)
+
+        # Mirror TerminationWrapper: clip-end truncation clears the termination
+        # flag; the step-limit does not (a genuine fall at the limit is terminal).
+        terminated_final = terminated & ~clip_truncated
+        truncated_final = clip_truncated | step_truncated
+        done = terminated | clip_truncated | step_truncated
+
+        # 3. last_act obs field = the current action (mirror step's info update),
+        #    then auto-reset done envs (which zeroes their last_act/filter/phase).
+        self._last_act = actions.copy()
+        self._reset_many(np.nonzero(done)[0])
+
+        # 4. Observation from the post-reset state, batched over envs.
+        obs = self._gather_obs()
+        metrics = {k: comps[k].astype(np.float32) for k in _METRIC_KEYS}
+        return (
+            obs, reward.astype(np.float32), terminated_final, truncated_final,
+            {"metrics": metrics},
+        )
 
 
 def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
@@ -397,8 +633,17 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         seed=seed,
         num_threads=num_threads,
     )
+    # Deterministic eval config (mirrors the GPU loader): disable the stochastic
+    # reset knobs so every test episode starts at frame 0 with no state noise —
+    # otherwise even a single-clip run reports nonzero test std for a
+    # deterministic policy. The training pool keeps the original config.
+    import copy
+
+    eval_config = copy.deepcopy(config)
+    eval_config.random_start = False
+    eval_config.reset_noise_scale = 0.0
     test_pool = MocapCpuPool(
-        mj_model, dataset, config,
+        mj_model, dataset, eval_config,
         num_envs=test_episodes,
         seed=seed + 1,
         num_threads=num_threads,

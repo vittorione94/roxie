@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import flax.struct as struct
 import jax
 import jax.numpy as jnp
+import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 
@@ -225,7 +226,20 @@ class Agent(abc.ABC):
         noise_config: dict = None,
     ):
         path = Path(path).resolve()
-        loaded = ocp.PyTreeCheckpointer().restore(path)
+        # Restore weights to host memory (numpy) instead of onto the device
+        # sharding baked into the checkpoint. A GPU-trained run pins arrays to
+        # cuda:0, so loading it in a CPU-only process (e.g. play.py) would fail
+        # with "Device cuda:0 was not found". Host arrays are placement-agnostic;
+        # the numpy->jax conversion below puts them on whatever device is active.
+        checkpointer = ocp.PyTreeCheckpointer()
+        restore_args = jax.tree.map(
+            lambda _a: ocp.RestoreArgs(restore_type=np.ndarray),
+            ocp.checkpoint_utils.construct_restore_args(
+                checkpointer.metadata(path).item_metadata
+            ),
+            is_leaf=lambda a: isinstance(a, ocp.RestoreArgs),
+        )
+        loaded = checkpointer.restore(path, restore_args=restore_args)
 
         ckpt_state = loaded["trainstate_state"]
         hyper = loaded.get("hyperparams", {})

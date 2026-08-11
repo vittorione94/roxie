@@ -105,7 +105,24 @@ def load_mocap_env(
     )
     env._xml_path = xml_path
     train_wrapper = TerminationWrapper(env, max_episode_steps=config.episode_length)
-    test_wrapper = TerminationWrapper(env, max_episode_steps=config.episode_length)
+
+    # Evaluation env: a shallow copy of the training env, so it SHARES the heavy
+    # GPU arrays (reference clips + mjx model) — nothing is loaded twice — but
+    # resets DETERMINISTICALLY. The training config resets stochastically
+    # (`random_start` picks a random clip phase, `reset_noise_scale` jitters the
+    # initial state), which is right for exploration but wrong for eval: it makes
+    # every test episode start somewhere different, so even a single-clip run with
+    # a deterministic policy reports nonzero test std. Override just those two
+    # knobs on a copied config (the training env keeps the original) so eval
+    # starts at frame 0 with no noise: single-clip eval is now exactly
+    # reproducible (0 std), and multi-clip eval still samples clips at reset but
+    # each rollout is deterministic.
+    eval_env = copy.copy(env)
+    eval_config = copy.deepcopy(config)
+    eval_config.random_start = False
+    eval_config.reset_noise_scale = 0.0
+    eval_env._config = eval_config
+    test_wrapper = TerminationWrapper(eval_env, max_episode_steps=config.episode_length)
     return train_wrapper, test_wrapper, xml_path
 
 

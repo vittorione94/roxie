@@ -1,0 +1,42 @@
+name: "d4pg"
+
+args:
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  target_policy_noise: 0.0        # D4PG paper doesn't smooth the target policy
+  target_noise_clip: 0.0
+  n_step: 5                       # paper's N-step return horizon
+  # Categorical critic support. MUST bracket the achievable n-step discounted
+  # return (r_1..r_n plus the bootstrapped tail) — a support that clips real
+  # returns saturates the edge atoms and biases Q. Acme's control-suite default.
+  v_min: -150.0
+  v_max: 150.0
+  num_atoms: 51
+  memory_warmup: 30_000           # start updates after 30k transitions (~75 loops @ 400 envs)
+  steps_before_learning: 30_000   # same as warmup (can differ if desired)
+  steps_between_updates: 400      # update every 400 new transitions (~once per trainer loop)
+  learning_steps: 100             # gradient steps per update trigger
+  max_grad_norm: 1
+
+actor:
+  _target_: roxie.models.actors.DeterministicActor
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+critic:
+  # num_atoms is injected by the agent from args.num_atoms — don't set it here.
+  _target_: roxie.models.critics.DistributionalQCritic
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000   # ~1.53 GB obs field @ obs=764 (look_ahead=5); 1M OOMs on 15 GB w/ Warp
+  min_length: 1_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
