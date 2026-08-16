@@ -4,6 +4,7 @@ import rlax
 from flax import nnx
 
 from roxie.agents.agent import Agent
+from roxie.models.actors import distribution_entropy
 
 @nnx.jit
 def ddpg_actor_loss_fn(
@@ -111,8 +112,10 @@ def ppo_loss_fn(
     distribution = actor_model(observations)
     logp_new = distribution.log_prob(actions_buf)       # (N, T)
 
-    # Analytical entropy from the distribution
-    entropy_t = distribution.entropy()[:, :-1]
+    # Entropy of the distribution. Analytic for a plain Normal; for a squashed
+    # policy it is a single-sample estimate and genuinely needs `key` (which was
+    # previously accepted and unused here).
+    entropy_t = distribution_entropy(distribution, key)[:, :-1]
 
     # Compute importance ratio aligned with advantages (skip last next-frame entry)
     ratio = jnp.exp(logp_new[:, :-1] - old_log_probs[:, :-1])
@@ -148,9 +151,20 @@ def ppo_loss_fn(
     surrogate = jnp.minimum(surrogate1, surrogate2)
     pg_loss = -surrogate
 
+    # Trust-region diagnostics, returned as aux so they cost no extra forward
+    # pass. `approx_kl` is Schulman's low-variance estimator of
+    # KL(pi_old || pi_new); it is >= 0 and equals 0 iff the ratio is 1 everywhere.
+    # `clip_frac` is the share of the batch that has left the clip range -- those
+    # samples select the constant branch of the min() above, whose gradient
+    # w.r.t. the policy is ZERO, so they stop pulling the policy back. A clip_frac
+    # near 1 means the surrogate is saturated and the update is being driven by
+    # whatever is left (in practice the entropy term).
+    approx_kl = jnp.mean((ratio - 1.0) - jnp.log(ratio))
+    clip_frac = jnp.mean((jnp.abs(ratio - 1.0) > clip_epsilon).astype(jnp.float32))
+
     # Per-step loss minus entropy term, then average across all dims
     per_step_loss = pg_loss - entropy_coef * entropy_t
-    return jnp.mean(per_step_loss)
+    return jnp.mean(per_step_loss), (approx_kl, clip_frac)
 
 
 @nnx.jit

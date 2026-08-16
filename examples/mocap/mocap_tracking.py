@@ -40,27 +40,56 @@ FOOT_TOUCH_SENSORS = (
 )
 
 
-def _configure_collisions(m: mujoco.MjModel, self_collisions: bool) -> None:
+COLLISION_MODES = ("full", "ground", "feet")
+
+
+def _configure_collisions(m: mujoco.MjModel, mode: str = "full") -> None:
     """Set up the collision filter for the CMU humanoid.
 
-    The dm_control CMU humanoid ships with contype=1/conaffinity=1 on every
-    geom, i.e. full self-collision plus ground contact (MuJoCo still skips
-    same-body and welded parent/child pairs automatically). On real mocap
-    reference poses this stays cheap — at most ~15 simultaneous contacts — so
-    the cost is bounded by the Warp contact budget (``naconmax``/``njmax``),
-    not by the number of *potential* geom pairs. We therefore leave the native
-    full-collision model in place when ``self_collisions`` is set.
+    MuJoCo admits a geom pair when ``contype1 & conaffinity2`` or
+    ``contype2 & conaffinity1`` is nonzero (on top of its automatic same-body /
+    welded-parent-child and ``<contact exclude>`` filtering). The three modes
+    set those two fields to pick which pairs survive:
 
-    When ``self_collisions`` is False we fall back to the old behaviour:
-    restrict collisions to feet/hands/head vs the floor only. This keeps the
-    contact budget minimal for memory-constrained runs at the cost of letting
-    limbs pass through each other.
+    ``full`` — the native dm_control model: contype=1/conaffinity=1 everywhere,
+      so limbs collide with each other *and* with the floor. Cheap at runtime on
+      real mocap poses (~15 simultaneous contacts, bounded by the Warp
+      ``naconmax``/``njmax`` budgets), but see the caveat below.
+
+    ``ground`` — no self-contact at all, full ground contact: every humanoid
+      geom gets contype=0/conaffinity=1 and the floor contype=1/conaffinity=0,
+      so humanoid-vs-humanoid never matches (0 & 1 both ways) while every
+      humanoid geom still collides with the floor. Use this when the *reference*
+      is the thing under test: retargeted mocap routinely interpenetrates its
+      own limbs (arm through torso, thigh through thigh), and with ``full`` the
+      solver shoves the body out of exactly the pose the tracking reward is
+      asking for — an unreachable target that no policy can fix. It also cuts
+      MJX's statically-sized contact arrays from all ~980 potential pairs to the
+      ~45 geom-vs-floor ones.
+
+    ``feet`` — collisions restricted to feet/hands/head vs the floor
+      (``GROUND_CONTACT_GEOMS``). The leanest contact budget; the torso and
+      limbs pass through the ground as well as through each other, so use it
+      only when contacts must be as cheap as possible.
     """
-    if self_collisions:
+    if mode not in COLLISION_MODES:
+        raise ValueError(f"collisions must be one of {COLLISION_MODES}, got {mode!r}")
+
+    if mode == "full":
         # Native model already has full self-collision + ground; nothing to do.
         return
 
     floor_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+
+    if mode == "ground":
+        # Humanoid geoms are pure "receivers" (contype 0), the floor a pure
+        # "emitter" (conaffinity 0): the only bit that can match is the floor's
+        # contype against a humanoid geom's conaffinity.
+        m.geom_contype[:] = 0
+        m.geom_conaffinity[:] = 1
+        m.geom_contype[floor_id] = 1
+        m.geom_conaffinity[floor_id] = 0
+        return
 
     m.geom_contype[:] = 0
     m.geom_conaffinity[:] = 0
@@ -71,6 +100,23 @@ def _configure_collisions(m: mujoco.MjModel, self_collisions: bool) -> None:
         gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, name)
         if gid >= 0:
             m.geom_contype[gid] = 1
+
+
+def resolve_collision_mode(cfg_env: Any) -> str:
+    """Read the collision mode off a run config (``env.collisions``).
+
+    Shared by every builder (MJX/Warp loader, CPU envpool) so they cannot drift.
+    Falls back to the superseded ``env.self_collisions`` bool when a config
+    predates the three-way key — that is what checkpoints saved by older runs
+    carry, and play.py replays them from their own saved config.
+    """
+    mode = cfg_env.get("collisions", None)
+    if mode is not None:
+        return str(mode)
+    legacy = cfg_env.get("self_collisions", None)
+    if legacy is None:
+        return "full"
+    return "full" if bool(legacy) else "feet"
 
 
 def _configure_actuation(
@@ -165,7 +211,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         naconmax: Optional[int] = None,
         njmax: Optional[int] = None,
         naccdmax: Optional[int] = None,
-        self_collisions: bool = True,
+        collisions: str = "full",
         graph_mode: Optional[str] = None,
         clip_swap: bool = True,
         clip_seed: int = 0,
@@ -179,9 +225,9 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         self._mj_model.opt.timestep = self.sim_dt
         self._actuation = actuation
 
-        # Full self-collision by default; set self_collisions=False to fall back
-        # to ground-only contacts for memory-constrained runs.
-        _configure_collisions(self._mj_model, self_collisions)
+        # "full" (self-collision + ground), "ground" (no self-contact, every
+        # geom still hits the floor) or "feet" — see _configure_collisions.
+        _configure_collisions(self._mj_model, collisions)
         # "torque" (raw motors) or "position" (PD-target servos, dm_control
         # tuned gains). Must run before put_model — it rewrites actuator arrays.
         _configure_actuation(
@@ -440,9 +486,18 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             "reward/vel": jp.zeros(()),
             "reward/ee": jp.zeros(()),
             "reward/root": jp.zeros(()),
+            "reward/root_pos": jp.zeros(()),
+            "reward/root_quat": jp.zeros(()),
+            "reward/root_vel": jp.zeros(()),
             "reward/torque": jp.zeros(()),
             "reward/action_rate": jp.zeros(()),
             "root_dist": jp.zeros(()),
+            # Must be present here too: `State.metrics` is part of the pytree, so
+            # reset and step have to agree on its keys or the structures mismatch
+            # under jit/scan. See _get_termination for what these mean.
+            "term/nan": jp.zeros(()),
+            "term/tracking": jp.zeros(()),
+            "term/root": jp.zeros(()),
         }
 
         reward_val, done = jp.zeros(2)
@@ -475,7 +530,9 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         )
 
         # Genuine termination: fall / NaN / tracking collapse / root drift.
-        terminated = self._get_termination(data, tracking, root_dist)
+        # `state.metrics` is mutated in place (same as _get_reward above) to
+        # record which rule fired.
+        terminated = self._get_termination(data, tracking, root_dist, state.metrics)
 
         # For a non-cyclic clip, end `look_ahead` frames before the last frame:
         # the obs references frames up to phase_idx + look_ahead, so stopping at
@@ -543,11 +600,11 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         # rotation (ref^-1 * current), not the raw quaternion diff: continuous
         # network input, no double-cover discontinuity. (look_ahead, 6)
         d_rot6d = quat_to_rot6d(batched_quat_diff(ref_qpos[:, 3:7], data.qpos[3:7]))
-        d_height = ref_qpos[:, 2:3] - data.qpos[2:3]
+        d_pos = ref_qpos[:, :3] - data.qpos[:3]
 
         # Flatten frame-by-frame: [frame1 block, frame2 block, ...].
         ref_delta = jp.concatenate(
-            [d_joints, d_jvel, d_rot6d, d_height], axis=-1
+            [d_joints, d_jvel, d_rot6d, d_pos], axis=-1
         ).reshape(-1)
 
         # Proprioception: each body's global frame (xpos/xmat), re-expressed
@@ -562,20 +619,19 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         body_rot6d = mat_to_rot6d(data.xmat[self._proprio_body_ids]).reshape(-1)
 
         obs = jp.concatenate([
-            data.qpos[7:],
-            data.qvel[6:],
-            quat_to_rot6d(data.qpos[3:7]),
-            data.qvel[3:6],
-            data.qpos[2:3],
-            data.qvel[0:3],
+            data.qpos[:3], # root position (x, y, z)
+            quat_to_rot6d(data.qpos[3:7]), # root orientation (6D continuous rotation rep)
+            data.qvel[:6], # root linear and angular velocity (vx, vy, vz, wx, wy, wz)
+            data.qpos[7:], # joint positions (excluding root)
+            data.qvel[6:], # joint velocities (excluding root)
             # Binary (left, right) foot ground-contact flags — an explicit
             # gait-phase cue the policy would otherwise have to infer from the
             # full contact-rich dynamics.
             self._feet_contacts(data),
-            body_pos,
-            body_rot6d,
-            info["last_act"],
-            ref_delta,
+            body_pos, # root-relative body positions (flattened)
+            body_rot6d, # root-relative body orientations (flattened)
+            info["last_act"], # last raw action (pre-filter) for action-rate penalty
+            ref_delta, # look-ahead reference trajectory deltas (flattened)
         ])
         return obs
 
@@ -604,13 +660,41 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         ee_err = jp.sum(jp.square(ee_pos - ref_ee_pos))
         r_ee = jp.exp(-ee_err / cfg.sigma_ee)
 
+        # Root position and orientation get SEPARATE kernels. Sharing one
+        # exponential made the term a poor lever on the thing that actually ends
+        # episodes: measured on real runs, `root_pos_err + root_quat_err` was
+        # 82-90% orientation and only 10-18% position, while `root_termination`
+        # fires on `root_dist = sqrt(root_pos_err)` -- position alone. Raising a
+        # single `w_root` therefore put ~85% of the extra pressure on a quantity
+        # that never terminates anything. Split, `w_root_pos` weights exactly
+        # what the termination measures.
         root_pos_err = jp.sum(jp.square(data.qpos[:3] - ref_qpos[:3]))
         root_quat_err = quaternion_distance(data.qpos[3:7], ref_qpos[3:7])
 
-        root_err = root_pos_err + root_quat_err
-        r_root = jp.exp(-root_err / cfg.sigma_root)
+        r_root_pos = jp.exp(-root_pos_err / cfg.sigma_root_pos)
+        r_root_quat = jp.exp(-root_quat_err / cfg.sigma_root_quat)
+        # Kept for logging continuity with earlier runs (same formula as before
+        # the split), so `reward/root` stays comparable across the change.
+        r_root = jp.exp(-(root_pos_err + root_quat_err) / cfg.sigma_root)
 
         root_dist = jp.sqrt(root_pos_err)
+
+        # Root VELOCITY tracking (qvel[:6] = 3 linear + 3 angular). Deliberately
+        # its own term: `r_vel` above starts at qvel[6:], so the root's own
+        # velocity is otherwise absent from every reward component, and root
+        # drift is the integral of exactly this error. Without it the only
+        # pressure on the root arrives after drift has already accumulated into
+        # position error -- and `r_root` is a poor proxy for that, since
+        # measured on real runs it is 82-90% orientation and only 10-18%
+        # position, while `root_termination` fires on position alone.
+        #
+        # Kept OUT of the `tracking` sum below (like the torque/action-rate
+        # penalties) on purpose: `tracking` sets the collapse threshold via
+        # `min_tracking_frac * sum(weights)`, so folding this in would move the
+        # termination floor at the same time as the reward gradient and
+        # confound the two. This term shapes behaviour only.
+        root_vel_err = jp.sum(jp.square(data.qvel[:6] - ref_qvel[:6]))
+        r_root_vel = jp.exp(-root_vel_err / cfg.sigma_root_vel)
 
         # Effort penalty: discourage needless actuation power. Uses the ACTUAL
         # actuator force normalized by each actuator's strength limit, so it
@@ -635,6 +719,9 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         metrics["reward/vel"] = r_vel
         metrics["reward/ee"] = r_ee
         metrics["reward/root"] = r_root
+        metrics["reward/root_pos"] = r_root_pos
+        metrics["reward/root_quat"] = r_root_quat
+        metrics["reward/root_vel"] = r_root_vel
         metrics["reward/torque"] = r_torque
         metrics["reward/action_rate"] = r_action_rate
         metrics["root_dist"] = root_dist
@@ -646,17 +733,40 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             cfg.w_pose * r_pose
             + cfg.w_vel * r_vel
             + cfg.w_ee * r_ee
-            + cfg.w_root * r_root
+            + cfg.w_root_pos * r_root_pos
+            + cfg.w_root_quat * r_root_quat
         )
         return (
-            tracking + cfg.w_alive + r_torque + r_action_rate,
+            tracking
+            + cfg.w_alive
+            + cfg.w_root_vel * r_root_vel
+            + r_torque
+            + r_action_rate,
             tracking,
             root_dist,
         )
 
     def _get_termination(
-        self, data: mjx.Data, tracking: jax.Array, root_dist: jax.Array
+        self,
+        data: mjx.Data,
+        tracking: jax.Array,
+        root_dist: jax.Array,
+        metrics: dict[str, Any] | None = None,
     ) -> jax.Array:
+        """Genuine termination: NaN / tracking collapse / root drift.
+
+        When `metrics` is given, records WHICH cause fired as `term/nan`,
+        `term/tracking` and `term/root`. Episodes here end almost entirely by
+        early termination rather than the 1000-step cap, so knowing which rule
+        binds is what tells you whether to retune the reward (tracking floor) or
+        the geometry (root drift) -- previously both were invisible.
+
+        These are per-step indicators, and the trainer averages them over the
+        epoch, so the logged value is `terminations_of_this_cause / env_steps`.
+        Multiply by the epoch's mean episode `length` to read it as a fraction of
+        episodes. The causes are NOT mutually exclusive -- both can fire on the
+        same step -- so they need not sum to the overall termination rate.
+        """
         nan_check = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
         # Tracking collapse: terminate once the weighted tracking reward drops
@@ -665,7 +775,9 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         cfg = self._config.reward_config
         rt = self._config.reward_termination
         if rt.enabled:
-            max_track = cfg.w_pose + cfg.w_vel + cfg.w_ee + cfg.w_root
+            max_track = (
+                cfg.w_pose + cfg.w_vel + cfg.w_ee + cfg.w_root_pos + cfg.w_root_quat
+            )
             low_track = tracking < rt.min_tracking_frac * max_track
         else:
             low_track = jp.bool_(False)
@@ -681,6 +793,16 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             root_too_far = root_dist > rrt.max_dist
         else:
             root_too_far = jp.bool_(False)
+
+        if metrics is not None:
+            # Gate the per-cause indicators the same way the return value is
+            # gated: with early_termination off, low_track/root_too_far are
+            # computed but never actually end an episode, so reporting them as
+            # causes would be misleading.
+            gate = jp.asarray(self._config.early_termination, dtype=bool)
+            metrics["term/nan"] = nan_check.astype(jp.float32)
+            metrics["term/tracking"] = (low_track & gate).astype(jp.float32)
+            metrics["term/root"] = (root_too_far & gate).astype(jp.float32)
 
         return jp.where(
             self._config.early_termination,
@@ -783,7 +905,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         reward, tracking, root_dist = self._get_reward(
             data, abs_idx, ctrl, np.asarray(action), info["last_act"], metrics
         )
-        terminated = bool(self._get_termination(data, tracking, root_dist))
+        terminated = bool(self._get_termination(data, tracking, root_dist, metrics))
         clip_truncated = (not self._config.cyclic) and (
             phase >= clip_len - self._config.look_ahead
         )

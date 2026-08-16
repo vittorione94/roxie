@@ -3,7 +3,9 @@ import jax.numpy as jnp
 import pytest
 from flax import nnx
 
-from roxie.models.actors import DeterministicActor, StochasticActor
+import distrax
+
+from roxie.models.actors import DeterministicActor, StochasticActor, TanhNormal
 from roxie.models.critics import QCritic, VCritic, TwinCritic
 
 
@@ -215,3 +217,88 @@ class TestTwinCritic:
         actions = jax.random.normal(rng_key, (8, action_dim))
         q1, q2 = twin(obs, actions)
         assert not jnp.allclose(q1, q2)
+
+
+class TestTanhSquashedActor:
+    """`squash=True` must bound actions and keep the density self-consistent."""
+
+    OBS_DIM = 8
+    ACT_DIM = 4
+
+    @classmethod
+    def _actor(cls, squash):
+        OBS_DIM, ACT_DIM = cls.OBS_DIM, cls.ACT_DIM
+        return StochasticActor(
+            in_features=OBS_DIM, features=[32, 32], action_dim=ACT_DIM,
+            rngs=nnx.Rngs(params=0, dropout=1), squash=squash, std_max=5.0,
+        )
+
+    def test_default_is_unsquashed(self):
+        """SAC/MPO share this class -- the default must not change behaviour."""
+        d = self._actor(False)(jnp.zeros((4, self.OBS_DIM)))
+        assert isinstance(d, distrax.MultivariateNormalDiag)
+
+    def test_samples_and_mean_are_in_range(self):
+        d = self._actor(True)(jax.random.normal(jax.random.PRNGKey(0), (64, self.OBS_DIM)))
+        a = d.sample(seed=jax.random.PRNGKey(1))
+        assert jnp.all(jnp.abs(a) < 1.0)
+        assert jnp.all(jnp.abs(d.mean()) < 1.0)
+
+    def test_log_prob_roundtrips_through_the_squash(self):
+        """log_prob(a) must match the value returned alongside the sample --
+        this is what makes PPO's stored old_log_probs consistent with the ratio
+        recomputed later."""
+        d = self._actor(True)(jax.random.normal(jax.random.PRNGKey(0), (64, self.OBS_DIM)))
+        a, lp = d.sample_and_log_prob(seed=jax.random.PRNGKey(1))
+        assert jnp.allclose(lp, d.log_prob(a), atol=1e-3)
+
+    def test_log_prob_roundtrips_at_saturating_scale(self):
+        """Regression: the round-trip must hold in the tail, not just near 0.
+
+        A freshly initialised actor emits sigma ~ 0.7, so `u` never reaches the
+        arctanh clip and the test above passes even when `sample_and_log_prob`
+        scores the raw `u`. At the configured std_max=5 a large share of draws
+        saturate tanh in float32, the action stops identifying its own `u`, and
+        the two log-probs diverge by whole nats -- which PPO would read as KL
+        and clipping on an update that has not changed the policy yet.
+        """
+        n = 8192
+        d = TanhNormal(
+            jnp.zeros((n, self.ACT_DIM)), jnp.full((n, self.ACT_DIM), 5.0))
+        a, lp = d.sample_and_log_prob(seed=jax.random.PRNGKey(0))
+
+        # The regime this test exists for: the sample must actually saturate.
+        assert float(jnp.mean(jnp.abs(a) >= 1.0 - 1e-6)) > 0.05
+
+        assert jnp.allclose(lp, d.log_prob(a), atol=1e-3)
+
+        # What it costs PPO: recomputing the ratio against an unchanged policy
+        # must be a no-op, so approx_kl and clip_frac stay at zero.
+        ratio = jnp.exp(d.log_prob(a) - lp)
+        approx_kl = jnp.mean((ratio - 1.0) - jnp.log(ratio))
+        assert float(approx_kl) < 1e-5
+        assert float(jnp.mean(jnp.abs(ratio - 1.0) > 0.2)) == 0.0
+
+    def test_entropy_has_an_interior_maximum_in_sigma(self):
+        """The whole point of squashing, for an entropy bonus.
+
+        An unsquashed Normal's entropy is const + sum(log sigma): unbounded and
+        monotonically increasing, so the bonus pays forever to inflate sigma and
+        the clipped-away spread costs nothing. Squashed, large sigma pushes
+        tanh(u) onto the two atoms at +-1, so the differential entropy PEAKS
+        (near sigma ~ 1) and then falls. The bonus therefore has an interior
+        optimum and stops driving sigma upward.
+        """
+        key = jax.random.PRNGKey(0)
+        loc = jnp.zeros((4096, self.ACT_DIM))
+        sq = lambda s: float(jnp.mean(
+            TanhNormal(loc, jnp.full((4096, self.ACT_DIM), s)).entropy(seed=key)))
+        plain = lambda s: float(jnp.mean(
+            distrax.MultivariateNormalDiag(
+                loc, jnp.full((4096, self.ACT_DIM), s)).entropy()))
+
+        # squashed: rises to a peak, then decreases
+        assert sq(1.0) > sq(0.25)
+        assert sq(1.0) > sq(5.0) > sq(10.0)
+        # plain: strictly increasing over the same range
+        assert plain(0.25) < plain(1.0) < plain(5.0) < plain(10.0)

@@ -5,7 +5,22 @@ args:
   actor_learning_rate: 5e-4
   critic_learning_rate: 1e-3
   # steps_before_learning: 30_000    # same as warmup (can differ if desired)
-  learning_steps: 20              # gradient steps per update trigger
+  gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
+  clip_eps: 0.2                   # PPO surrogate clip range
+  entropy_coef: 0.01              # entropy bonus weight in the actor loss
+  # Stop the learning_steps loop once the policy has drifted this far from the
+  # behaviour policy (Schulman's approx KL). Keeps `learning_steps` an upper
+  # bound rather than a fixed count, so extra passes are only taken while the
+  # trust region still holds. null disables the early stop.
+  target_kl: 0.02
+  # Gradient passes over each collected rollout before it is discarded. Only
+  # meaningful because old_log_probs stay pinned to the behaviour policy across
+  # the passes; at 1 the ratio is identically 1, the clip never binds and this
+  # reduces to A2C.
+  learning_steps: 20
+  # Minibatches per epoch, splitting the env axis; must divide
+  # memory.add_batch_size below. 1 = full-batch (previous behaviour).
+  num_minibatches: 4
   max_grad_norm: 1
 
 actor:

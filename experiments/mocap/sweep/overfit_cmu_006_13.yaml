@@ -6,10 +6,7 @@
 # this file in a launchable, or the comparison stops being an A/B on the
 # algorithm. Pair it with `env_config: cmu` + `reward: cmu_tracking` (also
 # identical across the sweep) and `backend: warp`.
-#
-# Values are copied from the current champion setup (td3_warp.yaml): position
-# actuation, look_ahead 5 (env_config/cmu.yaml), self-collisions on, one pinned
-# clip with clip_swap off.
+
 env:
   seed: 0
   parallel_envs: 1000
@@ -25,7 +22,12 @@ env:
   actuation: position
   actuation_kp_scale: 1.0
   actuation_kv_ratio: 0.0
-  self_collisions: true
+  # Collision filter: "full" (self-collision + ground, the dm_control default),
+  # "ground" (no self-contact at all, every geom still hits the floor) or "feet"
+  # (feet/hands/head vs floor only). Set to "ground" for the sweep: the
+  # retargeted CMU reference interpenetrates its own limbs, so under "full" the
+  # solver pushes the body out of the very pose the tracking reward asks for.
+  collisions: ground
 
 trainer:
   steps: 1_000_000_000

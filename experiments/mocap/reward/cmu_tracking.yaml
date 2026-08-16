@@ -5,7 +5,40 @@ reward:
   w_pose: 0.5
   w_vel: 0.05
   w_ee: 0.2
+  # Root position and orientation, split out of the old single w_root: 0.2.
+  # They sum to 0.2, so `max_track` (= sum of the tracking weights) and hence the
+  # tracking-collapse floor are UNCHANGED -- this reallocates pressure without
+  # moving the termination threshold. At typical values the root contribution to
+  # `tracking` also lands in the same place (0.128 -> 0.125), so the split should
+  # not shift which rule fires; only the gradient composition changes.
+  # Position is weighted 3:1 over orientation because root_termination fires on
+  # position alone, whereas the old shared term was 82-90% orientation.
+  w_root_pos: 0.15
+  w_root_quat: 0.05
+  # Retained only so `reward/root` keeps logging the pre-split formula and stays
+  # comparable with earlier runs; it no longer feeds the reward or `tracking`.
   w_root: 0.2
+  # Root VELOCITY tracking (qvel[:6]). w_vel's kernel starts at qvel[6:], so
+  # without this the root's own velocity appears in NO reward term, while root
+  # drift causes the majority of terminations (instrumented in run
+  # 2026-08-14_19-01-59: term/root rose 9% -> 64% of episodes as length grew
+  # 13 -> 43, and keeps rising with length). Drift is the integral of this
+  # error, so penalising it here acts before drift becomes position error.
+  # w_root cannot serve this role: decomposed from real runs it is 82-90%
+  # ORIENTATION and only 10-18% position, while root_termination fires on
+  # position alone. Deliberately excluded from the `tracking` sum in
+  # _get_reward, so it does not move the tracking-collapse threshold.
+  #
+  # DISABLED (0.0). Tested alone in run 2026-08-14_19-31-53 and it did nothing:
+  # term/root held at 61.1% of episodes vs 61.2% for the control, and episode
+  # length matched within noise, even though `reward/root_vel` itself climbed
+  # 0.04 -> 0.31 (so the term was live and correctly scaled, just not effective).
+  # Penalising the rate does not bound its integral -- a policy can track root
+  # velocity tolerably and still accumulate a systematic positional bias. What
+  # did work was making the POSITION kernel steep (sigma_root_pos below).
+  # Left wired up at weight 0 rather than deleted: the metric still logs, and
+  # re-testing it on top of the split is a one-line change.
+  w_root_vel: 0.0
   w_alive: 0.05
   # Torque penalty: weights mean-squared actuator command (ctrl in [-1, 1]), so
   # the term sits in [-w_torque, 0]. Discourages needless action power without
@@ -23,4 +56,25 @@ reward:
   sigma_pose: 5.0
   sigma_vel: 200.0
   sigma_ee: 0.15
+  # THE key number in the split. The old shared sigma_root: 0.2 was sized for the
+  # combined position+orientation error, which is dominated by orientation; on
+  # position alone it is far too forgiving. Across the whole survivable range it
+  # spans only 1.00 (0 m) -> 0.73 (0.25 m, the termination threshold), i.e. the
+  # policy is barely penalised right up to the point the episode is killed.
+  # At 0.02 the same range reads 1.00 / 0.88 (0.05 m) / 0.61 (0.10 m) /
+  # 0.33 (0.15 m) / 0.04 (0.25 m) -- steep exactly where episodes die.
+  # `root_dist` currently averages ~0.10, so the policy sits mid-kernel with
+  # gradient in both directions.
+  sigma_root_pos: 0.02
+  # Orientation error runs ~0.075-0.09, so 0.2 already puts this kernel around
+  # 0.64-0.69 -- responsive; kept as-is.
+  sigma_root_quat: 0.2
+  # Used only by the retained `reward/root` logging term (see w_root).
   sigma_root: 0.2
+  # Sized from the clip's own root velocities: sum(v^2) over the 6 root DOFs has
+  # mean 3.81 / median 2.44 (linear |v| mean 0.52 m/s, angular |w| mean 0.58
+  # rad/s). At sigma 2.0 the kernel reads 0.89 at 25% velocity error, 0.62 at
+  # 50% and 0.15 at 100% -- responsive across the range that matters instead of
+  # saturating at either end. Watch `reward/root_vel`: pinned near 1.0 means
+  # sigma is too forgiving, pinned near 0 means too sharp.
+  sigma_root_vel: 2.0
