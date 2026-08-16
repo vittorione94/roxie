@@ -10,6 +10,7 @@ from flax import nnx
 from roxie.utils import logger
 from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
+from roxie.models.actors import deterministic_action
 
 
 def _agent_replay_add(agent, buffer_state, transitions):
@@ -477,6 +478,13 @@ class Trainer:
                 # module's scheduled scale to see how much clipping eats.
                 if noise_iters > 0:
                     logger.store("noise/per_joint_abs", float(noise_abs_sum / noise_iters))
+                # Optional per-agent diagnostics, drained once per epoch. PPO
+                # uses this for its trust-region metrics (approx_kl, clip_frac);
+                # agents without the hook contribute nothing.
+                pop_diagnostics = getattr(agent, "pop_diagnostics", None)
+                if pop_diagnostics is not None:
+                    for k, v in pop_diagnostics().items():
+                        logger.store(k, float(v))
                 # GPU telemetry (utilization / temperature / memory / power).
                 # Sampled once per epoch; a no-op on hosts without nvidia-smi.
                 for k, v in logger.gpu_stats().items():
@@ -570,8 +578,10 @@ class Trainer:
                     obs = Agent.normalize_obs(obs, mean, std, agent.obs_clip)
                 # Deterministic eval: actor output (in [-1, 1]) scaled to env
                 # units. No noise module (its stateful update can't be mutated
-                # across the while_loop trace level).
-                action = jnp.clip(actor(obs), -1.0, 1.0)
+                # across the while_loop trace level). A stochastic actor (PPO)
+                # returns a distribution rather than an action, so the mean is
+                # taken here — never a sample, so eval stays deterministic.
+                action = jnp.clip(deterministic_action(actor(obs)), -1.0, 1.0)
                 action = Agent.scale_to_env(action, agent.action_low, agent.action_high)
 
                 next_states = v_step(states, action)

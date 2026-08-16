@@ -8,15 +8,49 @@
 #     env steps it sees far fewer gradient-relevant samples. Compare on
 #     score-vs-env-steps AND score-vs-wall-clock, and expect a different shape.
 #   - the critic is a V critic (state value), not Q(s, a).
-#   - GAE lambda 0.95 / clip 0.2 / entropy 0.01 are still hardcoded in ppo.py
-#     (see its TODO) — they are not settable from here.
 name: "ppo"
 
 args:
   gamma: 0.99
-  actor_learning_rate: 3e-4
+  # --- Gradient throughput, aligned with the reference PPO configs ----------
+  # Measured gap that motivated this block: at 1000 envs x 32-step rollouts we
+  # were taking 2 gradient steps per 32,000 transitions = 1 per 16,000, against
+  # 1 per 1,280 for brax `locomotion_params` (the humanoid-shaped reference) and
+  # 1 per 120 for `dm_control_suite_params`. Run 2026-08-13_02-48-28 spent 737M
+  # env steps on only 60,479 gradient steps -- roughly a tenth of the update rate
+  # the tuned references use, which is the likeliest reason a single clip is hard
+  # here when PPO fits clips routinely in the literature.
+  #
+  # 4 epochs x 20 minibatches = 80 steps per rollout => 1 per 400 transitions,
+  # inside the reference band. num_minibatches must divide env.parallel_envs
+  # (1000 / 20 = 50 envs, 1600 transitions per minibatch -- comparable to
+  # dm_control's 1920).
+  #
+  # learning_steps stays at 4: the configured cap is NOT what binds. The KL stop
+  # cuts each rollout at ~60-66 steps, so raising it to 8 (run
+  # 2026-08-14_23-45-47) changed nothing -- steps_per_rollout sat at 61/160 and
+  # both grad-steps/epoch and episode length matched the ls=4 run exactly.
+  learning_steps: 4
+  num_minibatches: 20
+  # 1e-4. Halving to 5e-5 (run 2026-08-15_00-10-18) does reach the same
+  # steps_per_rollout plateau sooner (~ep5 vs ~ep25) but plateaus at the SAME
+  # ~60/rollout and settles to fewer grad steps/epoch (824 vs 920), because the
+  # KL budget is per rollout: smaller steps fit more of them, but each does
+  # proportionally less, and total absorbable drift is what is fixed. Length was
+  # no better. 3e-4 was worse still (see the length comparison in git history).
+  actor_learning_rate: 1e-4
+  # Not KL-constrained, so left where it was.
   critic_learning_rate: 3e-4
-  learning_steps: 20              # epochs over each collected rollout
+  # Loosened from 0.05 to a pathology catcher rather than the binding
+  # constraint. At 0.02/0.05 the stop fired on EVERY rollout and capped passes at
+  # ~2, which is exactly what starves the update rate. The references run
+  # 128-512 steps per rollout with no KL stop at all; this keeps one only to
+  # catch the collapse seen when passes ran unbounded at a large step size
+  # (train length 11.5 vs 24 baseline, run 2026-08-12_21-39-18).
+  target_kl: 0.15
+  gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
+  clip_eps: 0.2                   # PPO surrogate clip range
+  entropy_coef: 0.001             # entropy bonus weight in the actor loss
   max_grad_norm: 1
 
 actor:
@@ -25,6 +59,13 @@ actor:
   use_layer_norm: true
   std_min: 1e-4
   std_max: 5.0
+  # Bound actions in (-1, 1) via tanh. Without it nothing keeps the policy mean
+  # inside actuator_ctrlrange: run 2026-08-12_22-30-14 logged
+  # reward/action_rate = -0.4585, i.e. mean((a_t - a_{t-1})^2) = 4.585 > 4, which
+  # is impossible for actions confined to [-1, 1]. The env clips for control, so
+  # that excess did nothing except pay the action-rate penalty (~30% of total
+  # reward) and let the entropy bonus inflate sigma for free.
+  squash: true
 
 critic:
   _target_: roxie.models.critics.VCritic
@@ -35,10 +76,27 @@ critic:
 memory:
   # On-policy trajectory queue: one timestep per env per step (add_sequence_
   # length 1), update fires once `sample_sequence_length` steps are queued =>
-  # 32 x 1000 envs = 32k transitions per update, then the queue drains.
+  # 64 x 1000 envs = 64k transitions per update, then the queue drains.
   # sample_sequence_length must be <= max_length_time_axis (flashbax asserts).
   _target_: flashbax.buffers.make_trajectory_queue
-  max_length_time_axis: 64
+  max_length_time_axis: 512
   add_batch_size: ${env.parallel_envs}
   add_sequence_length: 1
+  # Back to 32 after testing 64 three ways. 64 doubles the GAE horizon (episodes
+  # average ~93 steps, so 32 truncates the advantage well inside the episode) and
+  # it IS more efficient per gradient step -- it reached parity with 32 on ~45% of
+  # the gradient work. But it halves the rollout count (31.2 -> 15.6 per 1e6 env
+  # steps), and since the KL budget is per rollout that halves total gradient
+  # work; the per-step gain cancelled it exactly, every time:
+  #
+  #   config                      grad/epoch   train length @ep~30
+  #   seq64 / ls4 / lr1e-4            ~900            51.9
+  #   seq64 / ls8 / lr1e-4            ~920            50.4
+  #   seq64 / ls8 / lr5e-5            ~824            ~50
+  #   seq32 / ls4 / lr1e-4           ~2069            51.8
+  #
+  # Neither raising the pass cap nor lowering the LR broke the tie: both hit the
+  # same ~60-steps-per-rollout KL saturation. 32 and 64 are equivalent here, so
+  # keep the one with the higher update rate and the measured best result
+  # (100.3 @ep96, run 2026-08-14_21-39-32).
   sample_sequence_length: 32

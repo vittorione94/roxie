@@ -184,12 +184,17 @@ def evaluate(combos, env, horizon, reps, seed):
 
 @click.command()
 @click.option("--impl", default="warp", help="Physics backend (jax|warp).")
-@click.option("--self-collisions", default=True, type=bool)
+@click.option(
+    "--collisions",
+    default="full",
+    type=click.Choice(["full", "ground", "feet"]),
+    help="Collision filter (see mocap_tracking._configure_collisions).",
+)
 @click.option("--gpu-clip-budget", default=50, type=int)
 @click.option("--reps", default=32, type=int, help="Envs averaged per combo.")
 @click.option("--horizon", default=500, type=int, help="Rollout steps (cap=1000).")
 @click.option("--seed", default=0, type=int)
-def main(impl, self_collisions, gpu_clip_budget, reps, horizon, seed):
+def main(impl, collisions, gpu_clip_budget, reps, horizon, seed):
     combos, index_map = build_combos()
     total = len(combos) * reps
 
@@ -197,7 +202,7 @@ def main(impl, self_collisions, gpu_clip_budget, reps, horizon, seed):
         {
             "parallel_envs": total,
             "impl": impl,
-            "self_collisions": self_collisions,
+            "collisions": collisions,
             "gpu_clip_budget": gpu_clip_budget,
             "clip_ids": [],
             "naconmax": None,
@@ -214,7 +219,7 @@ def main(impl, self_collisions, gpu_clip_budget, reps, horizon, seed):
     print("\n" + "=" * 64)
     print("OU EXPLORATION SENSITIVITY ON MOCAP TRACKING")
     print(f"horizon={horizon}  reps={reps}  impl={impl}  "
-          f"self_collisions={self_collisions}")
+          f"collisions={collisions}")
     print(f"baseline: {BASELINE}")
     print("reward/step: max 1.0, ~0.05 = falling/idle floor")
     print("=" * 64)

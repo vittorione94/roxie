@@ -177,29 +177,60 @@ class TestPPOLoss:
         advantages = jax.random.normal(key, (num_envs, seq_len - 1))
         return obs, actions, log_probs, values, advantages
 
-    def test_actor_loss_scalar(self, stoch_actor, ppo_data):
-        obs, actions, log_probs, values, advantages = ppo_data
-        loss = ppo_loss_fn(
-            stoch_actor,
+    def _ppo_actor_loss(self, actor, obs, actions, log_probs, advantages, **kw):
+        return ppo_loss_fn(
+            actor,
             obs,
             actions,
             log_probs,
             jnp.full(ACT_DIM, -1.0),
             jnp.full(ACT_DIM, 1.0),
             advantages,
-            clip_epsilon=0.2,
-            entropy_coef=0.01,
+            clip_epsilon=kw.get("clip_epsilon", 0.2),
+            entropy_coef=kw.get("entropy_coef", 0.01),
             key=jax.random.PRNGKey(0),
+        )
+
+    def test_actor_loss_scalar(self, stoch_actor, ppo_data):
+        obs, actions, log_probs, values, advantages = ppo_data
+        loss, (approx_kl, clip_frac) = self._ppo_actor_loss(
+            stoch_actor, obs, actions, log_probs, advantages
         )
         assert loss.shape == ()
         assert jnp.isfinite(loss)
+        assert approx_kl.shape == () and clip_frac.shape == ()
+
+    def test_trust_region_diagnostics_are_zero_on_first_pass(self, stoch_actor, ppo_data):
+        """`log_probs` in the fixture come from this very actor, so the ratio is
+        exactly 1: approx_kl and clip_frac must both be 0. This is the property
+        that makes them a drift measurement -- anything non-zero on pass 1 means
+        the policy already moved (or the observations were normalized
+        differently) between acting and learning.
+        """
+        obs, actions, log_probs, values, advantages = ppo_data
+        _, (approx_kl, clip_frac) = self._ppo_actor_loss(
+            stoch_actor, obs, actions, log_probs, advantages
+        )
+        assert float(approx_kl) == pytest.approx(0.0, abs=1e-6)
+        assert float(clip_frac) == pytest.approx(0.0, abs=1e-6)
 
     def test_critic_loss_scalar(self, stoch_critic, ppo_data):
         obs, actions, log_probs, values, advantages = ppo_data
-        loss = ppo_critic_loss_fn(stoch_critic, obs, values, advantages)
+        returns = values[:, :-1] + advantages
+        loss = ppo_critic_loss_fn(stoch_critic, obs, returns)
         assert loss.shape == ()
         assert jnp.isfinite(loss)
         assert loss >= 0.0
+
+    def test_critic_loss_reaches_zero_on_own_prediction(self, stoch_critic, ppo_data):
+        """A plain regression target: handed the critic's own output back, the
+        loss must be ~0. The previous target (`V_old + normalized_advantage`)
+        could not do this -- it floored at var(normalized adv) ~ 1.0 regardless
+        of the critic, which is exactly what every training run logged.
+        """
+        obs, _, _, _, _ = ppo_data
+        returns = stoch_critic(obs)[:, :-1, 0]
+        assert ppo_critic_loss_fn(stoch_critic, obs, returns) < 1e-6
 
 
 class TestSACLosses:

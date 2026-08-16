@@ -25,7 +25,12 @@ env:
   actuation: position
   actuation_kp_scale: 1.0
   actuation_kv_ratio: 0.0
-  self_collisions: true
+  # Collision filter: "full" (self-collision + ground, the dm_control default),
+  # "ground" (no self-contact at all, every geom still hits the floor) or "feet"
+  # (feet/hands/head vs floor only). Set to "ground" for the sweep: the
+  # retargeted CMU reference interpenetrates its own limbs, so under "full" the
+  # solver pushes the body out of the very pose the tracking reward asks for.
+  collisions: ground
 
 trainer:
   steps: 1_000_000_000

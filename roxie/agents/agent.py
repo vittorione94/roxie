@@ -11,6 +11,9 @@ import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 
+# `roxie.models.actors` imports nothing from `roxie`, so this cannot cycle.
+from roxie.models.actors import distribution_entropy as _distribution_entropy
+
 
 class TrainState(nnx.Module, pytree=False):
     def __init__(
@@ -102,12 +105,12 @@ class Agent(abc.ABC):
             # Compute log-prob of the mean (useful for logging); this is deterministic.
             # For multivariate normals the log_prob returns a scalar per batch element.
             log_probs = distribution.log_prob(action)
-            entropy = distribution.entropy()
+            entropy = _distribution_entropy(distribution, key)
             return action, log_probs, entropy
 
         # Training / exploration mode: sample from the policy
         action, log_probs = distribution.sample_and_log_prob(seed=key)
-        entropy = distribution.entropy()
+        entropy = _distribution_entropy(distribution, key)
         return action, log_probs, entropy
 
     @staticmethod
