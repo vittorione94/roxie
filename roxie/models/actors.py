@@ -50,16 +50,38 @@ class TanhNormal:
         return jnp.tanh(self._base.sample(seed=seed))
 
     def sample_and_log_prob(self, seed):
-        u = self._base.sample(seed=seed)
-        return jnp.tanh(u), self._log_prob_from_pre(u)
+        """Sample an action and score it the way `log_prob` will score it later.
+
+        The density is deliberately NOT taken from the `u` that was drawn. tanh
+        saturates in float32 long before the sampler stops producing large |u|
+        (with std_max=5, |u| > arctanh(1 - 1e-6) ~ 7.25 is routine), so the
+        returned action no longer identifies the `u` behind it: `log_prob` can
+        only recover the clipped value. Scoring the draw with the original `u`
+        would hand PPO an `old_log_probs` that its own recomputation cannot
+        reproduce -- at the first epoch, with the policy still untouched, the
+        ratio would differ from 1, reporting KL and clipping that never happened.
+        Going through `log_prob` makes the pair consistent by construction.
+
+        This costs one arctanh, and makes the returned log-prob flat w.r.t. the
+        sample once tanh saturates. That is fine here: `TanhNormal` is used by
+        PPO, whose only caller of this method is act-time action selection (see
+        `Agent.stochastic_step_fn`) and never backprops through it. A
+        reparameterized objective (SAC-style) must not route its pathwise
+        gradient through this method.
+        """
+        action = jnp.tanh(self._base.sample(seed=seed))
+        return action, self.log_prob(action)
 
     def log_prob(self, actions: jnp.ndarray) -> jnp.ndarray:
         """Log-density of an already-squashed action.
 
-        Recovers the pre-squash `u` with arctanh. Note the correction term is a
-        function of `u` alone, so it is identical for the behaviour and current
-        policies and CANCELS in PPO's importance ratio -- numerical error here
-        cannot corrupt the ratio, which depends only on the base log-probs.
+        Recovers the pre-squash `u` with arctanh, clipping first because tanh
+        saturates in float32 and the exact inverse would return inf. This is the
+        one path that defines `u` for a stored action -- `sample_and_log_prob`
+        routes through it too, so behaviour and current policies agree on `u`.
+        Given that, the correction term is a function of `u` alone, is identical
+        for both policies and CANCELS in PPO's importance ratio, which then
+        depends only on the base log-probs.
         """
         u = jnp.arctanh(jnp.clip(actions, -_TANH_CLIP, _TANH_CLIP))
         return self._log_prob_from_pre(u)

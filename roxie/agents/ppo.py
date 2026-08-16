@@ -58,6 +58,7 @@ def _compute_gae(rewards, values, termination, truncation, gamma, gae_lambda):
         "gamma",
         "gae_lambda",
         "replay_get_fn",
+        "normalize",
     ),
 )
 def _prepare_rollout(
@@ -66,7 +67,9 @@ def _prepare_rollout(
     gae_lambda: float,
     replay_get_fn,  # Function to get the on-policy data
     obs_clip: float,
-    obs_eps: float,
+    normalize: bool,
+    obs_mean: jnp.ndarray,
+    obs_std: jnp.ndarray,
 ):
     """Dequeue one rollout and return the tensors every epoch trains on.
 
@@ -91,8 +94,18 @@ def _prepare_rollout(
         "truncations": data.truncation,  # time-limit / clip-end truncation
     }
 
-    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
-    norm_obs = Agent.normalize_obs(re_packed_samples["observations"], obs_mean, obs_std, obs_clip)
+    # `obs_mean`/`obs_std` are the snapshot the BEHAVIOUR policy ran under (see
+    # `PPO._obs_norm`), not the live running stats. Re-deriving them from
+    # `state.obs_stats` here would normalize with statistics that kept moving
+    # for the whole rollout, so re-evaluating step 0 would not reproduce the
+    # log-prob stored with it: the ratio would already differ from 1 before any
+    # gradient step, and the clip / KL early stop would fire on normalization
+    # drift instead of policy drift.
+    norm_obs = (
+        Agent.normalize_obs(re_packed_samples["observations"], obs_mean, obs_std, obs_clip)
+        if normalize
+        else re_packed_samples["observations"]
+    )
 
     # 4. Generalized advantage estimation, distinguishing termination from
     # truncation (see _compute_gae): a terminal zeroes the value bootstrap; a
@@ -376,6 +389,14 @@ class PPO(Agent):
         self.normalize_observations = normalize_observations
         self.obs_clip = float(obs_norm_clip)
         self.obs_eps = float(obs_norm_eps)
+        # Observation normalization is part of the policy, so it has to be a
+        # FIXED function for the whole rollout: `step()` and `_prepare_rollout`
+        # must use byte-identical mean/std or the stored log-probs stop matching
+        # a re-evaluation of the same states. `None` means "stale, recompute
+        # from obs_stats on next use"; `update()` invalidates it once a rollout
+        # has been consumed, which is the only safe refresh point (and also
+        # makes a checkpoint-restored `obs_stats` pick itself up).
+        self._obs_norm = None
 
         print("PPO agent initialized.")
 
@@ -390,7 +411,7 @@ class PPO(Agent):
         """
         # Call the standalone function, passing in the required parts from the agent's state.
         if self.normalize_observations:
-            mean, std = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
+            mean, std = self._frozen_obs_norm()
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
 
         action, self.last_log_prob, _ = Agent.stochastic_step_fn(
@@ -404,6 +425,19 @@ class PPO(Agent):
         self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
 
         return self.last_action
+
+    def _frozen_obs_norm(self):
+        """Mean/std the current rollout is pinned to, recomputing if stale.
+
+        Kept as device arrays: the snapshot is taken with a pure device op, so
+        acting never syncs to host just to normalize. The running `obs_stats`
+        keep accumulating underneath -- they are only *read* at rollout
+        boundaries, so the statistics still track the current policy's state
+        distribution, just one rollout behind instead of mid-trajectory.
+        """
+        if self._obs_norm is None:
+            self._obs_norm = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
+        return self._obs_norm
 
     def add(self, prev_states, states):
         # Add sequence dimension (length=1) to match trajectory buffer format
@@ -434,10 +468,22 @@ class PPO(Agent):
             )
 
     def update(self, steps, agent_rng):
-        gradient_steps, actor_loss, critic_loss = 0, 0, 0
+        # Losses are summed over every gradient pass actually executed and
+        # averaged at the end. Returning the last minibatch's value instead
+        # would make `loss/actor` / `loss/critic` a snapshot of one arbitrary
+        # slice of one epoch -- and, when the KL early stop fires, specifically
+        # the threshold-crossing batch -- rather than a summary of the update.
+        gradient_steps = 0
+        actor_loss_sum, critic_loss_sum = 0.0, 0.0
 
         # A full rollout is queued, so we can start learning
         while self.replay.can_sample(self.state.buffer_state):
+            # Normalizer snapshot the rollout was ACTED under. Read before the
+            # dequeue and passed in explicitly, so `norm_obs` reproduces exactly
+            # what `step()` fed the actor and `old_log_probs` is a true
+            # behaviour log-prob (ratio == 1 on the first pass).
+            obs_mean, obs_std = self._frozen_obs_norm()
+
             # Dequeue the rollout ONCE (this is what drops it from the queue),
             # then take `learning_steps` gradient passes over those same arrays.
             (
@@ -453,8 +499,15 @@ class PPO(Agent):
                 gae_lambda=self.gae_lambda,
                 replay_get_fn=self.replay.sample,  # Pass the sample method itself,
                 obs_clip=self.obs_clip,
-                obs_eps=self.obs_eps,
+                normalize=self.normalize_observations,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
             )
+
+            # The rollout is now consumed, so the next one may safely act under
+            # fresher statistics: drop the snapshot and let `_frozen_obs_norm`
+            # rebuild it from everything `add()` has accumulated since.
+            self._obs_norm = None
 
             self._rollouts += 1
             mb_size = self.minibatch_size
@@ -493,6 +546,12 @@ class PPO(Agent):
                     # into every epoch that had no update.
                     gradient_steps += 1
 
+                    # Accumulate this pass's losses. The `float()` costs no
+                    # extra sync: `approx_kl` below already blocks on the same
+                    # `_grad_step` output.
+                    actor_loss_sum += float(actor_loss)
+                    critic_loss_sum += float(critic_loss)
+
                     # Trust-region diagnostics for this step, exposed for the
                     # trainer to log (same opt-in getattr pattern as `last_noise`).
                     self.last_approx_kl = float(approx_kl)
@@ -522,7 +581,18 @@ class PPO(Agent):
 
         # The rollout was consumed from the queue by `_prepare_rollout` and the
         # local arrays go out of scope here: nothing is reused across updates.
-        return gradient_steps, actor_loss, critic_loss
+        #
+        # Mean over the passes actually executed (which may span several
+        # rollouts if more than one was queued). With no pass, the trainer
+        # gates on `gradient_steps > 0` and never reads the losses, so the 0.0
+        # is never logged.
+        if gradient_steps == 0:
+            return 0, 0.0, 0.0
+        return (
+            gradient_steps,
+            actor_loss_sum / gradient_steps,
+            critic_loss_sum / gradient_steps,
+        )
 
     def pop_diagnostics(self) -> dict:
         """Return the epoch's trust-region metrics and reset the accumulators.

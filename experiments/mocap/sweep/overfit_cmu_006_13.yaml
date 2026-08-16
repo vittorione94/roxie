@@ -6,10 +6,7 @@
 # this file in a launchable, or the comparison stops being an A/B on the
 # algorithm. Pair it with `env_config: cmu` + `reward: cmu_tracking` (also
 # identical across the sweep) and `backend: warp`.
-#
-# Values are copied from the current champion setup (td3_warp.yaml): position
-# actuation, look_ahead 5 (env_config/cmu.yaml), self-collisions on, one pinned
-# clip with clip_swap off.
+
 env:
   seed: 0
   parallel_envs: 1000

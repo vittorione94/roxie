@@ -139,7 +139,11 @@ class Agent(abc.ABC):
         count = jnp.maximum(stats.count, 1.0)
         mean = stats.sum / count
         var = jnp.maximum(stats.sumsq / count - jnp.square(mean), 0.0)
-        std = jnp.sqrt(var + eps)
+        # With 0 or 1 samples the variance is identically 0, so `sqrt(var + eps)`
+        # is ~1e-4 and normalizing divides the observation by it -- every feature
+        # saturates at the clip bound. Fall back to the identity scale until
+        # there is enough data for a meaningful spread.
+        std = jnp.where(stats.count > 1.0, jnp.sqrt(var + eps), 1.0)
         return mean, std
 
     @staticmethod

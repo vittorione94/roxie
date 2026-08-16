@@ -252,6 +252,33 @@ class TestTanhSquashedActor:
         a, lp = d.sample_and_log_prob(seed=jax.random.PRNGKey(1))
         assert jnp.allclose(lp, d.log_prob(a), atol=1e-3)
 
+    def test_log_prob_roundtrips_at_saturating_scale(self):
+        """Regression: the round-trip must hold in the tail, not just near 0.
+
+        A freshly initialised actor emits sigma ~ 0.7, so `u` never reaches the
+        arctanh clip and the test above passes even when `sample_and_log_prob`
+        scores the raw `u`. At the configured std_max=5 a large share of draws
+        saturate tanh in float32, the action stops identifying its own `u`, and
+        the two log-probs diverge by whole nats -- which PPO would read as KL
+        and clipping on an update that has not changed the policy yet.
+        """
+        n = 8192
+        d = TanhNormal(
+            jnp.zeros((n, self.ACT_DIM)), jnp.full((n, self.ACT_DIM), 5.0))
+        a, lp = d.sample_and_log_prob(seed=jax.random.PRNGKey(0))
+
+        # The regime this test exists for: the sample must actually saturate.
+        assert float(jnp.mean(jnp.abs(a) >= 1.0 - 1e-6)) > 0.05
+
+        assert jnp.allclose(lp, d.log_prob(a), atol=1e-3)
+
+        # What it costs PPO: recomputing the ratio against an unchanged policy
+        # must be a no-op, so approx_kl and clip_frac stay at zero.
+        ratio = jnp.exp(d.log_prob(a) - lp)
+        approx_kl = jnp.mean((ratio - 1.0) - jnp.log(ratio))
+        assert float(approx_kl) < 1e-5
+        assert float(jnp.mean(jnp.abs(ratio - 1.0) > 0.2)) == 0.0
+
     def test_entropy_has_an_interior_maximum_in_sigma(self):
         """The whole point of squashing, for an entropy bonus.
 
