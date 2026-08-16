@@ -13,12 +13,19 @@ args:
   steps_between_updates: 400
   learning_steps: 100
   max_grad_norm: 1
+  # Penalty on the actor's pre-tanh logits, mean(relu(|u| - 1)^2). Without it
+  # the DPG objective drives the logits out until tanh saturates and the actor
+  # gradient underflows to zero. See DeterministicActor's saturation note.
+  pre_activation_coef: 1e-2
 
 actor:
   _target_: roxie.models.actors.DeterministicActor
   features: [256, 256]
   use_layer_norm: true
   dropout_rate: 0.
+  # Small final layer (the original DDPG trick): start the logits inside
+  # tanh's linear region rather than near its knee.
+  output_init_scale: 0.01
 
 critic:
   _target_: roxie.models.critics.QCritic

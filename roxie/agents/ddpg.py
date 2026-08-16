@@ -200,6 +200,7 @@ class DDPG(Agent):
         target_noise_clip: float = 0.1,
         target_policy_noise: float = 0.1,
         max_grad_norm: float = 1.0,
+        pre_activation_coef: float = 0.0,
         normalize_observations: bool = True,
         obs_norm_clip: float = 5.0,
         obs_norm_eps: float = 1e-8,
@@ -317,6 +318,11 @@ class DDPG(Agent):
         self.normalize_observations = normalize_observations
         self.obs_clip = float(obs_norm_clip)
         self.obs_eps = float(obs_norm_eps)
+        # Weight on the actor's pre-tanh saturation penalty. Consumed by TD3's
+        # actor loss; stored on the base so every DeterministicActor agent
+        # round-trips it through checkpoints identically. 0.0 = off (the
+        # textbook DPG objective, which saturates -- see DeterministicActor).
+        self.pre_activation_coef = float(pre_activation_coef)
 
         print(f"{type(self).__name__} agent initialized.")
         print("Noise module hyperparameters:", self.noise_module.hyperparameters())
@@ -495,6 +501,7 @@ class DDPG(Agent):
             "env_obs_size": self.state.buffer_state.experience.observation.shape[2],
             "env_action_size": self.state.buffer_state.experience.action.shape[2],
             "target_policy_noise": float(self.target_policy_noise),
+            "pre_activation_coef": float(self.pre_activation_coef),
             "target_noise_clip": float(self.target_noise_clip),
             "steps_before_learning": int(self.steps_before_learning),
             "steps_between_updates": int(self.steps_between_updates),

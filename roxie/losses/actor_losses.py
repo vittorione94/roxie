@@ -5,6 +5,28 @@ from flax import nnx
 
 from roxie.agents.agent import Agent
 
+# Pre-tanh magnitude past which the saturation penalty starts charging.
+# tanh(1) = 0.76, so the policy keeps the whole useful range of the action
+# space for free and is only pushed back once it heads for the rails, where
+# d(tanh u)/du collapses and the DPG gradient dies. A two-sided u^2 penalty
+# would instead bias every action toward zero, which fights tasks (like mocap
+# position servos) that legitimately need targets near the joint limits.
+PRE_ACTIVATION_THRESHOLD = 1.0
+
+
+def pre_activation_penalty(pre_activation: jnp.ndarray) -> jnp.ndarray:
+    """One-sided hinge on the actor's pre-tanh logits: mean(relu(|u| - 1)^2).
+
+    Counterweight to the deterministic policy gradient, which pushes the logits
+    outward without bound (see `DeterministicActor`'s saturation note). Its
+    gradient grows linearly in the overshoot, so it still bites at |u| ~ 10
+    where the tanh derivative has already underflowed to zero and -dQ/du can no
+    longer pull the policy back on its own.
+    """
+    excess = jax.nn.relu(jnp.abs(pre_activation) - PRE_ACTIVATION_THRESHOLD)
+    return jnp.mean(jnp.square(excess))
+
+
 @nnx.jit
 def ddpg_actor_loss_fn(
     actor_model,
@@ -57,14 +79,22 @@ def td3_actor_loss_fn(
     obs_clip,
     action_low,
     action_high,
+    pre_activation_coef,
 ):
-    """Deterministic policy gradient through the first critic head (TD3)."""
+    """Deterministic policy gradient through the first critic head (TD3), plus
+    a one-sided penalty on the actor's pre-tanh logits.
+
+    Without the penalty term the DPG objective drives the logits out until tanh
+    saturates and the actor gradient underflows to zero, freezing the policy as
+    a bang-bang controller (see `DeterministicActor`). `pre_activation_coef`
+    trades Q against that; 0.0 recovers the textbook TD3 actor loss.
+    """
     obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    actions = actor_model(obs)  # [-1, 1]
+    actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
     actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
     q1, _ = twin_critic(obs, actions)
     actor_loss = -jnp.mean(q1)
-    return actor_loss
+    return actor_loss + pre_activation_coef * pre_activation_penalty(pre_activation)
 
 
 @nnx.jit

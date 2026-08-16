@@ -62,6 +62,57 @@ class TestDeterministicActor:
         out2 = actor(x)
         assert jnp.allclose(out1, out2)
 
+    def test_forward_returns_pre_activation(
+        self, rngs, obs_dim, action_dim, hidden_features, rng_key
+    ):
+        """`forward` exposes the pre-tanh logits, and `__call__` is its action."""
+        actor = DeterministicActor(
+            in_features=obs_dim, features=hidden_features, action_dim=action_dim, rngs=rngs
+        )
+        x = jax.random.normal(rng_key, (8, obs_dim))
+        action, pre_activation = actor.forward(x)
+        assert pre_activation.shape == (8, action_dim)
+        assert jnp.allclose(action, jnp.tanh(pre_activation))
+        assert jnp.allclose(action, actor(x))
+
+    def test_output_init_starts_unsaturated(self, obs_dim, action_dim, rng_key):
+        """The small final-layer init keeps the logits in tanh's linear region.
+
+        Regression guard for the saturation collapse: at the default init scale
+        the policy must start with a live gradient (1 - a^2 near 1), so the
+        pre-activation penalty only has to hold it there.
+        """
+        actor = DeterministicActor(
+            in_features=obs_dim,
+            features=[256, 256],
+            action_dim=action_dim,
+            rngs=nnx.Rngs(params=0, dropout=1),
+            use_layer_norm=True,
+        )
+        x = jax.random.normal(rng_key, (256, obs_dim))
+        action, pre_activation = actor.forward(x)
+        assert jnp.mean(jnp.abs(pre_activation)) < 0.5
+        assert jnp.mean(1.0 - action ** 2) > 0.9
+
+    def test_output_init_scale_controls_logit_magnitude(
+        self, obs_dim, action_dim, rng_key
+    ):
+        def mean_abs_logit(scale):
+            actor = DeterministicActor(
+                in_features=obs_dim,
+                features=[256, 256],
+                action_dim=action_dim,
+                rngs=nnx.Rngs(params=0, dropout=1),
+                use_layer_norm=True,
+                output_init_scale=scale,
+            )
+            return jnp.mean(jnp.abs(actor.forward(jax.random.normal(
+                rng_key, (256, obs_dim)))[1]))
+
+        # variance_scaling scales the VARIANCE, so 100x scale ~ 10x the logits.
+        small, large = mean_abs_logit(0.01), mean_abs_logit(1.0)
+        assert large > 5.0 * small
+
 
 class TestStochasticActor:
     def test_returns_distribution(self, rngs, obs_dim, action_dim, hidden_features, batch_size):

@@ -2,6 +2,7 @@ import copy
 
 import jax
 import jax.numpy as jnp
+import optax
 import pytest
 from flax import nnx
 
@@ -9,7 +10,14 @@ from flax import nnx
 import roxie.agents  # noqa: F401
 from roxie.agents.agent import Agent
 from roxie.agents.sac import LogAlpha
-from roxie.losses.actor_losses import ddpg_actor_loss_fn, ppo_loss_fn, sac_actor_loss_fn, sac_alpha_loss_fn
+from roxie.losses.actor_losses import (
+    ddpg_actor_loss_fn,
+    ppo_loss_fn,
+    pre_activation_penalty,
+    sac_actor_loss_fn,
+    sac_alpha_loss_fn,
+    td3_actor_loss_fn,
+)
 from roxie.losses.critic_losses import ddpg_critic_loss_fn, ppo_critic_loss_fn, sac_critic_loss_fn
 from roxie.models.actors import DeterministicActor, StochasticActor
 from roxie.models.critics import QCritic, VCritic, TwinCritic
@@ -120,6 +128,131 @@ class TestDDPGActorLoss:
             action_bounds["action_high"],
         )
         assert jnp.isfinite(loss)
+
+
+class TestPreActivationPenalty:
+    """The counterweight to DPG's unbounded outward push on the actor logits."""
+
+    def test_free_inside_the_threshold(self):
+        u = jnp.array([[-1.0, -0.4, 0.0, 0.9, 1.0]])
+        assert pre_activation_penalty(u) == 0.0
+
+    def test_grows_quadratically_in_the_overshoot(self):
+        # mean(relu(|u| - 1)^2) over a single element.
+        assert jnp.allclose(pre_activation_penalty(jnp.array([[3.0]])), 4.0)
+        assert jnp.allclose(pre_activation_penalty(jnp.array([[-3.0]])), 4.0)
+
+    def test_gradient_survives_tanh_saturation(self):
+        """The whole point: a live gradient where -dQ/du has underflowed.
+
+        At |u| = 12 the tanh derivative is ~1e-10, so the DPG term can no
+        longer move the policy; the penalty's gradient is linear in the
+        overshoot and still pulls inward.
+        """
+        u = jnp.array([[12.0, -12.0]])
+        assert jnp.mean(1.0 - jnp.tanh(u) ** 2) < 1e-9
+        grad = jax.grad(pre_activation_penalty)(u)
+        # Points back toward zero, with real magnitude.
+        assert jnp.all(grad * jnp.sign(u) > 0)
+        assert jnp.min(jnp.abs(grad)) > 1.0
+
+
+class TestTD3ActorLoss:
+    def _loss(self, actor, critic, samples, norm, bounds, coef):
+        return td3_actor_loss_fn(
+            actor,
+            critic,
+            samples,
+            norm["obs_mean"],
+            norm["obs_std"],
+            norm["obs_clip"],
+            bounds["action_low"],
+            bounds["action_high"],
+            coef,
+        )
+
+    def test_zero_coef_is_plain_dpg(
+        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+    ):
+        loss = self._loss(
+            det_actor, twin_critic, ddpg_samples, norm_params, action_bounds, 0.0
+        )
+        obs = Agent.normalize_obs(
+            ddpg_samples["observations"],
+            norm_params["obs_mean"],
+            norm_params["obs_std"],
+            norm_params["obs_clip"],
+        )
+        q1, _ = twin_critic(obs, det_actor(obs))
+        assert loss.shape == ()
+        assert jnp.allclose(loss, -jnp.mean(q1), atol=1e-5)
+
+    def test_penalty_only_charges_when_saturated(
+        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+    ):
+        """At the default (small) init the logits are inside the threshold, so
+        the penalty is inert; it must bite once the logits are driven out."""
+        base = self._loss(
+            det_actor, twin_critic, ddpg_samples, norm_params, action_bounds, 0.0
+        )
+        unsaturated = self._loss(
+            det_actor, twin_critic, ddpg_samples, norm_params, action_bounds, 1e-2
+        )
+        assert jnp.allclose(base, unsaturated, atol=1e-6)
+
+        saturated = copy.deepcopy(det_actor)
+        params = nnx.state(saturated, nnx.Param)
+        params["output_layer"]["kernel"].value *= 200.0
+        nnx.update(saturated, params)
+        with_penalty = self._loss(
+            saturated, twin_critic, ddpg_samples, norm_params, action_bounds, 1e-2
+        )
+        without = self._loss(
+            saturated, twin_critic, ddpg_samples, norm_params, action_bounds, 0.0
+        )
+        assert with_penalty > without
+
+    def test_gradient_pulls_a_saturated_actor_back(
+        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+    ):
+        """Regression guard for the CMU_006_13 collapse: a saturated actor must
+        still receive a gradient that reduces |pre-activation|."""
+        actor = copy.deepcopy(det_actor)
+        params = nnx.state(actor, nnx.Param)
+        params["output_layer"]["kernel"].value *= 200.0
+        nnx.update(actor, params)
+
+        obs = Agent.normalize_obs(
+            ddpg_samples["observations"],
+            norm_params["obs_mean"],
+            norm_params["obs_std"],
+            norm_params["obs_clip"],
+        )
+        before = jnp.mean(jnp.abs(actor.forward(obs)[1]))
+        assert before > 5.0  # genuinely saturated to start with
+        # ...and deep enough into tanh's flat region that the DPG term is
+        # heavily attenuated (a healthy actor sits around 0.6-0.7 here).
+        assert jnp.mean(1.0 - actor(obs) ** 2) < 0.1
+
+        # Same call shape as TD3._grad_step: differentiate w.r.t. arg 0 with the
+        # critic passed explicitly, so nnx owns its (dropout) rng state.
+        optimizer = nnx.Optimizer(actor, optax.adam(1e-2), wrt=nnx.Param)
+        for _ in range(50):
+            grads = nnx.grad(td3_actor_loss_fn)(
+                actor,
+                twin_critic,
+                ddpg_samples,
+                norm_params["obs_mean"],
+                norm_params["obs_std"],
+                norm_params["obs_clip"],
+                action_bounds["action_low"],
+                action_bounds["action_high"],
+                1e-2,
+            )
+            optimizer.update(actor, grads)
+
+        after = jnp.mean(jnp.abs(actor.forward(obs)[1]))
+        assert after < before
 
 
 class TestDDPGCriticLoss:

@@ -32,6 +32,7 @@ def _grad_step(
     obs_std: jnp.ndarray,
     obs_clip: float,
     update_actor,
+    pre_activation_coef: float,
     n_step: int = 1,
 ):
     """One TD3 step. `obs_mean`/`obs_std` are hoisted in by `_grad_steps` (the
@@ -76,6 +77,7 @@ def _grad_step(
             obs_clip,
             action_low,
             action_high,
+            pre_activation_coef,
         )
         state.actor_optimizer.update(state.actor, actor_grads)
 
@@ -149,6 +151,7 @@ def _grad_steps(
     obs_eps: float,
     obs_clip: float,
     policy_delay: int,
+    pre_activation_coef: float,
     n_step: int = 1,
 ):
     # Hoist the (loop-constant) normalization params out of the scan body.
@@ -177,6 +180,7 @@ def _grad_steps(
             obs_std,
             obs_clip,
             update_actor,
+            pre_activation_coef,
             n_step,
         )
         _, scan_state = nnx.split(st)
@@ -237,6 +241,7 @@ class TD3(DDPG):
             self.obs_eps,
             self.obs_clip,
             self.policy_delay,
+            self.pre_activation_coef,
             n_step=self.n_step,
         )
         return actor_loss, critic_loss

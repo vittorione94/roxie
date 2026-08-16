@@ -6,6 +6,11 @@
 # (replay ratio ~8), buffer 500k, warmup 30k, gamma 0.99, tau 0.005, lr 3e-4.
 #
 # TD3-specific: twin Q critics + delayed actor updates.
+#
+# 2026-08-16: this arm now also carries `pre_activation_coef` + the small
+# actor output init (see below). That is a REAL delta against the other arms,
+# which still run the unpenalized DPG actor loss -- the sweep is no longer a
+# clean algorithm-only A/B until the same fix lands on ddpg/d4pg/td4.
 name: "td3"
 
 args:
@@ -22,12 +27,20 @@ args:
   learning_steps: 128
   n_step: 5
   max_grad_norm: 1
+  # Actor saturation penalty, mean(relu(|u| - 1)^2) on the pre-tanh logits.
+  # The unpenalized run of this exact arm ended with mean |u| = 9.1 and 63% of
+  # action dims past |a| > 0.999 -- a bang-bang controller with a dead
+  # gradient. See td3_mocap.yaml for the full diagnosis.
+  pre_activation_coef: 1e-2
 
 actor:
   _target_: roxie.models.actors.DeterministicActor
   features: [1024, 512, 256]
   use_layer_norm: true
   dropout_rate: 0.
+  # Small final layer (the original DDPG trick): start the logits inside
+  # tanh's linear region rather than near its knee.
+  output_init_scale: 0.01
 
 critic:
   # Instantiated twice behind a TwinCritic.
