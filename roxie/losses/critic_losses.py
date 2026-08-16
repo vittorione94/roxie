@@ -263,20 +263,23 @@ def td4_critic_loss_fn(
 
 @nnx.jit
 def ppo_critic_loss_fn(
-    critic_model, 
+    critic_model,
     observations,
-    values, 
-    advantages, 
+    returns,
 ):
-    """Calculates the MSE loss for the critic using PPO."""
+    """Calculates the MSE loss for the critic using PPO.
+
+    `returns` is the GAE return target `A_raw + V_old`, built by the caller from
+    the *unnormalized* advantage. Do not rebuild it here from the advantage the
+    actor consumes: that one is standardized to zero mean / unit variance, which
+    is fine for the policy gradient but makes an unfittable regression target --
+    the critic would be chasing its own previous output plus unit-variance
+    noise, flooring this loss at ~1.0 permanently.
+    """
     v_t = critic_model(observations)[:, :-1, 0] # shape (NUM_ENVS, BATCH_SIZE, 1)
-    
-    # values --> (NUM_ENVS, BATCH_SIZE)
-    # advantages --> (NUM_ENVS, BATCH_SIZE -1 )
 
-    target_values = values[:, :-1] + advantages
-
-    critic_loss = jnp.mean((v_t - target_values) ** 2)
+    # returns --> (NUM_ENVS, BATCH_SIZE - 1)
+    critic_loss = jnp.mean((v_t - returns) ** 2)
     return critic_loss
 
 

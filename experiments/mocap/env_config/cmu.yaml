@@ -18,7 +18,21 @@ config:
   foot_contact_force_thresh: 1.0
   reward_termination:
     enabled: true
-    min_tracking_frac: 0.5
+    # Floor = min_tracking_frac * max_track, with max_track = 0.95 (the sum of
+    # the tracking weights), so 0.5 -> 0.475 and 0.4 -> 0.380.
+    #
+    # Lowered from 0.5 after instrumenting terminations: once the root reward was
+    # split (run 2026-08-14_19-55-11), tracking-collapse became ~77% of episode
+    # ends and stayed there for 40+ epochs, while root drift fell 34% -> 21% and
+    # `reward/pose` held at ~0.77. Typical `tracking` runs ~0.63 against the old
+    # 0.475 floor, i.e. episodes die on DIPS rather than sustained poor tracking.
+    #
+    # This is as much a diagnostic as a fix: if episode length scales with this
+    # number, termination strictness is what caps the run; if it does not, the
+    # policy genuinely cannot sustain tracking and the reward/observation design
+    # is the next place to look. Loosening a threshold does not help if failures
+    # are excursions -- it only delays them.
+    min_tracking_frac: 0.4
   root_termination:
     enabled: true
     max_dist: 0.25

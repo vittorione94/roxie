@@ -53,6 +53,19 @@ def main(cfg: DictConfig):
         # headroom for its solver/collision scratch. Don't disable preallocation
         # instead — that fragments and OOMs the large replay-buffer alloc.
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
+        # Use CUDA's own async pool instead of XLA's BFC allocator. BFC caps out
+        # on FRAGMENTATION, not on a leak: run 2026-08-13_23-03-23 died at epoch
+        # 131 requesting a contiguous 2.02 GiB while GPU memory had been flat at
+        # 12.5-14.4 GB and mem/live_arrays flat at ~1075 for the whole run (the
+        # allocator dump showed the classic free/used checkerboard). What made it
+        # bite there and not in the otherwise-identical 737-epoch run before it
+        # is allocation CHURN: `ppo/steps_per_rollout` had climbed 5 -> 67 as the
+        # KL early stop released, i.e. ~33x more alloc/free cycles per rollout.
+        # `cuda_async` still pools (so it does not pay a cudaMalloc per
+        # allocation the way "platform" does) but the driver pool tolerates that
+        # churn. Overridable: setdefault, so XLA_PYTHON_CLIENT_ALLOCATOR=default
+        # in the environment restores BFC if an agent regresses.
+        os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
     # XLA GPU autotuning hangs this machine's RTX 5080 (Blackwell) — required
     # for EVERY GPU run regardless of physics backend; unused/harmless on CPU.
     os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")

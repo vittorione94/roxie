@@ -51,6 +51,7 @@ from examples.mocap.mocap_tracking import (
     CMU_BODY_NAMES,
     FOOT_TOUCH_SENSORS,
     _configure_collisions,
+    resolve_collision_mode,
 )
 from roxie.environment.envpool_adapter import EnvPoolWrapper
 from roxie.environment.loader import EnvBundle
@@ -591,7 +592,7 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
                              the physical core count, unlike the GPU backends.
       num_threads (int?):    stepping threads; null = min(parallel_envs, cores).
       test_episodes (int):   eval pool size; must match trainer.test_episodes.
-      seed, clip_ids, self_collisions: as in the GPU builder.
+      seed, clip_ids, collisions: as in the GPU builder.
 
     ``gpu_clip_budget`` and the Warp budgets (naconmax/njmax/naccdmax,
     graph_mode) do not apply: native MuJoCo allocates contacts dynamically and
@@ -618,7 +619,7 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
 
     mj_model, _ = build_cmu_humanoid()
     mj_model.opt.timestep = config.sim_dt
-    _configure_collisions(mj_model, cfg_env.get("self_collisions", True))
+    _configure_collisions(mj_model, resolve_collision_mode(cfg_env))
 
     clip_ids = list(cfg_env.clip_ids) if cfg_env.get("clip_ids") else None
     dataset = load_cmu_clips(mj_model, clip_ids=clip_ids, ctrl_dt=config.ctrl_dt)

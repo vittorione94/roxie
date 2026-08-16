@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 import mujoco
 
 import copy
-from examples.mocap.mocap_tracking import MocapTrackingEnv
+from examples.mocap.mocap_tracking import MocapTrackingEnv, resolve_collision_mode
 
 # The env has no hard-coded defaults: its config_dict is assembled from the
 # Hydra config groups under experiments/mocap/ — the env.config block (core
@@ -79,7 +79,7 @@ def load_mocap_env(
     naconmax: int | None = None,
     njmax: int | None = None,
     naccdmax: int | None = None,
-    self_collisions: bool = True,
+    collisions: str = "full",
     graph_mode: str | None = None,
     clip_swap: bool = True,
     clip_seed: int = 0,
@@ -98,7 +98,7 @@ def load_mocap_env(
         mj_model=mj_model, dataset=dataset, config=config,
         gpu_clip_budget=gpu_clip_budget,
         impl=impl, naconmax=naconmax, njmax=njmax, naccdmax=naccdmax,
-        self_collisions=self_collisions, graph_mode=graph_mode,
+        collisions=collisions, graph_mode=graph_mode,
         clip_swap=clip_swap, clip_seed=clip_seed,
         actuation=actuation, actuation_kp_scale=actuation_kp_scale,
         actuation_kv_ratio=actuation_kv_ratio,
@@ -137,14 +137,14 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     clip pool: loading every clip bakes the full reference arrays into the
     jitted step as constants and can exhaust GPU memory.
 
-    With self-collisions enabled the per-world contact count is higher (~15 at
-    peak on real mocap poses vs. a handful for ground-only), so the Warp contact
-    arena is sized with extra headroom. On Warp memory stays linear in the
+    The Warp budgets are sized per collision mode (``env.collisions``: "full",
+    "ground" or "feet" — see ``_configure_collisions``), since that decides how
+    many geom pairs can ever be in contact. On Warp memory stays linear in the
     budget (naconmax/njmax) and does not blow up with the number of *potential*
     geom pairs. NOTE: the classic JAX/MJX backend ignores naconmax and instead
-    statically sizes its contact arrays to all potential pairs (~980 here), so
-    self-collisions are markedly heavier there — prefer ground-only
-    (self_collisions=false) for memory-constrained impl=jax runs.
+    statically sizes its contact arrays to all potential pairs (~980 for "full"
+    vs ~45 for "ground"), so self-collision is markedly heavier there — prefer
+    "ground" for memory-constrained impl=jax runs.
 
     ``naccdmax`` sizes the GJK/EPA convex-narrowphase scratch and defaults (in
     mujoco_warp) to the full ``naconmax``. For this humanoid only the 2 hand
@@ -157,20 +157,22 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     naconmax = cfg_env.get("naconmax", None)
     njmax = cfg_env.get("njmax", None)
     naccdmax = cfg_env.get("naccdmax", None)
-    self_collisions = cfg_env.get("self_collisions", True)
+    collisions = resolve_collision_mode(cfg_env)
+    # Per-mode (naconmax_per_world, njmax) for training. naconmax must cover the
+    # BROADPHASE candidate pairs (AABB overlaps), not just the actual contacts:
+    # with self-collision many limb AABBs overlap, so broadphase peaks near
+    # ~48/world (64 leaves headroom). "ground" only ever pairs geoms with the
+    # floor plane, whose AABB spans the world, so its candidates are the ~45
+    # humanoid geoms; "feet" restricts that to the 13 whitelisted ones. njmax is
+    # the per-world constraint budget (nefc): each contact adds several friction
+    # rows on top of the joint limits, so self-collision peaks near ~180.
+    _WARP_BUDGETS = {"full": (64, 256), "ground": (48, 192), "feet": (16, 128)}
     if mode == "train" and impl == "warp":
-        # naconmax must cover the BROADPHASE candidate pairs (AABB overlaps),
-        # not just the ~15 actual contacts: with self-collision many limb AABBs
-        # overlap, so broadphase peaks near ~48/world (vs a handful ground-only).
-        # 64 leaves headroom over the observed peak.
-        per_world = 64 if self_collisions else 16
+        per_world, per_world_njmax = _WARP_BUDGETS[collisions]
         if naconmax is None:
             naconmax = int(cfg_env.parallel_envs) * per_world
         if njmax is None:
-            # Per-world constraint budget (nefc). Each contact adds several
-            # friction rows on top of joint limits, so self-collision peaks
-            # near ~180; 256 leaves headroom. Ground-only stays well under 128.
-            njmax = 256 if self_collisions else 128
+            njmax = per_world_njmax
         if naccdmax is None:
             # Only the hand ellipsoids hit the EPA path (max ~2/world, almost
             # never); 4/world is generous and keeps the EPA scratch ~8x smaller
@@ -180,10 +182,11 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         # Single-world playback: mujoco_warp's own defaults are too small for
         # self-collision (broadphase peaks ~52, nefc ~88 for one world). Memory
         # is irrelevant here, so size generously above those peaks.
+        per_world, per_world_njmax = _WARP_BUDGETS[collisions]
         if naconmax is None:
-            naconmax = 128 if self_collisions else 32
+            naconmax = 2 * per_world
         if njmax is None:
-            njmax = 256 if self_collisions else 128
+            njmax = per_world_njmax
         if naccdmax is None:
             naccdmax = 16
 
@@ -218,7 +221,7 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         naconmax=naconmax,
         njmax=njmax,
         naccdmax=naccdmax,
-        self_collisions=self_collisions,
+        collisions=collisions,
         graph_mode=graph_mode,
         # clip_swap=False pins the initial gpu_clip_budget subset for the whole
         # run (fixed-subset training); the pick is seeded by env.seed so the
