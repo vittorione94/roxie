@@ -2,8 +2,10 @@
 # historical champion stack — so read the others against it.
 #
 # SWEEP INVARIANTS (see ddpg_sweep.yaml for the full list): features
-# [1024, 512, 256] + layer norm, batch 512 x 128 grad steps / 8k env steps
-# (replay ratio ~8), buffer 500k, warmup 30k, gamma 0.99, tau 0.005, lr 3e-4.
+# [1024, 512, 256] + layer norm, batch 512 x 64 grad steps / 8k env steps
+# (replay ratio ~4), buffer 500k, warmup 30k, gamma 0.99, tau 0.005, lr 3e-4.
+# NOTE: the ratio was 8 (128 grad steps) for every arm before 2026-08-16 — this
+# arm is now off-invariant on that axis too until the others follow.
 #
 # TD3-specific: twin Q critics + delayed actor updates.
 #
@@ -18,20 +20,50 @@ args:
   tau: 0.005
   actor_learning_rate: 3e-4
   critic_learning_rate: 3e-4
-  target_policy_noise: 0.05
-  target_noise_clip: 0.15
+  # 2026-08-16: restored to the TD3 paper's 0.2 / 0.5. At the previous
+  # 0.05 / 0.15 the smoothing kernel was ~4x narrower than the critic's own
+  # action resolution, so target policy smoothing -- the mechanism that stops
+  # the critic growing sharp peaks for the actor to chase -- was effectively
+  # off. Critic loss climbing monotonically (1.7 -> 11.9 over 17 epochs) while
+  # the score crawled is the signature. Watch `td3/twin_gap` and
+  # `td3/target_smooth_clip_frac` to confirm the smoothing is live.
+  target_policy_noise: 0.2
+  target_noise_clip: 0.5
   policy_delay: 2                 # actor + target updates every 2 critic steps
   memory_warmup: 30_000
   steps_before_learning: 30_000
   steps_between_updates: 8_000
-  learning_steps: 128
+  # 2026-08-16: 128 -> 64 (replay ratio 8 -> 4). The campaign tested this lever
+  # UPWARDS three times and got three nulls (RR 8 -> 33 = 4x the gradients for
+  # no per-step gain); downwards was never tried, so the ratio was simply
+  # over-provisioned. It is not free wall-clock: at ~1M steps/epoch the sim
+  # floor is ~45s (PPO, whose learner is ~3s of work, runs 47.8s epochs on this
+  # exact env), so TD3's 61.7s epochs are ~17s of learner — halving it should
+  # land near ~53s. Corroborating evidence that the extra gradients were not
+  # converting: through 17 epochs `td3/q_buffer` climbed 3.2 -> 9.9 and
+  # `td3/twin_gap` 0.27 -> 1.11 with `test/score_per_step` pinned flat at 0.545,
+  # i.e. the surplus updates went into value inflation, not tracking quality.
+  # NEXT RUNG if this reads null: 32 (RR 2), which would put the epoch at ~49s,
+  # level with PPO. Watch `td3/updates_per_env_step` (0.016 -> 0.008) to confirm
+  # the change took, and `td3/td_abs` for the critic falling behind its target.
+  learning_steps: 64
   n_step: 5
   max_grad_norm: 1
-  # Actor saturation penalty, mean(relu(|u| - 1)^2) on the pre-tanh logits.
-  # The unpenalized run of this exact arm ended with mean |u| = 9.1 and 63% of
-  # action dims past |a| > 0.999 -- a bang-bang controller with a dead
-  # gradient. See td3_mocap.yaml for the full diagnosis.
-  pre_activation_coef: 1e-2
+  # Actor saturation penalty on the pre-tanh logits: relu(|u| - 1)^2 summed
+  # over action dims, averaged over the batch. The unpenalized run of this exact
+  # arm ended with mean |u| = 9.1 and 63% of action dims past |a| > 0.999 -- a
+  # bang-bang controller with a dead gradient. See td3_mocap.yaml.
+  #
+  # 2026-08-16: raised 1e-2 -> 1e-1, and the penalty's reduction was fixed to
+  # sum (not mean) over the 56 action dims, so the effective strength is ~560x
+  # what it was. At 1e-2-with-mean the checkpointed actor was STILL saturating
+  # -- median |u| = 2.3, 40% of dims past |a| > 0.99, median d(tanh)/du = 0.037
+  # -- because the penalty gradient (coef/56 * 2 * excess ~ 5e-4) only beat the
+  # DPG term when |dQ/da| < 0.002, and Q was ~11. The hinge was present but
+  # inert. Deterministic eval scoring BELOW the noisy training policy (19 vs 5)
+  # was the visible symptom: clipping a+noise pulls railed actions back inside,
+  # so training measured a softer policy than eval deployed.
+  pre_activation_coef: 1e-1
 
 actor:
   _target_: roxie.models.actors.DeterministicActor

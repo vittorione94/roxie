@@ -12,6 +12,13 @@ from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
 from roxie.models.actors import deterministic_action
 
+# Seed for the evaluation reset keys. Held constant across epochs AND across
+# runs so every eval rollout starts from the same fixed set of states: test
+# curves are then comparable epoch-to-epoch within a run and arm-to-arm across
+# a sweep. Distinct from any training seed so eval starts are never a subset of
+# what the policy trained on by construction.
+_EVAL_SEED = 12345
+
 
 def _agent_replay_add(agent, buffer_state, transitions):
     """Add a (B, ...) batch through the agent's `replay_add` when it has one
@@ -604,11 +611,32 @@ class Trainer:
         return eval_fn
 
     def _test(self, rng, v_reset, v_step):
+        """Run the held-out eval rollouts. `rng` is accepted for call-site
+        symmetry but intentionally unused — see the fixed reset keys below."""
+        del rng
         num_tests = int(self.test_episodes)
         max_steps = int(getattr(self.test_environment, "max_episode_steps", 1000))
 
-        rng, keys_rng = jax.random.split(rng, 2)
-        states = v_reset(jax.random.split(keys_rng, num_tests))
+        # FIXED reset keys, not a fresh draw off `rng`. The eval env keeps its
+        # stochastic start phase (see the mocap loader's eval-env note), so the
+        # keys are what make eval reproducible: the same `num_tests` start states
+        # every epoch means a change in test/score is a change in the POLICY, not
+        # a different draw of start frames. Redrawing per epoch would put the
+        # start-state spread and the policy improvement into the same number.
+        states = v_reset(jax.random.split(jax.random.PRNGKey(_EVAL_SEED), num_tests))
+
+        # How many GENUINELY distinct states the eval batch starts from. The env
+        # decides its own reset stochasticity in Python (the mocap loader used to
+        # pin `random_start = False` on its eval copy), and none of that reaches
+        # the logged hydra config — every run recorded `random_start: true`
+        # whether eval spread its starts or collapsed all `test_episodes` onto
+        # frame 0. Runs were therefore not self-describing: you could not tell
+        # from a run's artifacts what protocol its test/* numbers meant.
+        # `test/length/std` cannot stand in for this — 0.00 means a degenerate
+        # eval OR a policy saturating the episode cap, which are opposite news.
+        # 1 here means `test_episodes` is buying exactly one sample.
+        start_obs = np.asarray(states.env_state.obs).reshape(num_tests, -1)
+        logger.store("test/distinct_starts", float(len(np.unique(start_obs, axis=0))))
 
         if getattr(self, "_eval_fn", None) is None:
             self._eval_fn = self._make_eval_fn(v_step, num_tests, max_steps)
@@ -626,6 +654,16 @@ class Trainer:
         logger.store("test/score/std", float(np.std(scores_np)))
         logger.store("test/length", float(np.mean(lengths_np)))
         logger.store("test/length/std", float(np.std(lengths_np)))
+        # Episode return is a SUM, so with spread start phases it is bounded by
+        # how much clip was left at reset — a policy starting late in a
+        # non-cyclic clip cannot score what a frame-0 start can, however well it
+        # tracks. The per-step rate divides that out: it is start-phase
+        # invariant, and it is the number to compare against runs recorded under
+        # the old frame-0-only eval, whose `test/score` is on a different scale.
+        logger.store(
+            "test/score_per_step",
+            float(np.mean(scores_np / np.maximum(lengths_np, 1))),
+        )
 
     # ------------------------------------------------------------------
     # EnvPool (CPU) training path
@@ -913,6 +951,14 @@ class Trainer:
                         logger.store(k, total / metric_iters)
                 if noise_iters > 0:
                     logger.store("noise/per_joint_abs", noise_abs_sum / noise_iters)
+                # Same optional per-agent diagnostics hook the MJX loop drains
+                # (PPO's trust-region metrics, TD3's saturation/value metrics).
+                # It was missing here, so the CPU path silently logged none of
+                # them; agents without the hook still contribute nothing.
+                pop_diagnostics = getattr(agent, "pop_diagnostics", None)
+                if pop_diagnostics is not None:
+                    for k, v in pop_diagnostics().items():
+                        logger.store(k, float(v))
                 for k, v in logger.gpu_stats().items():
                     logger.store(k, v)
                 logger.dump(step=self.steps)

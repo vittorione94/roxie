@@ -634,14 +634,14 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         seed=seed,
         num_threads=num_threads,
     )
-    # Deterministic eval config (mirrors the GPU loader): disable the stochastic
-    # reset knobs so every test episode starts at frame 0 with no state noise —
-    # otherwise even a single-clip run reports nonzero test std for a
-    # deterministic policy. The training pool keeps the original config.
+    # Reproducible eval config (mirrors the GPU loader): zero the state noise but
+    # KEEP `random_start`, so the test pool spans a spread of clip phases instead
+    # of collapsing every episode onto frame 0 (which made 100 eval envs report
+    # one sample). Reproducibility comes from the fixed `seed` below, which pins
+    # the same start phases every epoch. The training pool keeps the original.
     import copy
 
     eval_config = copy.deepcopy(config)
-    eval_config.random_start = False
     eval_config.reset_noise_scale = 0.0
     test_pool = MocapCpuPool(
         mj_model, dataset, eval_config,

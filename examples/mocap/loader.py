@@ -108,18 +108,20 @@ def load_mocap_env(
 
     # Evaluation env: a shallow copy of the training env, so it SHARES the heavy
     # GPU arrays (reference clips + mjx model) — nothing is loaded twice — but
-    # resets DETERMINISTICALLY. The training config resets stochastically
-    # (`random_start` picks a random clip phase, `reset_noise_scale` jitters the
-    # initial state), which is right for exploration but wrong for eval: it makes
-    # every test episode start somewhere different, so even a single-clip run with
-    # a deterministic policy reports nonzero test std. Override just those two
-    # knobs on a copied config (the training env keeps the original) so eval
-    # starts at frame 0 with no noise: single-clip eval is now exactly
-    # reproducible (0 std), and multi-clip eval still samples clips at reset but
-    # each rollout is deterministic.
+    # resets REPRODUCIBLY. Only `reset_noise_scale` is zeroed here; `random_start`
+    # is deliberately left ON.
+    #
+    # Reproducibility comes from the trainer holding the eval reset keys FIXED
+    # across epochs (see `Trainer._test`), not from collapsing every episode onto
+    # frame 0. Pinning the phase as well used to make all `test_episodes` rollouts
+    # byte-identical — `test/length/std` was exactly 0.00 every epoch — so 100
+    # eval envs bought one sample, and the whole test curve was a knife-edge
+    # measurement of a single start state (TD3's bounced 3.0 -> 9.3 -> 2.6 on an
+    # otherwise monotone policy). Keeping the phase spread and fixing the keys
+    # gives the best of both: a real distribution over the clip, identical start
+    # states every epoch, so epoch-to-epoch movement is pure policy change.
     eval_env = copy.copy(env)
     eval_config = copy.deepcopy(config)
-    eval_config.random_start = False
     eval_config.reset_noise_scale = 0.0
     eval_env._config = eval_config
     test_wrapper = TerminationWrapper(eval_env, max_episode_steps=config.episode_length)

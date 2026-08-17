@@ -138,9 +138,31 @@ class TestPreActivationPenalty:
         assert pre_activation_penalty(u) == 0.0
 
     def test_grows_quadratically_in_the_overshoot(self):
-        # mean(relu(|u| - 1)^2) over a single element.
+        # relu(|u| - 1)^2 over a single element.
         assert jnp.allclose(pre_activation_penalty(jnp.array([[3.0]])), 4.0)
         assert jnp.allclose(pre_activation_penalty(jnp.array([[-3.0]])), 4.0)
+
+    def test_scales_with_action_dim_not_averaged_over_it(self):
+        """The reduction is sum-over-dims, mean-over-batch — NOT a plain mean.
+
+        Averaging over action dims silently divided `pre_activation_coef` by
+        action_dim (56 on the CMU humanoid), which is what made the hinge inert
+        in the CMU_006_13 run while still looking configured. Guard it: the
+        per-logit gradient must not depend on how many logits there are.
+        """
+        one = jnp.array([[3.0]])
+        many = jnp.full((1, 56), 3.0)
+        assert jnp.allclose(pre_activation_penalty(many), 56.0 * 4.0)
+        g_one = jax.grad(pre_activation_penalty)(one)
+        g_many = jax.grad(pre_activation_penalty)(many)
+        assert jnp.allclose(g_one[0, 0], g_many[0, 0])
+
+    def test_batch_is_averaged_not_summed(self):
+        """Batch size must not change the penalty's weight against the DPG term
+        (which is itself a batch mean)."""
+        small = jnp.full((4, 3), 3.0)
+        large = jnp.full((512, 3), 3.0)
+        assert jnp.allclose(pre_activation_penalty(small), pre_activation_penalty(large))
 
     def test_gradient_survives_tanh_saturation(self):
         """The whole point: a live gradient where -dQ/du has underflowed.
@@ -158,7 +180,9 @@ class TestPreActivationPenalty:
 
 
 class TestTD3ActorLoss:
-    def _loss(self, actor, critic, samples, norm, bounds, coef):
+    def _call(self, actor, critic, samples, norm, bounds, coef):
+        """Returns the full `(loss, aux)` pair the agent differentiates with
+        `has_aux=True`."""
         return td3_actor_loss_fn(
             actor,
             critic,
@@ -170,6 +194,9 @@ class TestTD3ActorLoss:
             bounds["action_high"],
             coef,
         )
+
+    def _loss(self, actor, critic, samples, norm, bounds, coef):
+        return self._call(actor, critic, samples, norm, bounds, coef)[0]
 
     def test_zero_coef_is_plain_dpg(
         self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
@@ -238,7 +265,7 @@ class TestTD3ActorLoss:
         # critic passed explicitly, so nnx owns its (dropout) rng state.
         optimizer = nnx.Optimizer(actor, optax.adam(1e-2), wrt=nnx.Param)
         for _ in range(50):
-            grads = nnx.grad(td3_actor_loss_fn)(
+            grads, _aux = nnx.grad(td3_actor_loss_fn, has_aux=True)(
                 actor,
                 twin_critic,
                 ddpg_samples,
@@ -253,6 +280,47 @@ class TestTD3ActorLoss:
 
         after = jnp.mean(jnp.abs(actor.forward(obs)[1]))
         assert after < before
+
+
+class TestTD3ActorDiagnostics:
+    """The `td3/` saturation metrics must move BEFORE the score does — that is
+    the whole reason they exist, so pin their direction."""
+
+    def _aux(self, actor, critic, samples, norm, bounds):
+        return TestTD3ActorLoss()._call(actor, critic, samples, norm, bounds, 1e-2)[1]
+
+    def test_healthy_actor_reports_live_gradient(
+        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+    ):
+        aux = self._aux(det_actor, twin_critic, ddpg_samples, norm_params, action_bounds)
+        # Small output init keeps the logits in tanh's linear region.
+        assert float(aux["pre_act_abs"]) < 1.0
+        assert float(aux["tanh_grad"]) > 0.5
+        assert float(aux["sat_frac"]) < 0.05
+        assert float(aux["pre_act_penalty"]) == 0.0
+
+    def test_saturated_actor_is_flagged(
+        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+    ):
+        actor = copy.deepcopy(det_actor)
+        params = nnx.state(actor, nnx.Param)
+        params["output_layer"]["kernel"].value *= 200.0
+        nnx.update(actor, params)
+
+        healthy = self._aux(
+            det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+        )
+        saturated = self._aux(
+            actor, twin_critic, ddpg_samples, norm_params, action_bounds
+        )
+        assert saturated["pre_act_abs"] > healthy["pre_act_abs"]
+        assert saturated["pre_act_max"] >= saturated["pre_act_abs"]
+        # Healthy is <0.05 (asserted above), so 0.5 separates the two regimes
+        # with room to spare without pinning the fixture's exact geometry.
+        assert float(saturated["sat_frac"]) > 0.5
+        # The dead-gradient signature: this is the number to watch in the logs.
+        assert float(saturated["tanh_grad"]) < 0.05
+        assert float(saturated["pre_act_penalty"]) > 0.0
 
 
 class TestDDPGCriticLoss:

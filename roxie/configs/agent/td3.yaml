@@ -13,10 +13,15 @@ args:
   steps_between_updates: 400
   learning_steps: 100
   max_grad_norm: 1
-  # Penalty on the actor's pre-tanh logits, mean(relu(|u| - 1)^2). Without it
-  # the DPG objective drives the logits out until tanh saturates and the actor
-  # gradient underflows to zero. See DeterministicActor's saturation note.
-  pre_activation_coef: 1e-2
+  # Penalty on the actor's pre-tanh logits: relu(|u| - 1)^2 summed over action
+  # dims, averaged over the batch. Without it the DPG objective drives the
+  # logits out until tanh saturates and the actor gradient underflows to zero.
+  # See DeterministicActor's saturation note.
+  #
+  # Watch `td3/tanh_grad` and `td3/sat_frac` to tune this: if tanh_grad drifts
+  # toward 0 the coefficient is too small, if it pins near 1 (and score stalls)
+  # it is too large and the policy can no longer reach the action limits.
+  pre_activation_coef: 1e-1
 
 actor:
   _target_: roxie.models.actors.DeterministicActor
