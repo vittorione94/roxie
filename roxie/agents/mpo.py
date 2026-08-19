@@ -106,7 +106,7 @@ def _mpo_grad_step(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    # 1. Critic update (policy evaluation under the target policy).
+    # Critic update: policy evaluation under the target policy.
     critic_loss, critic_grads = nnx.value_and_grad(mpo_critic_loss_fn)(
         state.critic,
         state.target_actor,
@@ -120,7 +120,7 @@ def _mpo_grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # 2. Actor + dual update (E-step + M-step). Differentiate jointly w.r.t. the
+    # Actor + dual update (E-step + M-step), differentiated jointly w.r.t. the
     # policy and the Lagrange duals.
     (actor_loss, aux), (actor_grads, dual_grads) = nnx.value_and_grad(
         mpo_actor_loss_fn, argnums=(0, 1), has_aux=True
@@ -141,8 +141,8 @@ def _mpo_grad_step(
     state.actor_optimizer.update(state.actor, actor_grads)
     dual_optimizer.update(dual_params, dual_grads)
 
-    # 3. Soft-update both target networks. The target actor is the "old" policy
-    # the E-step samples from, so it tracks the online policy slowly.
+    # Soft-update both target networks. The target actor is the "old" policy the
+    # E-step samples from, so it tracks the online policy slowly.
     new_actor_tensors = nnx.state(state.actor, nnx.Param)
     old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
     nnx.update(
@@ -171,9 +171,9 @@ def _mpo_grad_step(
 
 
 # Fused N-step update. The body is compiled once and run `n_steps` times
-# on-device via `lax.scan` (instead of the Python loop this used to be, which
-# paid a full host dispatch + a full replay-buffer copy per gradient step).
-# The Lagrange duals and their optimizer ride along in the scan carry alongside
+# on-device via `lax.scan`, so a burst costs one host dispatch rather than one per
+# gradient step. The Lagrange duals and their optimizer ride along in the carry
+# alongside
 # the train state; `buffer_state` and the normalization params are loop-constant.
 @functools.partial(
     nnx.jit,
@@ -181,10 +181,9 @@ def _mpo_grad_step(
         "gamma", "tau", "replay_sample_fn", "num_action_samples", "n_steps",
         "normalize",
     ),
-    # Donate the train state (arg 0): its large read-only replay buffer is
-    # threaded unchanged through the scan, so without donation XLA allocates a
-    # full second copy of the buffer every update. The caller reassigns
-    # self.state from the result, so donating is safe.
+    # Donate the train state (arg 0): its large read-only replay buffer is threaded
+    # unchanged through the scan, so without donation XLA allocates a full second
+    # copy of it every update. The caller reassigns self.state from the result.
     donate_argnums=(0,),
 )
 def _mpo_grad_steps(

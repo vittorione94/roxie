@@ -307,7 +307,7 @@ class WandbBackend(Backend):
     """
 
     def __init__(self, project=None, entity=None, name=None, group=None,
-                 tags=None, mode="online", config=None, dir=None,
+                 job_type=None, tags=None, mode="online", config=None, dir=None,
                  relogin=True, **kwargs):
         try:
             import wandb
@@ -318,13 +318,11 @@ class WandbBackend(Backend):
                 "logging.wandb.enabled)."
             ) from e
         self._wandb = wandb
-        # Force an interactive re-authentication before the run starts. On a
-        # desktop with several wandb accounts the cached netrc credentials would
-        # otherwise silently pick whichever was last used, sending the run to the
-        # wrong account; ``relogin`` re-prompts for the API key every time so the
-        # account is chosen deliberately. Skipped when WANDB_API_KEY is set (CI)
-        # or offline/disabled modes, where no auth is needed. Set relogin=False
-        # to trust the cached login instead.
+        # Force an interactive re-authentication before the run starts: with
+        # several wandb accounts, cached netrc credentials would otherwise
+        # silently pick whichever was used last and send the run to the wrong
+        # account. Skipped when WANDB_API_KEY is set (CI) and in
+        # offline/disabled modes; set relogin=False to trust the cached login.
         needs_auth = relogin and mode not in ("offline", "disabled") \
             and not os.environ.get("WANDB_API_KEY")
         if needs_auth:
@@ -334,6 +332,11 @@ class WandbBackend(Backend):
             entity=entity,
             name=name,
             group=group,
+            # `group` and `job_type` are the two axes a report groups runs by —
+            # the release benchmark sets them to the task and the backend cell,
+            # so roxie/report.py can rebuild its panel grids from the project
+            # alone. Both are plain run metadata; None just leaves them unset.
+            job_type=job_type,
             tags=list(tags) if tags else None,
             mode=mode,
             config=config,
@@ -365,7 +368,6 @@ class Logger:
     def __init__(self, path=None, width=60, script_path=None, backends=None):
         self.path = path or str(time.time())
 
-        # Save the launch script.
         if script_path:
             with open(script_path, "r") as script_file:
                 script = script_file.read()
@@ -378,10 +380,9 @@ class Logger:
                     config_file.write(script)
                 log(f"Script file saved to {script_path}")
 
-        # The run config is NOT dumped here: Hydra already writes the fully
-        # composed, resolved config to ``<run>/.hydra/config.yaml`` (which is
-        # what play.py reads). Writing a second top-level ``config.yaml`` made
-        # two near-identical files that silently diverged when edited.
+        # The run config is deliberately NOT dumped here: Hydra already writes the
+        # fully composed, resolved config to ``<run>/.hydra/config.yaml``, which is
+        # what play.py reads. A second copy would only diverge from it.
 
         self.stat_keys = set()
         self.epoch_dict = {}
@@ -415,7 +416,6 @@ class Logger:
         when omitted it falls back to a monotonic epoch counter.
         """
 
-        # Compute statistics if needed.
         keys = list(self.epoch_dict.keys())
         for key in keys:
             values = self.epoch_dict[key]

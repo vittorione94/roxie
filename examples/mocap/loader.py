@@ -106,32 +106,26 @@ def load_mocap_env(
     env._xml_path = xml_path
     train_wrapper = TerminationWrapper(env, max_episode_steps=config.episode_length)
 
-    # Evaluation env: a shallow copy of the training env, so it SHARES the heavy
-    # GPU arrays (reference clips + mjx model) — nothing is loaded twice — but
-    # runs the CANONICAL EVAL PROTOCOL:
+    # Evaluation env: a shallow copy of the training env, so it SHARES the heavy GPU
+    # arrays (reference clips + mjx model) rather than loading them twice, but runs
+    # the canonical eval protocol:
     #
     #     start at frame 0, no reset noise, run the clip to its END.
     #
-    # This is the task as stated — "track this clip" — not a sample of it, and it
-    # is the protocol every agent is scored under, so numbers are comparable
-    # across agents, across runs, and against playback (`play.py`/`native_reset`
-    # start at frame 0 too, so what you watch is what the metric measured).
+    # This is the task as stated — "track this clip" — not a sample of it, so numbers
+    # are comparable across agents, across runs, and against playback, which also
+    # starts at frame 0. Two choices here are deliberate:
     #
-    # Two things are deliberate and must not be "fixed" back:
-    #
-    # * `random_start = False`. Sampling a random phase and running 1000 steps
-    #   measures a different, easier task: it skips the clip's opening and
-    #   truncates before its end, and the score becomes a sum over however much
-    #   clip happened to be left, so it is not comparable between clips or
-    #   protocols. It also hides exactly the failure playback exposes — phase 0
-    #   is the least-visited state in a non-cyclic clip (every phase k>0 is
-    #   reached by reset AND by continuation from k-1; phase 0 only by reset),
-    #   so a policy can score 1000-step rollouts from mid-clip while collapsing
-    #   in 39 steps from frame 0.
-    # * the episode cap is the LONGEST CLIP, not `config.episode_length`. Capping
-    #   at 1000 truncates any clip longer than that, so "ran the whole clip" and
-    #   "hit the cap" become indistinguishable. Each clip still ends at its own
-    #   natural end via the `clip_truncated` rule in `step`.
+    # * `random_start = False`. Sampling a random phase measures a different, easier
+    #   task: it skips the clip's opening, truncates before its end, and makes the
+    #   score a sum over however much clip happened to be left — not comparable
+    #   between clips or protocols. It also hides the failure playback exposes, since
+    #   phase 0 is the least-visited state in a non-cyclic clip (every phase k>0 is
+    #   reached both by reset and by continuation from k-1; phase 0 only by reset).
+    # * the episode cap is the LONGEST CLIP, not `config.episode_length`. A fixed cap
+    #   truncates any clip longer than it, making "ran the whole clip" and "hit the
+    #   cap" indistinguishable. Each clip still ends at its own natural end via the
+    #   `clip_truncated` rule in `step`.
     eval_env = copy.copy(env)
     eval_config = copy.deepcopy(config)
     eval_config.random_start = False
@@ -177,13 +171,12 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     naccdmax = cfg_env.get("naccdmax", None)
     collisions = resolve_collision_mode(cfg_env)
     # Per-mode (naconmax_per_world, njmax) for training. naconmax must cover the
-    # BROADPHASE candidate pairs (AABB overlaps), not just the actual contacts:
-    # with self-collision many limb AABBs overlap, so broadphase peaks near
-    # ~48/world (64 leaves headroom). "ground" only ever pairs geoms with the
-    # floor plane, whose AABB spans the world, so its candidates are the ~45
-    # humanoid geoms; "feet" restricts that to the 13 whitelisted ones. njmax is
-    # the per-world constraint budget (nefc): each contact adds several friction
-    # rows on top of the joint limits, so self-collision peaks near ~180.
+    # BROADPHASE candidate pairs (AABB overlaps), not just the actual contacts: with
+    # self-collision many limb AABBs overlap. "ground" only ever pairs geoms with the
+    # floor plane, whose AABB spans the world, so its candidates are all humanoid
+    # geoms; "feet" restricts that to the whitelisted ones. njmax is the per-world
+    # constraint budget (nefc), where each contact adds several friction rows on top
+    # of the joint limits. Each value leaves headroom above the measured peak.
     _WARP_BUDGETS = {"full": (64, 256), "ground": (48, 192), "feet": (16, 128)}
     if mode == "train" and impl == "warp":
         per_world, per_world_njmax = _WARP_BUDGETS[collisions]
@@ -192,14 +185,12 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         if njmax is None:
             njmax = per_world_njmax
         if naccdmax is None:
-            # Only the hand ellipsoids hit the EPA path (max ~2/world, almost
-            # never); 4/world is generous and keeps the EPA scratch ~8x smaller
-            # than the default (= naconmax).
+            # Only the hand ellipsoids ever hit the EPA path, so this is generous
+            # and keeps the EPA scratch far smaller than the default (= naconmax).
             naccdmax = int(cfg_env.parallel_envs) * 4
     elif mode == "play" and impl == "warp":
         # Single-world playback: mujoco_warp's own defaults are too small for
-        # self-collision (broadphase peaks ~52, nefc ~88 for one world). Memory
-        # is irrelevant here, so size generously above those peaks.
+        # self-collision. Memory is irrelevant at one world, so size generously.
         per_world, per_world_njmax = _WARP_BUDGETS[collisions]
         if naconmax is None:
             naconmax = 2 * per_world
@@ -213,12 +204,12 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         gpu_clip_budget = gpu_clip_budget or 32
 
     # Warp CUDA-graph mode. mjx's GraphMode.WARP default recaptures a graph every
-    # step under JAX (buffer addresses change), which is both slow and leaks host
-    # RAM (evicted graphs' native descriptors are never freed). WARP_STAGED_EX
-    # captures the graph ONCE on fixed staging buffers and replays it every step
-    # (a cheap device→staging memcpy per step), keeping graph-replay speed with no
-    # per-step recapture and no leak. JAX/NONE avoid the leak too but run kernels
-    # eagerly — far slower for this many-kernel step. Default warp to STAGED_EX.
+    # step under JAX (buffer addresses change), which is slow and leaks host RAM,
+    # since evicted graphs' native descriptors are never freed. WARP_STAGED_EX
+    # captures the graph ONCE on fixed staging buffers and replays it every step at
+    # the cost of a device->staging memcpy, so there is no recapture and no leak.
+    # JAX/NONE avoid the leak too but run kernels eagerly, far slower for a step
+    # with this many kernels.
     graph_mode = cfg_env.get("graph_mode", None)
     if impl == "warp" and graph_mode is None:
         graph_mode = "WARP_STAGED_EX"

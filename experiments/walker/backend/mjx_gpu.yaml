@@ -1,0 +1,26 @@
+# @package _global_
+
+# Release-grid cell 2/3: GPU physics (MJX) + GPU learner.
+#
+# Same task, same card, different physics implementation: MJX traces the step
+# into the XLA program itself rather than dispatching Warp kernels. Against the
+# warp_gpu cell this isolates the cost of the physics backend alone — the
+# learner, the agent and the env count are untouched.
+#
+# Note that MJX sizes contact arrays STATICALLY to all potential geom pairs,
+# where Warp uses a budgeted global arena. That is invisible on the walker (few
+# geoms) and is exactly why this cell is affordable here and not on the mocap
+# humanoid — see docs/backends.md#contact-budgets-three-backends-three-models.
+
+release:
+  cell: mjx_gpu
+
+env:
+  impl: jax
+  # MJX ignores both budgets (they are Warp-only knobs).
+  naconmax: null
+  njmax: null
+
+runtime:
+  jax_platform: null
+  matmul_precision: tensorfloat32

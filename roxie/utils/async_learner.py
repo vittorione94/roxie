@@ -14,9 +14,9 @@ envs on CPU, and hands the resulting transitions to the learner through a queue.
 So the CPU physics and the GPU gradient bursts overlap in wall-clock time.
 
 Why this ownership split matters: the agents' fused ``_grad_steps`` donates the
-whole train state (including the ~1.4 GB replay buffer) to avoid copying it. That
-donation is only safe if nothing else references the buffer concurrently — which
-holds precisely because the learner thread is the *only* thing that touches
+whole train state (replay buffer included) to avoid copying it. That donation is
+only safe if nothing else references the buffer concurrently — which holds
+precisely because the learner thread is the *only* thing that touches
 ``agent.state`` while it runs. The acting thread reads from an independent
 behaviour actor and pushes raw transition arrays; it never aliases the buffer.
 
@@ -59,11 +59,10 @@ class AsyncLearner:
         self.learning_steps = int(agent.learning_steps)
         self.steps_before_learning = int(agent.steps_before_learning)
         self.steps_between_updates = int(agent.steps_between_updates)
-        # Grad-steps per env-step: the sync loop's replay ratio, which the async
-        # scheduler reproduces on average. `chunk` is how many fused grad steps
-        # the learner submits at a time — small so the GPU stream keeps freeing
-        # up for the acting thread's forward pass (that interleaving is what lets
-        # the CPU physics overlap the GPU learning). Capped at learning_steps.
+        # `chunk` is how many fused grad steps the learner submits at a time —
+        # small so the GPU stream keeps freeing up for the acting thread's forward
+        # pass, which is what lets CPU physics overlap GPU learning. `_ratio` is
+        # the sync loop's grad-steps-per-env-step, reproduced on average below.
         self._chunk = max(1, min(int(chunk), self.learning_steps))
         self._ratio = self.learning_steps / max(1, self.steps_between_updates)
 
@@ -173,14 +172,11 @@ class AsyncLearner:
         return added
 
     def _publish_snapshot(self):
-        # Independent on-device COPIES of the learner's current actor params +
-        # obs stats. A plain reference would alias the buffers that the very next
-        # `learn()` DONATES (frees) — the acting thread would then read a freed
-        # buffer ("Buffer has been deleted or donated"). jnp.copy dispatches a
-        # copy op reading the current buffers (issued before the next burst's
-        # donation on the same GPU stream), so the copy survives. Cheap: the
-        # actor is a few MB and this runs once per burst. Kept on device (not
-        # host) so the normalization/step path stays jnp and doesn't recompile.
+        # Independent on-device COPIES of the learner's current actor params and
+        # obs stats. A plain reference would alias the buffers the very next
+        # `learn()` donates (frees), leaving the acting thread reading a freed
+        # buffer. The copy op is issued before that donation on the same GPU
+        # stream, so it survives. Kept on device so the step path stays jnp.
         params = jax.tree.map(jnp.copy, nnx.state(self._agent.state.actor, nnx.Param))
         obs_stats = jax.tree.map(jnp.copy, self._agent.state.obs_stats)
         with self._lock:

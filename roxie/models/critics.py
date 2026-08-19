@@ -11,7 +11,7 @@ class QCritic(nnx.Module):
         self,
         in_features: int,
         features: Sequence[int],
-        *,  # Make rngs a keyword-only argument
+        *,
         rngs: nnx.Rngs,
         activation_fn: Callable = nnx.relu,
         use_layer_norm: bool = False,
@@ -19,15 +19,12 @@ class QCritic(nnx.Module):
     ):
         """
 """
-        # --- Store static configuration ---
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
 
-        # --- Define stateful layers ---
         hidden_layers = []
         norm_layers = []
 
-        # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
             hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
@@ -39,7 +36,6 @@ class QCritic(nnx.Module):
         if self.use_layer_norm:
             self.norm_layers = nnx.List(norm_layers)
 
-        # Dropout and output layers
         self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.output_layer = nnx.Linear(current_features, 1, rngs=rngs)
 
@@ -71,21 +67,18 @@ class DistributionalQCritic(nnx.Module):
         in_features: int,
         features: Sequence[int],
         num_atoms: int,
-        *,  # Make rngs a keyword-only argument
+        *,
         rngs: nnx.Rngs,
         activation_fn: Callable = nnx.relu,
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,
     ):
-        # --- Store static configuration ---
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
 
-        # --- Define stateful layers ---
         hidden_layers = []
         norm_layers = []
 
-        # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
             hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
@@ -97,7 +90,6 @@ class DistributionalQCritic(nnx.Module):
         if self.use_layer_norm:
             self.norm_layers = nnx.List(norm_layers)
 
-        # Dropout and output layers
         self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.output_layer = nnx.Linear(current_features, num_atoms, rngs=rngs)
 
@@ -133,20 +125,17 @@ class VCritic(nnx.Module):
     def __init__(self,
         in_features: int,
         features: Sequence[int],
-        *,  # Make rngs a keyword-only argument
+        *,
         rngs: nnx.Rngs,
         activation_fn: Callable = nnx.relu,
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,):
-        # --- Store static configuration ---
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
 
-        # --- Define stateful layers ---
         hidden_layers = []
         norm_layers = []
 
-        # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
             hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
@@ -158,7 +147,6 @@ class VCritic(nnx.Module):
         if self.use_layer_norm:
             self.norm_layers = nnx.List(norm_layers)
 
-        # Dropout and output layers
         self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.output_layer = nnx.Linear(current_features, 1, rngs=rngs)
 

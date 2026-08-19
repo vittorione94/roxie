@@ -1,0 +1,27 @@
+# @package _global_
+#
+# WalkerWalk release benchmark — DDPG arm. Deterministic policy, single Q critic, n-step 5 — the reference arm.
+#
+#   uv run python roxie/train.py --config-name walker/bench_ddpg
+#   uv run python roxie/train.py --config-name walker/bench_ddpg backend=mjx_cpu
+#
+# The agent block, the noise block (where there is one) and the whole
+# bench/walker_walk block are shared VERBATIM with every other bench_*.yaml;
+# agent/ddpg_bench holds the only algorithmic difference. Nothing is
+# overridden below on purpose — put ad-hoc tweaks on the CLI so this file
+# keeps recording the benchmark condition.
+#
+# `backend` defaults to the headline GPU cell and is the ONE thing the
+# release grid varies: scripts/run_release_benchmark.sh runs this launchable
+# three times with backend=warp_gpu / mjx_gpu / mjx_cpu.
+defaults:
+  - agent: ddpg_bench
+  - noise: bench_gaussian
+  # bench BEFORE backend: the shared block declares release.cell as MISSING
+  # and the backend group is what fills it in, so the order is load-bearing.
+  - bench: walker_walk
+  - backend: warp_gpu
+  - _self_
+
+release:
+  agent: ddpg

@@ -112,10 +112,9 @@ def td3_actor_loss_fn(
     penalty = pre_activation_penalty(pre_activation)
 
     abs_u = jnp.abs(pre_activation)
-    # d(tanh u)/du: the factor the DPG gradient is multiplied by before it ever
-    # reaches the weights. As it goes to zero the actor stops being trainable,
-    # so this is the leading indicator of the saturation collapse — it moves
-    # well before the eval score does.
+    # d(tanh u)/du: the factor the DPG gradient is multiplied by before it reaches
+    # the weights. As it goes to zero the actor stops being trainable, which makes
+    # this the leading indicator of a saturation collapse.
     tanh_grad = 1.0 - jnp.square(actions)
     aux = {
         "pre_act_abs": jnp.mean(abs_u),
@@ -175,57 +174,37 @@ def ppo_loss_fn(
     distribution = actor_model(observations)
     logp_new = distribution.log_prob(actions_buf)       # (N, T)
 
-    # Entropy of the distribution. Analytic for a plain Normal; for a squashed
-    # policy it is a single-sample estimate and genuinely needs `key` (which was
-    # previously accepted and unused here).
+    # Analytic for a plain Normal; for a squashed policy it is a single-sample
+    # estimate, which is what `key` is for.
     entropy_t = distribution_entropy(distribution, key)[:, :-1]
 
-    # Compute importance ratio aligned with advantages (skip last next-frame entry)
+    # The last entry is the next-frame bootstrap, dropped so the ratio lines up
+    # with the advantages: (NUM_ENVS, BATCH_SIZE - 1).
     ratio = jnp.exp(logp_new[:, :-1] - old_log_probs[:, :-1])
-
-    # advantages --> (NUM_ENVS, BATCH_SIZE -1)
-    # ratio --> (NUM_ENVS, BATCH_SIZE -1)
-    # actions --> (NUM_ENVS, BATCH_SIZE, ACT_SIZE)
-    # logp_new --> (NUM_ENVS, BATCH_SIZE)
-    # old_log_probs --> (NUM_ENVS, BATCH_SIZE)
-
-    # Use compatibility wrapper which handles arbitrary leading batch dims
-    # and applies rlax per-time-step along the final axis.
-    # pg_loss = rlax_compat.clipped_surrogate_pg_loss(ratio, advantages, clip_epsilon)
 
     if ratio.shape != advantages.shape:
         raise ValueError(f"ratio and advantages shapes must match; got {ratio.shape} vs {advantages.shape}")
 
-    # Ensure there is a time axis
     if ratio.ndim < 1:
         raise ValueError("ratio must have at least 1 dimension (time axis)")
 
-    # Compute clipped surrogate objective elementwise so the output keeps
-    # the same shape as the inputs (i.e. per-timestep losses). rlax's
-    # implementation may return a reduced scalar for a 1-D input, so
-    # implement the per-step formula directly here to avoid ambiguity.
-    #
-    # surrogate = min(ratio * adv, clip(ratio, 1-eps, 1+eps) * adv)
-    # loss = -surrogate  (we minimize loss; maximizing surrogate)
-
+    # The clipped surrogate is written out elementwise so the result keeps the
+    # inputs' shape (per-timestep losses) rather than being reduced to a scalar.
     clipped_ratio = jnp.clip(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
     surrogate1 = ratio * advantages
     surrogate2 = clipped_ratio * advantages
     surrogate = jnp.minimum(surrogate1, surrogate2)
     pg_loss = -surrogate
 
-    # Trust-region diagnostics, returned as aux so they cost no extra forward
-    # pass. `approx_kl` is Schulman's low-variance estimator of
-    # KL(pi_old || pi_new); it is >= 0 and equals 0 iff the ratio is 1 everywhere.
-    # `clip_frac` is the share of the batch that has left the clip range -- those
-    # samples select the constant branch of the min() above, whose gradient
-    # w.r.t. the policy is ZERO, so they stop pulling the policy back. A clip_frac
-    # near 1 means the surrogate is saturated and the update is being driven by
-    # whatever is left (in practice the entropy term).
+    # Trust-region diagnostics, returned as aux so they cost no extra forward pass.
+    # `approx_kl` is Schulman's low-variance estimator of KL(pi_old || pi_new): >= 0,
+    # and 0 iff the ratio is 1 everywhere. `clip_frac` is the share of the batch that
+    # has left the clip range — those samples select the constant branch of the min()
+    # above, whose gradient w.r.t. the policy is zero, so they stop pulling the policy
+    # back. Near 1 the surrogate is saturated and the entropy term drives the update.
     approx_kl = jnp.mean((ratio - 1.0) - jnp.log(ratio))
     clip_frac = jnp.mean((jnp.abs(ratio - 1.0) > clip_epsilon).astype(jnp.float32))
 
-    # Per-step loss minus entropy term, then average across all dims
     per_step_loss = pg_loss - entropy_coef * entropy_t
     return jnp.mean(per_step_loss), (approx_kl, clip_frac)
 

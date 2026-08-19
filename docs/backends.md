@@ -16,7 +16,7 @@ Roxie can put the *physics* on the GPU or the CPU, and — independently — the
 | Bounded by | VRAM | VRAM | system RAM + core count |
 | Built by | `roxie.environment.loader.build_playground_env` | `examples.mocap.loader.build_mocap_env` | `roxie.environment.envpool_adapter.build_envpool_env` / `examples.mocap.mocap_envpool.build_mocap_envpool_env` |
 
-Selection is a Hydra config group. For the mocap task, [`experiments/mocap/backend/`](../experiments/mocap/backend/) holds `warp.yaml` and `envpool.yaml`, and a launchable picks one in its `defaults:`. Everything backend-mechanical (builder, `impl`, solver budgets, graph mode, thread count) lives in that group; per-experiment tuning stays in the launchable. That is what makes [`mocap/sweep_ppo`](../experiments/mocap/sweep_ppo.yaml) and [`mocap/sweep_ppo_envpool`](../experiments/mocap/sweep_ppo_envpool.yaml) a genuine A/B: they differ in exactly one line.
+Selection is a Hydra config group. For the mocap task, [`experiments/mocap/backend/`](../experiments/mocap/backend/) holds `warp_gpu.yaml`, `envpool_cpu.yaml` and `envpool_gpu.yaml`, and a launchable picks one in its `defaults:`. Everything backend-mechanical (builder, `impl`, solver budgets, graph mode, thread count) lives in that group; per-experiment tuning stays in the launchable. That is what makes the three cells of the [release benchmark](../experiments/README.md) a genuine A/B: they differ in exactly one line.
 
 `train.py` prints a loud banner at startup reporting the backend that *actually* loaded (read off the constructed env, not echoed from config) and flags a mismatch against what was requested.
 
@@ -74,7 +74,7 @@ The important negative result: **RAM is not a throughput lever.** The CPU pool c
 
 Collision handling is where the backends diverge most sharply, and it drives configuration on both the memory *and* the task-definition axis.
 
-- **Native MuJoCo (CPU)** allocates contacts dynamically. There is nothing to size. This is why `backend/envpool.yaml` simply omits the Warp budget keys.
+- **Native MuJoCo (CPU)** allocates contacts dynamically. There is nothing to size. This is why `backend/envpool_cpu.yaml` simply omits the Warp budget keys.
 - **Warp (GPU)** uses a **single global contact arena shared across all vmapped worlds** (rows tagged by `contact__worldid`, so these Data leaves have no per-env batch dimension — which is exactly why the trainer's auto-reset gather skips leaves lacking a leading per-env dim). `naconmax` therefore scales with `parallel_envs`, and it must cover *broadphase AABB-overlap candidate pairs* (~48/world peak here), not just the ~15 contacts that actually resolve. `njmax` is per-world. A third budget, `naccdmax` (GJK/EPA convex narrowphase), defaults to the full `naconmax` and reserves ~90 MB of EPA scratch per buffer; `build_mocap_env` caps it at `parallel_envs*4` because only two geoms on this humanoid take the convex path at all. Watch for "broadphase/narrowphase/nefc overflow" warnings.
 - **MJX (`impl: jax`)** ignores `naconmax` entirely and statically sizes contact arrays to *all potential geom pairs* — ~980 for this humanoid. Self-collisions are therefore roughly **75× heavier on MJX than on Warp**, which is why `self_collisions=false` is the right default there and not elsewhere.
 
@@ -95,7 +95,7 @@ With CPU physics there are two viable configurations, and the choice is exposed 
 | `runtime.jax_platform: cpu` | CPU pool | CPU (JAX) | **Default for `backend: envpool`.** The card is genuinely free. |
 | `runtime.jax_platform: null` | CPU pool | GPU (JAX) | Faster, but puts ~1.4 GB back on the card and re-couples the run to it. |
 
-The default matters more than it looks. The EnvPool pool's physics never touches the GPU, but the agent is plain JAX and would otherwise still claim the card — and preallocate most of it — so "running on CPU" would leave the GPU fully occupied, which is the opposite of the point. **The CPU backend is meant to free the card entirely**, so `backend/envpool.yaml` pins `jax_platform: cpu`.
+The default matters more than it looks. The EnvPool pool's physics never touches the GPU, but the agent is plain JAX and would otherwise still claim the card — and preallocate most of it — so "running on CPU" would leave the GPU fully occupied, which is the opposite of the point. **The CPU backend is meant to free the card entirely**, so `backend/envpool_cpu.yaml` pins `jax_platform: cpu`.
 
 Measured on a 12-core/24-thread 7900X, PPO, `parallel_envs=1000`, obs 1069, nets `[1024, 512, 256]`:
 

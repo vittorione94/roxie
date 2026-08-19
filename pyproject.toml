@@ -1,9 +1,20 @@
 [project]
 name = "roxie"
 version = "0.1.0"
-description = "Add your description here"
+description = "Reinforcement learning in JAX for continuous control in MuJoCo, across MJX, mujoco_warp and native-CPU physics backends"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Vittorio La Barbera" }]
+keywords = ["reinforcement-learning", "jax", "mujoco", "mjx", "warp", "continuous-control"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "chex>=0.1.90",
     "distrax>=0.1.5",
@@ -16,7 +27,6 @@ dependencies = [
     "rlax>=0.1.7",
     "termcolor>=3.1.0",
     "etils>=1.13.0",
-    "pytest>=9.1.1",
     "dm-control>=1.0.41",
     "h5py>=3.16.0",
     "mujoco-mjx>=3.9.0",
@@ -26,7 +36,21 @@ dependencies = [
     "envpool>=1.2.5",
 ]
 
+[project.urls]
+Homepage = "https://github.com/vittorione94/roxie"
+Repository = "https://github.com/vittorione94/roxie"
+
+[project.optional-dependencies]
+report = [
+    "wandb-workspaces>=0.4.5",
+]
+
 [dependency-groups]
+# Test-only. Installed by default with `uv sync`; excluded from a pip install.
+dev = [
+    "pytest>=9.1.1",
+]
+
 # Linux (NVIDIA): uv sync --group cuda
 # mujocos warp bridge imports warp._src.jax_experimental.ffi.GraphMode and
 # reads public warp.types.warp_type_to_np_dtype. Warp 1.13 dropped the latter
@@ -38,7 +62,7 @@ cuda = [
 ]
 
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 # Explicit setuptools package discovery: only include the roxie package

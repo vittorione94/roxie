@@ -133,3 +133,9 @@ class TestSerializeBound:
         result = serialize_bound(np.float32(3.0))
         assert result == 3.0
         assert isinstance(result, float)
+
+    def test_per_actuator_vector_keeps_every_entry(self):
+        # Heterogeneous ctrlrange: recording only the first entry would report
+        # the wrong bound for every other actuator.
+        result = serialize_bound(jnp.array([-1.0, -0.5, -2.0]))
+        assert result == [-1.0, -0.5, -2.0]

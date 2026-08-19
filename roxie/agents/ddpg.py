@@ -45,10 +45,9 @@ def _grad_step(
     across the update loop, so they are hoisted out by `_grad_steps`.
     `n_step` is the TD horizon (NOT the scan length `n_steps` in _grad_steps).
     """
-    # 1. Sample from the replay buffer. `repack_samples` folds the Bellman
-    # target ingredients (n-step return, per-sample bootstrap coefficient,
-    # bootstrap observation) into the dict for both buffer layouts, so the
-    # critic loss no longer sees gamma/terminals directly.
+    # `repack_samples` folds the Bellman target ingredients (n-step return,
+    # per-sample bootstrap coefficient, bootstrap observation) into the dict for
+    # both buffer layouts, so the critic loss never sees gamma/terminals.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
@@ -58,7 +57,6 @@ def _grad_step(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    # 2. Critic update
     critic_loss, critic_grads = nnx.value_and_grad(ddpg_critic_loss_fn)(
         state.critic,
         state.target_actor,
@@ -72,7 +70,6 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # 3. Actor update (use scaled actions)
     actor_loss, actor_grads = nnx.value_and_grad(ddpg_actor_loss_fn)(
         state.actor,
         state.critic,
@@ -82,8 +79,8 @@ def _grad_step(
     )
     state.actor_optimizer.update(state.actor, actor_grads)
 
-    # 4. Update target networks using soft updates
-    new_actor_tensors = nnx.state(state.actor, nnx.Param)  # Use updated_actor
+    # Soft update of both target networks.
+    new_actor_tensors = nnx.state(state.actor, nnx.Param)
     old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
 
     new_target_actor_tensors = optax.incremental_update(
@@ -99,7 +96,6 @@ def _grad_step(
     nnx.update(state.target_actor, new_target_actor_tensors)
     nnx.update(state.target_critic, new_target_critic_tensors)
 
-    # 5. Return the new, updated state object
     return (
         TrainState(
             actor=state.actor,
@@ -117,19 +113,17 @@ def _grad_step(
 
 
 # Fused N-step update. The body is compiled once and run `n_steps` times on-device
-# via `lax.scan` (instead of unrolling the Python loop, which at large `n_steps`
-# blows up compile time and the HLO graph). Only the trainable graph state is
-# carried; `buffer_state` and the observation normalization params are constant
-# across the loop and closed over.
+# via `lax.scan` rather than unrolled, which would blow up compile time and HLO
+# size at large `n_steps`. Only the trainable graph state is carried;
+# `buffer_state` and the normalization params are loop-constant and closed over.
 @functools.partial(
     nnx.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "n_step", "normalize",
     ),
-    # Donate the train state (arg 0): its large read-only replay buffer is
-    # threaded unchanged through the scan, so without donation XLA allocates a
-    # full second copy of the buffer (~1.4GB for 500k obs) every update. The
-    # caller reassigns self.state from the result, so donating is safe.
+    # Donate the train state (arg 0): its large read-only replay buffer is threaded
+    # unchanged through the scan, so without donation XLA allocates a full second
+    # copy of it every update. The caller reassigns self.state from the result.
     donate_argnums=(0,),
 )
 def _grad_steps(
@@ -182,7 +176,7 @@ def _grad_steps(
     scan_state, (actor_losses, critic_losses) = jax.lax.scan(body, scan_state, keys)
     state = nnx.merge(graphdef, scan_state)
 
-    # Average over the update steps for less noisy logging (was: last step only).
+    # Averaged over the fused steps for less noisy logging.
     return state, jnp.mean(actor_losses), jnp.mean(critic_losses)
 
 
@@ -223,7 +217,6 @@ class DDPG(Agent):
         # overridden by TD3/TD4) so subclasses can derive their own offsets.
         self.seed = int(seed)
 
-        # Instantiate actor
         actor = hydra.utils.instantiate(
             actor_config,
             in_features=env_obs_size,
@@ -231,12 +224,11 @@ class DDPG(Agent):
             rngs=network_rngs(self.seed, offset=0),
         )
 
-        # Instantiate critic (overridable so TD3 can swap in a TwinCritic)
+        # Overridable so TD3 can swap in a TwinCritic.
         critic = self._make_critic(critic_config, env_obs_size, env_action_size)
 
-        # Instantiate replay buffer. `truncation` is stored alongside `terminal`
-        # so n-step windows can stop at episode boundaries the terminal flag
-        # doesn't mark (clip-end / time-limit truncations).
+        # `truncation` is stored alongside `terminal` so n-step windows can stop at
+        # episode boundaries the terminal flag doesn't mark (clip-end / time-limit).
         prototype = Transition(
             observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
             action=jnp.zeros(env_action_size, dtype=jnp.float32),
@@ -268,12 +260,10 @@ class DDPG(Agent):
 
         buffer_state = replay.init(prototype)
 
-        # Instantiate noise module
         noise_module = hydra.utils.instantiate(
             noise_config, action_shape=(env_action_size,)
         )
 
-        # Create targets
         target_actor = copy.deepcopy(actor)
         target_critic = copy.deepcopy(critic)
 
@@ -304,10 +294,7 @@ class DDPG(Agent):
             wrt=nnx.Param,
         )
 
-        # Init observation stats from buffer state's observation shape
-        obs_shape = buffer_state.experience.observation.shape[
-            -1
-        ]  # Exclude batch dimension
+        obs_shape = buffer_state.experience.observation.shape[-1]
         obs_stats = Agent.init_obs_stats(obs_shape)
 
         self.state = TrainState(
@@ -321,7 +308,6 @@ class DDPG(Agent):
             obs_stats=obs_stats,
         )
 
-        # Store hyperparameters
         self.gamma = gamma
         self.tau = tau
         self.action_low = action_low
@@ -336,10 +322,9 @@ class DDPG(Agent):
         self.normalize_observations = normalize_observations
         self.obs_clip = float(obs_norm_clip)
         self.obs_eps = float(obs_norm_eps)
-        # Weight on the actor's pre-tanh saturation penalty. Consumed by TD3's
-        # actor loss; stored on the base so every DeterministicActor agent
-        # round-trips it through checkpoints identically. 0.0 = off (the
-        # textbook DPG objective, which saturates -- see DeterministicActor).
+        # Weight on the actor's pre-tanh saturation penalty, consumed by TD3's actor
+        # loss. Stored on the base so every DeterministicActor agent round-trips it
+        # through checkpoints identically. 0.0 = the textbook DPG objective.
         self.pre_activation_coef = float(pre_activation_coef)
 
         print(f"{type(self).__name__} agent initialized.")
@@ -425,11 +410,11 @@ class DDPG(Agent):
             observation=prev_obs,
             action=action,
             reward=reward,
-            # Use the true termination signal, NOT `done` (= termination OR
-            # truncation). A time-limit truncation must still bootstrap the
-            # next-state value in the Bellman target; marking it terminal zeroes
-            # the bootstrap and collapses Q at the cutoff. With all envs hitting
-            # the time limit in lockstep this floods the buffer at once.
+            # The true termination signal, NOT `done` (= termination OR truncation).
+            # A time-limit truncation must still bootstrap the next-state value in
+            # the Bellman target; marking it terminal zeroes the bootstrap and
+            # collapses Q at the cutoff — for every env at once, since they hit the
+            # time limit in lockstep.
             terminal=termination,
             # Stored separately so n-step windows can stop at truncations too —
             # in the flat stream the item after ANY done is the next episode's
@@ -437,23 +422,16 @@ class DDPG(Agent):
             truncation=truncation,
         )
 
-        # store in memory
         self.state.buffer_state = self.replay_add(self.state.buffer_state, experiences)
 
-        # Update observation normalization stats with both current and next observations
+        # Normalization stats see both the current and the next observation.
         if self.normalize_observations:
             obs_batch = jnp.concatenate([prev_obs, next_obs], axis=0)
-            # obs_batch.shape --> (2 * num_envs, obs_dim)
             self.state.obs_stats = Agent.update_obs_stats(
                 self.state.obs_stats, obs_batch
             )
 
     def add(self, prev_states, states):
-        # prev_states.obs.shape   (num_envs, obs_dim)
-        # states.reward.shape     (num_envs,)
-        # states.done.shape       (num_envs,)
-        # self.last_action.shape  (num_envs, action_dim)
-        # states.obs.shape        (num_envs, obs_dim)
         self.add_transitions(
             prev_states.obs,
             self.last_action,
@@ -481,8 +459,8 @@ class DDPG(Agent):
             self.learning_steps if n_steps is None else int(n_steps),
             self.gamma,
             self.tau,
-            self.replay.sample,  # Pass the sample method itself,
-            self.target_policy_noise,  # Use target_policy_noise
+            self.replay.sample,
+            self.target_policy_noise,
             self.target_noise_clip,
             self.action_low,
             self.action_high,
@@ -496,7 +474,6 @@ class DDPG(Agent):
     def update(self, steps, agent_rng):
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
-        # Conditionally call the JIT-compiled gradient step
         if (
             steps >= self.steps_before_learning
             and (steps - self.steps_before_learning) % self.steps_between_updates == 0
@@ -507,9 +484,6 @@ class DDPG(Agent):
         return gradient_steps, actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
-        # self.state.buffer_state.experience.observation.shape  (num_envs, steps, obs_dim)
-        # self.state.buffer_state.experience.action.shape       (num_envs, steps, action_dim)
-        # Keep this minimal and JSON-serializable
         return {
             "seed": int(self.seed),
             "gamma": float(self.gamma),
@@ -532,7 +506,6 @@ class DDPG(Agent):
             "normalize_observations": bool(self.normalize_observations),
             "obs_norm_clip": float(self.obs_clip),
             "obs_norm_eps": float(self.obs_eps),
-            # bounds can be scalar or arrays → use your helpers
             "action_low": serialize_bound(self.action_low),
             "action_high": serialize_bound(self.action_high),
         }

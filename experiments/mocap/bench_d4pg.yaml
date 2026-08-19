@@ -1,0 +1,31 @@
+# @package _global_
+#
+# CMU_006_13 release benchmark — D4PG arm. Single categorical critic, no target smoothing (paper).
+#
+#   uv run python roxie/train.py --config-name mocap/bench_d4pg
+#   uv run python roxie/train.py --config-name mocap/bench_d4pg \
+#       mocap/backend@backend=envpool_cpu
+#
+# agent/d4pg_bench holds the only algorithmic difference; env_config,
+# reward and the whole bench/cmu_006_13 block (env, trainer, logging) are
+# shared VERBATIM with every other bench_*.yaml. Nothing is overridden below
+# on purpose — put ad-hoc tweaks on the CLI so this file keeps recording the
+# benchmark condition.
+#
+# `backend` defaults to the headline GPU cell and is the ONE thing the
+# release grid varies: warp_gpu / envpool_cpu / envpool_gpu. Note the override
+# syntax above — a group declared in a subdirectory needs its full path AND
+# its package (`mocap/backend@backend=`), not a bare `backend=`.
+defaults:
+  - agent: d4pg_bench
+  - noise: bench_gaussian
+  - env_config: cmu
+  - reward: cmu_tracking
+  # bench BEFORE backend: the shared block declares release.cell as MISSING
+  # and the backend group is what fills it in, so the order is load-bearing.
+  - bench: cmu_006_13
+  - backend: warp_gpu
+  - _self_
+
+release:
+  agent: d4pg

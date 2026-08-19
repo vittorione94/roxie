@@ -58,9 +58,8 @@ def _grad_step(
     and target updates run under `nnx.cond` so the delayed-policy-update trick
     survives the `lax.scan` (where the step index is no longer static).
     `n_step` is the TD horizon (NOT the scan length)."""
-    # 1. Sample from the replay buffer. `repack_samples` folds the n-step
-    # return, bootstrap coefficient, and bootstrap obs into the dict, so the
-    # critic loss no longer sees gamma/terminals directly.
+    # `repack_samples` folds the n-step return, bootstrap coefficient, and
+    # bootstrap obs into the dict, so the critic loss never sees gamma/terminals.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
@@ -70,7 +69,7 @@ def _grad_step(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    # 2. Critic update (twin critic, clipped double-Q target) — every step
+    # Critic update (twin critic, clipped double-Q target), on every step.
     (critic_loss, critic_aux), critic_grads = nnx.value_and_grad(
         td3_critic_loss_fn, has_aux=True
     )(
@@ -86,9 +85,9 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # 3. Delayed actor + target updates — only on steps where `update_actor` is
-    # True. Under `lax.scan` the step index is traced, so this must be a runtime
-    # branch (`nnx.cond`) rather than a Python `if`.
+    # Delayed actor + target updates, only on steps where `update_actor` is True.
+    # Under `lax.scan` the step index is traced, so this must be a runtime branch
+    # (`nnx.cond`) rather than a Python `if`.
     def _actor_update(state):
         (actor_loss, actor_aux), actor_grads = nnx.value_and_grad(
             td3_actor_loss_fn, has_aux=True
@@ -102,7 +101,7 @@ def _grad_step(
         )
         state.actor_optimizer.update(state.actor, actor_grads)
 
-        # Soft-update both target networks alongside the policy update
+        # Soft-update both target networks alongside the policy.
         new_actor_tensors = nnx.state(state.actor, nnx.Param)
         old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
         new_target_actor_tensors = optax.incremental_update(
@@ -152,9 +151,9 @@ def _grad_step(
 
 
 # Fused N-step update. The body is compiled once and run `n_steps` times on-device
-# via `lax.scan` (instead of unrolling, which blows up compile time / HLO size at
-# large `n_steps`). The delayed-policy-update schedule is precomputed as a boolean
-# mask scanned over alongside the per-step keys. Only the trainable graph state is
+# via `lax.scan` rather than unrolled, which would blow up compile time and HLO
+# size at large `n_steps`. The delayed-policy-update schedule is precomputed as a
+# boolean mask scanned over alongside the per-step keys. Only the trainable graph state is
 # carried; `buffer_state` and the normalization params are loop-constant.
 @functools.partial(
     nnx.jit,
@@ -162,10 +161,9 @@ def _grad_step(
         "gamma", "tau", "replay_sample_fn", "n_steps", "policy_delay", "n_step",
         "normalize",
     ),
-    # Donate the train state (arg 0): its large read-only replay buffer is
-    # threaded unchanged through the scan, so without donation XLA allocates a
-    # full second copy of the buffer (~1.4GB for 500k obs) every update. The
-    # caller reassigns self.state from the result, so donating is safe.
+    # Donate the train state (arg 0): its large read-only replay buffer is threaded
+    # unchanged through the scan, so without donation XLA allocates a full second
+    # copy of it every update. The caller reassigns self.state from the result.
     donate_argnums=(0,),
 )
 def _grad_steps(
@@ -256,8 +254,7 @@ class TD3(DDPG):
         super().__init__(*args, **kwargs)
         # Per-burst diagnostic scalars, drained once per epoch by the trainer via
         # `pop_diagnostics`. Kept as device arrays and only reduced to floats at
-        # drain time: converting on every burst would force ~120 host syncs per
-        # epoch on the training loop's critical path.
+        # drain time, so no burst pays a host sync on the loop's critical path.
         self._diag_bursts: list[dict] = []
         self._diag_grad_steps = 0
         self._diag_env_steps = 0
@@ -356,21 +353,19 @@ class TD3(DDPG):
             reduced = jnp.max(values) if key in MAX_REDUCED_KEYS else jnp.mean(values)
             out[f"td3/{key}"] = float(reduced)
 
-        # Run-to-date (not per-epoch) counters, so these read as a level rather
-        # than a rate that jitters with epoch boundaries. Only available on the
-        # sync path: the async learner drives `learn` directly and never calls
-        # `update`, so there is no env-step count to divide by.
+        # Run-to-date (not per-epoch) counters, so these read as a level rather than
+        # a rate that jitters with epoch boundaries. Only available on the sync path:
+        # the async learner drives `learn` directly and never calls `update`, so
+        # there is no env-step count to divide by.
         if self._diag_env_steps > 0:
-            # Realized replay ratio: gradient steps per environment step. TD3's
-            # sample-efficiency argument rests on this being O(1); logging it
-            # makes the `steps_between_updates` / `learning_steps` pair readable
-            # as the single number they jointly control.
+            # Realized replay ratio, the single number `steps_between_updates` and
+            # `learning_steps` jointly control.
             out["td3/updates_per_env_step"] = (
                 self._diag_grad_steps / self._diag_env_steps
             )
-            # How much of the replay buffer holds real data. Below 1.0 the
-            # sampler draws from a window narrower than configured, which
-            # changes the effective off-policyness of every batch.
+            # How much of the replay buffer holds real data. Below 1.0 the sampler
+            # draws from a window narrower than configured, which changes the
+            # effective off-policyness of every batch.
             out["td3/buffer_frac"] = min(
                 1.0, self._diag_env_steps / float(self.buffer_size)
             )

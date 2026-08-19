@@ -142,11 +142,10 @@ def _quaternion_distance_np(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     dot = np.clip(np.abs(np.sum(q1 * q2, axis=-1)), -1.0, 1.0)
     return 2.0 * np.arccos(dot)
 
-# Metric keys match the GPU env's `metrics` dict so epoch logs (CSV/wandb)
-# line up column-for-column across backends. Mirrors MocapTrackingEnv.reset's
-# `metrics` dict field-for-field: the reward kernels (including the split root
-# terms and the retained pre-split `reward/root`), the two penalties, the
-# root-drift diagnostic and the three termination-cause indicators.
+# Metric keys match the GPU env's `metrics` dict so epoch logs line up
+# column-for-column across backends. Mirrors MocapTrackingEnv.reset's `metrics`
+# field-for-field: the reward kernels, the two penalties, the root-drift diagnostic
+# and the three termination-cause indicators.
 _METRIC_KEYS = (
     "reward/pose", "reward/vel", "reward/ee", "reward/root",
     "reward/root_pos", "reward/root_quat", "reward/root_vel",
@@ -359,18 +358,14 @@ class MocapCpuPool:
         self._step_count = np.zeros(self._num_envs, dtype=np.int64)
 
         # Auto-reset draws from a precomputed pool of reset states rather than
-        # building each one on demand, exactly as _run_jax does (`reset_pool` +
-        # a gather in `_step_and_autoreset`). Two reasons, and the parity one
-        # came first: on the GPU path an auto-reset IS a gather from a finite
-        # pool regenerated once per epoch, so sampling fresh states here was a
-        # genuine behavioural difference. It is also where the CPU time went —
-        # an on-demand reset needs `mj_forward` (~133 us, comparable to a whole
-        # control step) purely to produce the observation, and early in training
-        # ~20-25% of envs reset every step, which measured as roughly half of
-        # `env.step`. Pooled, a reset is a memcpy: the forward was already paid
-        # once when the pool was built. 0 disables pooling (the eval pool wants
-        # its exact deterministic reset, and `_test`/`v_test_reset` on the GPU
-        # side does not use the pool either).
+        # building each one on demand, exactly as _run_jax does. This is first a
+        # parity requirement: on the GPU path an auto-reset IS a gather from a finite
+        # pool regenerated once per epoch, so sampling fresh states here would be a
+        # behavioural difference. It is also much cheaper — an on-demand reset needs a
+        # whole `mj_forward` purely to produce the observation, and early in training
+        # a large fraction of envs reset every step. Pooled, a reset is a memcpy.
+        # 0 disables pooling: the eval pool wants its exact deterministic reset, and
+        # the GPU side's eval reset does not use the pool either.
         self._reset_pool_size = int(reset_pool_size)
         self._reset_pool = None
         self._pool_rng = np.random.default_rng(seed + 7919)
@@ -410,12 +405,11 @@ class MocapCpuPool:
             if self._num_threads > 1 else None
         )
 
-        # Env ranges the observation assembly is split over (see _gather_obs).
-        # Far fewer, far larger slices than the physics chunks: this is
-        # memory-bandwidth-bound numpy, so it stops scaling once the workers
-        # saturate DRAM — measured flat from 6 workers up at 5000 envs, and
-        # more slices only add per-slice numpy overhead. Disabled for small
-        # pools, where a single pass is already cheaper than the dispatch.
+        # Env ranges the observation assembly is split over (see _gather_obs). Far
+        # fewer, far larger slices than the physics chunks: this is
+        # memory-bandwidth-bound numpy, so it stops scaling once the workers saturate
+        # DRAM, and more slices only add per-slice overhead. Disabled for small pools,
+        # where a single pass is cheaper than the dispatch.
         if self._executor is not None and self._num_envs >= _OBS_THREAD_MIN_ENVS:
             n_sl = min(_OBS_WORKERS, self._num_threads)
             edges = np.linspace(0, self._num_envs, n_sl + 1).astype(int)
@@ -479,12 +473,11 @@ class MocapCpuPool:
         # qacc_warmstart is an INPUT to rollout with no matching output, so it
         # cannot be carried across control steps the way the threaded stepper's
         # MjData carries it. Feeding a fixed zero array keeps the stepper
-        # deterministic regardless of how the thread pool happens to schedule
-        # envs onto scratch data; the alternative (passing None, i.e. inheriting
-        # whatever env last used that scratch) would not be. The cost is that
-        # the Newton solver re-converges from cold each control step, which
-        # moves results by ~1e-9 in the float32 obs — the tolerance the parity
-        # check allows for, and the reason it is a tolerance and not equality.
+        # deterministic regardless of how the thread pool happens to schedule envs
+        # onto scratch data; passing None, i.e. inheriting whatever env last used that
+        # scratch, would not be. The cost is that the Newton solver re-converges from
+        # cold each control step, which perturbs the float32 obs slightly — which is
+        # why the parity check is a tolerance rather than an equality.
         self._warmstart = np.zeros((n, m.nv))
 
         # Cached fancy-index helpers for scattering a reset's rows (see
@@ -528,8 +521,8 @@ class MocapCpuPool:
     def _advance_rollout(self, actions: np.ndarray) -> None:
         """Physics + capture for every env: one native call."""
         cfg = self._config
-        # The per-env control work of `_advance_env`, batched. Held the GIL once
-        # per env before; now three numpy ops for the whole pool.
+        # The per-env control work of `_advance_env`, batched into a few numpy ops
+        # over the whole pool so the GIL is taken once rather than per env.
         ctrl = np.clip(actions * cfg.action_scale, self._lowers, self._uppers)
         if self._filter_alpha > 0.0:
             ctrl = (
@@ -615,8 +608,8 @@ class MocapCpuPool:
         d.qpos[:] = qpos
         d.qvel[:] = qvel
         # The proprioception and foot-contact obs terms read forward-kinematics
-        # outputs (xpos/xmat/sensordata), so a forward pass is now required at
-        # reset. But native mj_forward normalizes the noisy root quat in place,
+        # outputs (xpos/xmat/sensordata), so a forward pass is required at reset.
+        # Native mj_forward normalizes the noisy root quat in place,
         # while MJX (mjx.forward in reset) leaves qpos as sampled and only
         # normalizes the derived xquat — so we restore the raw quat afterwards.
         # This keeps the qpos-derived obs terms (root rot6d, ref deltas) bit-for
@@ -793,15 +786,14 @@ class MocapCpuPool:
             self._state[idxs] = p["state"][sel]
             return
 
-        # The MjData itself is NOT touched here — only flagged. Nothing reads it
-        # between now and the next `mj_step` (the observation and reward come
-        # from the buffers above), and mj_step runs its own forward pass from
-        # qpos/qvel, so the restore can be deferred into `_advance_env` where it
-        # happens on a worker thread instead of this one. That matters: the
-        # gathers above cost 0.84 ms for ~1700 envs while this loop cost 22 ms,
-        # because `mj_resetData` plus two slice assignments is ~13 us of
-        # GIL-held Python per env and it was the largest serial stage in the
-        # step. `_b_qpos`/`_b_qvel` already hold the pooled state to restore.
+        # The MjData itself is NOT touched here, only flagged. Nothing reads it
+        # between now and the next `mj_step` — the observation and reward come from
+        # the buffers above, and mj_step runs its own forward pass from qpos/qvel — so
+        # the restore is deferred into `_advance_env`, where it happens on a worker
+        # thread instead of this one. That matters because `mj_resetData` plus two
+        # slice assignments is GIL-held Python per env, which otherwise makes this the
+        # largest serial stage in the step. `_b_qpos`/`_b_qvel` already hold the pooled
+        # state to restore.
         self._needs_reset[idxs] = True
 
     # -- negative mining over start phases -----------------------------------
@@ -881,16 +873,13 @@ class MocapCpuPool:
 
     # -- vectorized obs/reward (batched over ALL envs at once) ---------------
     #
-    # The heavy per-frame math (obs assembly, reward kernels) runs ONCE on
-    # stacked (num_envs, ...) arrays rather than in a per-env Python loop. This
-    # is the key to CPU scaling: the per-env loop held the GIL for every small
-    # numpy op x num_envs, so the thread pool could never exceed ~3 cores no
-    # matter how many threads. Only mj_step / mj_forward stay per-env in the
-    # worker threads (they release the GIL, so they parallelize); the batched
-    # numpy below collapses hundreds of GIL-held dispatches into a handful of
-    # large C ops. The results are bit-for-bit identical to the old per-env
-    # code, which is why the single-env adapters (`_get_obs` / `_get_reward`,
-    # used by check_envpool_parity.py) just call these with a 1-row slice.
+    # The heavy per-frame math (obs assembly, reward kernels) runs ONCE on stacked
+    # (num_envs, ...) arrays rather than in a per-env Python loop. This is what makes
+    # the pool scale on CPU: a per-env loop holds the GIL for every small numpy op, so
+    # the thread pool would cap out at a few cores no matter how many threads. Only
+    # mj_step / mj_forward stay per-env in the worker threads, since they release the
+    # GIL and so parallelize. The single-env adapters below (`_get_obs`/`_get_reward`)
+    # just call these with a 1-row slice.
 
     def _obs_batch(
         self, qpos, qvel, xpos, xmat, sensordata,
@@ -965,11 +954,10 @@ class MocapCpuPool:
         ee_err = np.sum(np.square(ee_pos - ref_ee_pos), axis=(1, 2))
         r_ee = np.exp(-ee_err / cfg.sigma_ee)
 
-        # Root position and orientation get SEPARATE kernels (see the GPU env
-        # for why: the shared term was 82-90% orientation while root_termination
-        # fires on position alone). `r_root` is retained purely so the logged
-        # `reward/root` stays comparable with pre-split runs — it feeds neither
-        # the total nor `tracking`.
+        # Root position and orientation get SEPARATE kernels: a shared term is
+        # dominated by orientation while root_termination fires on position alone
+        # (see the GPU env). `r_root` is the combined kernel, logged as
+        # `reward/root`; it feeds neither the total nor `tracking`.
         root_pos_err = np.sum(np.square(qpos[:, :3] - ref_qpos[:, :3]), axis=1)
         root_quat_err = _quaternion_distance_np(qpos[:, 3:7], ref_qpos[:, 3:7])
         r_root_pos = np.exp(-root_pos_err / cfg.sigma_root_pos)
@@ -1410,26 +1398,24 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         rollout_model=rollout_model,
         rollout_addrs=rollout_addrs,
     )
-    # Canonical eval protocol (mirrors the GPU loader): start at frame 0, no
-    # reset noise, run each clip to its end. See the eval-env note in
-    # examples/mocap/loader.py for why this is fixed and must not be changed to
-    # random-phase / fixed-horizon sampling. The training pool keeps the original.
+    # Canonical eval protocol, mirroring the GPU loader: start at frame 0, no reset
+    # noise, run each clip to its end. See the eval-env note in
+    # examples/mocap/loader.py for why it is fixed. The training pool is unchanged.
     import copy
 
     eval_config = copy.deepcopy(config)
     eval_config.random_start = False
     eval_config.reset_noise_scale = 0.0
-    # Run to the clip END, not to `episode_length`: capping eval at 1000 makes
-    # "tracked the whole clip" and "hit the cap" indistinguishable. +1 so the
-    # final frame stays reachable past the look_ahead cutoff.
+    # Run to the clip END, not to `episode_length`: a fixed cap makes "tracked the
+    # whole clip" and "hit the cap" indistinguishable. +1 so the final frame stays
+    # reachable past the look_ahead cutoff.
     eval_horizon = int(max(dataset["clip_lengths"])) + 1
     eval_config.episode_length = eval_horizon
-    # The eval pool stays on the threaded stepper regardless of `stepper`. It is
-    # `test_episodes` envs (single digits), where rollout's advantage — amortizing
-    # dispatch over a large batch — does not exist, and it keeps the per-env
-    # MjData that `_get_obs`/`_get_reward` and the parity checker read. The two
-    # steppers' physics is the same model with the same rewrites, so an eval
-    # score is not measuring anything different from what training stepped.
+    # The eval pool stays on the threaded stepper regardless of `stepper`: at
+    # `test_episodes` envs there is no large batch for rollout to amortize dispatch
+    # over, and the threaded stepper keeps the per-env MjData that `_get_obs` /
+    # `_get_reward` read. Both steppers run the same model with the same rewrites, so
+    # this does not make eval measure something different from training.
     test_pool = MocapCpuPool(
         mj_model, dataset, eval_config,
         num_envs=test_episodes,

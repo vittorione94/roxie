@@ -76,9 +76,8 @@ def _grad_step(
     update_actor,
     n_step: int = 1,
 ):
-    # 1. Sample from the replay buffer. `repack_samples` folds the n-step
-    # return, bootstrap coefficient, and bootstrap obs into the dict, so the
-    # critic loss no longer sees gamma/terminals directly.
+    # `repack_samples` folds the n-step return, bootstrap coefficient, and
+    # bootstrap obs into the dict, so the critic loss never sees gamma/terminals.
     key, sample_key, actor_key, critic_key = jax.random.split(key, 4)
     samples = replay_sample_fn(state.buffer_state, sample_key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
@@ -90,7 +89,7 @@ def _grad_step(
 
     alpha = jnp.exp(log_alpha_module.log_alpha.value)
 
-    # 2. Critic update (twin critic, clipped double-Q soft target)
+    # Critic update (twin critic, clipped double-Q soft target).
     critic_loss, critic_grads = nnx.value_and_grad(sac_critic_loss_fn)(
         state.critic,
         state.actor,
@@ -103,12 +102,9 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # 3. Actor + temperature update — only on steps where `update_actor` is
-    # True. Ablation on the sweep-arm shapes puts this block at ~39% of the
-    # step, and it is the only part of a SAC step that is optional: the critic
-    # is what the replay ratio is really buying. `policy_delay` 1 (the default)
-    # reproduces textbook SAC exactly; >1 is the REDQ/DroQ-style trade of
-    # policy freshness for critic updates per second.
+    # Actor + temperature update, only on steps where `update_actor` is True.
+    # `policy_delay` 1 (the default) reproduces textbook SAC; >1 is the
+    # REDQ/DroQ-style trade of policy freshness for critic updates per second.
     #
     # Alpha rides with the actor rather than the critic: its gradient is a
     # function of the actor's log-probs, so updating it on a step where the
@@ -147,18 +143,16 @@ def _grad_step(
 
     operand = (state, log_alpha_module, alpha_optimizer)
     if update_actor is None:
-        # policy_delay == 1: the caller skips the mask entirely so the default
-        # configuration never pays for a branch it always takes (measured ~4%
-        # of the step on CPU when routed through `nnx.cond` regardless).
+        # policy_delay == 1: the caller skips the mask entirely, so the default
+        # configuration never pays for a branch it always takes.
         actor_loss = _actor_update(operand)
     else:
         actor_loss = nnx.cond(
             update_actor, _actor_update, _skip_actor_update, operand
         )
 
-    # 4. Soft update target critics (SAC has no target actor). Kept on every
-    # step regardless of `policy_delay`: it tracks the critic, not the policy,
-    # and the ablation measures it at ~0% of the step.
+    # Soft update of the target critics (SAC has no target actor). Runs on every
+    # step regardless of `policy_delay`: it tracks the critic, not the policy.
     new_critic_tensors = nnx.state(state.critic, nnx.Param)
     old_critic_tensors = nnx.state(state.target_critic, nnx.Param)
     new_target_critic_tensors = optax.incremental_update(
@@ -184,10 +178,9 @@ def _grad_step(
     )
 
 
-# Fused N-step update. The body is compiled once and run `n_steps` times
-# on-device via `lax.scan` (instead of the Python loop this used to be, which
-# paid a full host dispatch + a full replay-buffer copy per gradient step).
-# The entropy temperature and its optimizer ride along in the scan carry
+# Fused N-step update. The body is compiled once and run `n_steps` times on-device
+# via `lax.scan`, so a burst costs one host dispatch rather than one per gradient
+# step. The entropy temperature and its optimizer ride along in the scan carry
 # alongside the train state; `buffer_state` and the normalization params are
 # loop-constant.
 @functools.partial(
@@ -196,10 +189,9 @@ def _grad_step(
         "gamma", "tau", "replay_sample_fn", "n_steps",
         "target_entropy", "auto_alpha", "policy_delay", "n_step", "normalize",
     ),
-    # Donate the train state (arg 0): its large read-only replay buffer is
-    # threaded unchanged through the scan, so without donation XLA allocates a
-    # full second copy of the buffer (~1.4GB for 500k obs) every update. The
-    # caller reassigns self.state from the result, so donating is safe.
+    # Donate the train state (arg 0): its large read-only replay buffer is threaded
+    # unchanged through the scan, so without donation XLA allocates a full second
+    # copy of it every update. The caller reassigns self.state from the result.
     donate_argnums=(0,),
 )
 def _grad_steps(
@@ -225,10 +217,10 @@ def _grad_steps(
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
     # Pre-split per-step keys and precompute the delayed-update schedule.
-    # `policy_delay` is static, so at 1 (the default) the mask is dropped
-    # altogether and `_grad_step` takes its unconditional path — no `nnx.cond`
-    # in the compiled program at all. `None` is an empty pytree node, so it
-    # rides along in `xs` without contributing a scanned leaf.
+    # `policy_delay` is static, so at 1 the mask is dropped altogether and
+    # `_grad_step` takes its unconditional path — no `nnx.cond` in the compiled
+    # program at all. `None` is an empty pytree node, so it rides along in `xs`
+    # without contributing a scanned leaf.
     keys = jax.random.split(key, n_steps)
     update_mask = (
         None if policy_delay <= 1 else (jnp.arange(n_steps) % policy_delay) == 0

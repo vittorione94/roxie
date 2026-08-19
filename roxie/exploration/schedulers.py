@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 
 
-# Base classes for decay schedules
 class DecaySchedule(abc.ABC):
     """Abstract base class for noise decay schedules."""
 

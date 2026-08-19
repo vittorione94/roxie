@@ -1,4 +1,6 @@
-# testflashbax2.py
+"""Minimal flashbax TrajectoryQueue walkthrough: add (B, T) batches, sample
+fixed-length windows, and inspect what comes back."""
+
 import jax
 import jax.numpy as jnp
 import flashbax as fbx
@@ -15,12 +17,12 @@ def make_fake_batch(add_batch_size, add_sequence_length, obs_dim, offset=0.0):
              .reshape(B, T, obs_dim)) + offset
     action = (jnp.arange(B * T, dtype=jnp.int32).reshape(B, T)) % 4
     reward = jnp.linspace(0.0, 1.0, B * T, dtype=jnp.float32).reshape(B, T)
-    discount = jnp.ones((B, T), dtype=jnp.float32)  # or (B,T) float
+    discount = jnp.ones((B, T), dtype=jnp.float32)
     print('fake batch shapes:', tree_shapes({"obs": obs, "action": action, "reward": reward, "discount": discount}))
     return {"obs": obs, "action": action, "reward": reward, "discount": discount}
 
 def unwrap_experience(sample_obj):
-    # Some versions wrap as sample.experience, others return the experience directly
+    # Some flashbax versions wrap the result in `.experience`, others return it bare.
     return getattr(sample_obj, "experience", sample_obj)
 
 def main():
@@ -35,7 +37,7 @@ def main():
     buffer = fbx.buffers.make_trajectory_queue(
         add_batch_size=ADD_BATCH_SIZE,
         add_sequence_length=ADD_SEQ_LEN,
-        sample_sequence_length=SAMPLE_SEQ_LEN,        # REQUIRED by your version
+        sample_sequence_length=SAMPLE_SEQ_LEN,
         max_length_time_axis=MAX_LENGTH_TIME_AXIS,
     )
 

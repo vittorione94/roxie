@@ -243,16 +243,14 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         self._njmax = njmax
         self._naccdmax = naccdmax
         # CUDA-graph capture mode for the Warp backend. mjx defaults to
-        # GraphMode.WARP, whose capture cache is keyed on per-step input/output
-        # buffer addresses; under JAX those addresses change every step, so a new
-        # CUDA graph is captured each step (slow CPU graph-instantiate) and the
-        # evicted ones' native host descriptors are never reclaimed — a steady
-        # host-RAM leak (~0.25GB per 1M steps here) that OOM-kills long runs.
-        # GraphMode.WARP_STAGED_EX captures the graph ONCE on fixed staging
-        # buffers and replays it every step (+ a cheap device→staging memcpy):
-        # graph-replay speed, no per-step recapture, no leak. GraphMode.JAX/NONE
-        # also avoid the leak but launch kernels eagerly — far slower for this
-        # many-kernel step. Ignored by the classic "jax" backend.
+        # GraphMode.WARP, whose capture cache is keyed on per-step input/output buffer
+        # addresses; under JAX those change every step, so a new CUDA graph is
+        # captured each step and the evicted ones' native host descriptors are never
+        # reclaimed — a steady host-RAM leak that eventually OOMs a long run.
+        # GraphMode.WARP_STAGED_EX captures the graph ONCE on fixed staging buffers
+        # and replays it, adding only a device->staging memcpy per step.
+        # GraphMode.JAX/NONE also avoid the leak but launch kernels eagerly, far
+        # slower for a step with this many kernels. Ignored by the "jax" backend.
         put_kwargs = {}
         if impl == "warp" and graph_mode is not None:
             from warp._src.jax_experimental.ffi import GraphMode
@@ -787,59 +785,48 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         ee_err = jp.sum(jp.square(ee_pos - ref_ee_pos))
         r_ee = jp.exp(-ee_err / cfg.sigma_ee)
 
-        # Root position and orientation get SEPARATE kernels. Sharing one
-        # exponential made the term a poor lever on the thing that actually ends
-        # episodes: measured on real runs, `root_pos_err + root_quat_err` was
-        # 82-90% orientation and only 10-18% position, while `root_termination`
-        # fires on `root_dist = sqrt(root_pos_err)` -- position alone. Raising a
-        # single `w_root` therefore put ~85% of the extra pressure on a quantity
-        # that never terminates anything. Split, `w_root_pos` weights exactly
-        # what the termination measures.
+        # Root position and orientation get SEPARATE kernels. A shared exponential
+        # is dominated by the orientation error, while `root_termination` fires on
+        # `root_dist = sqrt(root_pos_err)` — position alone — so a single `w_root`
+        # puts most of its pressure on a quantity that never terminates anything.
+        # Split, `w_root_pos` weights exactly what the termination measures.
         root_pos_err = jp.sum(jp.square(data.qpos[:3] - ref_qpos[:3]))
         root_quat_err = quaternion_distance(data.qpos[3:7], ref_qpos[3:7])
 
         r_root_pos = jp.exp(-root_pos_err / cfg.sigma_root_pos)
         r_root_quat = jp.exp(-root_quat_err / cfg.sigma_root_quat)
-        # Kept for logging continuity with earlier runs (same formula as before
-        # the split), so `reward/root` stays comparable across the change.
+        # The combined kernel, logged as `reward/root` alongside the split terms.
         r_root = jp.exp(-(root_pos_err + root_quat_err) / cfg.sigma_root)
 
         root_dist = jp.sqrt(root_pos_err)
 
-        # Root VELOCITY tracking (qvel[:6] = 3 linear + 3 angular). Deliberately
-        # its own term: `r_vel` above starts at qvel[6:], so the root's own
-        # velocity is otherwise absent from every reward component, and root
-        # drift is the integral of exactly this error. Without it the only
-        # pressure on the root arrives after drift has already accumulated into
-        # position error -- and `r_root` is a poor proxy for that, since
-        # measured on real runs it is 82-90% orientation and only 10-18%
-        # position, while `root_termination` fires on position alone.
+        # Root VELOCITY tracking (qvel[:6] = 3 linear + 3 angular), deliberately its
+        # own term: `r_vel` above starts at qvel[6:], so the root's own velocity is
+        # otherwise absent from every reward component — and root drift is the
+        # integral of exactly this error. Without it, pressure on the root only
+        # arrives once drift has already accumulated into position error.
         #
-        # Kept OUT of the `tracking` sum below (like the torque/action-rate
-        # penalties) on purpose: `tracking` sets the collapse threshold via
+        # Kept OUT of the `tracking` sum below, like the torque/action-rate
+        # penalties: `tracking` sets the collapse threshold via
         # `min_tracking_frac * sum(weights)`, so folding this in would move the
-        # termination floor at the same time as the reward gradient and
-        # confound the two. This term shapes behaviour only.
+        # termination floor and the reward gradient at once. It shapes behaviour only.
         root_vel_err = jp.sum(jp.square(data.qvel[:6] - ref_qvel[:6]))
         r_root_vel = jp.exp(-root_vel_err / cfg.sigma_root_vel)
 
-        # Effort penalty: discourage needless actuation power. Uses the ACTUAL
-        # actuator force normalized by each actuator's strength limit, so it
-        # means "effort" under both actuation modes: in torque mode
-        # actuator_force = gear * ctrl, so force/limit == ctrl and this equals
-        # the old mean-square-ctrl penalty exactly; in position mode ctrl is a
-        # target pose, so penalizing it would be wrong — the servo's realized
-        # force is the effort. Penalty (negative), kept OUT of `tracking` below
+        # Effort penalty on the ACTUAL actuator force, normalized by each actuator's
+        # strength limit so it means "effort" under either actuation mode: in torque
+        # mode actuator_force = gear * ctrl, so force/limit reduces to ctrl, while in
+        # position mode ctrl is a target pose and penalizing it would be wrong — the
+        # servo's realized force is the effort. Negative, and kept OUT of `tracking`
         # so it never feeds the tracking-collapse termination.
         effort = data.actuator_force / self._force_limit
         r_torque = -cfg.w_torque * jp.mean(jp.square(effort))
 
-        # Action-rate penalty: temporal smoothness of the RAW policy output
-        # (pre-filter — penalize the source of chatter, not its filtered echo).
-        # Normalized [-1,1] units, so a persistent full-range flip costs
-        # w_action_rate * 4 per step. First step of an episode compares against
-        # last_act = 0 (reset init) — a mild, bounded artifact. Kept OUT of
-        # `tracking` so it never feeds the tracking-collapse termination.
+        # Action-rate penalty on the RAW policy output, pre-filter, so it charges the
+        # source of chatter rather than its filtered echo. In normalized [-1, 1]
+        # units, so a persistent full-range flip costs w_action_rate * 4 per step. The
+        # first step of an episode compares against last_act = 0, a bounded artifact.
+        # Kept OUT of `tracking` so it never feeds the tracking-collapse termination.
         r_action_rate = -cfg.w_action_rate * jp.mean(jp.square(action - last_action))
 
         metrics["reward/pose"] = r_pose

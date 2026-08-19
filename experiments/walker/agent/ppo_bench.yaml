@@ -1,0 +1,79 @@
+# PPO arm of the WalkerWalk release benchmark. The odd one out: on-policy, so
+# there is no replay buffer, no warmup, no target networks and no replay ratio
+# to match against the other six arms. Networks stay [256, 256] + layer norm so
+# capacity remains the controlled variable, and the env/trainer block is the
+# same shared file.
+#
+# What CANNOT be equalized, and belongs in the figure's caption:
+#   - sample efficiency: each rollout is discarded after its update, so at equal
+#     env steps PPO has seen far fewer gradient-relevant samples. Rank it on
+#     score-vs-env-steps AND score-vs-wall-clock, never on gradient steps.
+#   - the critic is a V critic (state value), not Q(s, a).
+_target_: roxie.agents.PPO
+
+gamma: 0.99
+gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
+clip_eps: 0.2                   # PPO surrogate clip range
+entropy_coef: 1e-2              # entropy bonus weight in the actor loss
+actor_learning_rate: 3e-4
+critic_learning_rate: 1e-3
+# Gradient passes over each rollout before it is discarded. Meaningful only
+# because old_log_probs stay pinned to the behaviour policy across the passes;
+# at 1 the ratio is identically 1, the clip never binds, and this reduces to
+# A2C.
+learning_steps: 8
+# Minibatches per pass, splitting the ENV axis — must divide add_batch_size
+# (= parallel_envs = 256) exactly.
+num_minibatches: 8
+# Stop the pass loop once the policy has drifted this far from the behaviour
+# policy (Schulman's approx KL), making learning_steps an upper bound rather
+# than a fixed count. Watch `ppo/steps_per_rollout`: it climbing toward
+# learning_steps means the trust region has stopped binding.
+target_kl: 0.03
+max_grad_norm: 1
+normalize_observations: true
+obs_norm_clip: 5.0
+obs_norm_eps: 1e-08
+
+actor_config:
+  _target_: roxie.models.actors.StochasticActor
+  features: [256, 256]
+  use_layer_norm: true
+  std_min: 1e-4
+  std_max: 5.0
+  # Bound actions in (-1, 1) via tanh. Without it nothing keeps the policy mean
+  # inside actuator_ctrlrange.
+  squash: true
+
+critic_config:
+  _target_: roxie.models.critics.VCritic
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory_config:
+  # On-policy trajectory queue: one timestep per env per step, and the update
+  # fires once `sample_sequence_length` steps are queued => 32 x 256 envs = 8192
+  # transitions per update, after which the queue drains.
+  _target_: flashbax.buffers.make_trajectory_queue
+  # CAPACITY, not update size — `update()` drains every step, so occupancy
+  # oscillates between 0 and sample_sequence_length and never approaches this.
+  # Oversizing it is pure allocation (and, since `add` copies the queue, pure
+  # per-step cost as well): 2x headroom is enough.
+  max_length_time_axis: 64
+  add_batch_size: ${env.parallel_envs}
+  add_sequence_length: 1
+  sample_sequence_length: 32
+
+seed: 0
+
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

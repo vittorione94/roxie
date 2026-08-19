@@ -291,14 +291,12 @@ def ppo_critic_loss_fn(
 
     `returns` is the GAE return target `A_raw + V_old`, built by the caller from
     the *unnormalized* advantage. Do not rebuild it here from the advantage the
-    actor consumes: that one is standardized to zero mean / unit variance, which
-    is fine for the policy gradient but makes an unfittable regression target --
-    the critic would be chasing its own previous output plus unit-variance
-    noise, flooring this loss at ~1.0 permanently.
+    actor consumes: that one is standardized to zero mean / unit variance, which is
+    fine for the policy gradient but makes an unfittable regression target — the
+    critic would be chasing its own previous output plus unit-variance noise.
     """
-    v_t = critic_model(observations)[:, :-1, 0] # shape (NUM_ENVS, BATCH_SIZE, 1)
-
-    # returns --> (NUM_ENVS, BATCH_SIZE - 1)
+    # Both operands are (NUM_ENVS, BATCH_SIZE - 1): the last step has no return.
+    v_t = critic_model(observations)[:, :-1, 0]
     critic_loss = jnp.mean((v_t - returns) ** 2)
     return critic_loss
 

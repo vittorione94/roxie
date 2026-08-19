@@ -98,7 +98,6 @@ def load_runs(paths):
 
 
 def main():
-    # Set up argument parsing
     parser = argparse.ArgumentParser(description="Generate learning curves from one or more run log CSVs.")
     parser.add_argument("--csv-path", "--path", dest="csv_path", required=True, nargs="+", type=str,
                         help="Path(s) to log.csv files and/or directories, which are searched "
@@ -119,7 +118,6 @@ def main():
 
     time_name, time_div = wallclock_unit(runs)
 
-    # Create the figure and subplots
     fig, axs = plt.subplots(4, 2, figsize=(15, 20))
     if multi:
         fig.suptitle(f"Training Metrics: {len(runs)} runs", fontsize=16, fontweight='bold')
@@ -129,54 +127,46 @@ def main():
     for (label, df), color in zip(runs, colors):
         prefix = f"{label}: " if multi else ""
 
-        # Plot 1: Scores vs Steps
         if 'score' in df.columns and 'test/score' in df.columns:
             axs[0, 0].plot(df['steps'], df['score'], label=f'{prefix}Train Score',
                            color=color, alpha=0.8, linewidth=2)
             axs[0, 0].plot(df['steps'], df['test/score'], label=f'{prefix}Test Score',
                            color=color, alpha=0.8, linewidth=2, linestyle='--')
 
-        # Plot 2: Episode Length vs Steps
         if 'length' in df.columns and 'test/length' in df.columns:
             axs[0, 1].plot(df['steps'], df['length'], label=f'{prefix}Train Length',
                            color=color, alpha=0.8, linewidth=2)
             axs[0, 1].plot(df['steps'], df['test/length'], label=f'{prefix}Test Length',
                            color=color, alpha=0.8, linewidth=2, linestyle='--')
 
-        # Plot 3: Actor Loss vs Steps
         if 'loss/actor' in df.columns:
             axs[1, 0].plot(df['steps'], df['loss/actor'], label=f'{prefix}Actor Loss',
                            color=color if multi else 'green', alpha=0.8, linewidth=2)
 
-        # Plot 4: Critic Loss vs Steps
         if 'loss/critic' in df.columns:
             axs[1, 1].plot(df['steps'], df['loss/critic'], label=f'{prefix}Critic Loss',
                            color=color if multi else 'red', alpha=0.8, linewidth=2)
 
-        # Plot 5: SPS vs Steps
         if 'sps' in df.columns:
             axs[2, 0].plot(df['steps'], df['sps'], label=f'{prefix}SPS',
                            color=color if multi else 'purple', alpha=0.8, linewidth=2)
 
-        # Plot 6: Gradient Steps vs Steps
         if 'gradient_steps' in df.columns:
             axs[2, 1].plot(df['steps'], df['gradient_steps'], label=f'{prefix}Gradient Steps',
                            color=color if multi else 'orange', alpha=0.8, linewidth=2)
 
-        # Plots 7-8: progress against wall-clock time, which is what actually
-        # ranks runs that reach the same score at very different throughputs.
+        # The wall-clock panels: what actually ranks runs that reach the same
+        # score at very different throughputs.
         if 'time/total_s' not in df.columns:
             continue
         wall = df['time/total_s'] / time_div
 
-        # Plot 7: Scores vs Wall-Clock Time
         if 'score' in df.columns and 'test/score' in df.columns:
             axs[3, 0].plot(wall, df['score'], label=f'{prefix}Train Score',
                            color=color, alpha=0.8, linewidth=2)
             axs[3, 0].plot(wall, df['test/score'], label=f'{prefix}Test Score',
                            color=color, alpha=0.8, linewidth=2, linestyle='--')
 
-        # Plot 8: Steps vs Wall-Clock Time
         if 'steps' in df.columns:
             axs[3, 1].plot(wall, df['steps'], label=f'{prefix}Steps',
                            color=color if multi else 'brown', alpha=0.8, linewidth=2)
@@ -202,10 +192,8 @@ def main():
         if ax.get_legend_handles_labels()[0]:
             ax.legend()
 
-    # Adjust layout to prevent overlapping text and accommodate the main title
     plt.tight_layout(rect=[0, 0.03, 1, 0.96])
 
-    # Save the figure to a PDF
     try:
         plt.savefig(args.output, format='pdf', bbox_inches='tight')
         print(f"Successfully generated plots and saved to: {args.output}")

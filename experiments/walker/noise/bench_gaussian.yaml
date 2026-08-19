@@ -1,0 +1,21 @@
+# Exploration noise shared by every DETERMINISTIC-policy arm of the WalkerWalk
+# release benchmark (DDPG / TD3 / TD4 / D4PG). Pinned here rather than selected
+# via `/noise: gaussian` so the benchmark cannot drift when the global
+# roxie/configs/noise/gaussian.yaml is retuned for another env.
+#
+# SAC / MPO / PPO explore from their own stochastic policies and their agents
+# take no `noise_config` at all — their launchables deliberately omit this
+# group, and adding it to them is a launch-time error.
+#
+# The anneal, not the scale, is the important part: a frozen scale caps the
+# achievable score because the behaviour policy never sharpens. `decay_steps`
+# is 40% of the 5M-step benchmark budget, so noise reaches its floor with more
+# than half the run left to exploit it. If you change trainer.steps, change
+# this with it — a decay measured in env steps silently becomes "no anneal" at
+# a shorter budget and "no exploration" at a longer one.
+_target_: roxie.exploration.noisy.GaussianNoise
+initial_noise_scale: 0.4
+decay_schedule:
+  _target_: roxie.exploration.schedulers.LinearDecay
+  decay_steps: 2_000_000
+  final_value: 0.1

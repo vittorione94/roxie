@@ -1,20 +1,16 @@
-# pip install flashbax jax jaxlib
+"""Minimal flashbax flat-buffer walkthrough: add one batched timestep per call
+(no time axis) and sample (t, t+1) transition pairs."""
 
 import jax
 import jax.numpy as jnp
 import flashbax as fbx
 
-# -----------------------------
-# Config
-# -----------------------------
 n_envs = 400
 obs_dim = 8
 act_dim = 2
 sample_batch_size = 256
 
-# -----------------------------
-# Build a Flat Buffer for batched adds (no time dim in add(...))
-# -----------------------------
+# A flat buffer takes batched adds with no time dimension.
 buffer = fbx.make_flat_buffer(
     max_length=100_000,
     min_length=3,               # need >= 3 timesteps to have 2 transitions
@@ -23,9 +19,7 @@ buffer = fbx.make_flat_buffer(
     add_batch_size=n_envs,      # <-- tells Flashbax your add batch size
 )
 
-# -----------------------------
-# Init with a SINGLE TIMESTEP (no batch/time dims)
-# -----------------------------
+# Initialized from a SINGLE TIMESTEP, with no batch or time dims.
 example_timestep = {
     "obs":      jnp.zeros((obs_dim,)),
     "action":   jnp.zeros((act_dim,)),
@@ -34,10 +28,7 @@ example_timestep = {
 }
 state = buffer.init(example_timestep)
 
-# -----------------------------
-# Toy data generator for one step across all 400 envs
-# IMPORTANT: shapes are (B, …)  -> NO time axis here
-# -----------------------------
+# One step across all envs: shapes are (B, ...), with no time axis.
 def make_step(rng):
     k1, k2, k3 = jax.random.split(rng, 3)
     obs      = jax.random.normal(k1, (n_envs, obs_dim))                 # (400, 8)
@@ -46,23 +37,19 @@ def make_step(rng):
     discount = jnp.ones((n_envs,))                                      # (400,)
     return {"obs": obs, "action": action, "reward": reward, "discount": discount}
 
-# -----------------------------
-# Add 10 sequential timesteps (internally Flashbax treats them as T=1 each call)
-# -----------------------------
+# Ten sequential timesteps; flashbax treats each call as T=1.
 key = jax.random.PRNGKey(0)
 for _ in range(10):
     key, sub = jax.random.split(key)
     step = make_step(sub)
-    # sanity-check shapes; none should have a time axis
+    # None of these should have a time axis.
     assert step["obs"].shape == (n_envs, obs_dim)
     assert step["action"].shape == (n_envs, act_dim)
     assert step["reward"].shape == (n_envs,)
     assert step["discount"].shape == (n_envs,)
     state = buffer.add(state, step)
 
-# -----------------------------
-# Sample a batch of transitions (t, t+1)
-# -----------------------------
+# Sample a batch of (t, t+1) transitions.
 assert buffer.can_sample(state), "Buffer cannot sample yet—need more timesteps."
 
 key, sub = jax.random.split(key)

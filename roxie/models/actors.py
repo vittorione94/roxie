@@ -168,23 +168,20 @@ class DeterministicActor(nnx.Module):
         in_features: int,
         features: Sequence[int],
         action_dim: int,
-        *,  # Make rngs a keyword-only argument
+        *,
         rngs: nnx.Rngs,
         activation_fn: Callable = nnx.relu,
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,
         output_init_scale: float = 0.01,
     ):
-        # --- Store static configuration ---
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
         self.action_dim = action_dim
 
-        # --- Define stateful layers ---
         hidden_layers = []
         norm_layers = []
 
-        # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
             hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
@@ -196,11 +193,9 @@ class DeterministicActor(nnx.Module):
         if self.use_layer_norm:
             self.norm_layers = nnx.List(norm_layers)
 
-        # Dropout and output layers
-        # self.dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
-        # `output_init_scale` scales the VARIANCE of the default lecun_normal
-        # init (1.0), so 0.01 means 10x smaller weights and pre-tanh logits
-        # starting at ~0.1 instead of ~1 -- squarely in tanh's linear region.
+        # `output_init_scale` scales the VARIANCE of the default lecun_normal init,
+        # so 0.01 gives 10x smaller weights and pre-tanh logits starting near 0.1
+        # instead of 1 — squarely inside tanh's linear region.
         self.output_layer = nnx.Linear(
             current_features,
             action_dim,
@@ -219,16 +214,13 @@ class DeterministicActor(nnx.Module):
         the action has saturated to exactly +-1 in float32) keeps the penalty
         differentiable at the only point where it matters.
         """
-        # Use the layers defined in __init__
         for i, layer in enumerate(self.hidden_layers):
             x = layer(x)
             if self.use_layer_norm:
                 x = self.norm_layers[i](x)
             x = self.activation_fn(x)
-            # x = self.dropout(x, deterministic=not training)
 
         pre_activation = self.output_layer(x)
-        # Scale output to action space range, e.g., [-1, 1]
         return nnx.tanh(pre_activation), pre_activation
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -242,7 +234,7 @@ class StochasticActor(nnx.Module):
         in_features: int,
         features: Sequence[int],
         action_dim: int,
-        *,  # Make rngs a keyword-only argument
+        *,
         rngs: nnx.Rngs,
         activation_fn: Callable = nnx.relu,
         use_layer_norm: bool = False,
@@ -250,7 +242,6 @@ class StochasticActor(nnx.Module):
         std_max: float = 1.0,
         squash: bool = False,
     ):
-        # --- Store static configuration ---
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
         self.action_dim = action_dim
@@ -260,11 +251,9 @@ class StochasticActor(nnx.Module):
         # False so SAC/MPO, which share this class, are untouched.
         self.squash = squash
 
-        # --- Define stateful layers ---
         hidden_layers = []
         norm_layers = []
 
-        # Create hidden layers dynamically
         current_features = in_features
         for feat in features:
             hidden_layers.append(nnx.Linear(current_features, feat, rngs=rngs))
@@ -283,7 +272,6 @@ class StochasticActor(nnx.Module):
         self.distribution = TanhNormal if squash else distrax.MultivariateNormalDiag
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # Use the layers defined in __init__
         for i, layer in enumerate(self.hidden_layers):
             x = layer(x)
             if self.use_layer_norm:
@@ -291,9 +279,8 @@ class StochasticActor(nnx.Module):
             x = self.activation_fn(x)
 
         mean = self.output_layer(x)
-        std = nnx.softplus(self.log_std_layer(x)) + 1e-5  # Ensure std is positive
-
-        # clamp std to avoid numerical issues
+        # softplus keeps std positive; the clip keeps it numerically sane.
+        std = nnx.softplus(self.log_std_layer(x)) + 1e-5
         std = jnp.clip(std, a_min=self.std_min, a_max=self.std_max)
 
         return self.distribution(mean, std)

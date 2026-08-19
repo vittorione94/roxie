@@ -76,12 +76,11 @@ class EnvPoolWrapper:
     # no MJX backend, the "physics impl" is the pool itself.
     _impl: str = "envpool"
 
-    # Optional pool hooks the trainer discovers by `hasattr`, forwarded verbatim
-    # so a pool that implements the negative-mining protocol (see
-    # MocapCpuPool) reaches `_run_envpool` through the wrapper. Unlike the JAX
-    # path the weights/counters live in the pool rather than being threaded as
-    # traced arguments — there is no trace to keep them out of — so the trainer
-    # only has to say *when* to refresh, not carry the state.
+    # Optional pool hooks the trainer discovers by `hasattr`, forwarded verbatim so
+    # a pool implementing the negative-mining protocol reaches `_run_envpool` through
+    # the wrapper. Unlike the JAX path, the weights/counters live in the pool rather
+    # than being threaded as traced arguments, so the trainer only has to say *when*
+    # to refresh, not carry the state.
     _POOL_HOOKS = (
         "mining_bins", "mining_refresh", "mining_stats", "refresh_reset_pool",
     )
@@ -118,10 +117,9 @@ class EnvPoolWrapper:
     def step(self, state: EnvPoolWrapperState, action: Any) -> EnvPoolWrapperState:
         obs, reward, terminated, truncated, info = self._pool.step(np.asarray(action))
         done = np.logical_or(terminated, truncated)
-        # Pools may report per-step env metrics (e.g. the mocap pool's reward
-        # components) under info["metrics"]; surface them on the state so the
-        # trainer logs them exactly like the JAX path does. Kept as numpy —
-        # the trainer reduces them host-side.
+        # Pools may report per-step env metrics under info["metrics"]; surface them
+        # on the state so the trainer logs them exactly as it does on the JAX path.
+        # Left as numpy: the trainer reduces them host-side.
         metrics = info.get("metrics", {}) if isinstance(info, dict) else {}
         return EnvPoolWrapperState(
             EnvPoolEnvState(

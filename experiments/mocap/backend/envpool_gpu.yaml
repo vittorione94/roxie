@@ -1,0 +1,48 @@
+# @package _global_
+
+# Release-grid cell 3/3 for the mocap task: CPU physics (native MuJoCo pool) +
+# GPU learner — the hybrid.
+#
+# Identical to backend/envpool_cpu.yaml except for `runtime.jax_platform`, which is
+# what splits the two devices: the pool steps physics in C++ on 24 threads while
+# the agent's dense actor/critic GEMMs stay on the card. Measured on this box
+# (12-core 7900X + RTX 5080, PPO, parallel_envs=1000, obs 1069, nets
+# [1024,512,256]):
+#
+#   CPU physics + GPU learner (this cell)   ~17.2k sps
+#   fully GPU-free (backend: envpool)       ~13.6k sps
+#   physics-only ceiling, no learner        ~38-40k sps
+#
+# So the hybrid buys ~20% back for ~1.4 GB of VRAM and a re-coupling to the
+# card. It also enables the async learner below, which is pointless in the
+# GPU-free cell (there are no two devices to overlap).
+
+release:
+  cell: envpool_gpu
+
+env:
+  builder: examples.mocap.mocap_envpool.build_mocap_envpool_env
+  impl: envpool
+  # See backend/envpool_cpu.yaml for the stepper/thread measurements — held
+  # identical to the GPU-free cell so the ONLY difference between the two is
+  # where the learner runs.
+  stepper: rollout
+  num_threads: null
+  test_episodes: ${trainer.test_episodes}
+
+runtime:
+  # null = leave the agent on the GPU. This is the one line that separates this
+  # cell from backend/envpool_cpu.yaml.
+  jax_platform: null
+
+trainer:
+  # Gradient updates move to a background thread that is the SOLE owner of
+  # agent.state; the acting thread selects actions from a published behaviour-
+  # actor snapshot and pushes transitions through a queue. Without it the loop
+  # is fully serial — step CPU physics, then run the GPU burst, each device idle
+  # while the other works. Replay ratio is preserved; the behaviour policy lags
+  # by up to one burst, which is standard for async off-policy RL. envpool-loop
+  # only, and meaningless when the agent is also on CPU.
+  async_learner: true
+  # Interleaving granularity vs per-dispatch overhead.
+  learner_chunk: 8

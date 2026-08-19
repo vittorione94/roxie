@@ -73,8 +73,8 @@ def _collect_and_update(agent, drift=2.0, unfreeze_norm=False):
         state = nxt
 
     if unfreeze_norm:
-        # Reproduce the pre-fix behaviour: throw away the acting snapshot so the
-        # update re-derives mean/std from the (heavily drifted) running stats.
+        # Throw away the acting snapshot so the update re-derives mean/std from the
+        # (heavily drifted) running stats — the failure mode the freeze prevents.
         agent._obs_norm = None
 
     key, update_key = jax.random.split(key)

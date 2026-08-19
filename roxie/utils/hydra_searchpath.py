@@ -5,7 +5,7 @@ by env into ``ant/``, ``walker/``, ``mocap/`` subfolders) — that tree isn't
 inside the installed ``roxie`` package, so Hydra can't see it by default. The
 primary ``config_path`` stays at ``roxie/configs`` (the shared ``agent`` /
 ``noise`` groups); this plugin appends ``experiments/`` so configs there compose
-against those groups (e.g. ``--config-name walker/walker_ddpg``). The path is
+against those groups (e.g. ``--config-name walker/bench_td3``). The path is
 derived from this file's location, so it holds regardless of the working
 directory Hydra runs in.
 """

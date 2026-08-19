@@ -1,0 +1,51 @@
+# @package _global_
+
+# Release-grid cell 2/3 for the mocap task: CPU physics (native MuJoCo pool) +
+# CPU learner — the fully GPU-free cell, which leaves the card genuinely empty.
+# Selected by a launchable via defaults: [ ..., backend: envpool_cpu ]. For the
+# hybrid (CPU physics, GPU learner) see backend/envpool_gpu.yaml. The Warp
+# budgets
+# (naconmax/njmax/naccdmax, graph_mode, gpu_clip_budget) don't apply here and are
+# simply omitted.
+#
+# Sizing parallel_envs: throughput is near-FLAT in it — the wall is per-env cost,
+# not dispatch. Measured with stepper=rollout: 35.2k sps at 1000 envs, 38.5k at
+# 4000 (and the threaded stepper is flat at ~14k from 250 envs to 8000). Raise it
+# for a bigger PPO batch per iteration, not for throughput.
+release:
+  cell: envpool_cpu
+
+env:
+  builder: examples.mocap.mocap_envpool.build_mocap_envpool_env
+  impl: envpool
+  # Physics stepper: "rollout" hands the batch to mujoco.rollout's own C++ thread
+  # pool; "threads" is the original per-env mj_step over a ThreadPoolExecutor,
+  # kept as the reference implementation. Measured on the 12-core/24-thread 7900X
+  # at parallel_envs=1000: 14.2k sps threaded, 35.2k rollout. Roughly half of that
+  # gain is the native pool (no per-chunk dispatch, no GIL between mj_step calls)
+  # and half is what stops being done in Python — the per-env control filtering
+  # and the whole MjData capture stage.
+  #
+  # The two agree bit-for-bit on a single step from identical state; over a free
+  # -running trajectory they separate, because mujoco.rollout takes qacc_warmstart
+  # as an input but returns none, so its solver re-converges cold each step and
+  # the ~1e-9 seed that plants amplifies chaotically. See check_envpool_parity.py.
+  stepper: rollout
+  # Stepping threads (both steppers); null = min(parallel_envs, cpu cores), which
+  # is the right default here. Measured at parallel_envs=1000: 24 threads beats 16
+  # once the env count is well above the core count, because mj_step releases the
+  # GIL and the SMT siblings absorb the memory stalls. Below ~100 envs the extra
+  # threads only add dispatch overhead.
+  num_threads: null
+  # EnvPool eval pool size must equal trainer.test_episodes (see the builder
+  # docstring); bind it so the two can't drift.
+  test_episodes: ${trainer.test_episodes}
+
+runtime:
+  # Where the AGENT runs. "cpu" keeps the whole process off the GPU, which is
+  # the point of this backend: the pool's physics is native MuJoCo, but the JAX
+  # agent would still claim (and preallocate most of) the card otherwise. See
+  # the `impl == "envpool"` branch in train.py for the measured throughput cost
+  # of doing so; set to null to keep the agent on the GPU (CPU physics + GPU
+  # learner), which is roughly 2x faster but puts ~1.4 GB back on the card.
+  jax_platform: cpu

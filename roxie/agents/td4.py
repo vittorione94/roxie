@@ -41,9 +41,9 @@ def _grad_step(
     actor and target updates run under `nnx.cond` so the delayed-policy-update
     trick survives the `lax.scan` (where the step index is no longer static).
     `n_step` is the TD horizon (NOT the scan length `n_steps`)."""
-    # 1. Sample from the replay buffer. `repack_samples` folds the n-step
-    # return, bootstrap coefficient, and bootstrap obs into the dict — exactly
-    # the ingredients the categorical projection needs to shift the support.
+    # `repack_samples` folds the n-step return, bootstrap coefficient, and
+    # bootstrap obs into the dict — exactly the ingredients the categorical
+    # projection needs to shift the support.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
@@ -53,8 +53,8 @@ def _grad_step(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    # 2. Critic update (cross-entropy against the projected target categorical
-    # of the pessimistic target head) — every step
+    # Critic update: cross-entropy against the projected target categorical of the
+    # pessimistic target head, on every step.
     critic_loss, critic_grads = nnx.value_and_grad(td4_critic_loss_fn)(
         state.critic,
         state.target_actor,
@@ -69,9 +69,9 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # 3. Delayed actor + target updates — only on steps where `update_actor` is
-    # True. Under `lax.scan` the step index is traced, so this must be a runtime
-    # branch (`nnx.cond`) rather than a Python `if`.
+    # Delayed actor + target updates, only on steps where `update_actor` is True.
+    # Under `lax.scan` the step index is traced, so this must be a runtime branch
+    # (`nnx.cond`) rather than a Python `if`.
     def _actor_update(state):
         actor_loss, actor_grads = nnx.value_and_grad(td4_actor_loss_fn)(
             state.actor,
@@ -83,7 +83,7 @@ def _grad_step(
         )
         state.actor_optimizer.update(state.actor, actor_grads)
 
-        # Soft-update both target networks alongside the policy update
+        # Soft-update both target networks alongside the policy.
         new_actor_tensors = nnx.state(state.actor, nnx.Param)
         old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
         new_target_actor_tensors = optax.incremental_update(
@@ -124,9 +124,9 @@ def _grad_step(
 
 
 # Fused N-step update. The body is compiled once and run `n_steps` times on-device
-# via `lax.scan` (instead of unrolling, which blows up compile time / HLO size at
-# large `n_steps`). The delayed-policy-update schedule is precomputed as a boolean
-# mask scanned over alongside the per-step keys. Only the trainable graph state is
+# via `lax.scan` rather than unrolled, which would blow up compile time and HLO
+# size at large `n_steps`. The delayed-policy-update schedule is precomputed as a
+# boolean mask scanned over alongside the per-step keys. Only the trainable graph state is
 # carried; `buffer_state`, the normalization params, and `atoms` are loop-constant.
 @functools.partial(
     nnx.jit,
@@ -134,10 +134,9 @@ def _grad_step(
         "gamma", "tau", "replay_sample_fn", "n_steps", "policy_delay", "n_step",
         "normalize",
     ),
-    # Donate the train state (arg 0): its large read-only replay buffer is
-    # threaded unchanged through the scan, so without donation XLA allocates a
-    # full second copy of the buffer (~1.4GB for 500k obs) every update. The
-    # caller reassigns self.state from the result, so donating is safe.
+    # Donate the train state (arg 0): its large read-only replay buffer is threaded
+    # unchanged through the scan, so without donation XLA allocates a full second
+    # copy of it every update. The caller reassigns self.state from the result.
     donate_argnums=(0,),
 )
 def _grad_steps(

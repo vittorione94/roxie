@@ -8,7 +8,6 @@ from flax import nnx
 from roxie.exploration.schedulers import ConstantSchedule, DecaySchedule
 
 
-# Base noise module
 class NoiseModule(nnx.Module):
     """Abstract base class for noise modules."""
 
@@ -58,7 +57,6 @@ class NoiseModule(nnx.Module):
         return actions + noise
 
 
-# Gaussian noise
 class GaussianNoise(NoiseModule):
     """Gaussian (white) noise module."""
 
@@ -78,7 +76,6 @@ class GaussianNoise(NoiseModule):
         }
 
 
-# Ornstein-Uhlenbeck noise
 class OrnsteinUhlenbeckNoise(NoiseModule):
     """Ornstein-Uhlenbeck (temporally correlated) noise module."""
 
@@ -97,33 +94,29 @@ class OrnsteinUhlenbeckNoise(NoiseModule):
         self.dt = dt
         self.clip = clip
         self.mu = mu
-        # Initialize the noise state
         self.noise_state = nnx.Variable(jnp.zeros(action_shape))
 
     def sample_noise(
         self, key: jax.random.PRNGKey, shape: Optional[tuple] = None
     ) -> jnp.ndarray:
-        # OU process: dx = theta * (mu - x) * dt + sqrt(2*theta) * dW
-        # Discretized: x_t = x_{t-1} + theta*dt*(mu - x_{t-1}) + sqrt(2*theta*dt)*noise
-        # The sqrt(2*theta*dt) increment makes the STATIONARY std of the process
-        # ~1.0 for any theta/dt, so `initial_noise_scale` (applied outside by
-        # add_noise) is the actual stationary noise std. A bare sqrt(dt)
-        # increment gives std = sqrt(1/(2*theta)) — e.g. 1.7x the scale at
-        # theta=0.15 — silently coupling amplitude to the mean-reversion rate.
-        # NOTE: this differs from roxie.agents.basic.OrnsteinUhlenbeck (the
-        # OU-as-policy agent), which keeps the unnormalized sqrt(dt) increment.
+        # OU process dx = theta * (mu - x) * dt + sqrt(2*theta) * dW, discretized as
+        # x_t = x_{t-1} + theta*dt*(mu - x_{t-1}) + sqrt(2*theta*dt)*noise.
+        #
+        # The sqrt(2*theta*dt) increment holds the process's STATIONARY std at ~1.0
+        # for any theta/dt, so `initial_noise_scale` (applied by add_noise) is the
+        # actual noise std. A bare sqrt(dt) increment would give
+        # std = sqrt(1/(2*theta)), coupling amplitude to the mean-reversion rate.
+        # Note this differs from roxie.agents.basic.OrnsteinUhlenbeck, the
+        # OU-as-policy agent, which keeps the unnormalized sqrt(dt) increment.
         current_noise = self.noise_state.value
 
-        # Mean reversion term
         mean_reversion = self.theta * self.dt * (self.mu - current_noise)
 
-        # Random component (gaussian sample clipped per step, then scaled to
-        # unit stationary variance).
+        # Gaussian sample clipped per step, then scaled to unit stationary variance.
         shape = shape or self.action_shape
         gaussian = jnp.clip(jax.random.normal(key, shape), -self.clip, self.clip)
         random_component = jnp.sqrt(2.0 * self.theta * self.dt) * gaussian
 
-        # Update noise state
         new_noise = current_noise + mean_reversion + random_component
         self.noise_state.value = new_noise
 
@@ -147,7 +140,6 @@ class OrnsteinUhlenbeckNoise(NoiseModule):
         }
 
 
-# Parameter noise (for parameter space exploration)
 class ParameterNoise(nnx.Module):
     """Parameter noise for parameter space exploration."""
 
@@ -178,14 +170,12 @@ class ParameterNoise(nnx.Module):
             self.current_stddev.value, self.step_count.value
         )
 
-        # Add noise to all parameters
         params = nnx.state(perturbed_model, nnx.Param)
 
         def add_param_noise(param, key):
             noise = jax.random.normal(key, param.shape) * current_scale
             return param + noise
 
-        # Split keys for each parameter
         keys = jax.random.split(key, len(jax.tree_leaves(params)))
         key_tree = jax.tree_unflatten(jax.tree_structure(params), keys)
 
@@ -214,7 +204,6 @@ class ParameterNoise(nnx.Module):
         }
 
 
-# Composite noise (combine multiple noise sources)
 class CompositeNoise(NoiseModule):
     """Combine multiple noise sources."""
 
@@ -269,7 +258,6 @@ class CompositeNoise(NoiseModule):
         return actions + noise
 
 
-# Adaptive noise that adjusts based on action variance
 class AdaptiveNoise(NoiseModule):
     """Adaptive noise that adjusts based on recent action variance."""
 
@@ -287,12 +275,10 @@ class AdaptiveNoise(NoiseModule):
         self.target_variance = target_variance
         self.window_size = window_size
 
-        # Rolling buffer of recent actions
         self.action_buffer = nnx.Variable(jnp.zeros((window_size,) + action_shape))
         self.buffer_index = nnx.Variable(0)
         self.buffer_full = nnx.Variable(False)
 
-        # Adaptive scale factor
         self.adaptive_scale = nnx.Variable(1.0)
 
     def update_action_history(self, actions: jnp.ndarray):
@@ -317,7 +303,6 @@ class AdaptiveNoise(NoiseModule):
         """Adapt the noise scale based on action variance."""
         current_variance = self.compute_action_variance()
 
-        # Simple proportional adaptation
         if current_variance < self.target_variance:
             self.adaptive_scale.value *= 1 + self.adaptation_rate
         else:
@@ -336,21 +321,17 @@ class AdaptiveNoise(NoiseModule):
         if evaluation:
             return actions
 
-        # Update action history
         self.update_action_history(actions)
 
-        # Adapt scale
         self.adapt_scale()
 
         # Get current base scale from decay schedule
         base_scale = self.get_current_scale()
 
-        # Apply adaptive scaling
         effective_scale = base_scale * self.adaptive_scale.value
 
         noise = self.sample_noise(key) * effective_scale
 
-        # Increment step counter
         self.step_count.value += 1
 
         return actions + noise

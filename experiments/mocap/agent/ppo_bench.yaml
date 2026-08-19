@@ -1,0 +1,115 @@
+# PPO arm of the CMU_006_13 RELEASE BENCHMARK (the "complex task" half of
+# the v1 release figure). Launched by experiments/mocap/bench_ppo.yaml.
+#
+# This set is a SIBLING of the *_sweep.yaml campaign arms, not a replacement:
+# the sweep files are a live tuning campaign whose arms are mid-migration and
+# therefore not mutually matched (TD3 alone carries the actor saturation
+# penalty and a halved replay ratio). A release figure has to be a clean
+# algorithm-only A/B, so this file is the sweep arm with exactly two campaign
+# findings applied UNIFORMLY to every arm that can take them:
+#
+#   1. learning_steps 128 -> 64 (replay ratio ~8 -> ~4). Tested upwards three
+#      times in the campaign for three nulls; the surplus gradients went into
+#      value inflation, not tracking quality.
+#   2. pre_activation_coef 0.0 -> 1e-1 and output_init_scale 0.01 on EVERY
+#      deterministic arm. Without them the DPG objective saturates the actor's
+#      tanh and the gradient underflows to zero — measured at 63% of action
+#      dims past |a| > 0.999. The tell is deterministic eval scoring BELOW the
+#      noisy behaviour policy.
+#
+# Everything else — nets [1024, 512, 256] + layer norm, buffer 500k x batch
+# 512, warmup 30k, 8k-env-step update boundary, gamma/tau/lr, n_step 5 where
+# supported — is unchanged from the sweep arm and identical across this set.
+_target_: roxie.agents.PPO
+
+gamma: 0.99
+learning_steps: 4
+num_minibatches: 20
+actor_learning_rate: 1e-4
+critic_learning_rate: 3e-4
+target_kl: 0.15
+gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
+clip_eps: 0.2                   # PPO surrogate clip range
+entropy_coef: 0.001             # entropy bonus weight in the actor loss
+max_grad_norm: 1
+# Constructor defaults, surfaced here so every knob is editable from yaml.
+normalize_observations: true   # running mean/std on observations
+obs_norm_clip: 5.0   # clip normalized observations to +/- this
+obs_norm_eps: 1e-08   # variance floor for the normalizer
+
+actor_config:
+  _target_: roxie.models.actors.StochasticActor
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  std_min: 1e-4
+  std_max: 5.0
+  # Bound actions in (-1, 1) via tanh. Without it nothing keeps the policy mean
+  # inside actuator_ctrlrange.
+  squash: true
+
+critic_config:
+  _target_: roxie.models.critics.VCritic
+  features: [1024, 512, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory_config:
+  # On-policy trajectory queue: one timestep per env per step (add_sequence_
+  # length 1), update fires once `sample_sequence_length` steps are queued =>
+  # 32 x 1000 envs = 32k transitions per update, then the queue drains.
+  # sample_sequence_length must be <= max_length_time_axis (flashbax asserts).
+  _target_: flashbax.buffers.make_trajectory_queue
+  # Capacity, NOT the update size — `update()` drains the queue every step, so
+  # occupancy oscillates 0..sample_sequence_length and never approaches this.
+  # It was 512 (16x sample_sequence_length), which is pure allocation: at
+  # parallel_envs=1000 and obs 1069 the queue is 1000 x T x 1069 floats, i.e.
+  # 2.31 GB of VRAM at T=512 against 0.29 GB at T=64 — measured, and on a 16 GB
+  # card that difference is most of the headroom. `add` is neither jitted nor
+  # donating, so the whole queue is also copied on every insert: shrinking it
+  # took agent.add from 8.9 ms to 5.5 ms per step as well. 64 leaves 2x headroom
+  # over sample_sequence_length; raise it only if that assumption changes.
+  max_length_time_axis: 64
+  add_batch_size: ${env.parallel_envs}
+  add_sequence_length: 1
+  sample_sequence_length: 32
+
+# Network parameter init. Feeds `nnx.Rngs`; the actor and each critic head take
+# distinct derived offsets so twin critics never start identical (a clipped
+# double-Q min over two identical heads buys nothing). Sweep this to separate a
+# real effect from init luck.
+seed: 0
+
+# Optimizers. `_target_` picks the optax family and carries its own
+# hyperparameters; the learning rate stays a top-level arg above so it remains
+# swept, logged and checkpointed, and `max_grad_norm` applies the global-norm
+# clip ahead of the transform (null/0 disables clipping entirely).
+#
+# For a schedule instead of a constant rate, give the block its own
+# `learning_rate:` sub-block — a block that declares one wins over the scalar
+# arg above:
+#
+#   actor_optimizer_config:
+#     _target_: optax.adamw
+#     weight_decay: 1e-4
+#     learning_rate:
+#       _target_: optax.cosine_decay_schedule
+#       init_value: 3e-4
+#       decay_steps: 1_000_000
+#
+# Swapping family from the CLI must also drop the kwargs the new family does
+# not take -- hydra MERGES dict overrides rather than replacing them, so the
+# b1/b2 below would survive into an optimizer that has no such argument:
+#
+#   agent.actor_optimizer_config._target_=optax.rmsprop \
+#     '~agent.actor_optimizer_config.b1' '~agent.actor_optimizer_config.b2' \
+#     +agent.actor_optimizer_config.decay=0.9
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

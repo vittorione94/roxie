@@ -1,0 +1,79 @@
+# MPO arm of the WalkerWalk release benchmark: Gaussian policy, single Q critic,
+# EM-style update with KL-constrained E/M steps and learned Lagrange duals.
+#
+# ddpg_bench.yaml is the reference file and lists the invariants held identical
+# across every arm.
+#
+# TWO CAVEATS that belong in the figure's caption, not just here:
+#  1. mpo.py takes no `n_step` argument, so this arm runs 1-STEP returns while
+#     every other off-policy arm runs n_step 5. That is an implementation gap,
+#     not a chosen handicap.
+#  2. COST: every gradient step evaluates the critic on `num_action_samples`
+#     (20) actions per state — ~10k critic forwards per step at batch 512, some
+#     20x the other arms. `learning_steps` is held at the common value anyway so
+#     the replay ratio stays comparable, which means this arm buys its fairness
+#     in wall-clock. Judge it on score-vs-env-steps first, wall-clock second.
+_target_: roxie.agents.MPO
+
+gamma: 0.99
+tau: 0.005
+actor_learning_rate: 3e-4
+critic_learning_rate: 3e-4
+dual_learning_rate: 1e-2
+num_action_samples: 20          # actions sampled per state for the E-step
+epsilon: 0.1                    # E-step temperature KL bound
+epsilon_mean: 1e-3              # M-step KL bound on the policy mean
+epsilon_stddev: 1e-5            # M-step KL bound on the policy covariance
+init_temperature: 1.0
+init_alpha_mean: 1.0
+init_alpha_stddev: 1.0
+memory_warmup: 30_000
+steps_before_learning: 30_000
+steps_between_updates: 2_048
+learning_steps: 20
+max_grad_norm: 1
+normalize_observations: true
+obs_norm_clip: 5.0
+obs_norm_eps: 1e-08
+
+actor_config:
+  # Layer norm ON to match the rest of the benchmark (the library mpo.yaml
+  # leaves it off).
+  _target_: roxie.models.actors.StochasticActor
+  features: [256, 256]
+  use_layer_norm: true
+  std_min: 1e-4
+  std_max: 5.0
+
+critic_config:
+  _target_: roxie.models.critics.QCritic
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory_config:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 10_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
+
+seed: 0
+
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+# Lagrange duals: a handful of scalars, so they are NOT global-norm clipped.
+dual_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

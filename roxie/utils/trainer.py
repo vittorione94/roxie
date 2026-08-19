@@ -12,11 +12,10 @@ from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
 from roxie.models.actors import deterministic_action
 
-# Seed for the evaluation reset keys. Held constant across epochs AND across
-# runs so every eval rollout starts from the same fixed set of states: test
-# curves are then comparable epoch-to-epoch within a run and arm-to-arm across
-# a sweep. Distinct from any training seed so eval starts are never a subset of
-# what the policy trained on by construction.
+# Seed for the evaluation reset keys. Held constant across epochs and runs so
+# every eval rollout starts from the same states, making test curves comparable
+# within a run and across a sweep. Distinct from any training seed so eval
+# starts are never a subset of what the policy trained on.
 _EVAL_SEED = 12345
 
 
@@ -45,14 +44,12 @@ class Trainer:
         self.replace_checkpoint = replace_checkpoint
         self.output_dir = output_dir
         # Overlap CPU env-stepping with GPU gradient bursts via a background
-        # learner thread (envpool loop only; see roxie.utils.async_learner).
-        # Opt-in: only pays off when the learner is the dominant cost and the
-        # env runs on CPU while the learner runs on GPU.
+        # learner thread (envpool loop only). Only pays off when the learner is
+        # the dominant cost and the env is on CPU while the learner is on GPU.
         self.async_learner = async_learner
         # Fused grad steps the async learner submits per GPU dispatch. Smaller =
-        # more acting/learning interleave (better overlap) but more per-chunk
-        # Python/dispatch overhead; larger = fewer, longer GPU submissions that
-        # stall acting. See roxie.utils.async_learner.
+        # better acting/learning overlap but more per-chunk dispatch overhead;
+        # larger = fewer, longer GPU submissions that stall acting.
         self.learner_chunk = int(learner_chunk)
 
     def initialize(self, agent, environment, test_environment=None):
@@ -112,15 +109,13 @@ class Trainer:
             dones = new_states.env_state.done
             idx = jax.random.randint(pool_key, (NUM_ENVS,), 0, POOL_SIZE)
 
-            # Two scatter-adds on a (bins,) array — negligible against the
-            # physics step, and it has to live here because this is the only
-            # place that sees every env's phase and done flag on-device.
+            # Has to live here: this is the only place that sees every env's
+            # phase and done flag on-device.
             if mining_counts is not None:
                 es = new_states.env_state
-                # `info["termination"]` is done-minus-truncation, already
-                # separated by TerminationWrapper — the same flag the critic
-                # bootstraps on. Clip-end and step-limit cutoffs are NOT
-                # failures and must not be mined for.
+                # `info["termination"]` is done-minus-truncation — the same flag
+                # the critic bootstraps on. Clip-end and step-limit cutoffs are
+                # not failures and must not be mined for.
                 mining_counts = mining_env.mining_observe(
                     mining_counts, es.info, es.info["termination"]
                 )
@@ -238,8 +233,7 @@ class Trainer:
                         reward=new_states.env_state.reward,
                         terminal=new_states.env_state.info["termination"],
                         # Only stored by agents whose prototype carries it
-                        # (DDPG/TD3 n-step); harmless extra field otherwise —
-                        # batch_add below prunes to the buffer's own layout.
+                        # (DDPG/TD3 n-step); pruned below for the others.
                         truncation=new_states.env_state.info["truncation"],
                     )
                     return (auto_states, rng), (transition, new_states.env_state.obs)
@@ -260,12 +254,6 @@ class Trainer:
             wrapped_states.env_state.obs.block_until_ready()
             print(f"  {time.time() - t0:.1f}s", flush=True)
 
-            # Donate the buffer state: without donation XLA keeps the input
-            # buffer alive AND allocates a full output copy — a transient 2x
-            # of the largest array in the program (the buffer's obs store:
-            # ~3GB per copy at look_ahead=5), which OOMs the pool right here.
-            # The input is dead after the reassignment below — same pattern
-            # as _grad_steps' donate_argnums in the agents.
             # Prune the rollout transitions to the fields the agent's buffer
             # actually stores (SAC's prototype has no `truncation`; DDPG/TD3's
             # does) so the pytree structures match at add time.
@@ -278,6 +266,9 @@ class Trainer:
                 for f in dataclasses.fields(Transition)
             })
 
+            # Donate the buffer state: without it XLA keeps the input alive and
+            # allocates a full output copy, a transient 2x of the largest array
+            # in the program (the buffer's obs store) that OOMs right here.
             @functools.partial(jax.jit, donate_argnums=(0,))
             def batch_add(buffer_state, transitions):
                 def add_one(bs, t):
@@ -327,30 +318,25 @@ class Trainer:
         print("Training...", flush=True)
         scores = jnp.zeros(NUM_ENVS)
         lengths = jnp.zeros(NUM_ENVS, dtype=jnp.int32)
-        # Completed-episode accumulators for the current epoch. `scores`/`lengths`
-        # above are the *in-flight* per-env counters; these collect the return and
-        # length of episodes that actually terminate, so the epoch log reports
-        # real episode stats rather than the in-progress counter. Reset each epoch.
+        # Completed-episode accumulators, reset each epoch. `scores`/`lengths`
+        # above are the *in-flight* per-env counters; these collect only episodes
+        # that actually terminate, so the epoch log reports real episode stats.
         ep_return_sum = jnp.zeros(())
         ep_len_sum = jnp.zeros(())
         ep_count = jnp.zeros(())
-        # Sum-of-squares companions to the two accumulators above, used to
-        # recover the per-episode std at the epoch boundary via
-        # sqrt(E[x^2] - E[x]^2) — without keeping a host-side list of individual
-        # episode returns (which would force a device->host sync every step).
+        # Sum-of-squares companions, to recover the per-episode std at the epoch
+        # boundary via sqrt(E[x^2] - E[x]^2) without keeping a host-side list of
+        # returns (which would force a device->host sync every step).
         ep_return_sq_sum = jnp.zeros(())
         ep_len_sq_sum = jnp.zeros(())
         # Per-epoch accumulators for the env's own metrics dict (e.g. the mocap
-        # env's `reward/pose`, `reward/vel`, ... tracking-reward components). The
-        # env populates `env_state.metrics` with a scalar per env each step; we
-        # sum the per-step env-mean and divide by the iteration count at dump
-        # time to report the epoch-mean of each component. Keys are discovered
-        # lazily so this stays generic across envs (empty dict -> nothing logged).
+        # env's reward components). The env writes a scalar per env each step; the
+        # per-step env-mean is summed here and divided by the iteration count at
+        # dump time. Keys are discovered lazily, so this stays generic across envs.
         metric_sums = {}
         metric_iters = 0
-        # Exploration-noise accumulator (deterministic agents only). Tracked
-        # separately from metric_sums: noise is added only on policy steps (not
-        # during the random warmup), so it has its own iteration count.
+        # Exploration-noise accumulator (deterministic agents only). Needs its own
+        # iteration count: noise is added only on policy steps, not during warmup.
         noise_abs_sum = jnp.zeros(())
         noise_iters = 0
         bench_t0 = time.time()
@@ -387,13 +373,9 @@ class Trainer:
             agent.add(old_wrapped_states.env_state, new_wrapped_states.env_state)
 
             # Keep the obs-normalization running stats tracking the CURRENT
-            # policy's state distribution. Stats were previously accumulated only
-            # from the random-action warmup and then frozen, so velocity- and
-            # ref-delta-scale features stayed normalized to the flailing-policy
-            # regime for the whole run. Obs are stored raw in the replay buffer
-            # and normalized at sample time, so continuously-updated stats stay
-            # consistent for old and new data alike. Pure device op — no host
-            # sync, same async-pipeline rules as the metric accumulation below.
+            # policy's state distribution rather than freezing them after warmup.
+            # Obs are stored raw in the replay buffer and normalized at sample
+            # time, so updated stats stay consistent for old and new data alike.
             if getattr(agent, "normalize_observations", False):
                 agent.state.obs_stats = Agent.update_obs_stats(
                     agent.state.obs_stats, new_wrapped_states.env_state.obs,
@@ -486,9 +468,7 @@ class Trainer:
                     epoch_score_std = float(jnp.std(scores))
                     epoch_length_std = float(jnp.std(lengths.astype(jnp.float32)))
 
-                # Feed the epoch stats through the logger so every configured
-                # backend (console table, CSV, wandb, ...) records them. Keyed
-                # by env steps so the wandb x-axis matches training progress.
+                # Keyed by env steps so the wandb x-axis matches training progress.
                 logger.store("epoch", epochs)
                 logger.store("steps", self.steps)
                 logger.store("episodes/epoch", ep_n)
@@ -509,42 +489,35 @@ class Trainer:
                     "loss/critic",
                     float(np.mean(critic_losses)) if critic_losses else 0.0,
                 )
-                # Epoch-mean of each env reward component (and any other metric
-                # the env exposes), keyed by its own name so the console/CSV/wandb
+                # Epoch-mean of each env metric, keyed by its own name so the
                 # backends nest it (e.g. under `reward/`).
                 if metric_iters > 0:
                     for k, total in metric_sums.items():
                         logger.store(k, float(jnp.mean(total) / metric_iters))
-                # Average exploration noise added per joint this epoch (post-clip,
-                # normalized [-1, 1] action units). Compare against the noise
-                # module's scheduled scale to see how much clipping eats.
+                # Post-clip noise in normalized [-1, 1] action units. Compare
+                # against the noise module's scheduled scale to see how much
+                # clipping eats.
                 if noise_iters > 0:
                     logger.store("noise/per_joint_abs", float(noise_abs_sum / noise_iters))
-                # Optional per-agent diagnostics, drained once per epoch. PPO
-                # uses this for its trust-region metrics (approx_kl, clip_frac);
+                # Optional per-agent diagnostics (PPO's trust-region metrics);
                 # agents without the hook contribute nothing.
                 pop_diagnostics = getattr(agent, "pop_diagnostics", None)
                 if pop_diagnostics is not None:
                     for k, v in pop_diagnostics().items():
                         logger.store(k, float(v))
-                # Negative-mining health. Logged BEFORE the refresh below, which
-                # zeroes the counters. `mining/effective_bins` is the one to
-                # watch: if it collapses toward 1 the start distribution has
-                # degenerated onto a single region and coverage is being lost.
+                # Logged before the refresh below, which zeroes the counters.
+                # `mining/effective_bins` collapsing toward 1 means the start
+                # distribution has degenerated onto a single region.
                 if mining_on:
                     for k, v in mining_env.mining_stats(
                         mining_weights, mining_counts
                     ).items():
                         logger.store(k, float(v))
-                # GPU telemetry (utilization / temperature / memory / power).
-                # Sampled once per epoch; a no-op on hosts without nvidia-smi.
+                # A no-op on hosts without nvidia-smi.
                 for k, v in logger.gpu_stats().items():
                     logger.store(k, v)
-                # Host-memory watch. Checkpoint saves once OOM-killed the process
-                # mid-write (host RAM exhausted); track resident set + the number
-                # of live JAX buffers each epoch so any baseline creep is visible
-                # in the logs well before it hits the ceiling. /proc is Linux-only;
-                # guarded so non-Linux hosts just skip it.
+                # Host-memory watch: resident set plus live JAX buffer count, so
+                # creep toward an OOM is visible in the logs. /proc is Linux-only.
                 try:
                     page = os.sysconf("SC_PAGE_SIZE")
                     rss_pages = int(open("/proc/self/statm").read().split()[1])
@@ -569,12 +542,10 @@ class Trainer:
                 # Regenerate the reset pool (fresh random starts for auto-reset)
                 # and reshuffle the GPU clip subset if the env supports it. Only a
                 # real clip swap invalidates in-progress episodes (their stored
-                # clip indices reference the old chunk), so only then do we reset
-                # the live envs. Otherwise episodes run continuously across epochs.
-                # Fold this epoch's terminations into the start distribution
-                # BEFORE rebuilding the pool, so the new pool already reflects
-                # them. Once per epoch: the per-step cost is two scatter-adds,
-                # the normalization/EMA happens here.
+                # clip indices reference the old chunk), so only then are the live
+                # envs reset; otherwise episodes run continuously across epochs.
+                # Terminations are folded into the start distribution before the
+                # pool is rebuilt, so the new pool already reflects them.
                 if mining_on:
                     mining_weights, mining_counts = mining_env.mining_refresh(
                         mining_weights, mining_counts
@@ -672,26 +643,19 @@ class Trainer:
         num_tests = int(self.test_episodes)
         max_steps = int(getattr(self.test_environment, "max_episode_steps", 1000))
 
-        # FIXED reset keys, not a fresh draw off `rng`. The eval env pins the
-        # start state itself (mocap: frame 0, no noise — see its eval-env note),
-        # so for a single-clip run the keys change nothing; they matter for
-        # multi-clip runs, where reset samples WHICH clip. Holding them constant
-        # means eval scores the same clips every epoch, so a change in
-        # test/score is a change in the POLICY rather than a different draw of
-        # clips. `max_steps` comes from the eval env's own horizon, which for
-        # mocap is the longest clip — eval runs each clip to its end.
+        # Fixed reset keys, not a fresh draw off `rng`. The eval env pins its own
+        # start state, so the keys only matter where reset samples WHICH clip;
+        # holding them constant means a change in test/score is a change in the
+        # POLICY rather than a different draw of clips. `max_steps` comes from the
+        # eval env's own horizon.
         states = v_reset(jax.random.split(jax.random.PRNGKey(_EVAL_SEED), num_tests))
 
-        # How many GENUINELY distinct states the eval batch starts from. The env
-        # decides its own reset stochasticity in Python and none of that reaches
-        # the logged hydra config, so runs were not self-describing: you could
-        # not tell from a run's artifacts what protocol its test/* numbers meant.
-        # `test/length/std` cannot stand in for this — 0.00 means a degenerate
-        # eval OR a policy saturating the episode cap, which are opposite news.
-        # Under the canonical mocap protocol this equals the number of DISTINCT
-        # CLIPS being evaluated; 1 on a multi-clip run means the eval keys are
-        # not covering the set, and 1 on a single-clip run means every extra
-        # `test_episodes` beyond the first is pure wasted compute.
+        # How many genuinely distinct states the eval batch starts from — the env
+        # decides its own reset stochasticity in Python, and none of that reaches
+        # the logged config. `test/length/std` cannot stand in for this: 0.00 there
+        # means a degenerate eval OR a policy saturating the episode cap, which are
+        # opposite news. A value of 1 on a multi-clip run means the eval keys are
+        # not covering the set.
         start_obs = np.asarray(states.env_state.obs).reshape(num_tests, -1)
         logger.store("test/distinct_starts", float(len(np.unique(start_obs, axis=0))))
 
@@ -704,19 +668,16 @@ class Trainer:
 
         scores_np = np.array(scores)
         lengths_np = np.array(lengths)
-        # Stored (not printed) so the eval stats land in the same epoch dump as
-        # the training stats and reach every backend. The epoch loop calls
-        # _test just before logger.dump().
+        # Stored, not printed: the epoch loop calls _test just before
+        # logger.dump(), so eval stats land in the same dump as training stats.
         logger.store("test/score", float(np.mean(scores_np)))
         logger.store("test/score/std", float(np.std(scores_np)))
         logger.store("test/length", float(np.mean(lengths_np)))
         logger.store("test/length/std", float(np.std(lengths_np)))
-        # Episode return is a SUM, so with spread start phases it is bounded by
-        # how much clip was left at reset — a policy starting late in a
-        # non-cyclic clip cannot score what a frame-0 start can, however well it
-        # tracks. The per-step rate divides that out: it is start-phase
-        # invariant, and it is the number to compare against runs recorded under
-        # the old frame-0-only eval, whose `test/score` is on a different scale.
+        # Episode return is a SUM, so with spread start phases it is bounded by how
+        # much clip was left at reset: a policy starting late in a non-cyclic clip
+        # cannot score what a frame-0 start can, however well it tracks. The
+        # per-step rate divides that out and is start-phase invariant.
         logger.store(
             "test/score_per_step",
             float(np.mean(scores_np / np.maximum(lengths_np, 1))),
@@ -745,12 +706,10 @@ class Trainer:
         loop_rng = rngs.envs()
         agent_key = rngs.agent()
 
-        # Optional negative mining over start states, mirroring _run_jax. The
-        # split of labour differs only in where the difficulty table lives: the
-        # JAX env cannot own mutable state inside a trace, so the trainer
-        # threads `mining_weights` through reset; a CPU pool resets in plain
-        # Python and owns its own table, so the trainer only has to observe the
-        # epoch boundary. Both accumulate per-step and normalize once per epoch.
+        # Optional negative mining over start states, mirroring _run_jax. Only the
+        # location of the difficulty table differs: a JAX env cannot own mutable
+        # state inside a trace, so the trainer threads `mining_weights` through
+        # reset, whereas a CPU pool resets in plain Python and owns its own table.
         mining_on = (
             hasattr(env, "mining_refresh") and getattr(env, "mining_bins", 0) > 0
         )
@@ -815,10 +774,9 @@ class Trainer:
             print(f"  {time.time() - t0:.1f}s", flush=True)
 
         # --- Optional async learner (overlap CPU acting + GPU learning) ---
-        # When enabled, a background thread owns agent.state and runs the
-        # gradient bursts, while this (main) thread acts from a behaviour-actor
-        # snapshot and hands transitions off through a queue. See
-        # roxie.utils.async_learner for the ownership/donation contract.
+        # A background thread owns agent.state and runs the gradient bursts, while
+        # this thread acts from a behaviour-actor snapshot and hands transitions
+        # off through a queue.
         learner = None
         behavior_actor = None
         behavior_stats = None
@@ -831,18 +789,17 @@ class Trainer:
             agent_key, learner_key = jax.random.split(agent_key)
             behavior_actor = copy.deepcopy(agent.state.actor)
             behavior_stats = agent.state.obs_stats
-            # Trigger any behaviour-path compilation on THIS thread before the
-            # learner starts dispatching, so the two threads never race a first
-            # compile of the same program.
+            # Compile the behaviour path on THIS thread before the learner starts
+            # dispatching, so the two never race a first compile of the same
+            # program.
             _warm_a, _ = agent.select_action(
                 behavior_actor, behavior_stats, state.env_state.obs,
                 loop_rng, evaluate=False,
             )
             jax.block_until_ready(_warm_a)
-            # Precompile the chunk-sized grad program here (the learner submits
-            # `learner_chunk` fused steps at a time, a different program from the
-            # full-burst precompile above) so the learner thread never pays a
-            # cold compile mid-run.
+            # The learner submits `learner_chunk` fused steps at a time, a
+            # different program from the full-burst precompile above; compile it
+            # here so the learner thread never pays a cold compile mid-run.
             agent_key, chunk_key = jax.random.split(agent_key)
             agent.learn(chunk_key, n_steps=self.learner_chunk)
             jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
@@ -921,13 +878,10 @@ class Trainer:
             else:
                 agent.add(old_state.env_state, state.env_state)
 
-                # Keep the obs-normalization running stats tracking the CURRENT
-                # policy's state distribution, exactly as _run_jax does. This is
-                # deliberately the same (redundant-looking) extra update the JAX
-                # loop performs on top of `agent.add`'s own: dropping it here
-                # would leave the two backends normalizing observations with
-                # differently-weighted statistics, which is precisely the kind
-                # of silent drift a CPU-vs-GPU comparison cannot tolerate.
+                # The same extra update _run_jax performs on top of `agent.add`'s
+                # own. It looks redundant but must stay: dropping it would leave
+                # the two backends normalizing observations with differently
+                # weighted statistics, breaking CPU-vs-GPU comparability.
                 if getattr(agent, "normalize_observations", False):
                     agent.state.obs_stats = Agent.update_obs_stats(
                         agent.state.obs_stats, state.env_state.obs,
@@ -1034,34 +988,25 @@ class Trainer:
                         logger.store(k, total / metric_iters)
                 if noise_iters > 0:
                     logger.store("noise/per_joint_abs", noise_abs_sum / noise_iters)
-                # Same optional per-agent diagnostics hook the MJX loop drains
-                # (PPO's trust-region metrics, TD3's saturation/value metrics).
-                # It was missing here, so the CPU path silently logged none of
-                # them; agents without the hook still contribute nothing.
+                # Same per-agent diagnostics hook the MJX loop drains.
                 pop_diagnostics = getattr(agent, "pop_diagnostics", None)
                 if pop_diagnostics is not None:
                     for k, v in pop_diagnostics().items():
                         logger.store(k, float(v))
-                # Negative-mining health, logged BEFORE the refresh below zeroes
-                # the counters (same ordering as _run_jax). Watch
-                # `mining/effective_bins`: collapsing toward 1 means the start
-                # distribution has degenerated onto a single region.
+                # Logged before the refresh below zeroes the counters, as in
+                # _run_jax.
                 if mining_on:
                     for k, v in env.mining_stats().items():
                         logger.store(k, float(v))
                     env.mining_refresh()
-                # Regenerate the auto-reset pool (fresh random starts), AFTER
-                # the mining refresh so the new pool already reflects this
-                # epoch's terminations — the same order, for the same reason, as
-                # the JAX loop's `mining_refresh` then `reset_pool = v_reset(...)`.
+                # Regenerate the auto-reset pool AFTER the mining refresh, so the
+                # new pool reflects this epoch's terminations.
                 refresh_pool = getattr(env, "refresh_reset_pool", None)
                 if refresh_pool is not None:
                     refresh_pool()
                 for k, v in logger.gpu_stats().items():
                     logger.store(k, v)
-                # Host-memory watch, as in _run_jax: resident set + live JAX
-                # buffers per epoch, so any baseline creep shows up in the logs
-                # long before it hits the ceiling. /proc is Linux-only.
+                # Host-memory watch, as in _run_jax. /proc is Linux-only.
                 try:
                     page = os.sysconf("SC_PAGE_SIZE")
                     rss_pages = int(open("/proc/self/statm").read().split()[1])
@@ -1129,10 +1074,8 @@ class Trainer:
         lengths = np.zeros(num_tests, dtype=np.int32)
         dones = np.zeros(num_tests, dtype=bool)
 
-        # How many GENUINELY distinct states the eval batch starts from — see
-        # the long note in `_test`. Under the canonical mocap protocol this
-        # equals the number of DISTINCT CLIPS evaluated, so 1 on a single-clip
-        # run means every `test_episodes` beyond the first is wasted compute.
+        # How many genuinely distinct states the eval batch starts from — see the
+        # note in `_test`.
         start_obs = np.asarray(state.env_state.obs).reshape(num_tests, -1)
         logger.store("test/distinct_starts", float(len(np.unique(start_obs, axis=0))))
 

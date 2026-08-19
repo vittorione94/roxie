@@ -36,7 +36,6 @@ class TerminationWrapper(wrapper.Wrapper):
 
         self.max_episode_steps = max_episode_steps
 
-        # External tracking (not part of state)
         self._current_step_count = 0
         self._episode_active = False
 
@@ -48,45 +47,36 @@ class TerminationWrapper(wrapper.Wrapper):
         traced second argument) work through the wrapper without it needing to
         know what those arguments mean.
         """
-        # Reset the base environment to get the initial mjx_env.State
         initial_env_state = self.env.reset(key, *reset_args)
 
-        # Normalize flags to 0-d jnp.bool_ for JAX consistency
         false_b = jnp.array(False, dtype=jnp.bool_)
 
-        # Update info and explicitly set done=False with consistent dtype
         new_info = initial_env_state.info | {
             "truncation": false_b,
             "termination": false_b,
         }
         initial_env_state = initial_env_state.replace(done=false_b, info=new_info)
 
-        # Return the initial WrapperState, starting the step count at 0
         return WrapperState(
             env_state=initial_env_state,
             step_count=jnp.zeros((), dtype=jnp.int32),
         )
 
     def step(self, state: WrapperState, action: jnp.ndarray) -> WrapperState:
-        """
-        Performs a step in the environment. This function is now pure
-        and can be safely jitted.
-        """
-        # Step the underlying environment using its state
+        """Performs a step in the environment. Pure, so it can be jitted."""
         next_env_state = super().step(state.env_state, action)
 
-        # Increment the step count from the input state
         new_step_count = state.step_count + 1
 
         # Wrapper-level truncation: the fixed step-limit time-out.
         step_truncated = new_step_count >= self.max_episode_steps
 
-        # The base env may fold its own truncation into `done` (e.g. the mocap
-        # clip-end cutoff, surfaced via info["truncation"]). Pull it back out so
-        # it does NOT count as termination: a truncated transition must still
-        # bootstrap the next-state value in the Bellman target, whereas marking
-        # it terminal zeroes the bootstrap and collapses Q at the cutoff. Envs
-        # that don't distinguish truncation default to False -> unchanged.
+        # The base env may fold its own truncation into `done` (e.g. a clip-end
+        # cutoff, surfaced via info["truncation"]). Pull it back out so it does NOT
+        # count as termination: a truncated transition must still bootstrap the
+        # next-state value in the Bellman target, whereas marking it terminal zeroes
+        # the bootstrap and collapses Q at the cutoff. Envs that don't distinguish
+        # truncation default to False, leaving this unchanged.
         env_truncation = next_env_state.info.get(
             "truncation", jnp.array(False, dtype=jnp.bool_)
         )
@@ -100,21 +90,17 @@ class TerminationWrapper(wrapper.Wrapper):
         truncated = jnp.logical_or(step_truncated, env_truncation)
         done = jnp.logical_or(next_env_state.done, step_truncated)
 
-        # Normalize flags to 0-d jnp.bool_
         trunc_b = jnp.asarray(truncated, dtype=jnp.bool_)
         term_b = jnp.asarray(terminated, dtype=jnp.bool_)
         done_b = jnp.asarray(done, dtype=jnp.bool_)
 
-        # Update the info dictionary for observation purposes
         new_info = next_env_state.info | {
             "truncation": trunc_b,
             "termination": term_b,
         }
 
-        # Create the final environment state with the updated done flag and info
         final_env_state = next_env_state.replace(done=done_b, info=new_info)
 
-        # Return the new WrapperState containing the new env state and step count
         return WrapperState(env_state=final_env_state, step_count=new_step_count)
 
 

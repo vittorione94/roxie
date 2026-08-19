@@ -3,10 +3,16 @@ import sys
 
 # device=<cpu|gpu> overrides JAX platform selection. Must be parsed from
 # sys.argv before JAX is imported — JAX_PLATFORMS is read at import time.
-_device = next(
-    (arg.split("=", 1)[1] for arg in sys.argv[1:] if arg.startswith("device=")),
-    None,
-)
+#
+# `device` is not a config key, so the arg is consumed (dropped from sys.argv)
+# rather than merely read: leaving it in argv makes Hydra reject the launch.
+# Both `device=` and `+device=` are accepted and hidden from Hydra.
+_device = None
+for _arg in list(sys.argv[1:]):
+    _bare = _arg.lstrip("+")
+    if _bare.startswith("device="):
+        _device = _bare.split("=", 1)[1]
+        sys.argv.remove(_arg)
 if _device:
     os.environ["JAX_PLATFORMS"] = _device
 
@@ -27,79 +33,65 @@ from roxie.environment.loader import (
 from roxie.utils import hydra_searchpath, logger
 from roxie.utils.trainer import Trainer
 
-# The launchable experiment configs live in top-level experiments/, grouped by
-# env into ant/, walker/, mocap/ subfolders — register that dir on Hydra's search
-# path so `--config-name <env>/<name>` resolves there while groups stay in
-# roxie/configs.
+# Launchable experiment configs live in top-level experiments/, grouped by env.
+# Registering that dir lets `--config-name <env>/<name>` resolve there while
+# config groups stay in roxie/configs.
 hydra_searchpath.register()
 # examples/ is not part of the installed roxie package; put the repo root on the
-# path so the mocap example (imported lazily below) is importable from anywhere.
+# path so example env builders are importable from anywhere.
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="walker/walker_ddpg")
+@hydra.main(version_base=None, config_path="configs", config_name="walker/bench_td3")
 def main(cfg: DictConfig):
     print("Agent:", cfg.agent._target_)
 
-    # Backend env vars are decided here, from the COMPOSED config, not at module
-    # import from sys.argv: `env.impl: warp` set in an experiment yaml never
-    # appears in argv, so an argv sniff misses it (JAX then preallocates its
-    # default 75% of VRAM and warp/reset constants OOM). This works because
-    # JAX's CUDA client initializes lazily at the first jax.* call below — the
-    # vars just have to be set before that, not before `import jax`.
+    # Backend env vars are decided from the COMPOSED config, not from sys.argv at
+    # module import: `env.impl: warp` set in an experiment yaml never appears in
+    # argv. Setting them here still works because JAX's CUDA client initializes
+    # lazily at the first jax.* call below.
     if cfg.env.get("impl", None) == "warp":
         # Warp allocates GPU memory outside JAX's pool: cap JAX so Warp has
         # headroom for its solver/collision scratch. Don't disable preallocation
         # instead — that fragments and OOMs the large replay-buffer alloc.
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
-        # Use CUDA's own async pool instead of XLA's BFC allocator. BFC caps out
-        # on FRAGMENTATION, not on a leak: run 2026-08-13_23-03-23 died at epoch
-        # 131 requesting a contiguous 2.02 GiB while GPU memory had been flat at
-        # 12.5-14.4 GB and mem/live_arrays flat at ~1075 for the whole run (the
-        # allocator dump showed the classic free/used checkerboard). What made it
-        # bite there and not in the otherwise-identical 737-epoch run before it
-        # is allocation CHURN: `ppo/steps_per_rollout` had climbed 5 -> 67 as the
-        # KL early stop released, i.e. ~33x more alloc/free cycles per rollout.
-        # `cuda_async` still pools (so it does not pay a cudaMalloc per
-        # allocation the way "platform" does) but the driver pool tolerates that
-        # churn. Overridable: setdefault, so XLA_PYTHON_CLIENT_ALLOCATOR=default
-        # in the environment restores BFC if an agent regresses.
+        # CUDA's async pool instead of XLA's BFC allocator: BFC fragments under
+        # the alloc/free churn of a varying-size rollout and eventually fails a
+        # large contiguous request. Set XLA_PYTHON_CLIENT_ALLOCATOR=default to
+        # restore BFC.
         os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
-    elif cfg.env.get("impl", None) == "envpool":
-        # CPU backend = CPU run. The pool's physics is pure native MuJoCo and
-        # never touches the GPU, but the AGENT is plain JAX and would otherwise
-        # still claim the card (and preallocate ~75% of it) — so "running on
-        # CPU" would leave the GPU occupied, which is the opposite of the point.
-        # Pin the whole process to CPU so the card is genuinely free.
-        #
-        # This is a real throughput trade, measured on this box (12-core 7900X,
-        # PPO, parallel_envs=1000, obs 1069, nets [1024,512,256]):
-        #   CPU physics + GPU learner   ~17.2k sps
-        #   everything on CPU           ~9.1k sps
-        # The gap is the dense actor/critic GEMMs, which is what the GPU is for.
-        # Set `runtime.jax_platform: null` in the experiment to opt back into the
-        # hybrid if you want the throughput and can spare ~1.4 GB of VRAM (the
-        # measured peak for this arm — the 15 GB you see reported is XLA's
-        # preallocated arena, not resident data).
-        # NOTE: this one must go through `jax.config`, NOT an env var. The
-        # XLA_PYTHON_CLIENT_* settings above work as `os.environ` writes because
-        # the PJRT C++ client reads them when it lazily initializes. But
-        # `JAX_PLATFORMS` is a JAX *Python* config option, parsed out of the
-        # environment once at `import jax` — which already happened at the top of
-        # this module — so setting the env var here is silently ignored and the
-        # run still lands on the GPU.
-        platform = (cfg.get("runtime") or {}).get("jax_platform", "cpu")
-        if platform:
-            jax.config.update("jax_platforms", str(platform))
-    # XLA GPU autotuning hangs this machine's RTX 5080 (Blackwell) — required
-    # for EVERY GPU run regardless of physics backend; unused/harmless on CPU.
+
+    # Where the AGENT (networks, optimizers, replay buffer) runs, applied for
+    # every physics backend.
+    #
+    # `envpool` defaults to "cpu": its physics is native MuJoCo and never touches
+    # the GPU, but the agent is plain JAX and would otherwise still claim (and
+    # preallocate most of) the card. Set `runtime.jax_platform: null` to opt into
+    # the hybrid — CPU physics with a GPU learner is faster, since the dense
+    # actor/critic GEMMs dominate, at the cost of holding the card.
+    #
+    # Every other backend defaults to null = leave JAX's own choice. Setting it
+    # explicitly is how an experiment records e.g. "MJX on the CPU" in its yaml
+    # rather than relying on the caller to pass `device=cpu`, so a benchmark grid
+    # stays reproducible from the config alone. An explicit `device=` on the CLI
+    # still wins.
+    #
+    # NOTE: this must go through `jax.config`, NOT an env var. Unlike the
+    # XLA_PYTHON_CLIENT_* settings above (read lazily by the PJRT client),
+    # `JAX_PLATFORMS` is parsed once at `import jax` — already done above — so an
+    # os.environ write here is silently ignored.
+    platform = (cfg.get("runtime") or {}).get(
+        "jax_platform", "cpu" if cfg.env.get("impl", None) == "envpool" else None
+    )
+    if platform and not _device:
+        jax.config.update("jax_platforms", str(platform))
+
+    # XLA GPU autotuning hangs on Blackwell GPUs; harmless on CPU.
     os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 
-    # Precision of every f32 matmul (see `runtime.matmul_precision` in the
-    # experiment yaml). null leaves JAX's own default in place. This is a
-    # GLOBAL setting — it reaches the agent's networks AND MJX physics — so
-    # change it for a whole sweep at once, never for a single arm, or the
-    # comparison stops being an A/B on the algorithm.
+    # Precision of every f32 matmul; null leaves JAX's own default. This is
+    # GLOBAL — it reaches the agent's networks and MJX physics alike — so change
+    # it for a whole sweep at once, never for a single arm.
     matmul_precision = (cfg.get("runtime") or {}).get("matmul_precision", None)
     if matmul_precision:
         jax.config.update("jax_default_matmul_precision", matmul_precision)
@@ -110,12 +102,11 @@ def main(cfg: DictConfig):
     if _device:
         print(f"JAX platform override: device={_device}")
 
-    # Each experiment names the callable that builds its env via ``env.builder``
-    # (a dotted path); the default builds a mujoco_playground env. The builder
-    # owns all env-specific setup (clip selection, Warp budget sizing, ...) and
-    # returns a normalized EnvBundle, so this loop stays env-agnostic. ``impl``
-    # selects the physics backend ("warp" routes through mujoco_warp) and is read
-    # here only for the load banner — the builder reads it off cfg.env itself.
+    # ``env.builder`` is a dotted path to the callable that builds the env; the
+    # default builds a mujoco_playground env. The builder owns all env-specific
+    # setup (clip selection, Warp budget sizing, ...) and returns a normalized
+    # bundle, so this stays env-agnostic. ``impl`` selects the physics backend and
+    # is read here only for the load banner.
     impl = cfg.env.get("impl", None)
     build_env = get_method(cfg.env.get("builder", DEFAULT_BUILDER))
     env, test_env, env_cfg = build_env(cfg.env, mode="train")
@@ -124,7 +115,6 @@ def main(cfg: DictConfig):
 
     output_dir = HydraConfig.get().runtime.output_dir
 
-    # Initialize the logger up front so trainer stats fan out to all backends.
     # Console + CSV (in output_dir) are always on; wandb is opt-in via the
     # `logging.wandb` config block so runs don't require the dependency.
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -137,6 +127,7 @@ def main(cfg: DictConfig):
                 entity=wandb_cfg.get("entity"),
                 name=wandb_cfg.get("name"),
                 group=wandb_cfg.get("group"),
+                job_type=wandb_cfg.get("job_type"),
                 tags=wandb_cfg.get("tags"),
                 mode=wandb_cfg.get("mode", "online"),
                 relogin=wandb_cfg.get("relogin", True),
@@ -146,8 +137,7 @@ def main(cfg: DictConfig):
         )
     logger.initialize(path=output_dir, backends=backends)
 
-    # Create RNGs for agent initialization
-    training_rngs = nnx.Rngs(envs=cfg.env.seed, agent=3)  # Use your seed from cfg.seed
+    training_rngs = nnx.Rngs(envs=cfg.env.seed, agent=3)
 
     # Action bounds: MuJoCo/Playground envs expose mj_model.actuator_ctrlrange;
     # EnvPool and other non-MuJoCo envs provide action_low/action_high directly.
@@ -162,8 +152,7 @@ def main(cfg: DictConfig):
     # The agent config IS the constructor call: `_target_` names the class and
     # every sibling key is one of its keywords, so a knob that exists in Python
     # but not in the yaml fails loudly here instead of silently taking its
-    # default (see tests/test_agent_configs.py). Only the four env-derived
-    # arguments are injected.
+    # default. Only the four env-derived arguments are injected.
     #
     # `_recursive_=False` keeps the nested `*_config` blocks as DictConfigs: the
     # agent instantiates its own actor/critic/memory/optimizers, injecting shapes

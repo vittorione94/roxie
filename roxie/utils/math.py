@@ -2,7 +2,6 @@ import jax.numpy as jnp
 from jax import vmap
 
 def quat_conjugate(q):
-    # Returns [w, -x, -y, -z]
     return jnp.concatenate([q[..., :1], -q[..., 1:]], axis=-1)
 
 def quat_norm(q):
@@ -12,7 +11,6 @@ def quat_inverse(q):
     return quat_conjugate(q) / jnp.square(quat_norm(q))
 
 def quat_multiply(q, p):
-    # Standard quaternion multiplication
     w1, x1, y1, z1 = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
     w2, x2, y2, z2 = p[..., 0], p[..., 1], p[..., 2], p[..., 3]
     
@@ -24,7 +22,6 @@ def quat_multiply(q, p):
     return jnp.stack([w, x, y, z], axis=-1)
 
 def batched_quat_diff(q_from, q_to):
-    # No vmap needed! The ellipsis (...) handles batching natively.
     q_from_inv = quat_inverse(q_from)
     return quat_multiply(q_from_inv, q_to)
 
@@ -34,16 +31,11 @@ def quaternion_distance(q1, q2):
     Computes the angular geodesic distance between two unit quaternions in radians.
     Expects quaternions in the format: (x, y, z, w) or (w, x, y, z)
     """
-    # 1. Compute the absolute value of the dot product (accounts for double cover q and -q)
+    # abs() folds the double cover (q and -q are the same rotation); the clip
+    # guards arccos against NaN from float round-off just outside [-1, 1].
     dot_product = jnp.abs(jnp.vdot(q1, q2))
-    
-    # 2. Clip the value to [-1, 1] to avoid NaN errors due to floating point inaccuracies
     dot_product = jnp.clip(dot_product, -1.0, 1.0)
-    
-    # 3. Calculate the angular difference
-    angle_rad = 2.0 * jnp.arccos(dot_product)
-    
-    return angle_rad
+    return 2.0 * jnp.arccos(dot_product)
 
 def quat_to_rot6d(q):
     """MuJoCo quaternion (w, x, y, z) -> 6D continuous rotation representation.

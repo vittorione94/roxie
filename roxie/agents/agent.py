@@ -73,8 +73,8 @@ class Agent(abc.ABC):
         action = actor_model(observation)
 
         noisy_action = noise_module.add_noise(action, key, evaluate)
-        noisy_action = jnp.clip(noisy_action, -1.0, 1.0)  # ensure in [-1, 1]
-        return noisy_action, action - noisy_action  # return noise for logging
+        noisy_action = jnp.clip(noisy_action, -1.0, 1.0)
+        return noisy_action, action - noisy_action  # the noise, for logging
 
     @staticmethod
     @functools.partial(nnx.jit, static_argnames=("evaluate",))
@@ -92,23 +92,17 @@ class Agent(abc.ABC):
         distribution = actor_model(observation)
 
         if evaluate:
-            # Deterministic action selection for evaluation: return the distribution mean
-            # Do not sample so results are deterministic.
-            # distrax distributions expose a `mean()` method for the expected value
-            # and `log_prob(x)` / `entropy()` methods for diagnostics.
+            # The distribution mean, never a sample, so evaluation is deterministic.
             try:
                 action = distribution.mean()
             except TypeError:
-                # Some distrax versions expose mean as a property
+                # Some distrax versions expose mean as a property.
                 action = distribution.mean
 
-            # Compute log-prob of the mean (useful for logging); this is deterministic.
-            # For multivariate normals the log_prob returns a scalar per batch element.
             log_probs = distribution.log_prob(action)
             entropy = _distribution_entropy(distribution, key)
             return action, log_probs, entropy
 
-        # Training / exploration mode: sample from the policy
         action, log_probs = distribution.sample_and_log_prob(seed=key)
         entropy = _distribution_entropy(distribution, key)
         return action, log_probs, entropy
@@ -139,10 +133,9 @@ class Agent(abc.ABC):
         count = jnp.maximum(stats.count, 1.0)
         mean = stats.sum / count
         var = jnp.maximum(stats.sumsq / count - jnp.square(mean), 0.0)
-        # With 0 or 1 samples the variance is identically 0, so `sqrt(var + eps)`
-        # is ~1e-4 and normalizing divides the observation by it -- every feature
-        # saturates at the clip bound. Fall back to the identity scale until
-        # there is enough data for a meaningful spread.
+        # With 0 or 1 samples the variance is identically 0, so `sqrt(var + eps)` is
+        # tiny and dividing by it saturates every feature at the clip bound. Fall
+        # back to the identity scale until there is a meaningful spread.
         std = jnp.where(stats.count > 1.0, jnp.sqrt(var + eps), 1.0)
         return mean, std
 
@@ -206,7 +199,7 @@ class Agent(abc.ABC):
         self,
         path: str | Path,
         *,
-        format_version: int = 1,  # bump format
+        format_version: int = 1,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ):
         try:
@@ -215,14 +208,12 @@ class Agent(abc.ABC):
 
             path = Path(path).resolve()
 
-            # The replay buffer (`self.state.buffer_state`) dominates the state —
-            # ~1.4GB for 500k transitions. `device_get`'ing it to host on every
-            # save spikes host RAM (orbax holds its own serialization copies on
-            # top), and on long runs that spike, stacked on a creeping baseline,
-            # OOM-kills the process mid-write. It is not needed to resume these
-            # runs, so detach it for the duration of the save; `load()` already
-            # treats `buffer_state` as optional. `_export_hyperparams` reads the
-            # buffer's obs/action shapes, so call it *before* detaching.
+            # The replay buffer dominates the state, and `device_get`'ing it to host
+            # on every save spikes host RAM (orbax holds its own serialization copies
+            # on top) hard enough to risk an OOM mid-write. It is not needed to
+            # resume, so it is detached for the duration of the save and `load()`
+            # treats it as optional. `_export_hyperparams` reads the buffer's
+            # obs/action shapes, so it must be called *before* detaching.
             hyperparams = self._export_hyperparams()
             saved_buffer = getattr(self.state, "buffer_state", None)
             self.state.buffer_state = None
@@ -238,12 +229,10 @@ class Agent(abc.ABC):
                 }
                 checkpointer = ocp.StandardCheckpointer()
 
-                # ocp.PyTreeCheckpointer().save(path, payload)
                 checkpointer.save(path, payload)
-                # save() returns before the background write finishes. Block here
-                # so the write completes while the checkpointer is still alive;
-                # otherwise it can be torn down mid-write at exit ("cannot schedule
-                # new futures after shutdown").
+                # save() returns before the background write finishes. Block here so
+                # the write completes while the checkpointer is still alive, rather
+                # than being torn down mid-write at interpreter exit.
                 checkpointer.wait_until_finished()
             finally:
                 # Restore the live buffer so training continues uninterrupted.
@@ -275,11 +264,10 @@ class Agent(abc.ABC):
         Everything else comes from the checkpoint's `hyperparams`.
         """
         path = Path(path).resolve()
-        # Restore weights to host memory (numpy) instead of onto the device
-        # sharding baked into the checkpoint. A GPU-trained run pins arrays to
-        # cuda:0, so loading it in a CPU-only process (e.g. play.py) would fail
-        # with "Device cuda:0 was not found". Host arrays are placement-agnostic;
-        # the numpy->jax conversion below puts them on whatever device is active.
+        # Restore weights to host memory (numpy) rather than onto the device sharding
+        # baked into the checkpoint: a GPU-trained run pins arrays to cuda:0, which a
+        # CPU-only process could not load. Host arrays are placement-agnostic, and the
+        # numpy->jax conversion below puts them on whatever device is active.
         checkpointer = ocp.PyTreeCheckpointer()
         restore_args = jax.tree.map(
             lambda _a: ocp.RestoreArgs(restore_type=np.ndarray),
@@ -322,17 +310,14 @@ class Agent(abc.ABC):
         )
         agent = cls(**init_kwargs)
 
-        # Minimal fields commonly used at play time
         hyper = ckpt_state.get("hyperparams", {}) or {}
         agent.exploration_noise = float(hyper.get("exploration_noise", 0.0))
 
-        # Helper: convert numpy -> jax arrays
         import numpy as _np
 
         def _to_jax(x):
             return jnp.asarray(x) if isinstance(x, _np.ndarray) else x
 
-        # 2) Merge submodules individually
         def _restore_submodule(name: str):
             if not (isinstance(ckpt_state, dict) and name in ckpt_state):
                 print(f"Info: '{name}' not in checkpoint; keeping live {name}.")
@@ -346,7 +331,7 @@ class Agent(abc.ABC):
                 restored = nnx.merge(gdef, sub_ckpt)
                 setattr(agent.state, name, restored)
             except ValueError as e:
-                # Architecture drift or partial state → fall back to replacing just params where possible
+                # Architecture drift or partial state: fall back to params only.
                 print(
                     f"Warning: merge({name}) failed ({e}). Falling back to param-only copy."
                 )
@@ -360,7 +345,7 @@ class Agent(abc.ABC):
                     if src_params is None:
                         print(f"Warning: no 'params' found for {name}; skipping.")
                     else:
-                        # Only update params; let NNX map into its own topology.
+                        # Params only; NNX maps them into its own topology.
                         nnx.update(sub_live, {"params": src_params})
                 except Exception as ee:
                     print(
@@ -370,11 +355,10 @@ class Agent(abc.ABC):
         for name in ("actor", "critic", "target_actor", "target_critic"):
             _restore_submodule(name)
 
-        # 3) Restore simple values directly (replace whole object; don't partial-update)
+        # Replaced wholesale rather than partial-updated.
         if isinstance(ckpt_state, dict) and "obs_stats" in ckpt_state:
             try:
                 obs = ckpt_state["obs_stats"]
-                # obs may be dict-like; normalize to ObsStats dataclass
                 if isinstance(obs, dict):
                     agent.state.obs_stats = ObsStats(
                         count=jnp.asarray(obs["count"]),
@@ -382,18 +366,18 @@ class Agent(abc.ABC):
                         sumsq=jnp.asarray(obs["sumsq"]),
                     )
                 else:
-                    # If it was saved as a struct-compatible tree, just assign it.
+                    # Already a struct-compatible tree.
                     agent.state.obs_stats = jax.tree_map(
                         _to_jax, obs, is_leaf=lambda x: isinstance(x, _np.ndarray)
                     )
             except Exception as e:
                 print(f"Warning: could not restore obs_stats ({e}); using live stats.")
 
-        # (Optional) if you really want buffer snapshot:
+        # Only present if the checkpoint was written with the buffer attached.
         if isinstance(ckpt_state, dict) and "buffer_state" in ckpt_state:
             agent.state.buffer_state = ckpt_state["buffer_state"]
 
-        # 4) DO NOT restore optimizer internals: they’re brittle; let them be reinitialized.
+        # Optimizer internals are deliberately not restored; they are reinitialized.
 
         if "exploration_noise" in hyper:
             agent.exploration_noise = float(hyper["exploration_noise"])

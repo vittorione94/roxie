@@ -26,10 +26,10 @@ def build_optimizer(config, *, learning_rate: float, max_grad_norm: float = None
             init_value: 3e-4
             decay_steps: 1_000_000
 
-    `config=None` falls back to plain Adam, so an agent constructed directly from
-    Python (tests, `Agent.load` on an old checkpoint) behaves as it always has.
-    Clipping stays outside the block: `max_grad_norm` is a top-level agent arg,
-    and null/0 disables it entirely.
+    `config=None` falls back to plain Adam, for agents constructed directly from
+    Python or loaded from a checkpoint that predates the block. Clipping stays
+    outside the block: `max_grad_norm` is a top-level agent arg, and null/0
+    disables it entirely.
     """
     if config is None:
         tx = optax.adam(learning_rate)
@@ -38,8 +38,8 @@ def build_optimizer(config, *, learning_rate: float, max_grad_norm: float = None
         tx = hydra.utils.instantiate(config, **overrides)
 
     if max_grad_norm:
-        # Clip first, then adapt: matches the original chain order, so a run with
-        # the default config reproduces pre-refactor numerics exactly.
+        # Clip first, then adapt, so the optimizer's moment estimates see the
+        # already-clipped gradient.
         tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), tx)
     return tx
 
@@ -49,9 +49,7 @@ def network_rngs(seed: int, offset: int = 0) -> nnx.Rngs:
 
     `offset` separates the networks of a single agent so twin critics never start
     identical (a clipped double-Q min over two identical heads is worthless).
-    The convention is actor=0, critic=2, second critic=4 — which reproduces the
-    previously hardcoded `nnx.Rngs(params=0, dropout=1)` / `(2, 3)` / `(4, 5)`
-    at the default `seed=0`.
+    The convention is actor=0, critic=2, second critic=4.
     """
     return nnx.Rngs(params=seed + offset, dropout=seed + offset + 1)
 
@@ -62,9 +60,9 @@ class Transition:
     action: jnp.ndarray
     reward: jnp.ndarray
     terminal: jnp.ndarray
-    log_probs: Optional[jnp.ndarray] = None    # Optional, used in some algorithms
-    value: Optional[jnp.ndarray] = None        # Optional, used in some algorithms
-    truncation: Optional[jnp.ndarray] = None   # Off-policy n-step masking + PPO GAE
+    log_probs: Optional[jnp.ndarray] = None    # on-policy agents only (PPO)
+    value: Optional[jnp.ndarray] = None        # on-policy agents only (PPO)
+    truncation: Optional[jnp.ndarray] = None   # off-policy n-step masking + PPO GAE
 
 
 def repack_samples(samples, gamma: float, n_step: int) -> dict:
@@ -132,13 +130,15 @@ def repack_samples(samples, gamma: float, n_step: int) -> dict:
     }
 
 
-# Helpers to serialize/deserialize bounds minimally
+# Action bounds -> JSON-friendly scalars/lists for the hyperparameter block written
+# into checkpoints and logs. Per-actuator bounds stay a full list, so an env whose
+# actuators have different ranges is not recorded as just the first one's.
 def serialize_bound(x):
     x = jax.device_get(x)
     if isinstance(x, (jnp.ndarray, np.ndarray)):
-        return (
-            float(x) if x.shape == () else np.asarray(x, dtype=np.float32).tolist()[0]
-        )  # TODO: check if this index is correct
+        if x.shape == ():
+            return float(x)
+        return np.asarray(x, dtype=np.float32).tolist()
     if hasattr(x, "item"):
         return x.item()
     return float(x)

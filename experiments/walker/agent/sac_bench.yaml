@@ -1,0 +1,76 @@
+# SAC arm of the WalkerWalk release benchmark: stochastic (tanh-Gaussian)
+# policy, twin Q critics, auto-tuned entropy temperature.
+#
+# ddpg_bench.yaml is the reference file and lists the invariants held identical
+# across every arm.
+#
+# SAC-specific: it explores from its own policy entropy, so its launchable
+# carries NO noise group — the agent takes no `noise_config` and passing one is
+# a launch-time error. The entropy bonus is applied at the bootstrap state only
+# (see sac_critic_loss_fn), the usual n-step approximation.
+_target_: roxie.agents.SAC
+
+gamma: 0.99
+tau: 0.005
+n_step: 5
+actor_learning_rate: 3e-4
+critic_learning_rate: 3e-4
+alpha_learning_rate: 3e-4
+init_log_alpha: 0.0
+auto_alpha: true
+target_entropy: null            # null -> -dim(A) = -6 on the walker
+memory_warmup: 30_000
+steps_before_learning: 30_000
+steps_between_updates: 2_048
+learning_steps: 20
+# 1 = textbook SAC (actor updated on every critic step). Raising it is an
+# algorithm change (REDQ/DroQ-style), not a free wall-clock win, so it stays at
+# the textbook value here and would be its own arm.
+policy_delay: 1
+max_grad_norm: 1
+normalize_observations: true
+obs_norm_clip: 5.0
+obs_norm_eps: 1e-8
+
+actor_config:
+  # Layer norm ON to match the rest of the benchmark — architecture is meant to
+  # be the controlled variable (the library sac.yaml leaves it off).
+  _target_: roxie.models.actors.StochasticActor
+  features: [256, 256]
+  use_layer_norm: true
+  std_min: 1e-4
+  std_max: 5.0
+
+critic_config:
+  # Instantiated twice behind a TwinCritic.
+  _target_: roxie.models.critics.QCritic
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory_config:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 10_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
+
+seed: 0
+
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+# Entropy temperature: a single scalar, so it is NOT global-norm clipped.
+alpha_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

@@ -1,10 +1,9 @@
 import os
-# Always run playback on CPU. Playback drives a single world into the viewer at
-# ~15x realtime, so GPU throughput buys nothing here, and CPU/MJX playback is
-# exactly reproducible — the warp GPU backend's atomic contact reductions make
-# even identical rollouts diverge (a ~1e-6 per-step difference that the chaotic
-# contact dynamics amplify). JAX_PLATFORMS is read at jax import, so this must be
-# set before `import jax` below.
+# Always run playback on CPU. It drives a single world into the viewer, so GPU
+# throughput buys nothing, and CPU/MJX playback is exactly reproducible — the warp
+# GPU backend's atomic contact reductions make even identical rollouts diverge, a
+# tiny per-step difference that the chaotic contact dynamics amplify.
+# JAX_PLATFORMS is read at jax import, so this must be set before `import jax`.
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 
@@ -38,41 +37,37 @@ def main(checkpoint_path, overrides):
     cfg_path = os.path.join(checkpoint_path, "../../.hydra/config.yaml")
     cfg = OmegaConf.load(cfg_path)
 
-    # Trailing ``dotted.key=value`` args override the saved run config (play.py
-    # is a Click CLI, not a Hydra entrypoint, so this stands in for Hydra's CLI
-    # overrides). E.g. ``env.config.early_termination=false`` to watch a clip run
-    # to its end instead of resetting on tracking collapse.
+    # Trailing ``dotted.key=value`` args override the saved run config. This is a
+    # Click CLI, not a Hydra entrypoint, so it stands in for Hydra's CLI overrides
+    # — e.g. ``env.config.early_termination=false`` to watch a clip run to its end.
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
 
-    # We force JAX onto CPU (top of file), but the warp backend targets CUDA, so
-    # a warp-trained checkpoint would fail to build its env here. Coerce the
-    # physics backend to MJX for playback: checkpoints are agent-side, so the
-    # policy replays identically on either backend (and warp-only knobs like the
-    # contact budgets / graph_mode are simply ignored by the MJX builder).
+    # JAX is forced onto CPU above, but the warp backend targets CUDA, so a
+    # warp-trained checkpoint could not build its env here. Checkpoints are
+    # agent-side and the policy replays identically on either backend, so the
+    # physics backend is coerced to MJX; warp-only knobs are ignored by its builder.
     if cfg.env.get("impl", None) == "warp":
         cfg.env.impl = "jax"
 
-    # Match the training run's matmul precision so playback evaluates the
-    # policy the same way it was trained (see `runtime.matmul_precision`).
+    # Match the training run's matmul precision so playback evaluates the policy
+    # the same way it was trained.
     matmul_precision = (cfg.get("runtime") or {}).get("matmul_precision", None)
     if matmul_precision:
         jax.config.update("jax_default_matmul_precision", matmul_precision)
 
     key = jax.random.PRNGKey(seed=0)
 
-    # Same builder protocol as train.py: ``env.builder`` names the env factory;
-    # ``mode="play"`` lets it apply playback-specific tweaks (the mocap builder
-    # shrinks its GPU clip pool here).
+    # Same builder protocol as train.py; ``mode="play"`` lets the builder apply
+    # playback-specific tweaks, such as shrinking a GPU clip pool.
     build_env = get_method(cfg.env.get("builder", DEFAULT_BUILDER))
     env, _, env_cfg = build_env(cfg.env, mode="play")
 
     log_loaded_backend(env, requested_impl=cfg.env.get("impl", "jax"))
 
     # Same source of truth as train.py: the saved config's `_target_` names the
-    # class. Forward every construction block it declares (actor/critic/memory,
-    # the optimizer blocks) plus the separate `noise` group; the remaining
-    # hyperparameters come from the checkpoint itself.
+    # class. Every construction block it declares is forwarded, plus the separate
+    # `noise` group; the remaining hyperparameters come from the checkpoint.
     agent_args = {
         key: value
         for key, value in cfg.agent.items()
@@ -88,25 +83,22 @@ def main(checkpoint_path, overrides):
         **agent_args,
     )
 
-    # Optional per-env viewer overrides, injected via ``env.viewer`` (a dotted
-    # path). The mocap example uses this to render a reference "ghost" alongside
-    # the policy; envs that don't set it just render their own model.
+    # Optional per-env viewer override, a dotted path in ``env.viewer``. Used to
+    # render a reference "ghost" alongside the policy; envs that don't set it just
+    # render their own model.
     viewer_path = cfg.env.get("viewer", None)
     ghost = get_method(viewer_path)(env) if viewer_path else None
     model = ghost.model if ghost is not None else env.mj_model
 
     data = mujoco.MjData(model)
 
-    # Prefer a native-MuJoCo CPU stepper when the env provides one (the mocap
-    # env does, via ``env.player``). The env is written in MJX, which is
-    # GPU-first and pathologically slow for a single world on CPU; the native
-    # player steps ``mujoco.mj_step`` instead while reusing the env's own
-    # obs/reward, so a checkpoint can be watched on a laptop with the GPU busy
-    # training. Falls back to the jitted MJX reset/step for envs without one.
-    # Default to the generic native-CPU player factory; it returns a player for
-    # any env implementing the ``native_*`` protocol and None for the rest (which
-    # then fall back to the jitted-MJX path below). Envs can override or disable
-    # it via the ``env.player`` config key (dotted path, or null to force MJX).
+    # Prefer a native-MuJoCo CPU stepper when the env provides one. MJX is GPU-first
+    # and pathologically slow for a single world on CPU, so the native player steps
+    # ``mujoco.mj_step`` instead while reusing the env's own obs/reward.
+    #
+    # The default factory returns a player for any env implementing the ``native_*``
+    # protocol and None for the rest, which fall back to the jitted-MJX path below.
+    # ``env.player`` overrides it (dotted path, or null to force MJX).
     player_path = cfg.env.get("player", "roxie.utils.native_player.make_native_player")
     player = get_method(player_path)(env) if player_path else None
     if player is not None:

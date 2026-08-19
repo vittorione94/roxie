@@ -37,9 +37,9 @@ def _grad_step(
     """One D4PG step. `obs_mean`/`obs_std` are hoisted in by `_grad_steps` (the
     stats are loop-constant), as is `atoms`. `n_step` is the TD horizon (NOT the
     scan length `n_steps` in _grad_steps)."""
-    # 1. Sample from the replay buffer. `repack_samples` folds the n-step
-    # return, bootstrap coefficient, and bootstrap obs into the dict — exactly
-    # the ingredients the categorical projection needs to shift the support.
+    # `repack_samples` folds the n-step return, bootstrap coefficient, and
+    # bootstrap obs into the dict — exactly the ingredients the categorical
+    # projection needs to shift the support.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
@@ -49,7 +49,7 @@ def _grad_step(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    # 2. Critic update (cross-entropy against the projected target categorical)
+    # Critic update: cross-entropy against the projected target categorical.
     critic_loss, critic_grads = nnx.value_and_grad(d4pg_critic_loss_fn)(
         state.critic,
         state.target_actor,
@@ -64,7 +64,7 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # 3. Actor update (DPG through the categorical's expected value)
+    # Actor update: DPG through the categorical's expected value.
     actor_loss, actor_grads = nnx.value_and_grad(d4pg_actor_loss_fn)(
         state.actor,
         state.critic,
@@ -75,7 +75,7 @@ def _grad_step(
     )
     state.actor_optimizer.update(state.actor, actor_grads)
 
-    # 4. Update target networks using soft updates
+    # Soft update of both target networks.
     new_actor_tensors = nnx.state(state.actor, nnx.Param)
     old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
     new_target_actor_tensors = optax.incremental_update(
@@ -91,7 +91,6 @@ def _grad_step(
     nnx.update(state.target_actor, new_target_actor_tensors)
     nnx.update(state.target_critic, new_target_critic_tensors)
 
-    # 5. Return the new, updated state object
     return (
         TrainState(
             actor=state.actor,
@@ -109,8 +108,8 @@ def _grad_step(
 
 
 # Fused N-step update. The body is compiled once and run `n_steps` times on-device
-# via `lax.scan` (instead of unrolling the Python loop, which at large `n_steps`
-# blows up compile time and the HLO graph). Only the trainable graph state is
+# via `lax.scan` rather than unrolled, which would blow up compile time and HLO
+# size at large `n_steps`. Only the trainable graph state is
 # carried; `buffer_state`, the normalization params, and `atoms` are constant
 # across the loop and closed over.
 @functools.partial(
@@ -118,10 +117,9 @@ def _grad_step(
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "n_step", "normalize",
     ),
-    # Donate the train state (arg 0): its large read-only replay buffer is
-    # threaded unchanged through the scan, so without donation XLA allocates a
-    # full second copy of the buffer (~1.4GB for 500k obs) every update. The
-    # caller reassigns self.state from the result, so donating is safe.
+    # Donate the train state (arg 0): its large read-only replay buffer is threaded
+    # unchanged through the scan, so without donation XLA allocates a full second
+    # copy of it every update. The caller reassigns self.state from the result.
     donate_argnums=(0,),
 )
 def _grad_steps(
