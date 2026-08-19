@@ -65,6 +65,32 @@ def main(cfg: DictConfig):
         # churn. Overridable: setdefault, so XLA_PYTHON_CLIENT_ALLOCATOR=default
         # in the environment restores BFC if an agent regresses.
         os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
+    elif cfg.env.get("impl", None) == "envpool":
+        # CPU backend = CPU run. The pool's physics is pure native MuJoCo and
+        # never touches the GPU, but the AGENT is plain JAX and would otherwise
+        # still claim the card (and preallocate ~75% of it) — so "running on
+        # CPU" would leave the GPU occupied, which is the opposite of the point.
+        # Pin the whole process to CPU so the card is genuinely free.
+        #
+        # This is a real throughput trade, measured on this box (12-core 7900X,
+        # PPO, parallel_envs=1000, obs 1069, nets [1024,512,256]):
+        #   CPU physics + GPU learner   ~17.2k sps
+        #   everything on CPU           ~9.1k sps
+        # The gap is the dense actor/critic GEMMs, which is what the GPU is for.
+        # Set `runtime.jax_platform: null` in the experiment to opt back into the
+        # hybrid if you want the throughput and can spare ~1.4 GB of VRAM (the
+        # measured peak for this arm — the 15 GB you see reported is XLA's
+        # preallocated arena, not resident data).
+        # NOTE: this one must go through `jax.config`, NOT an env var. The
+        # XLA_PYTHON_CLIENT_* settings above work as `os.environ` writes because
+        # the PJRT C++ client reads them when it lazily initializes. But
+        # `JAX_PLATFORMS` is a JAX *Python* config option, parsed out of the
+        # environment once at `import jax` — which already happened at the top of
+        # this module — so setting the env var here is silently ignored and the
+        # run still lands on the GPU.
+        platform = (cfg.get("runtime") or {}).get("jax_platform", "cpu")
+        if platform:
+            jax.config.update("jax_platforms", str(platform))
     # XLA GPU autotuning hangs this machine's RTX 5080 (Blackwell) — required
     # for EVERY GPU run regardless of physics backend; unused/harmless on CPU.
     os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")

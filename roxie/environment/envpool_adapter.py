@@ -76,9 +76,23 @@ class EnvPoolWrapper:
     # no MJX backend, the "physics impl" is the pool itself.
     _impl: str = "envpool"
 
+    # Optional pool hooks the trainer discovers by `hasattr`, forwarded verbatim
+    # so a pool that implements the negative-mining protocol (see
+    # MocapCpuPool) reaches `_run_envpool` through the wrapper. Unlike the JAX
+    # path the weights/counters live in the pool rather than being threaded as
+    # traced arguments — there is no trace to keep them out of — so the trainer
+    # only has to say *when* to refresh, not carry the state.
+    _POOL_HOOKS = (
+        "mining_bins", "mining_refresh", "mining_stats", "refresh_reset_pool",
+    )
+
     def __init__(self, pool: Any, max_episode_steps: int = 1000):
         self._pool = pool
         self.max_episode_steps = max_episode_steps
+        for name in self._POOL_HOOKS:
+            attr = getattr(pool, name, None)
+            if attr is not None:
+                setattr(self, name, attr)
 
         obs_space = pool.observation_space
         act_space = pool.action_space

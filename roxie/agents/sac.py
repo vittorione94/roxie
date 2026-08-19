@@ -72,6 +72,7 @@ def _grad_step(
     obs_mean: jnp.ndarray,
     obs_std: jnp.ndarray,
     obs_clip: float,
+    normalize: bool,
     update_actor,
     n_step: int = 1,
 ):
@@ -81,6 +82,11 @@ def _grad_step(
     key, sample_key, actor_key, critic_key = jax.random.split(key, 4)
     samples = replay_sample_fn(state.buffer_state, sample_key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
+    # Normalize once, here: the critic and (delayed) actor losses read the same
+    # `observations`, and neither normalizes (see `Agent.normalize_samples`).
+    re_packed_samples = Agent.normalize_samples(
+        re_packed_samples, obs_mean, obs_std, obs_clip, normalize
+    )
 
     alpha = jnp.exp(log_alpha_module.log_alpha.value)
 
@@ -94,9 +100,6 @@ def _grad_step(
         critic_key,
         action_low,
         action_high,
-        obs_mean,
-        obs_std,
-        obs_clip,
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
@@ -120,9 +123,6 @@ def _grad_step(
             alpha,
             re_packed_samples,
             actor_key,
-            obs_mean,
-            obs_std,
-            obs_clip,
             action_low,
             action_high,
         )
@@ -194,7 +194,7 @@ def _grad_step(
     nnx.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps",
-        "target_entropy", "auto_alpha", "policy_delay", "n_step",
+        "target_entropy", "auto_alpha", "policy_delay", "n_step", "normalize",
     ),
     # Donate the train state (arg 0): its large read-only replay buffer is
     # threaded unchanged through the scan, so without donation XLA allocates a
@@ -217,6 +217,7 @@ def _grad_steps(
     action_high: float,
     obs_eps: float,
     obs_clip: float,
+    normalize: bool = True,
     policy_delay: int = 1,
     n_step: int = 1,
 ):
@@ -257,6 +258,7 @@ def _grad_steps(
             obs_mean,
             obs_std,
             obs_clip,
+            normalize,
             update_actor,
             n_step,
         )
@@ -571,6 +573,7 @@ class SAC(Agent):
             self.action_high,
             self.obs_eps,
             self.obs_clip,
+            self.normalize_observations,
             self.policy_delay,
             n_step=self.n_step,
         )

@@ -48,6 +48,7 @@ def _grad_step(
     obs_mean: jnp.ndarray,
     obs_std: jnp.ndarray,
     obs_clip: float,
+    normalize: bool,
     update_actor,
     pre_activation_coef: float,
     n_step: int = 1,
@@ -63,6 +64,11 @@ def _grad_step(
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
+    # Normalize once, here: the critic and (delayed) actor losses read the same
+    # `observations`, and neither normalizes (see `Agent.normalize_samples`).
+    re_packed_samples = Agent.normalize_samples(
+        re_packed_samples, obs_mean, obs_std, obs_clip, normalize
+    )
 
     # 2. Critic update (twin critic, clipped double-Q target) — every step
     (critic_loss, critic_aux), critic_grads = nnx.value_and_grad(
@@ -77,9 +83,6 @@ def _grad_step(
         target_noise_clip,
         action_low,
         action_high,
-        obs_mean,
-        obs_std,
-        obs_clip,
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
@@ -93,9 +96,6 @@ def _grad_step(
             state.actor,
             state.critic,
             re_packed_samples,
-            obs_mean,
-            obs_std,
-            obs_clip,
             action_low,
             action_high,
             pre_activation_coef,
@@ -160,6 +160,7 @@ def _grad_step(
     nnx.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "policy_delay", "n_step",
+        "normalize",
     ),
     # Donate the train state (arg 0): its large read-only replay buffer is
     # threaded unchanged through the scan, so without donation XLA allocates a
@@ -180,6 +181,7 @@ def _grad_steps(
     action_high: float,
     obs_eps: float,
     obs_clip: float,
+    normalize: bool,
     policy_delay: int,
     pre_activation_coef: float,
     n_step: int = 1,
@@ -209,6 +211,7 @@ def _grad_steps(
             obs_mean,
             obs_std,
             obs_clip,
+            normalize,
             update_actor,
             pre_activation_coef,
             n_step,
@@ -292,6 +295,7 @@ class TD3(DDPG):
             self.action_high,
             self.obs_eps,
             self.obs_clip,
+            self.normalize_observations,
             self.policy_delay,
             self.pre_activation_coef,
             n_step=self.n_step,

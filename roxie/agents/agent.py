@@ -151,6 +151,41 @@ class Agent(abc.ABC):
     def normalize_obs(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, clip: float):
         return jnp.clip((x - mean) / std, -clip, clip)
 
+    @staticmethod
+    def normalize_samples(
+        samples: dict,
+        mean: jnp.ndarray,
+        std: jnp.ndarray,
+        clip: float,
+        enabled: bool = True,
+    ) -> dict:
+        """Normalize the observation entries of a repacked sample dict.
+
+        This is the contract every loss function relies on: losses are handed
+        observations that have ALREADY been normalized and therefore take no
+        `obs_mean` / `obs_std` / `obs_clip` arguments of their own (the
+        on-policy path does the same once per rollout in `PPO._prepare_rollout`).
+        Normalizing here also does it once per gradient step rather than once
+        per loss — the actor and critic losses read the same `observations`.
+
+        `enabled` is the agent's `normalize_observations` flag and is static at
+        trace time. When it is False the samples pass through untouched, clip
+        included: `obs_clip` bounds *normalized* observations, and the unused
+        running stats degrade to mean 0 / std 1, so applying it anyway would
+        silently squash raw observations into +/- `clip`.
+        """
+        if not enabled:
+            return samples
+        return {
+            **samples,
+            "observations": Agent.normalize_obs(
+                samples["observations"], mean, std, clip
+            ),
+            "next_observations": Agent.normalize_obs(
+                samples["next_observations"], mean, std, clip
+            ),
+        }
+
     def update(self, old_states, new_states, steps, agent_rng):
         """Informs the agent of the latest transitions during training."""
         gradient_steps, actor_loss, critic_loss = 0, 0, 0

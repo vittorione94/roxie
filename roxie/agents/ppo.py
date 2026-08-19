@@ -327,6 +327,18 @@ class PPO(Agent):
 
         buffer_state = replay.init(prototype)
 
+        # flashbax's `add` is a pure (queue_state, batch) -> queue_state
+        # function, but calling it eagerly runs it as a standalone XLA program
+        # with the queue as a live input, so the whole queue is COPIED on every
+        # env step — at parallel_envs=1000 and obs 1069 that is a 0.29 GB
+        # read+write per step (2.3 GB before the capacity fix, which is what
+        # made `agent.add` the single most expensive item in the CPU training
+        # loop: 43 ms/step against 41 ms for the physics). Jitting with donation
+        # turns it into an in-place scatter. Donation is safe for the same
+        # reason it is in DDPG's `_grad_steps`: the input is dead the moment
+        # `add` reassigns `self.state.buffer_state` below.
+        self._jit_replay_add = jax.jit(replay.add, donate_argnums=(0,))
+
         self.critic_learning_rate = critic_learning_rate
         self.actor_learning_rate = actor_learning_rate
         self.max_grad_norm = max_grad_norm
@@ -465,8 +477,8 @@ class PPO(Agent):
             value=self.last_values,          # (NUM_ENVS, 1)
             truncation=states.info["truncation"][:, None],  # (NUM_ENVS,) -> (NUM_ENVS, 1)
         )
-        # store in memory
-        self.state.buffer_state = self.replay.add(
+        # store in memory (jitted + donating — see _jit_replay_add in __init__)
+        self.state.buffer_state = self._jit_replay_add(
             self.state.buffer_state, experiences
         )
         # print(self.state.buffer_state.experience.observation.shape) --> (NUM_ENVS, TIME, OBS_SPACE)

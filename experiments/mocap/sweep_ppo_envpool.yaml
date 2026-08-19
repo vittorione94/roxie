@@ -1,0 +1,33 @@
+# @package _global_
+
+# CMU_006_13 single-clip overfit sweep — PPO arm, CPU (envpool) backend.
+#   uv run python roxie/train.py --config-name mocap/sweep_ppo_envpool
+#
+# Identical to mocap/sweep_ppo in every respect except `backend`: same agent,
+# same env config, same reward block, same shared sweep block. That is the whole
+# point — it is the CPU/GPU A/B of the PPO arm, so the ONLY difference between
+# the two runs must be where the physics executes. `examples/mocap/
+# check_envpool_parity.py` is what verifies the two backends agree on obs and
+# reward; keep it passing whenever either side gains a term.
+#
+# Why run it at all: the GPU (warp) backend is bounded by the 16 GB card, while
+# the CPU pool is bounded by 64 GB of system RAM, so parallel_envs and replay
+# capacity stop competing with the physics for memory. Throughput is comparable
+# (the pool saturates near the physical core count, not the env count) — see the
+# note on num_threads in backend/envpool.yaml.
+
+defaults:
+  - agent: ppo_sweep
+  - env_config: cmu
+  - reward: cmu_tracking
+  - backend: envpool
+  - sweep: overfit_cmu_006_13
+  - _self_
+
+logging:
+  wandb:
+    name: ppo_envpool
+
+hydra:
+  run:
+    dir: outputs/sweep_cmu_006_13/ppo_envpool/${now:%Y-%m-%d_%H-%M-%S}

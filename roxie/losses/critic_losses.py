@@ -1,3 +1,14 @@
+"""Critic losses.
+
+Uniform contract across every loss in this module (and in `actor_losses`): the
+observations in `samples` — `observations` and `next_observations` — arrive
+ALREADY normalized. `Agent.normalize_samples` is the single place that happens,
+called once per gradient step by the agent, so no loss function normalizes on
+its own and none of them carry `obs_mean` / `obs_std` / `obs_clip` arguments.
+PPO's losses take their observations as a plain array for the same reason: the
+on-policy path normalizes once per rollout in `PPO._prepare_rollout`.
+"""
+
 import jax
 import jax.numpy as jnp
 import rlax
@@ -17,16 +28,10 @@ def ddpg_critic_loss_fn(
     target_noise_clip,
     action_low,
     action_high,
-    obs_mean,
-    obs_std,
-    obs_clip,
 ):
     """Calculates the MSE loss for the critic."""
-    # Normalize observations
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    next_obs = Agent.normalize_obs(
-        samples["next_observations"], obs_mean, obs_std, obs_clip
-    )
+    obs = samples["observations"]
+    next_obs = samples["next_observations"]
 
     # Target actions in env scale
     next_actions = target_actor_model(next_obs)  # [-1, 1]
@@ -69,9 +74,6 @@ def td3_critic_loss_fn(
     target_noise_clip,
     action_low,
     action_high,
-    obs_mean,
-    obs_std,
-    obs_clip,
 ):
     """MSE loss for the twin critic using clipped double-Q targets (TD3).
 
@@ -83,10 +85,8 @@ def td3_critic_loss_fn(
     agent logs under `td3/` (see `TD3.pop_diagnostics`), read off this forward
     pass so the instrumentation costs nothing extra.
     """
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    next_obs = Agent.normalize_obs(
-        samples["next_observations"], obs_mean, obs_std, obs_clip
-    )
+    obs = samples["observations"]
+    next_obs = samples["next_observations"]
 
     # Target actions in env scale
     next_actions = target_actor_model(next_obs)  # [-1, 1]
@@ -153,9 +153,6 @@ def d4pg_critic_loss_fn(
     target_noise_clip,
     action_low,
     action_high,
-    obs_mean,
-    obs_std,
-    obs_clip,
     atoms,
 ):
     """Categorical distributional critic loss for D4PG (Barth-Maron et al. 2018).
@@ -171,11 +168,8 @@ def d4pg_critic_loss_fn(
     Target policy smoothing is kept for signature parity with the DDPG/TD3
     losses; the paper doesn't smooth, so configs set the noise to 0.
     """
-    # Normalize observations
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    next_obs = Agent.normalize_obs(
-        samples["next_observations"], obs_mean, obs_std, obs_clip
-    )
+    obs = samples["observations"]
+    next_obs = samples["next_observations"]
 
     # Target actions in env scale
     next_actions = target_actor_model(next_obs)  # [-1, 1]
@@ -220,9 +214,6 @@ def td4_critic_loss_fn(
     target_noise_clip,
     action_low,
     action_high,
-    obs_mean,
-    obs_std,
-    obs_clip,
     atoms,
 ):
     """Categorical distributional loss for a twin critic with clipped double-Q.
@@ -238,10 +229,8 @@ def td4_critic_loss_fn(
     Both online heads are then trained by cross-entropy against the same
     projected target, and the two losses are summed (as in `td3_critic_loss_fn`).
     """
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    next_obs = Agent.normalize_obs(
-        samples["next_observations"], obs_mean, obs_std, obs_clip
-    )
+    obs = samples["observations"]
+    next_obs = samples["next_observations"]
 
     # Target actions in env scale
     next_actions = target_actor_model(next_obs)  # [-1, 1]
@@ -296,6 +285,10 @@ def ppo_critic_loss_fn(
 ):
     """Calculates the MSE loss for the critic using PPO.
 
+    `observations` are already normalized — `PPO._prepare_rollout` does it once
+    per rollout, under the *frozen* behaviour-policy statistics, and every epoch
+    and minibatch then trains on that same array.
+
     `returns` is the GAE return target `A_raw + V_old`, built by the caller from
     the *unnormalized* advantage. Do not rebuild it here from the advantage the
     actor consumes: that one is standardized to zero mean / unit variance, which
@@ -320,9 +313,6 @@ def mpo_critic_loss_fn(
     num_action_samples,
     action_low,
     action_high,
-    obs_mean,
-    obs_std,
-    obs_clip,
 ):
     """MSE critic loss for MPO (policy evaluation).
 
@@ -336,10 +326,8 @@ def mpo_critic_loss_fn(
     this is called from inside the already-jitted grad step rather than jitted on
     its own.
     """
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    next_obs = Agent.normalize_obs(
-        samples["next_observations"], obs_mean, obs_std, obs_clip
-    )
+    obs = samples["observations"]
+    next_obs = samples["next_observations"]
 
     # Sample N next actions from the target policy: [S, B, A] (Gaussian, no
     # squashing — bounded by clipping, consistent with action selection).
@@ -374,9 +362,6 @@ def sac_critic_loss_fn(
     key,
     action_low,
     action_high,
-    obs_mean,
-    obs_std,
-    obs_clip,
 ):
     """Soft Bellman MSE for the twin critic (SAC).
 
@@ -392,10 +377,8 @@ def sac_critic_loss_fn(
     is the usual n-step SAC approximation (the stored actions came from an older
     policy, so their log-probs are not the current pi's anyway).
     """
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    next_obs = Agent.normalize_obs(
-        samples["next_observations"], obs_mean, obs_std, obs_clip
-    )
+    obs = samples["observations"]
+    next_obs = samples["next_observations"]
 
     # Sample next actions from current policy with tanh squashing
     next_dist = actor_model(next_obs)

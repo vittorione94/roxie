@@ -30,6 +30,7 @@ def _grad_step(
     obs_mean: jnp.ndarray,
     obs_std: jnp.ndarray,
     obs_clip: float,
+    normalize: bool,
     atoms: jnp.ndarray,
     n_step: int = 1,
 ):
@@ -42,6 +43,11 @@ def _grad_step(
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
+    # Normalize once, here: both losses below read the same `observations`, and
+    # neither of them normalizes (see `Agent.normalize_samples`).
+    re_packed_samples = Agent.normalize_samples(
+        re_packed_samples, obs_mean, obs_std, obs_clip, normalize
+    )
 
     # 2. Critic update (cross-entropy against the projected target categorical)
     critic_loss, critic_grads = nnx.value_and_grad(d4pg_critic_loss_fn)(
@@ -54,9 +60,6 @@ def _grad_step(
         target_noise_clip,
         action_low,
         action_high,
-        obs_mean,
-        obs_std,
-        obs_clip,
         atoms,
     )
     state.critic_optimizer.update(state.critic, critic_grads)
@@ -66,9 +69,6 @@ def _grad_step(
         state.actor,
         state.critic,
         re_packed_samples,
-        obs_mean,
-        obs_std,
-        obs_clip,
         action_low,
         action_high,
         atoms,
@@ -115,7 +115,9 @@ def _grad_step(
 # across the loop and closed over.
 @functools.partial(
     nnx.jit,
-    static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps", "n_step"),
+    static_argnames=(
+        "gamma", "tau", "replay_sample_fn", "n_steps", "n_step", "normalize",
+    ),
     # Donate the train state (arg 0): its large read-only replay buffer is
     # threaded unchanged through the scan, so without donation XLA allocates a
     # full second copy of the buffer (~1.4GB for 500k obs) every update. The
@@ -135,6 +137,7 @@ def _grad_steps(
     action_high: float,
     obs_eps: float,
     obs_clip: float,
+    normalize: bool,
     atoms: jnp.ndarray,
     n_step: int = 1,
 ):
@@ -163,6 +166,7 @@ def _grad_steps(
             obs_mean,
             obs_std,
             obs_clip,
+            normalize,
             atoms,
             n_step,
         )
@@ -238,6 +242,7 @@ class D4PG(DDPG):
             self.action_high,
             self.obs_eps,
             self.obs_clip,
+            self.normalize_observations,
             self.atoms,
             n_step=self.n_step,
         )

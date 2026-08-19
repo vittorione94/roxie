@@ -745,6 +745,20 @@ class Trainer:
         loop_rng = rngs.envs()
         agent_key = rngs.agent()
 
+        # Optional negative mining over start states, mirroring _run_jax. The
+        # split of labour differs only in where the difficulty table lives: the
+        # JAX env cannot own mutable state inside a trace, so the trainer
+        # threads `mining_weights` through reset; a CPU pool resets in plain
+        # Python and owns its own table, so the trainer only has to observe the
+        # epoch boundary. Both accumulate per-step and normalize once per epoch.
+        mining_on = (
+            hasattr(env, "mining_refresh") and getattr(env, "mining_bins", 0) > 0
+        )
+        if mining_on:
+            print(
+                f"Negative mining ON: {env.mining_bins} phase bins", flush=True
+            )
+
         def _random_actions(key):
             u = jax.random.uniform(key, (NUM_ENVS, action_size))
             return action_low + (action_high - action_low) * u
@@ -907,6 +921,18 @@ class Trainer:
             else:
                 agent.add(old_state.env_state, state.env_state)
 
+                # Keep the obs-normalization running stats tracking the CURRENT
+                # policy's state distribution, exactly as _run_jax does. This is
+                # deliberately the same (redundant-looking) extra update the JAX
+                # loop performs on top of `agent.add`'s own: dropping it here
+                # would leave the two backends normalizing observations with
+                # differently-weighted statistics, which is precisely the kind
+                # of silent drift a CPU-vs-GPU comparison cannot tolerate.
+                if getattr(agent, "normalize_observations", False):
+                    agent.state.obs_stats = Agent.update_obs_stats(
+                        agent.state.obs_stats, state.env_state.obs,
+                    )
+
                 gradient_steps, actor_loss, critic_loss = agent.update(
                     steps=self.steps, agent_rng=update_key,
                 )
@@ -1016,8 +1042,33 @@ class Trainer:
                 if pop_diagnostics is not None:
                     for k, v in pop_diagnostics().items():
                         logger.store(k, float(v))
+                # Negative-mining health, logged BEFORE the refresh below zeroes
+                # the counters (same ordering as _run_jax). Watch
+                # `mining/effective_bins`: collapsing toward 1 means the start
+                # distribution has degenerated onto a single region.
+                if mining_on:
+                    for k, v in env.mining_stats().items():
+                        logger.store(k, float(v))
+                    env.mining_refresh()
+                # Regenerate the auto-reset pool (fresh random starts), AFTER
+                # the mining refresh so the new pool already reflects this
+                # epoch's terminations — the same order, for the same reason, as
+                # the JAX loop's `mining_refresh` then `reset_pool = v_reset(...)`.
+                refresh_pool = getattr(env, "refresh_reset_pool", None)
+                if refresh_pool is not None:
+                    refresh_pool()
                 for k, v in logger.gpu_stats().items():
                     logger.store(k, v)
+                # Host-memory watch, as in _run_jax: resident set + live JAX
+                # buffers per epoch, so any baseline creep shows up in the logs
+                # long before it hits the ceiling. /proc is Linux-only.
+                try:
+                    page = os.sysconf("SC_PAGE_SIZE")
+                    rss_pages = int(open("/proc/self/statm").read().split()[1])
+                    logger.store("mem/rss_gb", rss_pages * page / 1e9)
+                    logger.store("mem/live_arrays", len(jax.live_arrays()))
+                except (OSError, ValueError):
+                    pass
                 logger.dump(step=self.steps)
 
                 actor_losses = []
@@ -1078,6 +1129,13 @@ class Trainer:
         lengths = np.zeros(num_tests, dtype=np.int32)
         dones = np.zeros(num_tests, dtype=bool)
 
+        # How many GENUINELY distinct states the eval batch starts from — see
+        # the long note in `_test`. Under the canonical mocap protocol this
+        # equals the number of DISTINCT CLIPS evaluated, so 1 on a single-clip
+        # run means every `test_episodes` beyond the first is wasted compute.
+        start_obs = np.asarray(state.env_state.obs).reshape(num_tests, -1)
+        logger.store("test/distinct_starts", float(len(np.unique(start_obs, axis=0))))
+
         # Use a fixed key for eval (noise is bypassed when evaluate=True).
         eval_key = jax.random.PRNGKey(0)
 
@@ -1097,3 +1155,9 @@ class Trainer:
         logger.store("test/score/std", float(np.std(scores)))
         logger.store("test/length", float(np.mean(lengths)))
         logger.store("test/length/std", float(np.std(lengths)))
+        # Start-phase-invariant companion to `test/score` (a sum, hence bounded
+        # by how much clip was left at reset). Same definition as `_test`.
+        logger.store(
+            "test/score_per_step",
+            float(np.mean(scores / np.maximum(lengths, 1))),
+        )

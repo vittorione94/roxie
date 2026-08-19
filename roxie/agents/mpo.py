@@ -88,6 +88,7 @@ def _mpo_grad_step(
     obs_mean: jnp.ndarray,
     obs_std: jnp.ndarray,
     obs_clip: float,
+    normalize: bool,
 ):
     key, sample_key, critic_key, actor_key = jax.random.split(key, 4)
 
@@ -99,6 +100,11 @@ def _mpo_grad_step(
         "next_observations": samples.experience.second.observation,
         "terminals": samples.experience.first.terminal,
     }
+    # Normalize once, here: both losses below read the same `observations`, and
+    # neither of them normalizes (see `Agent.normalize_samples`).
+    re_packed_samples = Agent.normalize_samples(
+        re_packed_samples, obs_mean, obs_std, obs_clip, normalize
+    )
 
     # 1. Critic update (policy evaluation under the target policy).
     critic_loss, critic_grads = nnx.value_and_grad(mpo_critic_loss_fn)(
@@ -111,9 +117,6 @@ def _mpo_grad_step(
         num_action_samples,
         action_low,
         action_high,
-        obs_mean,
-        obs_std,
-        obs_clip,
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
@@ -134,9 +137,6 @@ def _mpo_grad_step(
         epsilon_stddev,
         action_low,
         action_high,
-        obs_mean,
-        obs_std,
-        obs_clip,
     )
     state.actor_optimizer.update(state.actor, actor_grads)
     dual_optimizer.update(dual_params, dual_grads)
@@ -179,6 +179,7 @@ def _mpo_grad_step(
     nnx.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "num_action_samples", "n_steps",
+        "normalize",
     ),
     # Donate the train state (arg 0): its large read-only replay buffer is
     # threaded unchanged through the scan, so without donation XLA allocates a
@@ -203,6 +204,7 @@ def _mpo_grad_steps(
     action_high: float,
     obs_eps: float,
     obs_clip: float,
+    normalize: bool,
 ):
     # Hoist the (loop-constant) normalization params out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
@@ -235,6 +237,7 @@ def _mpo_grad_steps(
             obs_mean,
             obs_std,
             obs_clip,
+            normalize,
         )
         _, scan_state = nnx.split((st, duals, dopt))
         return scan_state, (actor_loss, critic_loss)
@@ -482,6 +485,7 @@ class MPO(Agent):
             self.action_high,
             self.obs_eps,
             self.obs_clip,
+            self.normalize_observations,
         )
         return actor_loss, critic_loss
 

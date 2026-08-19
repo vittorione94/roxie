@@ -70,6 +70,12 @@ def twin_critic():
 
 @pytest.fixture
 def ddpg_samples():
+    """A repacked batch as the losses see it: observations ALREADY normalized.
+
+    Every loss function takes them that way — the agent runs the batch through
+    `Agent.normalize_samples` once per gradient step (see `TestSampleNormalization`),
+    so no loss takes obs_mean/obs_std/obs_clip arguments.
+    """
     key = jax.random.PRNGKey(0)
     k1, k2, k3, k4 = jax.random.split(key, 4)
     return {
@@ -86,15 +92,6 @@ def ddpg_samples():
 
 
 @pytest.fixture
-def norm_params():
-    return {
-        "obs_mean": jnp.zeros(OBS_DIM),
-        "obs_std": jnp.ones(OBS_DIM),
-        "obs_clip": 5.0,
-    }
-
-
-@pytest.fixture
 def action_bounds():
     return {
         "action_low": jnp.full(ACT_DIM, -1.0),
@@ -102,28 +99,59 @@ def action_bounds():
     }
 
 
+class TestSampleNormalization:
+    """`Agent.normalize_samples` is the ONE place observations are normalized on
+    the learning path, so every loss can take them pre-normalized."""
+
+    def test_normalizes_both_observation_entries(self, ddpg_samples):
+        mean = jnp.full(OBS_DIM, 2.0)
+        std = jnp.full(OBS_DIM, 4.0)
+        out = Agent.normalize_samples(ddpg_samples, mean, std, clip=5.0)
+        for k in ("observations", "next_observations"):
+            assert jnp.allclose(out[k], (ddpg_samples[k] - mean) / std)
+
+    def test_leaves_the_rest_of_the_batch_alone(self, ddpg_samples):
+        out = Agent.normalize_samples(
+            ddpg_samples, jnp.zeros(OBS_DIM), jnp.ones(OBS_DIM), clip=5.0
+        )
+        assert out.keys() == ddpg_samples.keys()
+        for k in ("actions", "rewards", "bootstrap", "terminals"):
+            assert jnp.array_equal(out[k], ddpg_samples[k])
+
+    def test_disabled_is_a_true_passthrough(self, ddpg_samples):
+        """Off means off — the clip goes too.
+
+        With normalization disabled the running stats are never updated and
+        degrade to mean 0 / std 1, so clipping anyway would silently squash raw
+        observations into +/- obs_clip. Guard it with observations well outside
+        the clip bound.
+        """
+        raw = dict(ddpg_samples)
+        raw["observations"] = ddpg_samples["observations"] * 100.0
+        raw["next_observations"] = ddpg_samples["next_observations"] * 100.0
+        out = Agent.normalize_samples(
+            raw, jnp.zeros(OBS_DIM), jnp.ones(OBS_DIM), clip=5.0, enabled=False
+        )
+        assert jnp.array_equal(out["observations"], raw["observations"])
+        assert jnp.max(jnp.abs(out["observations"])) > 5.0
+
+
 class TestDDPGActorLoss:
-    def test_returns_scalar(self, det_actor, det_critic, ddpg_samples, norm_params, action_bounds):
+    def test_returns_scalar(self, det_actor, det_critic, ddpg_samples, action_bounds):
         loss = ddpg_actor_loss_fn(
             det_actor,
             det_critic,
             ddpg_samples,
-            norm_params["obs_mean"],
-            norm_params["obs_std"],
-            norm_params["obs_clip"],
             action_bounds["action_low"],
             action_bounds["action_high"],
         )
         assert loss.shape == ()
 
-    def test_finite(self, det_actor, det_critic, ddpg_samples, norm_params, action_bounds):
+    def test_finite(self, det_actor, det_critic, ddpg_samples, action_bounds):
         loss = ddpg_actor_loss_fn(
             det_actor,
             det_critic,
             ddpg_samples,
-            norm_params["obs_mean"],
-            norm_params["obs_std"],
-            norm_params["obs_clip"],
             action_bounds["action_low"],
             action_bounds["action_high"],
         )
@@ -180,50 +208,38 @@ class TestPreActivationPenalty:
 
 
 class TestTD3ActorLoss:
-    def _call(self, actor, critic, samples, norm, bounds, coef):
+    def _call(self, actor, critic, samples, bounds, coef):
         """Returns the full `(loss, aux)` pair the agent differentiates with
         `has_aux=True`."""
         return td3_actor_loss_fn(
             actor,
             critic,
             samples,
-            norm["obs_mean"],
-            norm["obs_std"],
-            norm["obs_clip"],
             bounds["action_low"],
             bounds["action_high"],
             coef,
         )
 
-    def _loss(self, actor, critic, samples, norm, bounds, coef):
-        return self._call(actor, critic, samples, norm, bounds, coef)[0]
+    def _loss(self, actor, critic, samples, bounds, coef):
+        return self._call(actor, critic, samples, bounds, coef)[0]
 
     def test_zero_coef_is_plain_dpg(
-        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+        self, det_actor, twin_critic, ddpg_samples, action_bounds
     ):
-        loss = self._loss(
-            det_actor, twin_critic, ddpg_samples, norm_params, action_bounds, 0.0
-        )
-        obs = Agent.normalize_obs(
-            ddpg_samples["observations"],
-            norm_params["obs_mean"],
-            norm_params["obs_std"],
-            norm_params["obs_clip"],
-        )
+        loss = self._loss(det_actor, twin_critic, ddpg_samples, action_bounds, 0.0)
+        obs = ddpg_samples["observations"]
         q1, _ = twin_critic(obs, det_actor(obs))
         assert loss.shape == ()
         assert jnp.allclose(loss, -jnp.mean(q1), atol=1e-5)
 
     def test_penalty_only_charges_when_saturated(
-        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+        self, det_actor, twin_critic, ddpg_samples, action_bounds
     ):
         """At the default (small) init the logits are inside the threshold, so
         the penalty is inert; it must bite once the logits are driven out."""
-        base = self._loss(
-            det_actor, twin_critic, ddpg_samples, norm_params, action_bounds, 0.0
-        )
+        base = self._loss(det_actor, twin_critic, ddpg_samples, action_bounds, 0.0)
         unsaturated = self._loss(
-            det_actor, twin_critic, ddpg_samples, norm_params, action_bounds, 1e-2
+            det_actor, twin_critic, ddpg_samples, action_bounds, 1e-2
         )
         assert jnp.allclose(base, unsaturated, atol=1e-6)
 
@@ -232,15 +248,13 @@ class TestTD3ActorLoss:
         params["output_layer"]["kernel"].value *= 200.0
         nnx.update(saturated, params)
         with_penalty = self._loss(
-            saturated, twin_critic, ddpg_samples, norm_params, action_bounds, 1e-2
+            saturated, twin_critic, ddpg_samples, action_bounds, 1e-2
         )
-        without = self._loss(
-            saturated, twin_critic, ddpg_samples, norm_params, action_bounds, 0.0
-        )
+        without = self._loss(saturated, twin_critic, ddpg_samples, action_bounds, 0.0)
         assert with_penalty > without
 
     def test_gradient_pulls_a_saturated_actor_back(
-        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+        self, det_actor, twin_critic, ddpg_samples, action_bounds
     ):
         """Regression guard for the CMU_006_13 collapse: a saturated actor must
         still receive a gradient that reduces |pre-activation|."""
@@ -249,12 +263,7 @@ class TestTD3ActorLoss:
         params["output_layer"]["kernel"].value *= 200.0
         nnx.update(actor, params)
 
-        obs = Agent.normalize_obs(
-            ddpg_samples["observations"],
-            norm_params["obs_mean"],
-            norm_params["obs_std"],
-            norm_params["obs_clip"],
-        )
+        obs = ddpg_samples["observations"]
         before = jnp.mean(jnp.abs(actor.forward(obs)[1]))
         assert before > 5.0  # genuinely saturated to start with
         # ...and deep enough into tanh's flat region that the DPG term is
@@ -269,9 +278,6 @@ class TestTD3ActorLoss:
                 actor,
                 twin_critic,
                 ddpg_samples,
-                norm_params["obs_mean"],
-                norm_params["obs_std"],
-                norm_params["obs_clip"],
                 action_bounds["action_low"],
                 action_bounds["action_high"],
                 1e-2,
@@ -286,13 +292,13 @@ class TestTD3ActorDiagnostics:
     """The `td3/` saturation metrics must move BEFORE the score does — that is
     the whole reason they exist, so pin their direction."""
 
-    def _aux(self, actor, critic, samples, norm, bounds):
-        return TestTD3ActorLoss()._call(actor, critic, samples, norm, bounds, 1e-2)[1]
+    def _aux(self, actor, critic, samples, bounds):
+        return TestTD3ActorLoss()._call(actor, critic, samples, bounds, 1e-2)[1]
 
     def test_healthy_actor_reports_live_gradient(
-        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+        self, det_actor, twin_critic, ddpg_samples, action_bounds
     ):
-        aux = self._aux(det_actor, twin_critic, ddpg_samples, norm_params, action_bounds)
+        aux = self._aux(det_actor, twin_critic, ddpg_samples, action_bounds)
         # Small output init keeps the logits in tanh's linear region.
         assert float(aux["pre_act_abs"]) < 1.0
         assert float(aux["tanh_grad"]) > 0.5
@@ -300,19 +306,15 @@ class TestTD3ActorDiagnostics:
         assert float(aux["pre_act_penalty"]) == 0.0
 
     def test_saturated_actor_is_flagged(
-        self, det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
+        self, det_actor, twin_critic, ddpg_samples, action_bounds
     ):
         actor = copy.deepcopy(det_actor)
         params = nnx.state(actor, nnx.Param)
         params["output_layer"]["kernel"].value *= 200.0
         nnx.update(actor, params)
 
-        healthy = self._aux(
-            det_actor, twin_critic, ddpg_samples, norm_params, action_bounds
-        )
-        saturated = self._aux(
-            actor, twin_critic, ddpg_samples, norm_params, action_bounds
-        )
+        healthy = self._aux(det_actor, twin_critic, ddpg_samples, action_bounds)
+        saturated = self._aux(actor, twin_critic, ddpg_samples, action_bounds)
         assert saturated["pre_act_abs"] > healthy["pre_act_abs"]
         assert saturated["pre_act_max"] >= saturated["pre_act_abs"]
         # Healthy is <0.05 (asserted above), so 0.5 separates the two regimes
@@ -324,7 +326,7 @@ class TestTD3ActorDiagnostics:
 
 
 class TestDDPGCriticLoss:
-    def test_returns_scalar(self, det_critic, det_actor, ddpg_samples, norm_params, action_bounds):
+    def test_returns_scalar(self, det_critic, det_actor, ddpg_samples, action_bounds):
         target_actor = copy.deepcopy(det_actor)
         target_critic = copy.deepcopy(det_critic)
         key = jax.random.PRNGKey(0)
@@ -338,13 +340,10 @@ class TestDDPGCriticLoss:
             0.1,
             action_bounds["action_low"],
             action_bounds["action_high"],
-            norm_params["obs_mean"],
-            norm_params["obs_std"],
-            norm_params["obs_clip"],
         )
         assert loss.shape == ()
 
-    def test_non_negative(self, det_critic, det_actor, ddpg_samples, norm_params, action_bounds):
+    def test_non_negative(self, det_critic, det_actor, ddpg_samples, action_bounds):
         target_actor = copy.deepcopy(det_actor)
         target_critic = copy.deepcopy(det_critic)
         key = jax.random.PRNGKey(0)
@@ -358,9 +357,6 @@ class TestDDPGCriticLoss:
             0.1,
             action_bounds["action_low"],
             action_bounds["action_high"],
-            norm_params["obs_mean"],
-            norm_params["obs_std"],
-            norm_params["obs_clip"],
         )
         assert loss >= 0.0
 
@@ -435,7 +431,7 @@ class TestPPOLoss:
 
 
 class TestSACLosses:
-    def test_actor_loss(self, stoch_actor, twin_critic, ddpg_samples, norm_params, action_bounds):
+    def test_actor_loss(self, stoch_actor, twin_critic, ddpg_samples, action_bounds):
         key = jax.random.PRNGKey(0)
         alpha = 0.2
         loss, log_probs = sac_actor_loss_fn(
@@ -444,9 +440,6 @@ class TestSACLosses:
             alpha,
             ddpg_samples,
             key,
-            norm_params["obs_mean"],
-            norm_params["obs_std"],
-            norm_params["obs_clip"],
             action_bounds["action_low"],
             action_bounds["action_high"],
         )
@@ -454,7 +447,7 @@ class TestSACLosses:
         assert jnp.isfinite(loss)
         assert log_probs.shape == (BATCH,)
 
-    def test_critic_loss(self, stoch_actor, twin_critic, ddpg_samples, norm_params, action_bounds):
+    def test_critic_loss(self, stoch_actor, twin_critic, ddpg_samples, action_bounds):
         target_twin = copy.deepcopy(twin_critic)
         key = jax.random.PRNGKey(0)
         loss = sac_critic_loss_fn(
@@ -466,9 +459,6 @@ class TestSACLosses:
             key,
             action_bounds["action_low"],
             action_bounds["action_high"],
-            norm_params["obs_mean"],
-            norm_params["obs_std"],
-            norm_params["obs_clip"],
         )
         assert loss.shape == ()
         assert jnp.isfinite(loss)

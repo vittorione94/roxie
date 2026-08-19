@@ -36,6 +36,7 @@ def _grad_step(
     obs_mean: jnp.ndarray,
     obs_std: jnp.ndarray,
     obs_clip: float,
+    normalize: bool,
     n_step: int = 1,
 ):
     """Performs one full gradient update step and returns the new state.
@@ -51,6 +52,11 @@ def _grad_step(
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
+    # Normalize once, here: both losses below read the same `observations`, and
+    # neither of them normalizes (see `Agent.normalize_samples`).
+    re_packed_samples = Agent.normalize_samples(
+        re_packed_samples, obs_mean, obs_std, obs_clip, normalize
+    )
 
     # 2. Critic update
     critic_loss, critic_grads = nnx.value_and_grad(ddpg_critic_loss_fn)(
@@ -63,9 +69,6 @@ def _grad_step(
         target_noise_clip,
         action_low,
         action_high,
-        obs_mean,
-        obs_std,
-        obs_clip,
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
@@ -74,9 +77,6 @@ def _grad_step(
         state.actor,
         state.critic,
         re_packed_samples,
-        obs_mean,
-        obs_std,
-        obs_clip,
         action_low,
         action_high,
     )
@@ -123,7 +123,9 @@ def _grad_step(
 # across the loop and closed over.
 @functools.partial(
     nnx.jit,
-    static_argnames=("gamma", "tau", "replay_sample_fn", "n_steps", "n_step"),
+    static_argnames=(
+        "gamma", "tau", "replay_sample_fn", "n_steps", "n_step", "normalize",
+    ),
     # Donate the train state (arg 0): its large read-only replay buffer is
     # threaded unchanged through the scan, so without donation XLA allocates a
     # full second copy of the buffer (~1.4GB for 500k obs) every update. The
@@ -143,6 +145,7 @@ def _grad_steps(
     action_high: float,
     obs_eps: float,
     obs_clip: float,
+    normalize: bool,
     n_step: int = 1,
 ):
     # Hoist the (loop-constant) normalization params out of the scan body.
@@ -170,6 +173,7 @@ def _grad_steps(
             obs_mean,
             obs_std,
             obs_clip,
+            normalize,
             n_step,
         )
         _, scan_state = nnx.split(st)
@@ -484,6 +488,7 @@ class DDPG(Agent):
             self.action_high,
             self.obs_eps,
             self.obs_clip,
+            self.normalize_observations,
             n_step=self.n_step,
         )
         return actor_loss, critic_loss

@@ -49,8 +49,9 @@ from examples.mocap.mocap_envpool import MocapCpuPool  # noqa: E402
 from examples.mocap.mocap_tracking import MocapTrackingEnv  # noqa: E402
 
 _COMPONENT_KEYS = (
-    "reward/pose", "reward/vel", "reward/ee", "reward/root", "reward/torque",
-    "reward/action_rate", "root_dist",
+    "reward/pose", "reward/vel", "reward/ee", "reward/root",
+    "reward/root_pos", "reward/root_quat", "reward/root_vel",
+    "reward/torque", "reward/action_rate", "root_dist",
 )
 
 
@@ -109,20 +110,30 @@ def _place_pool_env(
     "--check-physics/--no-check-physics", default=True,
     help="Also report one-control-step divergence (jits an MJX step).",
 )
-def main(frames, noise, seed, clip_ids, check_physics):
+@click.option(
+    "--actuation", default="position",
+    type=click.Choice(["torque", "position"]),
+    help="Actuation mode to check parity under (the sweeps run 'position').",
+)
+def main(frames, noise, seed, clip_ids, check_physics, actuation):
     config = load_default_config()
     clip_list = [c.strip() for c in clip_ids.split(",") if c.strip()]
 
-    # The MJX env configures collisions + timestep on the shared MjModel in its
-    # constructor; build it first and hand the same model to the CPU pool.
+    # The MJX env configures collisions, actuation and timestep on the shared
+    # MjModel in its constructor; build it first and hand the same (rewritten)
+    # model to the CPU pool, so any divergence that shows up is in the obs /
+    # reward code rather than in the two builders' model setup.
     mj_model, _ = build_cmu_humanoid()
     dataset = load_cmu_clips(mj_model, clip_ids=clip_list, ctrl_dt=config.ctrl_dt)
     menv = MocapTrackingEnv(
         mj_model=mj_model, dataset=dataset, config=config, impl="jax",
+        actuation=actuation,
     )
     pool = MocapCpuPool(
         mj_model, dataset, config, num_envs=1, seed=seed, num_threads=1,
+        actuation=actuation,
     )
+    print(f"actuation = {actuation}")
 
     rng = np.random.default_rng(seed)
     nu = mj_model.nu

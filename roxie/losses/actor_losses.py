@@ -1,3 +1,10 @@
+"""Actor losses.
+
+Same contract as `critic_losses`: the observations in `samples` arrive ALREADY
+normalized (`Agent.normalize_samples`, once per gradient step in the agent), so
+no loss here normalizes on its own or takes `obs_mean` / `obs_std` / `obs_clip`.
+"""
+
 import jax
 import jax.numpy as jnp
 import rlax
@@ -45,14 +52,11 @@ def ddpg_actor_loss_fn(
     actor_model,
     critic_model,
     samples,
-    obs_mean,
-    obs_std,
-    obs_clip,
     action_low,
     action_high,
 ):
     """Calculates the loss for the actor (aims to maximize Q-value)."""
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    obs = samples["observations"]
     actions = actor_model(obs)  # [-1, 1]
     actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
     q_values = critic_model(obs, actions)
@@ -65,15 +69,12 @@ def d4pg_actor_loss_fn(
     actor_model,
     critic_model,
     samples,
-    obs_mean,
-    obs_std,
-    obs_clip,
     action_low,
     action_high,
     atoms,
 ):
     """DPG through the distributional critic: maximize the categorical's mean."""
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    obs = samples["observations"]
     actions = actor_model(obs)  # [-1, 1]
     actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
     logits = critic_model(obs, actions)  # (B, num_atoms)
@@ -87,9 +88,6 @@ def td3_actor_loss_fn(
     actor_model,
     twin_critic,
     samples,
-    obs_mean,
-    obs_std,
-    obs_clip,
     action_low,
     action_high,
     pre_activation_coef,
@@ -106,7 +104,7 @@ def td3_actor_loss_fn(
     logs under `td3/` (see `TD3.pop_diagnostics`). They are read off this very
     forward pass rather than a second one, so the instrumentation is free.
     """
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    obs = samples["observations"]
     actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
     scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
     q1, _ = twin_critic(obs, scaled_actions)
@@ -135,9 +133,6 @@ def td4_actor_loss_fn(
     actor_model,
     twin_critic,
     samples,
-    obs_mean,
-    obs_std,
-    obs_clip,
     action_low,
     action_high,
     atoms,
@@ -147,7 +142,7 @@ def td4_actor_loss_fn(
     The TD3 convention: the actor follows critic 1 only, so the pessimistic
     min stays confined to the critic's bootstrap target.
     """
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    obs = samples["observations"]
     actions = actor_model(obs)  # [-1, 1]
     actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
     logits1, _ = twin_critic(obs, actions)  # (B, num_atoms)
@@ -169,7 +164,13 @@ def ppo_loss_fn(
     entropy_coef,
     key
 ):
-    """Calculates the loss for the actor using PPO clipped objective."""
+    """Calculates the loss for the actor using PPO clipped objective.
+
+    `observations` are already normalized, under the *frozen* behaviour-policy
+    statistics (`PPO._prepare_rollout`). That freeze is what keeps the ratio
+    exactly 1 on the first pass: normalizing here from the live running stats
+    would make the clip and the KL early stop fire on normalization drift.
+    """
 
     distribution = actor_model(observations)
     logp_new = distribution.log_prob(actions_buf)       # (N, T)
@@ -236,13 +237,10 @@ def sac_actor_loss_fn(
     alpha,
     samples,
     key,
-    obs_mean,
-    obs_std,
-    obs_clip,
     action_low,
     action_high,
 ):
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    obs = samples["observations"]
     distribution = actor_model(obs)
     u = distribution.sample(seed=key)
     actions = jnp.tanh(u)
@@ -269,9 +267,6 @@ def mpo_actor_loss_fn(
     epsilon_stddev,
     action_low,
     action_high,
-    obs_mean,
-    obs_std,
-    obs_clip,
 ):
     """MPO policy improvement loss (E-step + M-step).
 
@@ -289,7 +284,7 @@ def mpo_actor_loss_fn(
     ``dual_params`` and are optimized jointly with the actor by this same loss.
     Gradients are taken w.r.t. ``actor_model`` and ``dual_params``.
     """
-    obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
+    obs = samples["observations"]
 
     # Sample N actions per state from the target (old) policy: [S, B, A].
     target_dist = target_actor_model(obs)
