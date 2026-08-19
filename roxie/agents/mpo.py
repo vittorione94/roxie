@@ -9,7 +9,12 @@ import optax
 from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
-from roxie.agents.utils import Transition, serialize_bound
+from roxie.agents.utils import (
+    Transition,
+    build_optimizer,
+    network_rngs,
+    serialize_bound,
+)
 from roxie.losses.actor_losses import mpo_actor_loss_fn
 from roxie.losses.critic_losses import mpo_critic_loss_fn
 
@@ -63,10 +68,9 @@ def _mpo_step_fn(actor_model, observation, evaluate, key):
     return jnp.clip(action, -1.0, 1.0)
 
 
-@functools.partial(
-    nnx.jit,
-    static_argnames=("gamma", "tau", "replay_sample_fn", "num_action_samples"),
-)
+# Single MPO gradient step. Not jitted on its own — called inside the jitted
+# `_mpo_grad_steps` below so N steps fuse into one compiled program. `obs_mean` /
+# `obs_std` are hoisted in by the caller (the stats are loop-constant).
 def _mpo_grad_step(
     state: TrainState,
     dual_params: MPODualParams,
@@ -81,7 +85,8 @@ def _mpo_grad_step(
     epsilon_stddev: float,
     action_low: float,
     action_high: float,
-    obs_eps: float,
+    obs_mean: jnp.ndarray,
+    obs_std: jnp.ndarray,
     obs_clip: float,
 ):
     key, sample_key, critic_key, actor_key = jax.random.split(key, 4)
@@ -94,8 +99,6 @@ def _mpo_grad_step(
         "next_observations": samples.experience.second.observation,
         "terminals": samples.experience.first.terminal,
     }
-
-    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
     # 1. Critic update (policy evaluation under the target policy).
     critic_loss, critic_grads = nnx.value_and_grad(mpo_critic_loss_fn)(
@@ -164,7 +167,89 @@ def _mpo_grad_step(
         buffer_state=state.buffer_state,
         obs_stats=state.obs_stats,
     )
-    return new_state, dual_params, dual_optimizer, actor_loss, critic_loss
+    return new_state, actor_loss, critic_loss
+
+
+# Fused N-step update. The body is compiled once and run `n_steps` times
+# on-device via `lax.scan` (instead of the Python loop this used to be, which
+# paid a full host dispatch + a full replay-buffer copy per gradient step).
+# The Lagrange duals and their optimizer ride along in the scan carry alongside
+# the train state; `buffer_state` and the normalization params are loop-constant.
+@functools.partial(
+    nnx.jit,
+    static_argnames=(
+        "gamma", "tau", "replay_sample_fn", "num_action_samples", "n_steps",
+    ),
+    # Donate the train state (arg 0): its large read-only replay buffer is
+    # threaded unchanged through the scan, so without donation XLA allocates a
+    # full second copy of the buffer every update. The caller reassigns
+    # self.state from the result, so donating is safe.
+    donate_argnums=(0,),
+)
+def _mpo_grad_steps(
+    state: TrainState,
+    dual_params: MPODualParams,
+    dual_optimizer: nnx.Optimizer,
+    key: jax.random.PRNGKey,
+    n_steps: int,
+    gamma: float,
+    tau: float,
+    replay_sample_fn,
+    num_action_samples: int,
+    epsilon: float,
+    epsilon_mean: float,
+    epsilon_stddev: float,
+    action_low: float,
+    action_high: float,
+    obs_eps: float,
+    obs_clip: float,
+):
+    # Hoist the (loop-constant) normalization params out of the scan body.
+    obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
+
+    # Pre-split all per-step keys so they can be scanned over as `xs`.
+    keys = jax.random.split(key, n_steps)
+
+    # Split into a static graph definition + the trainable pytree state. Only
+    # the state is carried through the scan; the graphdef is closed over. The
+    # three graph nodes are split as one tuple so the duals and their Adam slots
+    # stay in the carry and keep updating across the fused steps.
+    graphdef, scan_state = nnx.split((state, dual_params, dual_optimizer))
+
+    def body(scan_state, step_key):
+        st, duals, dopt = nnx.merge(graphdef, scan_state)
+        st, actor_loss, critic_loss = _mpo_grad_step(
+            st,
+            duals,
+            dopt,
+            step_key,
+            gamma,
+            tau,
+            replay_sample_fn,
+            num_action_samples,
+            epsilon,
+            epsilon_mean,
+            epsilon_stddev,
+            action_low,
+            action_high,
+            obs_mean,
+            obs_std,
+            obs_clip,
+        )
+        _, scan_state = nnx.split((st, duals, dopt))
+        return scan_state, (actor_loss, critic_loss)
+
+    scan_state, (actor_losses, critic_losses) = jax.lax.scan(body, scan_state, keys)
+    state, dual_params, dual_optimizer = nnx.merge(graphdef, scan_state)
+
+    # Average over the burst for less noisy logging.
+    return (
+        state,
+        dual_params,
+        dual_optimizer,
+        jnp.mean(actor_losses),
+        jnp.mean(critic_losses),
+    )
 
 
 class MPO(Agent):
@@ -195,6 +280,10 @@ class MPO(Agent):
         critic_config: dict,
         memory_config: dict,
         *,
+        actor_optimizer_config: dict = None,
+        critic_optimizer_config: dict = None,
+        dual_optimizer_config: dict = None,
+        seed: int = 0,
         actor_learning_rate: float = 3e-4,
         critic_learning_rate: float = 3e-4,
         dual_learning_rate: float = 1e-2,
@@ -216,22 +305,21 @@ class MPO(Agent):
         obs_norm_clip: float = 5.0,
         obs_norm_eps: float = 1e-8,
     ):
-        actor_rngs = nnx.Rngs(params=0, dropout=1)
-        critic_rngs = nnx.Rngs(params=2, dropout=3)
+        self.seed = int(seed)
 
         # Gaussian policy (mean + diagonal std).
         actor = hydra.utils.instantiate(
             actor_config,
             in_features=env_obs_size,
             action_dim=env_action_size,
-            rngs=actor_rngs,
+            rngs=network_rngs(self.seed, offset=0),
         )
 
         # Single Q critic (as in the original MPO paper).
         critic = hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
-            rngs=critic_rngs,
+            rngs=network_rngs(self.seed, offset=2),
         )
 
         # Replay buffer.
@@ -265,23 +353,30 @@ class MPO(Agent):
 
         actor_optimizer = nnx.Optimizer(
             actor,
-            optax.chain(
-                optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.actor_learning_rate),
+            build_optimizer(
+                actor_optimizer_config,
+                learning_rate=self.actor_learning_rate,
+                max_grad_norm=self.max_grad_norm,
             ),
             wrt=nnx.Param,
         )
         critic_optimizer = nnx.Optimizer(
             critic,
-            optax.chain(
-                optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.critic_learning_rate),
+            build_optimizer(
+                critic_optimizer_config,
+                learning_rate=self.critic_learning_rate,
+                max_grad_norm=self.max_grad_norm,
             ),
             wrt=nnx.Param,
         )
+        # The Lagrange duals are a handful of scalars, deliberately unclipped:
+        # a global-norm clip over them would just rescale the dual ascent step
+        # and fight the KL bounds it is supposed to enforce.
         self.dual_optimizer = nnx.Optimizer(
             self.dual_params,
-            optax.adam(self.dual_learning_rate),
+            build_optimizer(
+                dual_optimizer_config, learning_rate=self.dual_learning_rate
+            ),
             wrt=nnx.Param,
         )
 
@@ -353,6 +448,43 @@ class MPO(Agent):
                 self.state.obs_stats, obs_batch
             )
 
+    def _learn(self, agent_rng, n_steps=None):
+        """Run one unconditional burst of ``n_steps`` (default ``learning_steps``)
+        fused gradient steps, updating ``self.state`` in place; returns
+        ``(actor_loss, critic_loss)``.
+
+        Deliberately named `_learn`, not `learn`: the trainer treats a public
+        `learn` as the signal that an agent can be driven by the async learner
+        (`Trainer._run`), which additionally requires `select_action` and
+        `add_transitions`. MPO implements neither, so it stays on the sync path
+        until it does.
+        """
+        (
+            self.state,
+            self.dual_params,
+            self.dual_optimizer,
+            actor_loss,
+            critic_loss,
+        ) = _mpo_grad_steps(
+            self.state,
+            self.dual_params,
+            self.dual_optimizer,
+            agent_rng,
+            self.learning_steps if n_steps is None else int(n_steps),
+            self.gamma,
+            self.tau,
+            self.replay.sample,
+            self.num_action_samples,
+            self.epsilon,
+            self.epsilon_mean,
+            self.epsilon_stddev,
+            self.action_low,
+            self.action_high,
+            self.obs_eps,
+            self.obs_clip,
+        )
+        return actor_loss, critic_loss
+
     def update(self, steps, agent_rng):
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
@@ -360,37 +492,14 @@ class MPO(Agent):
             steps >= self.steps_before_learning
             and (steps - self.steps_before_learning) % self.steps_between_updates == 0
         ):
-            for _ in range(self.learning_steps):
-                agent_rng, key = jax.random.split(agent_rng, 2)
-                (
-                    self.state,
-                    self.dual_params,
-                    self.dual_optimizer,
-                    actor_loss,
-                    critic_loss,
-                ) = _mpo_grad_step(
-                    self.state,
-                    self.dual_params,
-                    self.dual_optimizer,
-                    key,
-                    self.gamma,
-                    self.tau,
-                    self.replay.sample,
-                    self.num_action_samples,
-                    self.epsilon,
-                    self.epsilon_mean,
-                    self.epsilon_stddev,
-                    self.action_low,
-                    self.action_high,
-                    self.obs_eps,
-                    self.obs_clip,
-                )
+            actor_loss, critic_loss = self._learn(agent_rng)
             gradient_steps += self.learning_steps
 
         return gradient_steps, actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
         return {
+            "seed": int(self.seed),
             "gamma": float(self.gamma),
             "tau": float(self.tau),
             "actor_learning_rate": float(self.actor_learning_rate),

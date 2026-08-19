@@ -1,36 +1,99 @@
-name: "sac"
+_target_: roxie.agents.SAC
 
-args:
-  gamma: 0.99
-  tau: 0.005
-  actor_learning_rate: 3e-4
-  critic_learning_rate: 3e-4
-  alpha_learning_rate: 3e-4
-  init_log_alpha: 0.0
-  auto_alpha: true
-  memory_warmup: 30_000
-  steps_before_learning: 30_000
-  steps_between_updates: 400
-  learning_steps: 20
-  max_grad_norm: 1
+# Every SAC.__init__ keyword appears below. Values here are the constructor
+# defaults unless noted, so this file is the complete, editable surface of the
+# agent — nothing is reachable only from Python.
+gamma: 0.99
+tau: 0.005
+actor_learning_rate: 3e-4
+critic_learning_rate: 3e-4
+alpha_learning_rate: 3e-4
+# Entropy temperature. `auto_alpha` tunes it against `target_entropy`;
+# null means the SAC default of -dim(A).
+init_log_alpha: 0.0
+auto_alpha: true
+target_entropy: null
+memory_warmup: 30_000
+steps_before_learning: 30_000
+steps_between_updates: 400
+learning_steps: 20
+# TD horizon for the Bellman target. >1 swaps the flat replay buffer for a
+# trajectory buffer and uses masked n-step returns.
+n_step: 1
+# Actor + temperature update on 1 of every `policy_delay` gradient steps; the
+# critic updates on all of them. 1 = textbook SAC (and compiles without a
+# branch at all). >1 trades policy freshness for critic updates per second —
+# the actor block is ~39% of a gradient step, so 2 buys ~1.25x, 4 ~1.45x.
+policy_delay: 1
+max_grad_norm: 1
+normalize_observations: true
+obs_norm_clip: 5.0
+obs_norm_eps: 1e-8
 
-actor:
+actor_config:
   _target_: roxie.models.actors.StochasticActor
   features: [256, 256]
   use_layer_norm: false
   std_min: 1e-4
   std_max: 10.0
 
-critic:
+critic_config:
   _target_: roxie.models.critics.QCritic
   features: [256, 256]
   use_layer_norm: false
   dropout_rate: 0.
 
-memory:
+memory_config:
   _target_: flashbax.buffers.make_flat_buffer
   max_length: 1_000_000
   min_length: 1_000
   sample_batch_size: 256
   add_sequences: False
   add_batch_size: ${env.parallel_envs}
+
+# Network parameter init. Feeds `nnx.Rngs`; the actor and each critic head take
+# distinct derived offsets so twin critics never start identical (a clipped
+# double-Q min over two identical heads buys nothing). Sweep this to separate a
+# real effect from init luck.
+seed: 0
+
+# Optimizers. `_target_` picks the optax family and carries its own
+# hyperparameters; the learning rate stays a top-level arg above so it remains
+# swept, logged and checkpointed, and `max_grad_norm` applies the global-norm
+# clip ahead of the transform (null/0 disables clipping entirely).
+#
+# For a schedule instead of a constant rate, give the block its own
+# `learning_rate:` sub-block — a block that declares one wins over the scalar
+# arg above:
+#
+#   actor_optimizer_config:
+#     _target_: optax.adamw
+#     weight_decay: 1e-4
+#     learning_rate:
+#       _target_: optax.cosine_decay_schedule
+#       init_value: 3e-4
+#       decay_steps: 1_000_000
+#
+# Swapping family from the CLI must also drop the kwargs the new family does
+# not take -- hydra MERGES dict overrides rather than replacing them, so the
+# b1/b2 below would survive into an optimizer that has no such argument:
+#
+#   agent.actor_optimizer_config._target_=optax.rmsprop \
+#     '~agent.actor_optimizer_config.b1' '~agent.actor_optimizer_config.b2' \
+#     +agent.actor_optimizer_config.decay=0.9
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+# Entropy temperature: a single scalar, so it is NOT global-norm clipped.
+alpha_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

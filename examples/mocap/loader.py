@@ -108,23 +108,39 @@ def load_mocap_env(
 
     # Evaluation env: a shallow copy of the training env, so it SHARES the heavy
     # GPU arrays (reference clips + mjx model) — nothing is loaded twice — but
-    # resets REPRODUCIBLY. Only `reset_noise_scale` is zeroed here; `random_start`
-    # is deliberately left ON.
+    # runs the CANONICAL EVAL PROTOCOL:
     #
-    # Reproducibility comes from the trainer holding the eval reset keys FIXED
-    # across epochs (see `Trainer._test`), not from collapsing every episode onto
-    # frame 0. Pinning the phase as well used to make all `test_episodes` rollouts
-    # byte-identical — `test/length/std` was exactly 0.00 every epoch — so 100
-    # eval envs bought one sample, and the whole test curve was a knife-edge
-    # measurement of a single start state (TD3's bounced 3.0 -> 9.3 -> 2.6 on an
-    # otherwise monotone policy). Keeping the phase spread and fixing the keys
-    # gives the best of both: a real distribution over the clip, identical start
-    # states every epoch, so epoch-to-epoch movement is pure policy change.
+    #     start at frame 0, no reset noise, run the clip to its END.
+    #
+    # This is the task as stated — "track this clip" — not a sample of it, and it
+    # is the protocol every agent is scored under, so numbers are comparable
+    # across agents, across runs, and against playback (`play.py`/`native_reset`
+    # start at frame 0 too, so what you watch is what the metric measured).
+    #
+    # Two things are deliberate and must not be "fixed" back:
+    #
+    # * `random_start = False`. Sampling a random phase and running 1000 steps
+    #   measures a different, easier task: it skips the clip's opening and
+    #   truncates before its end, and the score becomes a sum over however much
+    #   clip happened to be left, so it is not comparable between clips or
+    #   protocols. It also hides exactly the failure playback exposes — phase 0
+    #   is the least-visited state in a non-cyclic clip (every phase k>0 is
+    #   reached by reset AND by continuation from k-1; phase 0 only by reset),
+    #   so a policy can score 1000-step rollouts from mid-clip while collapsing
+    #   in 39 steps from frame 0.
+    # * the episode cap is the LONGEST CLIP, not `config.episode_length`. Capping
+    #   at 1000 truncates any clip longer than that, so "ran the whole clip" and
+    #   "hit the cap" become indistinguishable. Each clip still ends at its own
+    #   natural end via the `clip_truncated` rule in `step`.
     eval_env = copy.copy(env)
     eval_config = copy.deepcopy(config)
+    eval_config.random_start = False
     eval_config.reset_noise_scale = 0.0
     eval_env._config = eval_config
-    test_wrapper = TerminationWrapper(eval_env, max_episode_steps=config.episode_length)
+    # +1 so the final frame is reachable: `step` truncates at
+    # phase >= clip_len - look_ahead, and the wrapper cap must not bind first.
+    eval_horizon = int(max(dataset["clip_lengths"])) + 1
+    test_wrapper = TerminationWrapper(eval_env, max_episode_steps=eval_horizon)
     return train_wrapper, test_wrapper, xml_path
 
 

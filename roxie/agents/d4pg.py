@@ -8,7 +8,7 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.ddpg import DDPG
-from roxie.agents.utils import repack_samples
+from roxie.agents.utils import network_rngs, repack_samples
 from roxie.losses.actor_losses import d4pg_actor_loss_fn
 from roxie.losses.critic_losses import d4pg_critic_loss_fn
 
@@ -214,12 +214,11 @@ class D4PG(DDPG):
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
         """Build the categorical critic. `num_atoms` is injected from the agent
         args so the critic yaml doesn't have to repeat it."""
-        critic_rngs = nnx.Rngs(params=0, dropout=1)
         return hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
             num_atoms=self.num_atoms,
-            rngs=critic_rngs,
+            rngs=network_rngs(self.seed, offset=2),
         )
 
     def learn(self, agent_rng, n_steps=None):

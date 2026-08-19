@@ -8,7 +8,7 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.ddpg import DDPG
-from roxie.agents.utils import repack_samples
+from roxie.agents.utils import network_rngs, repack_samples
 from roxie.losses.actor_losses import td3_actor_loss_fn
 from roxie.losses.critic_losses import td3_critic_loss_fn
 from roxie.models.critics import TwinCritic
@@ -260,17 +260,18 @@ class TD3(DDPG):
         self._diag_env_steps = 0
 
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
-        critic_rngs_1 = nnx.Rngs(params=2, dropout=3)
-        critic_rngs_2 = nnx.Rngs(params=4, dropout=5)
+        """Two Q heads behind a TwinCritic. The heads get distinct seed offsets
+        so they don't start identical — the double-Q min is worthless if they
+        do."""
         critic1 = hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
-            rngs=critic_rngs_1,
+            rngs=network_rngs(self.seed, offset=2),
         )
         critic2 = hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
-            rngs=critic_rngs_2,
+            rngs=network_rngs(self.seed, offset=4),
         )
         return TwinCritic(critic1, critic2)
 

@@ -80,7 +80,24 @@ class Trainer:
 
         start_time = last_epoch_time = time.time()
         agent = self.agent
-        v_reset = jax.vmap(self.environment.reset)
+        # Optional negative mining over start states (mocap). The env owns the
+        # difficulty table; the trainer only threads it. `mining_weights` is a
+        # TRACED reset argument rather than an env attribute so refreshing it
+        # each epoch does not retrigger compilation.
+        mining_env = self.environment.unwrapped if hasattr(
+            self.environment, "unwrapped"
+        ) else self.environment
+        mining_on = hasattr(mining_env, "mining_init") and mining_env.mining_bins > 0
+        if mining_on:
+            mining_weights, mining_counts = mining_env.mining_init()
+            v_reset = jax.vmap(self.environment.reset, in_axes=(0, None))
+            print(f"Negative mining ON: {mining_env.mining_bins} phase bins", flush=True)
+        else:
+            mining_weights, mining_counts = None, None
+            _plain_reset = jax.vmap(self.environment.reset)
+            # Uniform signature at every call site; the weights are ignored.
+            def v_reset(keys, _w=None):
+                return _plain_reset(keys)
         v_step = jax.vmap(self.environment.step)
         action_size = self.environment.action_size
         action_low = agent.action_low
@@ -89,11 +106,24 @@ class Trainer:
 
         # --- Core: step envs, auto-reset done ones from a pre-built pool ---
 
-        def _step_and_autoreset(states, actions, rng, reset_pool):
+        def _step_and_autoreset(states, actions, rng, reset_pool, mining_counts):
             step_key, pool_key = jax.random.split(rng)
             new_states = v_step(states, actions)
             dones = new_states.env_state.done
             idx = jax.random.randint(pool_key, (NUM_ENVS,), 0, POOL_SIZE)
+
+            # Two scatter-adds on a (bins,) array — negligible against the
+            # physics step, and it has to live here because this is the only
+            # place that sees every env's phase and done flag on-device.
+            if mining_counts is not None:
+                es = new_states.env_state
+                # `info["termination"]` is done-minus-truncation, already
+                # separated by TerminationWrapper — the same flag the critic
+                # bootstraps on. Clip-end and step-limit cutoffs are NOT
+                # failures and must not be mined for.
+                mining_counts = mining_env.mining_observe(
+                    mining_counts, es.info, es.info["termination"]
+                )
 
             def _autoreset_leaf(pool_leaf, s):
                 # Leaves without a per-env leading dim (e.g. the warp backend's
@@ -108,7 +138,7 @@ class Trainer:
                 )
 
             auto_states = jax.tree.map(_autoreset_leaf, reset_pool, new_states)
-            return new_states, auto_states
+            return new_states, auto_states, mining_counts
 
         def _random_actions(key):
             u = jax.random.uniform(key, (NUM_ENVS, action_size))
@@ -117,8 +147,10 @@ class Trainer:
         # --- JIT wrappers ---
 
         @jax.jit
-        def train_step(states, actions, rng, reset_pool):
-            return _step_and_autoreset(states, actions, rng, reset_pool)
+        def train_step(states, actions, rng, reset_pool, mining_counts):
+            return _step_and_autoreset(
+                states, actions, rng, reset_pool, mining_counts
+            )
 
         jit_v_reset = jax.jit(v_reset)
 
@@ -130,18 +162,21 @@ class Trainer:
         loop_rng = rngs.envs()
 
         reset_keys = jax.random.split(loop_rng, NUM_ENVS)
-        wrapped_states = self._timed(jit_v_reset, reset_keys, label="reset")
+        wrapped_states = self._timed(
+            jit_v_reset, reset_keys, mining_weights, label="reset"
+        )
 
         # Build initial reset pool (reused for auto-reset via gather)
         loop_rng, pool_rng = jax.random.split(loop_rng)
         reset_pool = self._timed(
-            jit_v_reset, jax.random.split(pool_rng, POOL_SIZE), label="reset pool",
+            jit_v_reset, jax.random.split(pool_rng, POOL_SIZE), mining_weights,
+            label="reset pool",
         )
 
         dummy_actions = jnp.zeros((NUM_ENVS, action_size))
         self._timed(
             train_step, wrapped_states, dummy_actions, loop_rng, reset_pool,
-            label="train step",
+            mining_counts, label="train step",
         )
 
         print("Compiling agent step...", flush=True)
@@ -169,7 +204,7 @@ class Trainer:
 
         # Clean reset
         loop_rng, rng = jax.random.split(loop_rng)
-        wrapped_states = jit_v_reset(jax.random.split(rng, NUM_ENVS))
+        wrapped_states = jit_v_reset(jax.random.split(rng, NUM_ENVS), mining_weights)
 
         # --- Warmup: scan with random actions ---
 
@@ -194,8 +229,8 @@ class Trainer:
                     state, rng = carry
                     rng, act_key, step_key = jax.random.split(rng, 3)
                     actions = _random_actions(act_key)
-                    new_states, auto_states = _step_and_autoreset(
-                        state, actions, step_key, reset_pool,
+                    new_states, auto_states, _ = _step_and_autoreset(
+                        state, actions, step_key, reset_pool, None,
                     )
                     transition = Transition(
                         observation=state.env_state.obs,
@@ -344,8 +379,8 @@ class Trainer:
                 agent.last_action = actions
 
             old_wrapped_states = wrapped_states
-            new_wrapped_states, wrapped_states = train_step(
-                old_wrapped_states, actions, step_key, reset_pool,
+            new_wrapped_states, wrapped_states, mining_counts = train_step(
+                old_wrapped_states, actions, step_key, reset_pool, mining_counts,
             )
 
             agent_key, update_key = jax.random.split(agent_key)
@@ -492,6 +527,15 @@ class Trainer:
                 if pop_diagnostics is not None:
                     for k, v in pop_diagnostics().items():
                         logger.store(k, float(v))
+                # Negative-mining health. Logged BEFORE the refresh below, which
+                # zeroes the counters. `mining/effective_bins` is the one to
+                # watch: if it collapses toward 1 the start distribution has
+                # degenerated onto a single region and coverage is being lost.
+                if mining_on:
+                    for k, v in mining_env.mining_stats(
+                        mining_weights, mining_counts
+                    ).items():
+                        logger.store(k, float(v))
                 # GPU telemetry (utilization / temperature / memory / power).
                 # Sampled once per epoch; a no-op on hosts without nvidia-smi.
                 for k, v in logger.gpu_stats().items():
@@ -527,14 +571,25 @@ class Trainer:
                 # real clip swap invalidates in-progress episodes (their stored
                 # clip indices reference the old chunk), so only then do we reset
                 # the live envs. Otherwise episodes run continuously across epochs.
+                # Fold this epoch's terminations into the start distribution
+                # BEFORE rebuilding the pool, so the new pool already reflects
+                # them. Once per epoch: the per-step cost is two scatter-adds,
+                # the normalization/EMA happens here.
+                if mining_on:
+                    mining_weights, mining_counts = mining_env.mining_refresh(
+                        mining_weights, mining_counts
+                    )
+
                 loop_rng, pool_rng = jax.random.split(loop_rng)
-                reset_pool = jit_v_reset(jax.random.split(pool_rng, POOL_SIZE))
+                reset_pool = jit_v_reset(jax.random.split(pool_rng, POOL_SIZE), mining_weights)
                 swapped = False
                 if hasattr(self.environment, 'swap_clips'):
                     swapped = bool(self.environment.swap_clips())
                 if swapped:
                     loop_rng, reset_rng = jax.random.split(loop_rng)
-                    wrapped_states = jit_v_reset(jax.random.split(reset_rng, NUM_ENVS))
+                    wrapped_states = jit_v_reset(
+                        jax.random.split(reset_rng, NUM_ENVS), mining_weights
+                    )
                     scores = jnp.zeros(NUM_ENVS)
                     lengths = jnp.zeros(NUM_ENVS, dtype=jnp.int32)
 
@@ -617,24 +672,26 @@ class Trainer:
         num_tests = int(self.test_episodes)
         max_steps = int(getattr(self.test_environment, "max_episode_steps", 1000))
 
-        # FIXED reset keys, not a fresh draw off `rng`. The eval env keeps its
-        # stochastic start phase (see the mocap loader's eval-env note), so the
-        # keys are what make eval reproducible: the same `num_tests` start states
-        # every epoch means a change in test/score is a change in the POLICY, not
-        # a different draw of start frames. Redrawing per epoch would put the
-        # start-state spread and the policy improvement into the same number.
+        # FIXED reset keys, not a fresh draw off `rng`. The eval env pins the
+        # start state itself (mocap: frame 0, no noise — see its eval-env note),
+        # so for a single-clip run the keys change nothing; they matter for
+        # multi-clip runs, where reset samples WHICH clip. Holding them constant
+        # means eval scores the same clips every epoch, so a change in
+        # test/score is a change in the POLICY rather than a different draw of
+        # clips. `max_steps` comes from the eval env's own horizon, which for
+        # mocap is the longest clip — eval runs each clip to its end.
         states = v_reset(jax.random.split(jax.random.PRNGKey(_EVAL_SEED), num_tests))
 
         # How many GENUINELY distinct states the eval batch starts from. The env
-        # decides its own reset stochasticity in Python (the mocap loader used to
-        # pin `random_start = False` on its eval copy), and none of that reaches
-        # the logged hydra config — every run recorded `random_start: true`
-        # whether eval spread its starts or collapsed all `test_episodes` onto
-        # frame 0. Runs were therefore not self-describing: you could not tell
-        # from a run's artifacts what protocol its test/* numbers meant.
+        # decides its own reset stochasticity in Python and none of that reaches
+        # the logged hydra config, so runs were not self-describing: you could
+        # not tell from a run's artifacts what protocol its test/* numbers meant.
         # `test/length/std` cannot stand in for this — 0.00 means a degenerate
         # eval OR a policy saturating the episode cap, which are opposite news.
-        # 1 here means `test_episodes` is buying exactly one sample.
+        # Under the canonical mocap protocol this equals the number of DISTINCT
+        # CLIPS being evaluated; 1 on a multi-clip run means the eval keys are
+        # not covering the set, and 1 on a single-clip run means every extra
+        # `test_episodes` beyond the first is pure wasted compute.
         start_obs = np.asarray(states.env_state.obs).reshape(num_tests, -1)
         logger.store("test/distinct_starts", float(len(np.unique(start_obs, axis=0))))
 

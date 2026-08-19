@@ -126,7 +126,7 @@ class TestOrnsteinUhlenbeckNoise:
 
     def test_temporal_correlation(self, rng_key):
         action_shape = (4,)
-        noise = OrnsteinUhlenbeckNoise(action_shape=action_shape, damping=0.15)
+        noise = OrnsteinUhlenbeckNoise(action_shape=action_shape, theta=0.15)
         samples = []
         for i in range(10):
             key = jax.random.fold_in(rng_key, i)
@@ -145,11 +145,11 @@ class TestOrnsteinUhlenbeckNoise:
 
     def test_hyperparameters(self):
         noise = OrnsteinUhlenbeckNoise(
-            action_shape=(4,), initial_noise_scale=0.3, damping=0.2, mu=0.1
+            action_shape=(4,), initial_noise_scale=0.3, theta=0.2, mu=0.1
         )
         hp = noise.hyperparameters()
         assert hp["name"] == "Ornstein-Uhlenbeck"
-        assert hp["damping"] == 0.2
+        assert hp["theta"] == 0.2
         assert hp["mu"] == 0.1
 
 

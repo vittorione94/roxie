@@ -13,6 +13,32 @@ config:
   random_start: true
   look_ahead: 5
   reset_noise_scale: 0.001
+  # Negative mining over START PHASES. Uniform random starts spend most of their
+  # budget on clip regions already tracked well, while the regions that actually
+  # end episodes stay under-practised — and phase 0 is the extreme case, reached
+  # only by reset (never by continuation, since the clip is non-cyclic) yet
+  # responsible for the worst rollouts we have measured (TD3 @910M: 1000-step
+  # rollouts from mid-clip, 39 steps from frame 0).
+  #
+  # The env keeps a per-bin failure RATE over the clip (bins so the estimate is
+  # not spread over thousands of near-identical frames) and biases reset toward
+  # the bins that terminate most. Rate, not count: dying early means later
+  # phases are visited less, and a raw count would mistake that for competence.
+  negative_mining:
+    enabled: true
+    # Mixture weight against uniform. 0 = pure uniform (feature off), 1 = sample
+    # ONLY from the hardest bins, which collapses coverage and lets the easy
+    # regions rot. Keep well below 1 — this is a re-weighting, not a curriculum.
+    alpha: 0.5
+    bins: 64
+    # EMA on the per-bin failure rate. The table updates once per epoch off that
+    # epoch's terminations; smoothing stops one noisy epoch from dominating the
+    # start distribution for the next.
+    ema: 0.8
+    # Frames to back up from the sampled bin, so the policy gets a run-up INTO
+    # the hard region rather than being dropped at the point of failure with no
+    # context. 0 = start exactly at the sampled phase.
+    lead_in: 0
   # Touch-sensor normal force (newtons) above which a foot's binary
   # ground-contact obs flag reads 1. ~0 when airborne, tens of N when planted.
   foot_contact_force_thresh: 1.0

@@ -1,8 +1,10 @@
 # @package _global_
 
+# NO noise group: PPO explores by sampling its own stochastic policy (with the
+# entropy bonus keeping that spread alive), so it takes no noise module. Pulling
+# one in here made this config fail at launch with an unexpected `noise_config`.
 defaults:
   - /agent: ppo
-  - /noise: ou
   - _self_
 
 env:

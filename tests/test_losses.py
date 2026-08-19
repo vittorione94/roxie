@@ -77,9 +77,9 @@ def ddpg_samples():
         "actions": jax.random.normal(k2, (BATCH, ACT_DIM)),
         "rewards": jax.random.normal(k3, (BATCH,)),
         "next_observations": jax.random.normal(k4, (BATCH, OBS_DIM)),
-        # Per-sample bootstrap coefficient (gamma^b, 0 at terminals) — the
-        # DDPG/TD3 critic losses consume this instead of gamma + terminal
-        # flags. SAC still reads `terminals`; both keys coexist here.
+        # Per-sample bootstrap coefficient (gamma^b, 0 at terminals) — every
+        # off-policy critic loss consumes this instead of gamma + terminal
+        # flags. `terminals` is kept for MPO, which still reads it directly.
         "bootstrap": 0.99 * jnp.ones(BATCH),
         "terminals": jnp.zeros(BATCH, dtype=jnp.bool_),
     }
@@ -462,7 +462,6 @@ class TestSACLosses:
             stoch_actor,
             target_twin,
             ddpg_samples,
-            0.99,
             0.2,
             key,
             action_bounds["action_low"],
