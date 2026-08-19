@@ -29,14 +29,41 @@ env:
   # solver pushes the body out of the very pose the tracking reward asks for.
   collisions: ground
 
+runtime:
+  # Precision of every f32 matmul, applied globally (agent networks AND MJX
+  # physics), so it lives here rather than in an agent yaml — flipping it for
+  # one arm would break the A/B.
+  #
+  # null = leave JAX's default. Measured on the RTX 5080 over a SAC gradient
+  # burst (obs 700, batch 512, [1024,512,256]+LN), where ~95% of a step is
+  # GEMMs:
+  #
+  #   float32         1.87 ms/step   critic_loss 804.791687  (f32 reference)
+  #   tensorfloat32   1.26 ms/step   critic_loss 804.758789  (rel err 4.1e-5)
+  #   null (default)  2.14 ms/step   critic_loss 804.739685  (rel err 6.5e-5)
+  #
+  # JAX's default resolves to the bf16 path here, which is BOTH slower and less
+  # accurate than tf32 — so `tensorfloat32` is ~1.7x faster than what these runs
+  # currently do while sitting closer to the f32 reference. Left null so the
+  # campaign's historical numbers stay comparable; flip it once, here, to adopt
+  # it for every arm simultaneously.
+  matmul_precision: tensorfloat32
+
 trainer:
   steps: 1_000_000_000
   epoch_steps: 1_000_000
   save_steps: 10_000_000
-  # Eval variance is the limiting factor when ranking agents (epoch-to-epoch
-  # std was +-2.7 at 50 episodes), so keep this high and rank on the back-half
-  # mean, not on a peak epoch.
-  test_episodes: 100
+  # 2026-08-17: 100 -> 4, because under the canonical eval protocol (frame 0,
+  # no reset noise, run the whole clip — see examples/mocap/loader.py) a
+  # single-clip run makes every eval episode the SAME rollout. The old 100 was
+  # sized for stochastic eval; here 96 of those episodes were re-measuring one
+  # start state, and eval now also runs to the clip end (1631 steps) rather than
+  # stopping at 1000, so the waste got more expensive. 4 (not 1) only because
+  # warp's atomic contact reductions are not bit-reproducible, so a handful of
+  # rollouts still shows that spread — watch `test/distinct_starts`, which
+  # reports the number of distinct CLIPS and will read 1 here.
+  # RAISE THIS on multi-clip runs: it is the eval clip sample size there.
+  test_episodes: 4
   show_progress: true
   replace_checkpoint: false
 

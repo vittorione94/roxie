@@ -1,29 +1,32 @@
-name: "ppo"
+_target_: roxie.agents.PPO
 
-args: 
-  gamma: 0.99
-  actor_learning_rate: 5e-4
-  critic_learning_rate: 1e-3
-  # steps_before_learning: 30_000    # same as warmup (can differ if desired)
-  gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
-  clip_eps: 0.2                   # PPO surrogate clip range
-  entropy_coef: 0.01              # entropy bonus weight in the actor loss
-  # Stop the learning_steps loop once the policy has drifted this far from the
-  # behaviour policy (Schulman's approx KL). Keeps `learning_steps` an upper
-  # bound rather than a fixed count, so extra passes are only taken while the
-  # trust region still holds. null disables the early stop.
-  target_kl: 0.02
-  # Gradient passes over each collected rollout before it is discarded. Only
-  # meaningful because old_log_probs stay pinned to the behaviour policy across
-  # the passes; at 1 the ratio is identically 1, the clip never binds and this
-  # reduces to A2C.
-  learning_steps: 20
-  # Minibatches per epoch, splitting the env axis; must divide
-  # memory.add_batch_size below. 1 = full-batch (previous behaviour).
-  num_minibatches: 4
-  max_grad_norm: 1
+gamma: 0.99
+actor_learning_rate: 5e-4
+critic_learning_rate: 1e-3
+# steps_before_learning: 30_000    # same as warmup (can differ if desired)
+gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
+clip_eps: 0.2                   # PPO surrogate clip range
+entropy_coef: 0.01              # entropy bonus weight in the actor loss
+# Stop the learning_steps loop once the policy has drifted this far from the
+# behaviour policy (Schulman's approx KL). Keeps `learning_steps` an upper
+# bound rather than a fixed count, so extra passes are only taken while the
+# trust region still holds. null disables the early stop.
+target_kl: 0.02
+# Gradient passes over each collected rollout before it is discarded. Only
+# meaningful because old_log_probs stay pinned to the behaviour policy across
+# the passes; at 1 the ratio is identically 1, the clip never binds and this
+# reduces to A2C.
+learning_steps: 20
+# Minibatches per epoch, splitting the env axis; must divide
+# memory.add_batch_size below. 1 = full-batch (previous behaviour).
+num_minibatches: 4
+max_grad_norm: 1
+# Constructor defaults, surfaced here so every knob is editable from yaml.
+normalize_observations: true   # running mean/std on observations
+obs_norm_clip: 5.0   # clip normalized observations to +/- this
+obs_norm_eps: 1e-08   # variance floor for the normalizer
 
-actor:
+actor_config:
   # The _target_ points to the Python class you want to instantiate.
   # Make sure the path is correct for your project structure.
   _target_: roxie.models.actors.StochasticActor
@@ -36,17 +39,57 @@ actor:
   # dropout_rate: 0.
 
 
-critic:
+critic_config:
   # Path to the Critic class
   _target_: roxie.models.critics.VCritic
   features: [256, 256]
   use_layer_norm: false 
   # dropout_rate: 0.   
 
-memory:
+memory_config:
   _target_: flashbax.buffers.make_trajectory_queue
   max_length_time_axis: 1000 # max length of each env trajectory
   add_batch_size: 800 # the number of envs
   add_sequence_length: 1
   sample_sequence_length: 50 # equivalent to sample_batch_size for flat buffer
 
+# Network parameter init. Feeds `nnx.Rngs`; the actor and each critic head take
+# distinct derived offsets so twin critics never start identical (a clipped
+# double-Q min over two identical heads buys nothing). Sweep this to separate a
+# real effect from init luck.
+seed: 0
+
+# Optimizers. `_target_` picks the optax family and carries its own
+# hyperparameters; the learning rate stays a top-level arg above so it remains
+# swept, logged and checkpointed, and `max_grad_norm` applies the global-norm
+# clip ahead of the transform (null/0 disables clipping entirely).
+#
+# For a schedule instead of a constant rate, give the block its own
+# `learning_rate:` sub-block — a block that declares one wins over the scalar
+# arg above:
+#
+#   actor_optimizer_config:
+#     _target_: optax.adamw
+#     weight_decay: 1e-4
+#     learning_rate:
+#       _target_: optax.cosine_decay_schedule
+#       init_value: 3e-4
+#       decay_steps: 1_000_000
+#
+# Swapping family from the CLI must also drop the kwargs the new family does
+# not take -- hydra MERGES dict overrides rather than replacing them, so the
+# b1/b2 below would survive into an optimizer that has no such argument:
+#
+#   agent.actor_optimizer_config._target_=optax.rmsprop \
+#     '~agent.actor_optimizer_config.b1' '~agent.actor_optimizer_config.b2' \
+#     +agent.actor_optimizer_config.decay=0.9
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

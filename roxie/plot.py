@@ -66,6 +66,23 @@ def discover_runs(paths):
     return runs
 
 
+def wallclock_unit(runs):
+    """Pick a wall-clock unit ('s' / 'min' / 'h') that suits the longest run.
+
+    Returns ``(name, divisor)``; runs without a ``time/total_s`` column are
+    ignored, and the fallback is seconds when no run logged wall-clock time.
+    """
+    longest = 0.0
+    for _, df in runs:
+        if 'time/total_s' in df.columns and len(df):
+            longest = max(longest, float(df['time/total_s'].max()))
+    if longest >= 2 * 3600:
+        return 'hours', 3600.0
+    if longest >= 120:
+        return 'minutes', 60.0
+    return 'seconds', 1.0
+
+
 def load_runs(paths):
     """Load each discovered CSV into a (label, DataFrame) pair, skipping unreadable ones."""
     runs = []
@@ -100,8 +117,10 @@ def main():
     prop_colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', [])
     colors = [prop_colors[i % len(prop_colors)] for i in range(len(runs))] if prop_colors else [None] * len(runs)
 
+    time_name, time_div = wallclock_unit(runs)
+
     # Create the figure and subplots
-    fig, axs = plt.subplots(3, 2, figsize=(15, 15))
+    fig, axs = plt.subplots(4, 2, figsize=(15, 20))
     if multi:
         fig.suptitle(f"Training Metrics: {len(runs)} runs", fontsize=16, fontweight='bold')
     else:
@@ -144,7 +163,26 @@ def main():
             axs[2, 1].plot(df['steps'], df['gradient_steps'], label=f'{prefix}Gradient Steps',
                            color=color if multi else 'orange', alpha=0.8, linewidth=2)
 
+        # Plots 7-8: progress against wall-clock time, which is what actually
+        # ranks runs that reach the same score at very different throughputs.
+        if 'time/total_s' not in df.columns:
+            continue
+        wall = df['time/total_s'] / time_div
+
+        # Plot 7: Scores vs Wall-Clock Time
+        if 'score' in df.columns and 'test/score' in df.columns:
+            axs[3, 0].plot(wall, df['score'], label=f'{prefix}Train Score',
+                           color=color, alpha=0.8, linewidth=2)
+            axs[3, 0].plot(wall, df['test/score'], label=f'{prefix}Test Score',
+                           color=color, alpha=0.8, linewidth=2, linestyle='--')
+
+        # Plot 8: Steps vs Wall-Clock Time
+        if 'steps' in df.columns:
+            axs[3, 1].plot(wall, df['steps'], label=f'{prefix}Steps',
+                           color=color if multi else 'brown', alpha=0.8, linewidth=2)
+
     # Titles / labels / grid are per-axis and shared across runs.
+    time_label = f'Wall-Clock Time ({time_name})'
     titles = [
         ('Score vs Steps', 'Environment Steps', 'Score'),
         ('Episode Length vs Steps', 'Environment Steps', 'Length'),
@@ -152,6 +190,8 @@ def main():
         ('Critic Loss vs Steps', 'Environment Steps', 'Loss'),
         ('Steps Per Second (SPS) vs Steps', 'Environment Steps', 'SPS'),
         ('Gradient Steps vs Env Steps', 'Environment Steps', 'Gradient Steps'),
+        ('Score vs Wall-Clock Time', time_label, 'Score'),
+        ('Env Steps vs Wall-Clock Time', time_label, 'Environment Steps'),
     ]
     for ax, (title, xlabel, ylabel) in zip(axs.flat, titles):
         ax.set_title(title)

@@ -634,15 +634,20 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         seed=seed,
         num_threads=num_threads,
     )
-    # Deterministic eval config (mirrors the GPU loader): disable the stochastic
-    # reset knobs so every test episode starts at frame 0 with no state noise —
-    # otherwise even a single-clip run reports nonzero test std for a
-    # deterministic policy. The training pool keeps the original config.
+    # Canonical eval protocol (mirrors the GPU loader): start at frame 0, no
+    # reset noise, run each clip to its end. See the eval-env note in
+    # examples/mocap/loader.py for why this is fixed and must not be changed to
+    # random-phase / fixed-horizon sampling. The training pool keeps the original.
     import copy
 
     eval_config = copy.deepcopy(config)
     eval_config.random_start = False
     eval_config.reset_noise_scale = 0.0
+    # Run to the clip END, not to `episode_length`: capping eval at 1000 makes
+    # "tracked the whole clip" and "hit the cap" indistinguishable. +1 so the
+    # final frame stays reachable past the look_ahead cutoff.
+    eval_horizon = int(max(dataset["clip_lengths"])) + 1
+    eval_config.episode_length = eval_horizon
     test_pool = MocapCpuPool(
         mj_model, dataset, eval_config,
         num_envs=test_episodes,
@@ -653,6 +658,6 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     max_steps = int(config.episode_length)
     return EnvBundle(
         env=EnvPoolWrapper(train_pool, max_episode_steps=max_steps),
-        test_env=EnvPoolWrapper(test_pool, max_episode_steps=max_steps),
+        test_env=EnvPoolWrapper(test_pool, max_episode_steps=eval_horizon),
         env_cfg=None,
     )

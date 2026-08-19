@@ -78,6 +78,10 @@ def td3_critic_loss_fn(
     Identical to DDPG's target construction but takes the elementwise minimum
     of the two target critics to curb the overestimation bias that makes
     single-critic DDPG diverge.
+
+    Returns ``(loss, aux)``; `aux` carries the value-health diagnostics the
+    agent logs under `td3/` (see `TD3.pop_diagnostics`), read off this forward
+    pass so the instrumentation costs nothing extra.
     """
     obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
     next_obs = Agent.normalize_obs(
@@ -94,8 +98,12 @@ def td3_critic_loss_fn(
         target_policy_noise * act_span
     )
     noise_clip = target_noise_clip * act_span
-    noise = jnp.clip(noise, -noise_clip, noise_clip)
-    next_actions = jnp.clip(next_actions + noise, action_low, action_high)
+    clipped_noise = jnp.clip(noise, -noise_clip, noise_clip)
+    # Share of smoothing samples the clip actually bit. Near 0 means
+    # `target_noise_clip` is inert; near 1 means it has flattened the Gaussian
+    # into a two-point distribution and smoothing is no longer smoothing.
+    smooth_clip_frac = jnp.mean((jnp.abs(noise) > noise_clip).astype(jnp.float32))
+    next_actions = jnp.clip(next_actions + clipped_noise, action_low, action_high)
 
     # Clipped double-Q: take the minimum of the two target critics
     target_q1, target_q2 = target_twin_critic(next_obs, next_actions)
@@ -109,10 +117,29 @@ def td3_critic_loss_fn(
     target_q = jax.lax.stop_gradient(target_q)
 
     q1, q2 = twin_critic(obs, samples["actions"])
-    critic_loss = jnp.mean((jnp.squeeze(q1) - target_q) ** 2) + jnp.mean(
-        (jnp.squeeze(q2) - target_q) ** 2
+    q1, q2 = jnp.squeeze(q1), jnp.squeeze(q2)
+    critic_loss = jnp.mean((q1 - target_q) ** 2) + jnp.mean((q2 - target_q) ** 2)
+
+    # Fraction of target actions pinned to the action-range rail after
+    # smoothing. High values mean the TARGET actor has saturated too, so the
+    # bootstrap is evaluated at the corners of the action space where the
+    # critic has the least data — the classic overestimation setup.
+    rail_tol = 1e-3 * (action_high - action_low)
+    at_rail = (next_actions <= action_low + rail_tol) | (
+        next_actions >= action_high - rail_tol
     )
-    return critic_loss
+    aux = {
+        "q_buffer": jnp.mean(q1),
+        "q_target": jnp.mean(target_q),
+        "td_abs": jnp.mean(jnp.abs(q1 - target_q)),
+        # |Q1 - Q2| is the disagreement the clipped-double-Q min feeds on. It
+        # should stay small relative to |Q|; a widening gap means the two heads
+        # are extrapolating differently and the min is doing heavy lifting.
+        "twin_gap": jnp.mean(jnp.abs(q1 - q2)),
+        "target_smooth_clip_frac": smooth_clip_frac,
+        "target_act_rail_frac": jnp.mean(at_rail.astype(jnp.float32)),
+    }
+    return critic_loss, aux
 
 
 @nnx.jit
@@ -343,7 +370,6 @@ def sac_critic_loss_fn(
     actor_model,
     target_twin_critic,
     samples,
-    gamma,
     alpha,
     key,
     action_low,
@@ -352,6 +378,20 @@ def sac_critic_loss_fn(
     obs_std,
     obs_clip,
 ):
+    """Soft Bellman MSE for the twin critic (SAC).
+
+    Same clipped double-Q target as `td3_critic_loss_fn`, minus target policy
+    smoothing (the stochastic policy already smooths) and plus the entropy
+    bonus -alpha * log pi(a'|s'). Like the other off-policy losses it consumes
+    the precomputed `bootstrap` coefficient rather than gamma/terminal flags,
+    so it works unchanged for 1-step and n-step returns.
+
+    The entropy bonus is applied only at the bootstrap state, scaled by the same
+    `bootstrap` coefficient. At n_step 1 that is exactly the textbook soft
+    target; at n > 1 the intermediate-step entropy bonuses are dropped, which
+    is the usual n-step SAC approximation (the stored actions came from an older
+    policy, so their log-probs are not the current pi's anyway).
+    """
     obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
     next_obs = Agent.normalize_obs(
         samples["next_observations"], obs_mean, obs_std, obs_clip
@@ -372,10 +412,11 @@ def sac_critic_loss_fn(
     target_q = jnp.minimum(jnp.squeeze(target_q1), jnp.squeeze(target_q2))
     target_q = target_q - alpha * next_log_probs
 
-    # Bellman target
+    # `rewards` is the (n-step) return and `bootstrap` the per-sample
+    # coefficient gamma^b * (0 if terminal in window) — both precomputed by
+    # repack_samples, which owns all gamma/terminal/truncation handling.
     reward = jnp.squeeze(samples["rewards"])
-    terminal = samples["terminals"].astype(jnp.float32)
-    target = reward + gamma * (1.0 - terminal) * target_q
+    target = reward + samples["bootstrap"] * target_q
     target = jax.lax.stop_gradient(target)
 
     # Current Q values from both critics

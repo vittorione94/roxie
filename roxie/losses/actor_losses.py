@@ -6,6 +6,40 @@ from flax import nnx
 from roxie.agents.agent import Agent
 from roxie.models.actors import distribution_entropy
 
+# Pre-tanh magnitude past which the saturation penalty starts charging.
+# tanh(1) = 0.76, so the policy keeps the whole useful range of the action
+# space for free and is only pushed back once it heads for the rails, where
+# d(tanh u)/du collapses and the DPG gradient dies. A two-sided u^2 penalty
+# would instead bias every action toward zero, which fights tasks (like mocap
+# position servos) that legitimately need targets near the joint limits.
+PRE_ACTIVATION_THRESHOLD = 1.0
+
+
+def pre_activation_penalty(pre_activation: jnp.ndarray) -> jnp.ndarray:
+    """One-sided hinge on the actor's pre-tanh logits: sum_j relu(|u_j| - 1)^2,
+    averaged over the batch.
+
+    Counterweight to the deterministic policy gradient, which pushes the logits
+    outward without bound (see `DeterministicActor`'s saturation note). Its
+    gradient grows linearly in the overshoot, so it still bites at |u| ~ 10
+    where the tanh derivative has already underflowed to zero and -dQ/du can no
+    longer pull the policy back on its own.
+
+    REDUCTION: sum over the action dimension, mean over the batch — deliberately
+    *not* a plain `mean` over both. The DPG term it counterbalances is
+    `-mean_batch(Q)`, and a single Q depends on the whole action vector, so its
+    gradient w.r.t. one logit carries no 1/action_dim factor. Averaging the
+    penalty over action dims too would silently divide `pre_activation_coef` by
+    action_dim (56 for the CMU humanoid — two orders of magnitude), making the
+    hinge inert exactly where it is needed and making a tuned coefficient
+    meaningless across embodiments. Summing keeps the two terms commensurate:
+    per logit, the penalty gradient is `2 * coef * excess` against the DPG
+    term's `dQ/da_j * (1 - tanh^2 u_j)`.
+    """
+    excess = jax.nn.relu(jnp.abs(pre_activation) - PRE_ACTIVATION_THRESHOLD)
+    return jnp.mean(jnp.sum(jnp.square(excess), axis=-1))
+
+
 @nnx.jit
 def ddpg_actor_loss_fn(
     actor_model,
@@ -58,14 +92,42 @@ def td3_actor_loss_fn(
     obs_clip,
     action_low,
     action_high,
+    pre_activation_coef,
 ):
-    """Deterministic policy gradient through the first critic head (TD3)."""
+    """Deterministic policy gradient through the first critic head (TD3), plus
+    a one-sided penalty on the actor's pre-tanh logits.
+
+    Without the penalty term the DPG objective drives the logits out until tanh
+    saturates and the actor gradient underflows to zero, freezing the policy as
+    a bang-bang controller (see `DeterministicActor`). `pre_activation_coef`
+    trades Q against that; 0.0 recovers the textbook TD3 actor loss.
+
+    Returns ``(loss, aux)``; `aux` carries the saturation diagnostics the agent
+    logs under `td3/` (see `TD3.pop_diagnostics`). They are read off this very
+    forward pass rather than a second one, so the instrumentation is free.
+    """
     obs = Agent.normalize_obs(samples["observations"], obs_mean, obs_std, obs_clip)
-    actions = actor_model(obs)  # [-1, 1]
-    actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
-    q1, _ = twin_critic(obs, actions)
-    actor_loss = -jnp.mean(q1)
-    return actor_loss
+    actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
+    scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
+    q1, _ = twin_critic(obs, scaled_actions)
+    actor_q = jnp.mean(q1)
+    penalty = pre_activation_penalty(pre_activation)
+
+    abs_u = jnp.abs(pre_activation)
+    # d(tanh u)/du: the factor the DPG gradient is multiplied by before it ever
+    # reaches the weights. As it goes to zero the actor stops being trainable,
+    # so this is the leading indicator of the saturation collapse — it moves
+    # well before the eval score does.
+    tanh_grad = 1.0 - jnp.square(actions)
+    aux = {
+        "pre_act_abs": jnp.mean(abs_u),
+        "pre_act_max": jnp.max(abs_u),
+        "pre_act_penalty": penalty,
+        "sat_frac": jnp.mean((jnp.abs(actions) > 0.99).astype(jnp.float32)),
+        "tanh_grad": jnp.mean(tanh_grad),
+        "actor_q": actor_q,
+    }
+    return -actor_q + pre_activation_coef * penalty, aux
 
 
 @nnx.jit

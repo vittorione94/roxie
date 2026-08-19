@@ -20,7 +20,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import get_method
 
-from roxie.agents import agents
 from roxie.environment.loader import (
     DEFAULT_BUILDER,
     log_loaded_backend,
@@ -40,7 +39,7 @@ sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 @hydra.main(version_base=None, config_path="configs", config_name="walker/walker_ddpg")
 def main(cfg: DictConfig):
-    print(cfg.agent.name)
+    print("Agent:", cfg.agent._target_)
 
     # Backend env vars are decided here, from the COMPOSED config, not at module
     # import from sys.argv: `env.impl: warp` set in an experiment yaml never
@@ -69,6 +68,16 @@ def main(cfg: DictConfig):
     # XLA GPU autotuning hangs this machine's RTX 5080 (Blackwell) — required
     # for EVERY GPU run regardless of physics backend; unused/harmless on CPU.
     os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+
+    # Precision of every f32 matmul (see `runtime.matmul_precision` in the
+    # experiment yaml). null leaves JAX's own default in place. This is a
+    # GLOBAL setting — it reaches the agent's networks AND MJX physics — so
+    # change it for a whole sweep at once, never for a single arm, or the
+    # comparison stops being an A/B on the algorithm.
+    matmul_precision = (cfg.get("runtime") or {}).get("matmul_precision", None)
+    if matmul_precision:
+        jax.config.update("jax_default_matmul_precision", matmul_precision)
+        print(f"Matmul precision: {matmul_precision}")
 
     print("JAX devices:", jax.devices())
     print("JAX platform:", jax.default_backend())
@@ -124,23 +133,27 @@ def main(cfg: DictConfig):
         action_low = env.action_low
         action_high = env.action_high
 
-    agent_args = {
-        "env_obs_size": env.observation_size,
-        "env_action_size": env.action_size,
-        "action_low": action_low,
-        "action_high": action_high,
-        **cfg.agent.args,
-    }
-    if "actor" in cfg.agent:
-        agent_args["actor_config"] = cfg.agent.actor
-    if "critic" in cfg.agent:
-        agent_args["critic_config"] = cfg.agent.critic
-    if "memory" in cfg.agent:
-        agent_args["memory_config"] = cfg.agent.memory
+    # The agent config IS the constructor call: `_target_` names the class and
+    # every sibling key is one of its keywords, so a knob that exists in Python
+    # but not in the yaml fails loudly here instead of silently taking its
+    # default (see tests/test_agent_configs.py). Only the four env-derived
+    # arguments are injected.
+    #
+    # `_recursive_=False` keeps the nested `*_config` blocks as DictConfigs: the
+    # agent instantiates its own actor/critic/memory/optimizers, injecting shapes
+    # (in_features, action_dim, rngs, num_atoms) that are unknown out here.
+    agent_kwargs = dict(
+        env_obs_size=env.observation_size,
+        env_action_size=env.action_size,
+        action_low=action_low,
+        action_high=action_high,
+    )
+    # `noise` is its own top-level config group (agents that explore from their
+    # own policy — SAC, MPO, PPO — carry no noise group and take no such arg).
     if "noise" in cfg:
-        agent_args["noise_config"] = cfg.noise
+        agent_kwargs["noise_config"] = cfg.noise
 
-    agent = agents[cfg.agent.name](**agent_args)
+    agent = hydra.utils.instantiate(cfg.agent, _recursive_=False, **agent_kwargs)
 
     trainer = Trainer(
         output_dir=output_dir,

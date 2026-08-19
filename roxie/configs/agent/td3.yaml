@@ -1,35 +1,92 @@
-name: "td3"
+_target_: roxie.agents.TD3
 
-args:
-  gamma: 0.99
-  tau: 0.005
-  actor_learning_rate: 3e-4
-  critic_learning_rate: 3e-4
-  target_policy_noise: 0.2        # TD3 default target smoothing (env-unit fraction)
-  target_noise_clip: 0.5
-  policy_delay: 2                 # actor + target updates every 2 critic steps
-  memory_warmup: 30_000
-  steps_before_learning: 30_000
-  steps_between_updates: 400
-  learning_steps: 100
-  max_grad_norm: 1
+gamma: 0.99
+tau: 0.005
+actor_learning_rate: 3e-4
+critic_learning_rate: 3e-4
+target_policy_noise: 0.2        # TD3 default target smoothing (env-unit fraction)
+target_noise_clip: 0.5
+policy_delay: 2                 # actor + target updates every 2 critic steps
+memory_warmup: 30_000
+steps_before_learning: 30_000
+steps_between_updates: 400
+learning_steps: 100
+max_grad_norm: 1
+# Penalty on the actor's pre-tanh logits: relu(|u| - 1)^2 summed over action
+# dims, averaged over the batch. Without it the DPG objective drives the
+# logits out until tanh saturates and the actor gradient underflows to zero.
+# See DeterministicActor's saturation note.
+#
+# Watch `td3/tanh_grad` and `td3/sat_frac` to tune this: if tanh_grad drifts
+# toward 0 the coefficient is too small, if it pins near 1 (and score stalls)
+# it is too large and the policy can no longer reach the action limits.
+pre_activation_coef: 1e-1
+# Constructor defaults, surfaced here so every knob is editable from yaml.
+n_step: 1   # TD horizon; >1 switches to a trajectory buffer + n-step returns
+normalize_observations: true   # running mean/std on observations
+obs_norm_clip: 5.0   # clip normalized observations to +/- this
+obs_norm_eps: 1e-08   # variance floor for the normalizer
 
-actor:
+actor_config:
   _target_: roxie.models.actors.DeterministicActor
   features: [256, 256]
   use_layer_norm: true
   dropout_rate: 0.
+  # Small final layer (the original DDPG trick): start the logits inside
+  # tanh's linear region rather than near its knee.
+  output_init_scale: 0.01
 
-critic:
+critic_config:
   _target_: roxie.models.critics.QCritic
   features: [256, 256]
   use_layer_norm: true            # strong stabilizer against value divergence
   dropout_rate: 0.
 
-memory:
+memory_config:
   _target_: flashbax.buffers.make_flat_buffer
   max_length: 500_000
   min_length: 1_000
   sample_batch_size: 512
   add_sequences: False
   add_batch_size: ${env.parallel_envs}
+
+# Network parameter init. Feeds `nnx.Rngs`; the actor and each critic head take
+# distinct derived offsets so twin critics never start identical (a clipped
+# double-Q min over two identical heads buys nothing). Sweep this to separate a
+# real effect from init luck.
+seed: 0
+
+# Optimizers. `_target_` picks the optax family and carries its own
+# hyperparameters; the learning rate stays a top-level arg above so it remains
+# swept, logged and checkpointed, and `max_grad_norm` applies the global-norm
+# clip ahead of the transform (null/0 disables clipping entirely).
+#
+# For a schedule instead of a constant rate, give the block its own
+# `learning_rate:` sub-block — a block that declares one wins over the scalar
+# arg above:
+#
+#   actor_optimizer_config:
+#     _target_: optax.adamw
+#     weight_decay: 1e-4
+#     learning_rate:
+#       _target_: optax.cosine_decay_schedule
+#       init_value: 3e-4
+#       decay_steps: 1_000_000
+#
+# Swapping family from the CLI must also drop the kwargs the new family does
+# not take -- hydra MERGES dict overrides rather than replacing them, so the
+# b1/b2 below would survive into an optimizer that has no such argument:
+#
+#   agent.actor_optimizer_config._target_=optax.rmsprop \
+#     '~agent.actor_optimizer_config.b1' '~agent.actor_optimizer_config.b2' \
+#     +agent.actor_optimizer_config.decay=0.9
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

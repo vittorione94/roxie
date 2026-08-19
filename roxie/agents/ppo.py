@@ -3,11 +3,15 @@ import functools
 import hydra
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
-from roxie.agents.utils import Transition, serialize_bound
+from roxie.agents.utils import (
+    Transition,
+    build_optimizer,
+    network_rngs,
+    serialize_bound,
+)
 from roxie.losses.actor_losses import ppo_loss_fn
 from roxie.losses.critic_losses import ppo_critic_loss_fn
 
@@ -258,6 +262,9 @@ class PPO(Agent):
         critic_config: dict,
         memory_config: dict,
         *,
+        actor_optimizer_config: dict = None,
+        critic_optimizer_config: dict = None,
+        seed: int = 0,
         actor_learning_rate: float = 3e-4,
         critic_learning_rate: float = 3e-4,
         gamma: float = 0.99,
@@ -273,20 +280,21 @@ class PPO(Agent):
         obs_norm_eps: float = 1e-8,
     ):
 
-        actor_rngs = nnx.Rngs(params=0, dropout=1)
-        critic_rngs = nnx.Rngs(params=0, dropout=1)
+        self.seed = int(seed)
 
         # Instantiate actor
         actor = hydra.utils.instantiate(
             actor_config,
             in_features=env_obs_size,
             action_dim=env_action_size,
-            rngs=actor_rngs,
+            rngs=network_rngs(self.seed, offset=0),
         )
 
         # Instantiate critic
         critic = hydra.utils.instantiate(
-            critic_config, in_features=env_obs_size, rngs=critic_rngs
+            critic_config,
+            in_features=env_obs_size,
+            rngs=network_rngs(self.seed, offset=2),
         )
 
         # Instantiate replay buffer
@@ -323,21 +331,24 @@ class PPO(Agent):
         self.actor_learning_rate = actor_learning_rate
         self.max_grad_norm = max_grad_norm
 
-        # Add gradient clipping to optimizers
+        # Optimizer family + its hyperparameters come from yaml; the learning
+        # rate and the global-norm clip stay top-level agent args.
         actor_optimizer = nnx.Optimizer(
             actor,
-            optax.chain(
-                optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.actor_learning_rate),
+            build_optimizer(
+                actor_optimizer_config,
+                learning_rate=self.actor_learning_rate,
+                max_grad_norm=self.max_grad_norm,
             ),
             wrt=nnx.Param,
         )
 
         critic_optimizer = nnx.Optimizer(
             critic,
-            optax.chain(
-                optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.critic_learning_rate),
+            build_optimizer(
+                critic_optimizer_config,
+                learning_rate=self.critic_learning_rate,
+                max_grad_norm=self.max_grad_norm,
             ),
             wrt=nnx.Param,
         )
@@ -632,6 +643,7 @@ class PPO(Agent):
     def _export_hyperparams(self) -> dict:
         # Keep this minimal and JSON-serializable
         return {
+            "seed": int(self.seed),
             "gamma": float(self.gamma),
             "gae_lambda": float(self.gae_lambda),
             "clip_eps": float(self.clip_eps),

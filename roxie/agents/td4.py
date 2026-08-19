@@ -8,7 +8,7 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.d4pg import D4PG
-from roxie.agents.utils import repack_samples
+from roxie.agents.utils import network_rngs, repack_samples
 from roxie.losses.actor_losses import td4_actor_loss_fn
 from roxie.losses.critic_losses import td4_critic_loss_fn
 from roxie.models.critics import TwinCritic
@@ -225,21 +225,19 @@ class TD4(D4PG):
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
         """Two categorical critics behind a TwinCritic. `num_atoms` is injected
         from the agent args so the critic yaml doesn't have to repeat it; the
-        two heads get distinct seeds so they don't start identical (the double-Q
-        min is worthless if they are)."""
-        critic_rngs_1 = nnx.Rngs(params=2, dropout=3)
-        critic_rngs_2 = nnx.Rngs(params=4, dropout=5)
+        two heads get distinct seed offsets so they don't start identical (the
+        double-Q min is worthless if they are)."""
         critic1 = hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
             num_atoms=self.num_atoms,
-            rngs=critic_rngs_1,
+            rngs=network_rngs(self.seed, offset=2),
         )
         critic2 = hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
             num_atoms=self.num_atoms,
-            rngs=critic_rngs_2,
+            rngs=network_rngs(self.seed, offset=4),
         )
         return TwinCritic(critic1, critic2)
 

@@ -10,7 +10,13 @@ import optax
 from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
-from roxie.agents.utils import Transition, repack_samples, serialize_bound
+from roxie.agents.utils import (
+    Transition,
+    build_optimizer,
+    network_rngs,
+    repack_samples,
+    serialize_bound,
+)
 from roxie.losses.actor_losses import ddpg_actor_loss_fn
 from roxie.losses.critic_losses import ddpg_critic_loss_fn
 
@@ -188,6 +194,9 @@ class DDPG(Agent):
         memory_config: dict,
         noise_config: dict,
         *,
+        actor_optimizer_config: dict = None,
+        critic_optimizer_config: dict = None,
+        seed: int = 0,
         actor_learning_rate: float = 3e-4,
         critic_learning_rate: float = 3e-4,
         gamma: float = 0.99,
@@ -200,19 +209,22 @@ class DDPG(Agent):
         target_noise_clip: float = 0.1,
         target_policy_noise: float = 0.1,
         max_grad_norm: float = 1.0,
+        pre_activation_coef: float = 0.0,
         normalize_observations: bool = True,
         obs_norm_clip: float = 5.0,
         obs_norm_eps: float = 1e-8,
     ):
 
-        actor_rngs = nnx.Rngs(params=0, dropout=1)
+        # Network-init seed. Set before `_make_critic` (called below and
+        # overridden by TD3/TD4) so subclasses can derive their own offsets.
+        self.seed = int(seed)
 
         # Instantiate actor
         actor = hydra.utils.instantiate(
             actor_config,
             in_features=env_obs_size,
             action_dim=env_action_size,
-            rngs=actor_rngs,
+            rngs=network_rngs(self.seed, offset=0),
         )
 
         # Instantiate critic (overridable so TD3 can swap in a TwinCritic)
@@ -266,21 +278,24 @@ class DDPG(Agent):
         self.max_grad_norm = max_grad_norm
         self.noise_module = noise_module
 
-        # Add gradient clipping to optimizers
+        # Optimizer family + its hyperparameters come from yaml; the learning
+        # rate and the global-norm clip stay top-level agent args.
         actor_optimizer = nnx.Optimizer(
             actor,
-            optax.chain(
-                optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.actor_learning_rate),
+            build_optimizer(
+                actor_optimizer_config,
+                learning_rate=self.actor_learning_rate,
+                max_grad_norm=self.max_grad_norm,
             ),
             wrt=nnx.Param,
         )
 
         critic_optimizer = nnx.Optimizer(
             critic,
-            optax.chain(
-                optax.clip_by_global_norm(self.max_grad_norm),
-                optax.adam(self.critic_learning_rate),
+            build_optimizer(
+                critic_optimizer_config,
+                learning_rate=self.critic_learning_rate,
+                max_grad_norm=self.max_grad_norm,
             ),
             wrt=nnx.Param,
         )
@@ -317,6 +332,11 @@ class DDPG(Agent):
         self.normalize_observations = normalize_observations
         self.obs_clip = float(obs_norm_clip)
         self.obs_eps = float(obs_norm_eps)
+        # Weight on the actor's pre-tanh saturation penalty. Consumed by TD3's
+        # actor loss; stored on the base so every DeterministicActor agent
+        # round-trips it through checkpoints identically. 0.0 = off (the
+        # textbook DPG objective, which saturates -- see DeterministicActor).
+        self.pre_activation_coef = float(pre_activation_coef)
 
         print(f"{type(self).__name__} agent initialized.")
         print("Noise module hyperparameters:", self.noise_module.hyperparameters())
@@ -324,11 +344,10 @@ class DDPG(Agent):
 
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
         """Build the critic network. Overridden by TD3 to return a TwinCritic."""
-        critic_rngs = nnx.Rngs(params=0, dropout=1)
         return hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
-            rngs=critic_rngs,
+            rngs=network_rngs(self.seed, offset=2),
         )
 
     def replay_add(self, buffer_state, transitions):
@@ -487,6 +506,7 @@ class DDPG(Agent):
         # self.state.buffer_state.experience.action.shape       (num_envs, steps, action_dim)
         # Keep this minimal and JSON-serializable
         return {
+            "seed": int(self.seed),
             "gamma": float(self.gamma),
             "tau": float(self.tau),
             "actor_learning_rate": float(self.actor_learning_rate),
@@ -495,6 +515,7 @@ class DDPG(Agent):
             "env_obs_size": self.state.buffer_state.experience.observation.shape[2],
             "env_action_size": self.state.buffer_state.experience.action.shape[2],
             "target_policy_noise": float(self.target_policy_noise),
+            "pre_activation_coef": float(self.pre_activation_coef),
             "target_noise_clip": float(self.target_noise_clip),
             "steps_before_learning": int(self.steps_before_learning),
             "steps_between_updates": int(self.steps_between_updates),

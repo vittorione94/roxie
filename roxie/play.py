@@ -18,9 +18,8 @@ import mujoco
 import mujoco.viewer
 from omegaconf import OmegaConf
 
-from hydra.utils import get_method
+from hydra.utils import get_class, get_method
 
-from roxie.agents import agents
 from roxie.environment.loader import (
     DEFAULT_BUILDER,
     log_loaded_backend,
@@ -54,6 +53,12 @@ def main(checkpoint_path, overrides):
     if cfg.env.get("impl", None) == "warp":
         cfg.env.impl = "jax"
 
+    # Match the training run's matmul precision so playback evaluates the
+    # policy the same way it was trained (see `runtime.matmul_precision`).
+    matmul_precision = (cfg.get("runtime") or {}).get("matmul_precision", None)
+    if matmul_precision:
+        jax.config.update("jax_default_matmul_precision", matmul_precision)
+
     key = jax.random.PRNGKey(seed=0)
 
     # Same builder protocol as train.py: ``env.builder`` names the env factory;
@@ -64,17 +69,19 @@ def main(checkpoint_path, overrides):
 
     log_loaded_backend(env, requested_impl=cfg.env.get("impl", "jax"))
 
-    agent_args = {}
-    if "actor" in cfg.agent:
-        agent_args["actor_config"] = cfg.agent.actor
-    if "critic" in cfg.agent:
-        agent_args["critic_config"] = cfg.agent.critic
-    if "memory" in cfg.agent:
-        agent_args["memory_config"] = cfg.agent.memory
+    # Same source of truth as train.py: the saved config's `_target_` names the
+    # class. Forward every construction block it declares (actor/critic/memory,
+    # the optimizer blocks) plus the separate `noise` group; the remaining
+    # hyperparameters come from the checkpoint itself.
+    agent_args = {
+        key: value
+        for key, value in cfg.agent.items()
+        if key.endswith("_config")
+    }
     if "noise" in cfg:
         agent_args["noise_config"] = cfg.noise
 
-    agent = agents[cfg.agent.name].load(
+    agent = get_class(cfg.agent._target_).load(
         path=checkpoint_path,
         env_obs_size=env.observation_size,
         env_act_size=env.action_size,

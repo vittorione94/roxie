@@ -1,11 +1,10 @@
-name: "ou"
+_target_: roxie.agents.OrnsteinUhlenbeck
 
-# Non-learning Ornstein-Uhlenbeck baseline (roxie.agents.basic.OrnsteinUhlenbeck).
-# These map straight onto the agent's __init__ kwargs.
-args:
-  scale: 0.5     # noise magnitude
-  theta: 0.15    # mean-reversion (higher => less temporal correlation)
-  dt: 1e-2       # integration step
-  clip: 2.0      # per-step gaussian sample clip
-  mu: 0.0        # mean the OU state reverts toward
-  seed: 0
+# Non-learning Ornstein-Uhlenbeck baseline. It has no networks, no replay and no
+# optimizers, so this file is just its __init__ kwargs.
+scale: 0.5     # noise magnitude
+theta: 0.15    # mean-reversion (higher => less temporal correlation)
+dt: 1e-2       # integration step
+clip: 2.0      # per-step gaussian sample clip
+mu: 0.0        # mean the OU state reverts toward
+seed: 0        # PRNG seed for the driving noise

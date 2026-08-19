@@ -1,5 +1,7 @@
-name: "normal_random"
+_target_: roxie.agents.NormalRandom
 
-args:
-  loc: 0.1
-  scale: 0.5
+# Non-learning gaussian baseline. No networks, no replay, no optimizers — this
+# file is its complete __init__ surface.
+loc: 0.1
+scale: 0.5
+seed: 0   # PRNG seed for the random policy

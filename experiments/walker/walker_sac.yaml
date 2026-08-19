@@ -1,8 +1,10 @@
 # @package _global_
 
+# NO noise group: SAC explores from its own policy entropy (the tanh-Gaussian
+# sample plus the learned temperature), so it takes no noise module. Pulling one
+# in here made this config fail at launch with an unexpected `noise_config`.
 defaults:
   - /agent: sac
-  - /noise: ou
   - _self_
 
 env:
@@ -20,6 +22,13 @@ env:
   impl: warp
   naconmax: null
   njmax: null
+
+runtime:
+  # Precision of every f32 matmul, applied globally (agent networks AND MJX
+  # physics). null leaves JAX's default. "tensorfloat32" measured ~1.7x faster
+  # than the default on the RTX 5080 *and* closer to the f32 reference — see the
+  # numbers in experiments/mocap/sweep/overfit_cmu_006_13.yaml.
+  matmul_precision: null
 
 trainer:
   steps: 1_000_000_000

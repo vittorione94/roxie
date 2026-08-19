@@ -353,6 +353,20 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             dtype=jp.float32,
         )
 
+        # --- Negative mining over start phases (see cmu.yaml) ---
+        mining = self._config.get("negative_mining", None)
+        self._mining_enabled = bool(mining is not None and mining.get("enabled", False))
+        if self._mining_enabled:
+            self._mining_bins = int(mining.get("bins", 64))
+            self._mining_alpha = float(mining.get("alpha", 0.5))
+            self._mining_ema = float(mining.get("ema", 0.8))
+            self._mining_lead_in = int(mining.get("lead_in", 0))
+        else:
+            self._mining_bins = 0
+            self._mining_alpha = 0.0
+            self._mining_ema = 0.0
+            self._mining_lead_in = 0
+
     def _load_gpu_chunk(self, clip_indices=None, seed=None):
         if clip_indices is None:
             if self._gpu_clip_budget >= self._total_clips:
@@ -382,6 +396,91 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         self._clip_starts = jp.array(new_starts, dtype=jp.int32)
         self._clip_lengths = jp.array(new_lengths, dtype=jp.int32)
         self._num_clips = len(clip_indices)
+
+    # ------------------------------------------------------------------
+    # Negative mining over start phases
+    #
+    # Optional env hook, discovered by the trainer via `hasattr(env,
+    # "mining_init")`. Three pure functions so nothing mutable lives on the env
+    # and the whole thing stays jit-friendly:
+    #
+    #   mining_init()                     -> (weights, counts)   uniform, empty
+    #   mining_observe(counts, info, ...) -> counts              per step, on device
+    #   mining_refresh(weights, counts)   -> (weights, counts)   once per epoch
+    #
+    # The per-step piece is two scatter-adds on a (bins,) array; the expensive
+    # part (normalisation, EMA) happens once per epoch on the epoch boundary.
+    # ------------------------------------------------------------------
+
+    @property
+    def mining_bins(self) -> int:
+        return self._mining_bins
+
+    def mining_init(self):
+        """Uniform start distribution and empty counters."""
+        w = jp.full((self._mining_bins,), 1.0 / self._mining_bins, dtype=jp.float32)
+        counts = {
+            "fail": jp.zeros((self._mining_bins,), dtype=jp.float32),
+            "visit": jp.zeros((self._mining_bins,), dtype=jp.float32),
+        }
+        return w, counts
+
+    def mining_observe(self, counts, info, terminated):
+        """Accumulate where episodes DIE, per clip-relative phase bin.
+
+        `terminated` must be GENUINE failure, not `done`: a clip that simply ran
+        out (or hit the step limit) is not a tracking failure, and counting it
+        would make the end of every clip look maximally hard and soak up the
+        whole start budget. `TerminationWrapper` already separates the two into
+        `info["termination"]`, and that is deliberately the same flag the critic
+        treats as terminal — mining and bootstrapping should never disagree
+        about what counts as a failure.
+        """
+        phase = info["phase_idx"]
+        clip_len = jp.maximum(info["clip_len"], 1)
+        b = jp.clip(
+            (phase * self._mining_bins) // clip_len, 0, self._mining_bins - 1
+        )
+        return {
+            "visit": counts["visit"].at[b].add(1.0),
+            "fail": counts["fail"].at[b].add(
+                jp.asarray(terminated, dtype=jp.bool_).astype(jp.float32)
+            ),
+        }
+
+    def mining_refresh(self, weights, counts):
+        """Fold this epoch's failure rates into the start distribution."""
+        # Rate, not count: a bin reached rarely (because we die before it) would
+        # otherwise look easy purely for lack of visits.
+        rate = counts["fail"] / jp.maximum(counts["visit"], 1.0)
+        total = jp.sum(rate)
+        # All-zero rate (nothing failed anywhere) => fall back to uniform rather
+        # than dividing by zero and mining noise.
+        hard = jp.where(
+            total > 0, rate / jp.maximum(total, 1e-12), 1.0 / self._mining_bins
+        )
+        uniform = 1.0 / self._mining_bins
+        target = (1.0 - self._mining_alpha) * uniform + self._mining_alpha * hard
+        new_w = self._mining_ema * weights + (1.0 - self._mining_ema) * target
+        new_w = new_w / jp.sum(new_w)
+        zeros = {k: jp.zeros_like(v) for k, v in counts.items()}
+        return new_w, zeros
+
+    def mining_stats(self, weights, counts) -> dict:
+        """Loggable scalars: is mining actually concentrating, and on what."""
+        u = 1.0 / self._mining_bins
+        visits = jp.maximum(jp.sum(counts["visit"]), 1.0)
+        return {
+            # 1.0 = uniform; higher = more concentrated on hard bins.
+            "mining/max_weight_ratio": jp.max(weights) / u,
+            "mining/hardest_bin": jp.argmax(weights).astype(jp.float32),
+            "mining/fail_rate": jp.sum(counts["fail"]) / visits,
+            # Effective number of bins actually being sampled (exp of entropy);
+            # if this collapses toward 1 the start distribution has degenerated.
+            "mining/effective_bins": jp.exp(
+                -jp.sum(weights * jp.log(weights + 1e-12))
+            ),
+        }
 
     def swap_clips(self, seed=None):
         """Reshuffle the on-GPU clip subset. Returns True if clips actually
@@ -420,7 +519,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
     def _abs_idx(self, info: dict[str, Any]) -> jax.Array:
         return info["clip_start"] + info["phase_idx"]
 
-    def reset(self, rng: jax.Array) -> mjx_env.State:
+    def reset(self, rng: jax.Array, mining_weights: jax.Array | None = None) -> mjx_env.State:
         rng, clip_rng, start_rng, qpos_rng, qvel_rng = jax.random.split(rng, 5)
 
         clip_idx = jax.random.randint(clip_rng, (), 0, self._num_clips)
@@ -436,9 +535,37 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             clip_len,
             jp.maximum(clip_len - self._config.look_ahead, 1),
         )
+
+        def _uniform_start(r):
+            return jax.random.randint(r, (), 0, start_high)
+
+        def _mined_start(r):
+            """Draw a bin from the difficulty weights, then a frame within it.
+
+            `mining_weights` is a TRACED argument, not a closed-over constant, so
+            the trainer can refresh the table every epoch without retriggering a
+            recompile of the reset (which would cost more than the mining buys).
+            """
+            bin_rng, frac_rng = jax.random.split(r)
+            b = jax.random.categorical(bin_rng, jp.log(mining_weights + 1e-12))
+            # Bins span the clip, so convert to a frame range and pick uniformly
+            # inside the bin — the bin is the unit of *estimation*, not of start
+            # granularity, so starts stay spread over every frame.
+            lo = (b * start_high) // self._mining_bins
+            hi = jp.maximum(((b + 1) * start_high) // self._mining_bins, lo + 1)
+            idx = jax.random.randint(frac_rng, (), lo, hi)
+            # Back up so the policy runs INTO the hard region with context rather
+            # than being dropped at the failure point cold.
+            return jp.clip(idx - self._mining_lead_in, 0, start_high - 1)
+
+        if mining_weights is not None and self._mining_enabled:
+            start_sampler = _mined_start
+        else:
+            start_sampler = _uniform_start
+
         start_idx = jax.lax.cond(
             self._config.random_start,
-            lambda r: jax.random.randint(r, (), 0, start_high),
+            start_sampler,
             lambda r: jp.int32(0),
             start_rng,
         )

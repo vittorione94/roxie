@@ -226,12 +226,19 @@ class Agent(abc.ABC):
         cls,
         path: str | Path,
         env_obs_size: int,
-        env_act_size: int, 
-        actor_config: dict,
-        critic_config: dict,
-        memory_config: dict,
-        noise_config: dict = None,
+        env_act_size: int,
+        **config_blocks,
     ):
+        """Rebuild an agent from a checkpoint.
+
+        `config_blocks` are the yaml-side construction blocks — `actor_config`,
+        `critic_config`, `memory_config`, `noise_config`, the `*_optimizer_config`
+        blocks — forwarded verbatim from the run's agent config. They are taken
+        as keywords rather than a fixed positional list so an agent that grows a
+        new block (or drops one it never had, like SAC and `noise_config`) needs
+        no change here; `play.py` passes whichever blocks the config declares.
+        Everything else comes from the checkpoint's `hyperparams`.
+        """
         path = Path(path).resolve()
         # Restore weights to host memory (numpy) instead of onto the device
         # sharding baked into the checkpoint. A GPU-trained run pins arrays to
@@ -263,14 +270,7 @@ class Agent(abc.ABC):
                 valid_params |= set(inspect.signature(init).parameters.keys())
         # Keys we set explicitly below must not also come from the checkpoint,
         # or cls(**...) would receive duplicate keyword arguments.
-        explicit_keys = {
-            "env_obs_size",
-            "env_action_size",
-            "actor_config",
-            "critic_config",
-            "memory_config",
-            "noise_config",
-        }
+        explicit_keys = {"env_obs_size", "env_action_size", *config_blocks}
         filtered_hyper = {
             k: v
             for k, v in (hyper or {}).items()
@@ -280,13 +280,11 @@ class Agent(abc.ABC):
         init_kwargs = dict(
             env_obs_size=env_obs_size,
             env_action_size=env_act_size,
-            actor_config=actor_config,
-            critic_config=critic_config,
-            memory_config=memory_config,
+            # A block the config omits is dropped rather than passed as None, so
+            # the constructor's own default applies.
+            **{k: v for k, v in config_blocks.items() if v is not None},
             **(filtered_hyper or {}),
         )
-        if noise_config is not None:
-            init_kwargs["noise_config"] = noise_config
         agent = cls(**init_kwargs)
 
         # Minimal fields commonly used at play time

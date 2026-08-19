@@ -8,21 +8,24 @@
 #     env steps it sees far fewer gradient-relevant samples. Compare on
 #     score-vs-env-steps AND score-vs-wall-clock, and expect a different shape.
 #   - the critic is a V critic (state value), not Q(s, a).
-name: "ppo"
+_target_: roxie.agents.PPO
 
-args:
-  gamma: 0.99
-  learning_steps: 4
-  num_minibatches: 20
-  actor_learning_rate: 1e-4
-  critic_learning_rate: 3e-4
-  target_kl: 0.15
-  gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
-  clip_eps: 0.2                   # PPO surrogate clip range
-  entropy_coef: 0.001             # entropy bonus weight in the actor loss
-  max_grad_norm: 1
+gamma: 0.99
+learning_steps: 4
+num_minibatches: 20
+actor_learning_rate: 1e-4
+critic_learning_rate: 3e-4
+target_kl: 0.15
+gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
+clip_eps: 0.2                   # PPO surrogate clip range
+entropy_coef: 0.001             # entropy bonus weight in the actor loss
+max_grad_norm: 1
+# Constructor defaults, surfaced here so every knob is editable from yaml.
+normalize_observations: true   # running mean/std on observations
+obs_norm_clip: 5.0   # clip normalized observations to +/- this
+obs_norm_eps: 1e-08   # variance floor for the normalizer
 
-actor:
+actor_config:
   _target_: roxie.models.actors.StochasticActor
   features: [1024, 512, 256]
   use_layer_norm: true
@@ -32,13 +35,13 @@ actor:
   # inside actuator_ctrlrange.
   squash: true
 
-critic:
+critic_config:
   _target_: roxie.models.critics.VCritic
   features: [1024, 512, 256]
   use_layer_norm: true
   dropout_rate: 0.
 
-memory:
+memory_config:
   # On-policy trajectory queue: one timestep per env per step (add_sequence_
   # length 1), update fires once `sample_sequence_length` steps are queued =>
   # 64 x 1000 envs = 64k transitions per update, then the queue drains.
@@ -48,3 +51,44 @@ memory:
   add_batch_size: ${env.parallel_envs}
   add_sequence_length: 1
   sample_sequence_length: 32
+
+# Network parameter init. Feeds `nnx.Rngs`; the actor and each critic head take
+# distinct derived offsets so twin critics never start identical (a clipped
+# double-Q min over two identical heads buys nothing). Sweep this to separate a
+# real effect from init luck.
+seed: 0
+
+# Optimizers. `_target_` picks the optax family and carries its own
+# hyperparameters; the learning rate stays a top-level arg above so it remains
+# swept, logged and checkpointed, and `max_grad_norm` applies the global-norm
+# clip ahead of the transform (null/0 disables clipping entirely).
+#
+# For a schedule instead of a constant rate, give the block its own
+# `learning_rate:` sub-block — a block that declares one wins over the scalar
+# arg above:
+#
+#   actor_optimizer_config:
+#     _target_: optax.adamw
+#     weight_decay: 1e-4
+#     learning_rate:
+#       _target_: optax.cosine_decay_schedule
+#       init_value: 3e-4
+#       decay_steps: 1_000_000
+#
+# Swapping family from the CLI must also drop the kwargs the new family does
+# not take -- hydra MERGES dict overrides rather than replacing them, so the
+# b1/b2 below would survive into an optimizer that has no such argument:
+#
+#   agent.actor_optimizer_config._target_=optax.rmsprop \
+#     '~agent.actor_optimizer_config.b1' '~agent.actor_optimizer_config.b2' \
+#     +agent.actor_optimizer_config.decay=0.9
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

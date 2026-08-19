@@ -40,10 +40,16 @@ class TerminationWrapper(wrapper.Wrapper):
         self._current_step_count = 0
         self._episode_active = False
 
-    def reset(self, key: jnp.ndarray) -> WrapperState:
-        """Resets the environment and the wrapper's state."""
+    def reset(self, key: jnp.ndarray, *reset_args) -> WrapperState:
+        """Resets the environment and the wrapper's state.
+
+        `*reset_args` is forwarded verbatim to the wrapped env, so envs with a
+        richer reset signature (the mocap env takes negative-mining weights as a
+        traced second argument) work through the wrapper without it needing to
+        know what those arguments mean.
+        """
         # Reset the base environment to get the initial mjx_env.State
-        initial_env_state = super().reset(key)
+        initial_env_state = self.env.reset(key, *reset_args)
 
         # Normalize flags to 0-d jnp.bool_ for JAX consistency
         false_b = jnp.array(False, dtype=jnp.bool_)

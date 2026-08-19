@@ -1,9 +1,59 @@
 from typing import Optional
 
 import flax.struct as struct
+import hydra
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+from flax import nnx
+
+
+def build_optimizer(config, *, learning_rate: float, max_grad_norm: float = None):
+    """Build one network's optax transform from a hydra `_target_` config.
+
+    `config` names the optimizer family and its own hyperparameters (betas, eps,
+    weight decay, ...); `learning_rate` comes from the agent's
+    `<net>_learning_rate` arg so it stays a first-class swept/logged/checkpointed
+    hyperparameter rather than hiding inside the optimizer block. A block that
+    declares its own `learning_rate` wins — that is how a schedule is passed:
+
+        actor_optimizer_config:
+          _target_: optax.adamw
+          weight_decay: 1e-4
+          learning_rate:
+            _target_: optax.cosine_decay_schedule
+            init_value: 3e-4
+            decay_steps: 1_000_000
+
+    `config=None` falls back to plain Adam, so an agent constructed directly from
+    Python (tests, `Agent.load` on an old checkpoint) behaves as it always has.
+    Clipping stays outside the block: `max_grad_norm` is a top-level agent arg,
+    and null/0 disables it entirely.
+    """
+    if config is None:
+        tx = optax.adam(learning_rate)
+    else:
+        overrides = {} if "learning_rate" in config else {"learning_rate": learning_rate}
+        tx = hydra.utils.instantiate(config, **overrides)
+
+    if max_grad_norm:
+        # Clip first, then adapt: matches the original chain order, so a run with
+        # the default config reproduces pre-refactor numerics exactly.
+        tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), tx)
+    return tx
+
+
+def network_rngs(seed: int, offset: int = 0) -> nnx.Rngs:
+    """Parameter-init RNGs for one network, derived from the agent's `seed`.
+
+    `offset` separates the networks of a single agent so twin critics never start
+    identical (a clipped double-Q min over two identical heads is worthless).
+    The convention is actor=0, critic=2, second critic=4 — which reproduces the
+    previously hardcoded `nnx.Rngs(params=0, dropout=1)` / `(2, 3)` / `(4, 5)`
+    at the default `seed=0`.
+    """
+    return nnx.Rngs(params=seed + offset, dropout=seed + offset + 1)
 
 
 @struct.dataclass
