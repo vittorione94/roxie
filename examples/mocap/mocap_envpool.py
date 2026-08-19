@@ -30,11 +30,27 @@ reset obs on both backends. The true final obs differs in exactly one place —
 it feeds the observation-normalization statistics on the JAX path, while the
 reset obs feeds them here.
 
-Parallelism: one ``MjData`` per env, stepped by a persistent thread pool
-(MuJoCo's python bindings release the GIL inside ``mj_step``, so threads scale
-across cores without pickling). Unlike the GPU backends there are no contact
-budgets to size (native MuJoCo allocates contacts dynamically) and no GPU clip
-budget — the full clip dataset always lives in host RAM.
+Parallelism: two interchangeable steppers, selected by ``env.stepper``.
+
+``rollout`` (default) hands the whole batch to ``mujoco.rollout``, which steps it
+in MuJoCo's own C++ thread pool and returns the post-step state and sensordata as
+batched arrays. Physics, the per-env control filtering and the state capture all
+collapse into that one call. Because rollout exposes only ``state`` and
+``sensordata``, the fields the obs/reward read off MjData (``xpos``, ``xmat``,
+``actuator_force``) are routed through added sensors — see
+``cmu_mocap_data.add_rollout_sensors``.
+
+``threads`` is the original stepper: one ``MjData`` per env driven by a Python
+``ThreadPoolExecutor`` (MuJoCo's bindings release the GIL inside ``mj_step``, so
+threads scale across cores without pickling). Kept as the reference
+implementation and the fallback; the two agree bit-for-bit on obs, reward and
+metrics apart from a ~1e-9 solver drift (see ``check_envpool_parity.py``).
+
+Measured on the 12-core 7900X at 1000 envs: 14.2k sps threaded, 34.3k rollout.
+
+Unlike the GPU backends there are no contact budgets to size (native MuJoCo
+allocates contacts dynamically) and no GPU clip budget — the full clip dataset
+always lives in host RAM.
 
 Usage via experiment YAML::
 
@@ -42,6 +58,7 @@ Usage via experiment YAML::
       builder: examples.mocap.mocap_envpool.build_mocap_envpool_env
       parallel_envs: 20
       num_threads: null   # default: min(parallel_envs, cpu cores)
+      stepper: rollout    # or "threads" for the per-env mj_step loop
 """
 
 from __future__ import annotations
@@ -54,6 +71,7 @@ from typing import Any, Optional
 import mujoco
 import numpy as np
 from ml_collections import config_dict
+from mujoco import rollout as mj_rollout
 
 from examples.mocap.mocap_tracking import (
     CMU_BODY_NAMES,
@@ -147,6 +165,10 @@ _CHUNKS_PER_THREAD = 2
 _OBS_WORKERS = 6
 _OBS_THREAD_MIN_ENVS = 256
 
+# The state vector mujoco.rollout round-trips: (time, qpos, qvel, act).
+_FULL_PHYSICS = mujoco.mjtState.mjSTATE_FULLPHYSICS
+_CTRL_SPEC = int(mujoco.mjtState.mjSTATE_CTRL)
+
 
 class MocapCpuPool:
     """Vectorized CPU mocap-tracking pool with EnvPool-style auto-reset.
@@ -169,9 +191,22 @@ class MocapCpuPool:
         body_names: Optional[dict] = None,
         actuation: str = "torque",
         reset_pool_size: int = 0,
+        rollout_model: Optional[mujoco.MjModel] = None,
+        rollout_addrs: Optional[tuple] = None,
     ):
         self._model = mj_model
         self._config = config
+        # Physics stepper. `rollout_model` is the sensor-augmented twin of
+        # `mj_model` (see cmu_mocap_data.add_rollout_sensors); when given, the
+        # per-env `mj_step` loop and the `_capture` gather are replaced by one
+        # `mujoco.rollout` call. `self._model` stays the BASE model throughout —
+        # obs sizing, foot-sensor addresses and the reward all read it — and the
+        # augmented model is used only where physics is actually stepped, which
+        # is `self._sim_model`. The two are bit-identical dynamically; the
+        # augmented one merely reports more sensors.
+        self._rollout_model = rollout_model
+        self._sim_model = rollout_model if rollout_model is not None else mj_model
+        self._use_rollout = rollout_model is not None
         self._num_envs = int(num_envs)
         self._n_substeps = int(round(config.ctrl_dt / config.sim_dt))
         # Mirrors MocapTrackingEnv._actuation. The MODEL is converted by the
@@ -301,7 +336,14 @@ class MocapCpuPool:
         self._mining_visit = np.zeros(max(self._mining_bins, 1))
         self._mining_fail = np.zeros(max(self._mining_bins, 1))
 
-        self._datas = [mujoco.MjData(mj_model) for _ in range(self._num_envs)]
+        # One MjData per env is the threaded stepper's whole state. The rollout
+        # stepper keeps its state in a plain (num_envs, nstate) array instead and
+        # only needs one scratch MjData per THREAD, so the per-env allocation is
+        # skipped entirely — at 4000 envs that is 4000 MjData not built.
+        self._datas = (
+            [] if self._use_rollout
+            else [mujoco.MjData(mj_model) for _ in range(self._num_envs)]
+        )
         self._rngs = [
             np.random.default_rng(s)
             for s in np.random.SeedSequence(seed).spawn(self._num_envs)
@@ -387,6 +429,129 @@ class MocapCpuPool:
         else:
             self._obs_slices = None
             self._obs_out = None
+
+        self._rollout = None
+        if self._use_rollout:
+            self._init_rollout(rollout_addrs)
+
+    # -- rollout stepper -----------------------------------------------------
+
+    def _init_rollout(self, rollout_addrs) -> None:
+        """Allocate the buffers ``mujoco.rollout`` reads and writes.
+
+        Why this is faster than the thread pool it replaces, measured on the
+        12-core 7900X at 1000 envs stepping the same trajectory:
+
+          - the physics itself: 32.4 ms of bare `ThreadPoolExecutor` mj_step ->
+            19.6 ms in rollout's C++ pool. Same work; the executor loses ~40% to
+            per-chunk dispatch and to workers queueing for the GIL between
+            mj_step calls, which a native pool never touches.
+          - the ~16 ms of GIL-held Python glue that used to run per env inside
+            the stepping worker (clip, filter EMA, `d.ctrl[:] =`, phase advance)
+            becomes a handful of batched numpy ops on (num_envs, nu) arrays.
+          - `_capture` disappears: the state and sensordata come back already
+            batched, so the ~5 ms of per-env MjData reads are simply not paid.
+
+        End to end that is 14.2k -> 34.3k sps at 1000 envs, 13.7k -> 38.5k at
+        4000, with obs/reward/metrics bit-identical to the threaded stepper (see
+        the stepper-parity check in check_envpool_parity.py).
+        """
+        m = self._sim_model
+        self._blk_adr, self._frc_adr = rollout_addrs
+        self._nstate = mujoco.mj_stateSize(m, _FULL_PHYSICS)
+        n, ns, nsub = self._num_envs, self._nstate, self._n_substeps
+
+        self._rollout = mj_rollout.Rollout(nthread=self._num_threads)
+        # rollout wants one scratch MjData per thread, not per env. A second set
+        # is kept for sampling resets (`_reset_rollout`), so that path never
+        # allocates an MjData in the hot loop nor disturbs the stepper's own.
+        self._rl_datas = [mujoco.MjData(m) for _ in range(self._num_threads)]
+        self._rl_scratch = [mujoco.MjData(m) for _ in range(self._num_threads)]
+        # With skip_checks the C++ side does no singleton tiling, so the model
+        # list has to be nbatch long. Same object repeated: it is a list of
+        # references, built once.
+        self._rl_models = [m] * n
+
+        self._state = np.zeros((n, ns))
+        self._st_out = np.zeros((n, nsub, ns))
+        self._sd_out = np.zeros((n, nsub, m.nsensordata))
+        self._control = np.zeros((n, nsub, m.nu))
+        # qacc_warmstart is an INPUT to rollout with no matching output, so it
+        # cannot be carried across control steps the way the threaded stepper's
+        # MjData carries it. Feeding a fixed zero array keeps the stepper
+        # deterministic regardless of how the thread pool happens to schedule
+        # envs onto scratch data; the alternative (passing None, i.e. inheriting
+        # whatever env last used that scratch) would not be. The cost is that
+        # the Newton solver re-converges from cold each control step, which
+        # moves results by ~1e-9 in the float32 obs — the tolerance the parity
+        # check allows for, and the reason it is a tolerance and not equality.
+        self._warmstart = np.zeros((n, m.nv))
+
+        # Cached fancy-index helpers for scattering a reset's rows (see
+        # _apply_pooled_reset); built once because np.ix_ on every reset showed
+        # up in the profile.
+        nb = self._model.nbody
+        self._body_rows = np.arange(1, nb)
+        self._xmat_c0 = np.arange(0, 7, 3)   # xmat is row-major: col 0 = 0,3,6
+        self._xmat_c1 = np.arange(1, 8, 3)   # col 1 = 1,4,7
+
+    def _unpack_rollout(self, st, sd, idxs=None) -> None:
+        """Scatter rollout's (state, sensordata) rows into the batched buffers.
+
+        This is what `_capture` did, minus the per-env MjData reads: the same
+        six arrays, filled from two contiguous blocks. `idxs=None` writes every
+        env (the hot path); an index array writes just those rows (auto-reset).
+        """
+        nb = self._model.nbody
+        nq, nv = self._model.nq, self._model.nv
+        rows = slice(None) if idxs is None else idxs
+        n = self._num_envs if idxs is None else len(idxs)
+
+        self._b_qpos[rows] = st[:, 1:1 + nq]
+        self._b_qvel[rows] = st[:, 1 + nq:1 + nq + nv]
+        # [pos(3), xaxis(3), yaxis(3)] per body, bodies 1..nbody-1, contiguous.
+        blk = sd[:, self._blk_adr:self._blk_adr + 9 * (nb - 1)].reshape(n, nb - 1, 9)
+        if idxs is None:
+            self._b_xpos[:, 1:] = blk[:, :, 0:3]
+            self._b_xmat[:, 1:, self._xmat_c0] = blk[:, :, 3:6]
+            self._b_xmat[:, 1:, self._xmat_c1] = blk[:, :, 6:9]
+        else:
+            self._b_xpos[np.ix_(idxs, self._body_rows)] = blk[:, :, 0:3]
+            self._b_xmat[np.ix_(idxs, self._body_rows, self._xmat_c0)] = blk[:, :, 3:6]
+            self._b_xmat[np.ix_(idxs, self._body_rows, self._xmat_c1)] = blk[:, :, 6:9]
+        self._b_afrc[rows] = sd[:, self._frc_adr:self._frc_adr + self._model.nu]
+        # The task's own sensors keep their addresses: the rollout sensors are
+        # APPENDED, so the base model's block is still sensordata[:nsensordata]
+        # (asserted in add_rollout_sensors).
+        self._b_sensor[rows] = sd[:, :self._model.nsensordata]
+
+    def _advance_rollout(self, actions: np.ndarray) -> None:
+        """Physics + capture for every env: one native call."""
+        cfg = self._config
+        # The per-env control work of `_advance_env`, batched. Held the GIL once
+        # per env before; now three numpy ops for the whole pool.
+        ctrl = np.clip(actions * cfg.action_scale, self._lowers, self._uppers)
+        if self._filter_alpha > 0.0:
+            ctrl = (
+                self._filter_alpha * self._filtered_ctrl
+                + (1.0 - self._filter_alpha) * ctrl
+            )
+        self._filtered_ctrl = ctrl
+        # One command held across all substeps == mj_step(nstep=n_substeps).
+        self._control[...] = ctrl[:, None, :]
+
+        # skip_checks bypasses the wrapper's per-call shape validation and
+        # ascontiguousarray pass; every array here is preallocated, contiguous
+        # and float64, which is exactly the contract that check enforces.
+        self._rollout.rollout(
+            self._rl_models, self._rl_datas, self._state, self._control,
+            skip_checks=True, nstep=self._n_substeps,
+            initial_warmstart=self._warmstart,
+            state=self._st_out, sensordata=self._sd_out,
+        )
+        self._state[...] = self._st_out[:, -1]
+        self._unpack_rollout(self._state, self._sd_out[:, -1])
+        self._phase_idx = (self._phase_idx + 1) % self._clip_len
 
     # -- per-env logic (mirrors MocapTrackingEnv) ----------------------------
 
@@ -507,11 +672,13 @@ class MocapCpuPool:
             "clip_start": np.zeros(n, dtype=np.int64),
             "clip_len": np.ones(n, dtype=np.int64),
         }
+        if self._use_rollout:
+            pool["state"] = np.zeros((n, self._nstate))
         # One scratch MjData per worker thread, not per entry: building the pool
         # is O(pool_size) forward solves and allocating that many MjData would
         # dwarf the work itself.
         n_workers = self._num_threads
-        scratch = [mujoco.MjData(m) for _ in range(n_workers)]
+        scratch = [mujoco.MjData(self._sim_model) for _ in range(n_workers)]
         rngs = [
             np.random.default_rng(s)
             for s in np.random.SeedSequence(
@@ -535,7 +702,10 @@ class MocapCpuPool:
         """Draw one reset state into row ``k`` of ``out`` using scratch data ``d``.
 
         The sampling is `_reset_env`'s, factored out so the on-demand and pooled
-        paths cannot drift apart.
+        paths cannot drift apart. ``out`` is any dict of (n, ...) arrays keyed as
+        below — the reset pool, or the live buffers themselves with ``k`` an env
+        index (see `_reset_all_rollout`). An optional ``"state"`` key receives
+        the packed rollout state; ``d`` must then be a `self._sim_model` MjData.
         """
         cfg = self._config
         clip_idx = int(rng.integers(self._num_clips))
@@ -556,7 +726,8 @@ class MocapCpuPool:
         qpos = self._ref_qpos[abs_idx] + noise * rng.standard_normal(self._model.nq)
         qvel = self._ref_qvel[abs_idx] + noise * rng.standard_normal(self._model.nv)
 
-        mujoco.mj_resetData(self._model, d)
+        m = self._sim_model
+        mujoco.mj_resetData(m, d)
         d.qpos[:] = qpos
         d.qvel[:] = qvel
         # See _reset_env: native mj_forward normalizes the noisy root quat in
@@ -564,18 +735,26 @@ class MocapCpuPool:
         # restored afterwards — the derived xpos/xmat come from the same
         # normalized xquat both backends' kinematics use.
         q_root = d.qpos[3:7].copy()
-        mujoco.mj_forward(self._model, d)
+        mujoco.mj_forward(m, d)
         d.qpos[3:7] = q_root
 
         out["qpos"][k] = d.qpos
         out["qvel"][k] = d.qvel
         out["xpos"][k] = d.xpos
         out["xmat"][k] = d.xmat
-        out["sensor"][k] = d.sensordata
+        # Truncate rather than assign whole: under the rollout stepper `d` is an
+        # augmented-model MjData whose sensordata carries the extra rollout
+        # sensors after the task's own block.
+        out["sensor"][k] = d.sensordata[:self._model.nsensordata]
         out["afrc"][k] = d.actuator_force
         out["phase_idx"][k] = start_idx
         out["clip_start"][k] = clip_start
         out["clip_len"][k] = clip_len
+        if "state" in out:
+            # The rollout stepper's physics state is this packed row, not the
+            # MjData — which is why an auto-reset under it is a pure array copy
+            # with no deferred `mj_resetData` to run on the next step.
+            mujoco.mj_getState(m, d, out["state"][k], _FULL_PHYSICS)
         if self._actuation == "position":
             out["filtered_ctrl"][k] = np.clip(
                 (qpos[self._act_qadr] - self._act_q_lo) / self._act_slope - 1.0,
@@ -606,6 +785,13 @@ class MocapCpuPool:
         self._filtered_ctrl[idxs] = p["filtered_ctrl"][sel]
         self._last_act[idxs] = 0.0
         self._step_count[idxs] = 0
+
+        if self._use_rollout:
+            # Under rollout the physics state IS an array row, so restoring it is
+            # the same kind of copy as the buffers above and there is nothing to
+            # defer: no per-env `mj_resetData`, no `_needs_reset` bookkeeping.
+            self._state[idxs] = p["state"][sel]
+            return
 
         # The MjData itself is NOT touched here — only flagged. Nothing reads it
         # between now and the next `mj_step` (the observation and reward come
@@ -957,33 +1143,87 @@ class MocapCpuPool:
         list(self._executor.map(worker, self._obs_slices))
         return out
 
-    def reset(self) -> tuple[np.ndarray, dict]:
-        def worker(chunk):
-            for i in chunk:
-                self._reset_env(i)
+    def _live_view(self) -> dict:
+        """The live per-env buffers, keyed the way `_sample_reset_into` writes.
 
-        self._run_chunked(worker)
-        # `_reset_env` wrote the MjData directly, so nothing is deferred.
-        self._needs_reset[:] = False
-        self._capture(range(self._num_envs))
+        Lets the rollout stepper reset straight into the arrays the obs is read
+        from, with no MjData in between — the same trick `refresh_reset_pool`
+        uses, pointed at the pool's own state instead of at a side table.
+        """
+        return {
+            "qpos": self._b_qpos, "qvel": self._b_qvel,
+            "xpos": self._b_xpos, "xmat": self._b_xmat,
+            "sensor": self._b_sensor, "afrc": self._b_afrc,
+            "filtered_ctrl": self._filtered_ctrl,
+            "phase_idx": self._phase_idx, "clip_start": self._clip_start,
+            "clip_len": self._clip_len, "state": self._state,
+        }
+
+    def _reset_rollout(self, idxs) -> None:
+        """Freshly sample a reset for ``idxs`` under the rollout stepper.
+
+        Same per-env sampling and the same per-env RNG streams as `_reset_env`
+        (so the two steppers reset to identical states from identical seeds),
+        landing in the live buffers and the packed state array rather than in a
+        per-env MjData. Used for the initial `reset()` and, when no reset pool is
+        configured, for auto-reset.
+        """
+        view = self._live_view()
+        chunks = [c for c in np.array_split(
+            np.asarray(idxs), min(len(idxs), self._num_threads)) if len(c)]
+
+        def worker(w):
+            d = self._rl_scratch[w]
+            for i in chunks[w]:
+                self._sample_reset_into(d, self._rngs[i], view, int(i))
+
+        if self._executor is None or len(chunks) == 1:
+            for w in range(len(chunks)):
+                worker(w)
+        else:
+            list(self._executor.map(worker, range(len(chunks))))
+        self._last_act[idxs] = 0.0
+        self._step_count[idxs] = 0
+
+    def reset(self) -> tuple[np.ndarray, dict]:
+        if self._use_rollout:
+            self._reset_rollout(np.arange(self._num_envs))
+        else:
+            def worker(chunk):
+                for i in chunk:
+                    self._reset_env(i)
+
+            self._run_chunked(worker)
+            # `_reset_env` wrote the MjData directly, so nothing is deferred.
+            self._needs_reset[:] = False
+            self._capture(range(self._num_envs))
         # Build the auto-reset pool off the same distribution, on first reset.
         # `refresh_reset_pool` rebuilds it every epoch thereafter.
         if self._reset_pool_size > 0 and self._reset_pool is None:
             self.refresh_reset_pool()
         return self._gather_obs(), {}
 
-    def step(self, actions: Any) -> tuple[np.ndarray, ...]:
-        actions = np.asarray(actions, dtype=np.float64)
-        cfg = self._config
-
-        # 1. Physics + phase advance, per env across the thread pool (mj_step
-        #    releases the GIL, so this is where the cores get used).
+    def _advance_threads(self, actions: np.ndarray) -> None:
+        """Physics + phase advance, per env across the thread pool (mj_step
+        releases the GIL, so this is where the cores get used)."""
         def worker(chunk):
             for i in chunk:
                 self._advance_env(i, actions[i])
 
         self._run_chunked(worker)
         self._capture(range(self._num_envs))
+
+    def step(self, actions: Any) -> tuple[np.ndarray, ...]:
+        actions = np.asarray(actions, dtype=np.float64)
+        cfg = self._config
+
+        # 1. Advance physics and publish the post-step state into the batched
+        #    buffers. The two steppers differ ONLY here — everything below reads
+        #    the buffers and is shared, which is what keeps them in parity.
+        if self._use_rollout:
+            self._advance_rollout(actions)
+        else:
+            self._advance_threads(actions)
 
         # 2. Reward + termination from the post-step state, batched over envs.
         #    The buffers still hold the post-step (pre-reset) state here — the
@@ -1051,9 +1291,12 @@ class MocapCpuPool:
         done_idx = np.nonzero(done)[0]
         if self._reset_pool is not None:
             self._apply_pooled_reset(done_idx)
-        else:
-            self._reset_many(done_idx)
-            self._capture(done_idx)
+        elif len(done_idx):
+            if self._use_rollout:
+                self._reset_rollout(done_idx)
+            else:
+                self._reset_many(done_idx)
+                self._capture(done_idx)
 
         # 5. Observation from the post-reset state, batched over envs.
         obs = self._gather_obs()
@@ -1068,9 +1311,14 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     """Builder for the CPU EnvPool-style mocap env (see ``env.builder``).
 
     Reads from cfg_env (beyond the shared config/reward groups):
-      parallel_envs (int):   training pool size; throughput saturates around
-                             the physical core count, unlike the GPU backends.
+      parallel_envs (int):   training pool size. Throughput is near-flat in this
+                             number (per-env cost, not dispatch, is the wall):
+                             measured 34.3k sps at 1000 and 38.5k at 4000.
       num_threads (int?):    stepping threads; null = min(parallel_envs, cores).
+      stepper (str):         "rollout" (default, native batched stepping) or
+                             "threads" (per-env mj_step over a ThreadPoolExecutor,
+                             the reference implementation). See the module
+                             docstring.
       test_episodes (int):   eval pool size; must match trainer.test_episodes.
       seed, clip_ids, collisions, actuation, actuation_kp_scale,
       actuation_kv_ratio: as in the GPU builder, and read with the SAME
@@ -1095,15 +1343,23 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
             OmegaConf.merge(cfg_env, {"impl": "jax"}), mode="play"
         )
 
-    from examples.mocap.cmu_mocap_data import build_cmu_humanoid, load_cmu_clips
+    from examples.mocap.cmu_mocap_data import (
+        add_rollout_sensors, build_cmu_humanoid, load_cmu_clips,
+    )
     from examples.mocap.loader import build_env_config
 
     config = build_env_config(cfg_env)
 
+    stepper = str(cfg_env.get("stepper", "rollout"))
+    if stepper not in ("rollout", "threads"):
+        raise ValueError(
+            f"env.stepper must be 'rollout' or 'threads', got {stepper!r}"
+        )
+
     # Build model -> load clips -> configure, in that order, because that is
     # what load_mocap_env does: clip retargeting reads the model, so doing it
     # on either side of the model rewrites is a difference worth not having.
-    mj_model, _ = build_cmu_humanoid()
+    mj_model, xml_path = build_cmu_humanoid()
     mj_model.opt.timestep = config.sim_dt
 
     clip_ids = list(cfg_env.clip_ids) if cfg_env.get("clip_ids") else None
@@ -1126,6 +1382,23 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     num_threads = cfg_env.get("num_threads", None)
     test_episodes = int(cfg_env.get("test_episodes", 5))
 
+    # The sensor-augmented twin the rollout stepper steps. Built from the SAME
+    # cached XML and then given the same rewrites in the same order, so its
+    # dynamics are bit-identical to `mj_model` — only its sensor block is wider.
+    rollout_model = None
+    rollout_addrs = None
+    if stepper == "rollout":
+        rollout_model, blk, frc = add_rollout_sensors(xml_path)
+        rollout_model.opt.timestep = config.sim_dt
+        _configure_collisions(rollout_model, resolve_collision_mode(cfg_env))
+        _configure_actuation(
+            rollout_model,
+            actuation,
+            float(cfg_env.get("actuation_kp_scale", 1.0)),
+            float(cfg_env.get("actuation_kv_ratio", 0.1)),
+        )
+        rollout_addrs = (blk, frc)
+
     train_pool = MocapCpuPool(
         mj_model, dataset, config,
         num_envs=int(cfg_env.parallel_envs),
@@ -1134,6 +1407,8 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         actuation=actuation,
         # POOL_SIZE == NUM_ENVS, the same sizing _run_jax uses.
         reset_pool_size=int(cfg_env.parallel_envs),
+        rollout_model=rollout_model,
+        rollout_addrs=rollout_addrs,
     )
     # Canonical eval protocol (mirrors the GPU loader): start at frame 0, no
     # reset noise, run each clip to its end. See the eval-env note in
@@ -1149,6 +1424,12 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     # final frame stays reachable past the look_ahead cutoff.
     eval_horizon = int(max(dataset["clip_lengths"])) + 1
     eval_config.episode_length = eval_horizon
+    # The eval pool stays on the threaded stepper regardless of `stepper`. It is
+    # `test_episodes` envs (single digits), where rollout's advantage — amortizing
+    # dispatch over a large batch — does not exist, and it keeps the per-env
+    # MjData that `_get_obs`/`_get_reward` and the parity checker read. The two
+    # steppers' physics is the same model with the same rewrites, so an eval
+    # score is not measuring anything different from what training stepped.
     test_pool = MocapCpuPool(
         mj_model, dataset, eval_config,
         num_envs=test_episodes,

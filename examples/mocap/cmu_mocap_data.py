@@ -122,6 +122,87 @@ def _add_foot_touch_sensors(root: ET.Element, probe_model: mujoco.MjModel) -> No
         )
 
 
+# Name prefix for the sensors that exist only to carry MjData fields out of
+# ``mujoco.rollout`` (see ``add_rollout_sensors``). Prefixed so they are trivially
+# distinguishable from the task's real sensors when reading a model.
+ROLLOUT_SENSOR_PREFIX = "_rollout_"
+
+
+def add_rollout_sensors(xml_path: str) -> tuple[mujoco.MjModel, int, int]:
+    """Compile the humanoid with sensors mirroring xpos / xmat / actuator_force.
+
+    ``mujoco.rollout`` steps physics in its own C++ thread pool and hands back
+    only two arrays: the packed state (time, qpos, qvel, act) and ``sensordata``.
+    The mocap observation and reward additionally read ``xpos``, ``xmat`` and
+    ``actuator_force`` off MjData -- fields rollout never exposes, because the
+    MjData it steps through is per-*thread* scratch, not per-env. Adding a sensor
+    for each of them routes those fields through ``sensordata``, which is how the
+    whole capture stage collapses into the same native call as the physics.
+
+    Per non-world body: ``framepos`` (== xpos) plus ``framexaxis``/``frameyaxis``
+    (== columns 0 and 1 of xmat, i.e. exactly the 6D rotation rep the obs wants,
+    so ``_mat_to_rot6d_np`` becomes a free reshape). Per actuator: ``actuatorfrc``
+    (== actuator_force). All verified bit-for-bit against the MjData fields by
+    ``check_envpool_parity.py``.
+
+    NOTE the frame sensors bind to ``mjOBJ_XBODY``, not ``mjOBJ_BODY``. In MuJoCo
+    the latter is the body's INERTIAL frame (xipos/ximat); the body frame that
+    ``xpos``/``xmat`` hold is XBODY. Getting this wrong yields plausible-looking
+    but silently wrong observations.
+
+    These sensors are for the CPU rollout backend only -- they roughly 12x
+    ``nsensordata`` (29 -> 364), which costs ~9% of the physics step here but
+    would be pure waste on the MJX/Warp paths, which read MjData fields directly.
+
+    Returns ``(model, frame_block_adr, actuator_frc_adr)``, where the frame block
+    is ``nbody - 1`` contiguous rows of ``[pos(3), xaxis(3), yaxis(3)]`` in body
+    order starting at body 1.
+    """
+    spec = mujoco.MjSpec.from_file(xml_path)
+    base = spec.compile()
+    names = [base.body(i).name for i in range(base.nbody)]
+
+    for bname in names[1:]:
+        for stype, tag in (
+            (mujoco.mjtSensor.mjSENS_FRAMEPOS, "pos"),
+            (mujoco.mjtSensor.mjSENS_FRAMEXAXIS, "xax"),
+            (mujoco.mjtSensor.mjSENS_FRAMEYAXIS, "yax"),
+        ):
+            s = spec.add_sensor()
+            s.name = f"{ROLLOUT_SENSOR_PREFIX}{tag}_{bname}"
+            s.type = stype
+            s.objtype = mujoco.mjtObj.mjOBJ_XBODY
+            s.objname = bname
+    for a in range(base.nu):
+        s = spec.add_sensor()
+        s.name = f"{ROLLOUT_SENSOR_PREFIX}frc_{a}"
+        s.type = mujoco.mjtSensor.mjSENS_ACTUATORFRC
+        s.objtype = mujoco.mjtObj.mjOBJ_ACTUATOR
+        s.objname = base.actuator(a).name
+
+    model = spec.compile()
+
+    blk = int(model.sensor(f"{ROLLOUT_SENSOR_PREFIX}pos_{names[1]}").adr[0])
+    frc = int(model.sensor(f"{ROLLOUT_SENSOR_PREFIX}frc_0").adr[0])
+    # Two layout facts the pool's unpacking relies on, asserted rather than
+    # assumed: the appended sensors start exactly where the base model's
+    # sensordata ends (so `sensordata[:base.nsensordata]` is still the task's own
+    # sensor block, unshifted), and the frame sensors form one contiguous
+    # (nbody-1, 9) block that can be reshaped instead of gathered.
+    if blk != base.nsensordata:
+        raise AssertionError(
+            f"rollout sensors start at {blk}, expected {base.nsensordata}"
+        )
+    expected = np.arange(blk, blk + 9 * (base.nbody - 1))
+    got = np.array([
+        int(model.sensor(f"{ROLLOUT_SENSOR_PREFIX}{tag}_{b}").adr[0]) + k
+        for b in names[1:] for tag in ("pos", "xax", "yax") for k in range(3)
+    ])
+    if not np.array_equal(expected, got):
+        raise AssertionError("rollout frame sensors are not one contiguous block")
+    return model, blk, frc
+
+
 def build_cmu_humanoid() -> tuple[mujoco.MjModel, str]:
     """Build the CMU humanoid MuJoCo model with a free joint and floor.
 
