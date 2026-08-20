@@ -19,8 +19,8 @@ alpha_learning_rate: 3e-4
 init_log_alpha: 0.0
 auto_alpha: true
 target_entropy: null            # null -> -dim(A) = -6 on the walker
-memory_warmup: 30_000
-steps_before_learning: 30_000
+memory_warmup: 30_720
+steps_before_learning: 30_720
 steps_between_updates: 2_048
 learning_steps: 20
 # 1 = textbook SAC (actor updated on every critic step). Raising it is an

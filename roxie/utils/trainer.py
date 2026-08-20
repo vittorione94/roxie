@@ -311,6 +311,10 @@ class Trainer:
             agent_key, warm_key = jax.random.split(agent_key)
             agent.update(steps=agent.steps_before_learning, agent_rng=warm_key)
             jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
+            # That call served the boundary at `steps_before_learning`. Hand it
+            # back so the training loop runs the full schedule and the realized
+            # replay ratio is the one the config asks for, not one burst short.
+            agent._last_update_boundary = -1
             print(f"  {time.time() - t0:.1f}s", flush=True)
 
         # --- Training loop ---
@@ -468,63 +472,35 @@ class Trainer:
                     epoch_score_std = float(jnp.std(scores))
                     epoch_length_std = float(jnp.std(lengths.astype(jnp.float32)))
 
-                # Keyed by env steps so the wandb x-axis matches training progress.
-                logger.store("epoch", epochs)
-                logger.store("steps", self.steps)
-                logger.store("episodes/epoch", ep_n)
-                logger.store("episodes/total", int(episodes))
-                logger.store("time/total_s", time.time() - start_time)
-                logger.store("time/epoch_s", time.time() - last_epoch_time)
-                logger.store("sps", sps)
-                logger.store("score", epoch_score)
-                logger.store("score/std", epoch_score_std)
-                logger.store("length", epoch_length)
-                logger.store("length/std", epoch_length_std)
-                logger.store("gradient_steps", tot_gradient_steps)
-                logger.store(
-                    "loss/actor",
-                    float(np.mean(actor_losses)) if actor_losses else 0.0,
-                )
-                logger.store(
-                    "loss/critic",
-                    float(np.mean(critic_losses)) if critic_losses else 0.0,
-                )
-                # Epoch-mean of each env metric, keyed by its own name so the
-                # backends nest it (e.g. under `reward/`).
-                if metric_iters > 0:
-                    for k, total in metric_sums.items():
-                        logger.store(k, float(jnp.mean(total) / metric_iters))
-                # Post-clip noise in normalized [-1, 1] action units. Compare
-                # against the noise module's scheduled scale to see how much
-                # clipping eats.
-                if noise_iters > 0:
-                    logger.store("noise/per_joint_abs", float(noise_abs_sum / noise_iters))
-                # Optional per-agent diagnostics (PPO's trust-region metrics);
-                # agents without the hook contribute nothing.
-                pop_diagnostics = getattr(agent, "pop_diagnostics", None)
-                if pop_diagnostics is not None:
-                    for k, v in pop_diagnostics().items():
-                        logger.store(k, float(v))
-                # Logged before the refresh below, which zeroes the counters.
-                # `mining/effective_bins` collapsing toward 1 means the start
-                # distribution has degenerated onto a single region.
-                if mining_on:
-                    for k, v in mining_env.mining_stats(
+                # Keyed by env steps so the wandb x-axis matches training
+                # progress. Every metric is namespaced by its producer — see
+                # `_store_epoch_metrics` for the scheme.
+                self._store_epoch_metrics(
+                    agent=agent,
+                    epochs=epochs,
+                    ep_n=ep_n,
+                    episodes=episodes,
+                    start_time=start_time,
+                    last_epoch_time=last_epoch_time,
+                    sps=sps,
+                    epoch_score=epoch_score,
+                    epoch_score_std=epoch_score_std,
+                    epoch_length=epoch_length,
+                    epoch_length_std=epoch_length_std,
+                    tot_gradient_steps=tot_gradient_steps,
+                    actor_losses=actor_losses,
+                    critic_losses=critic_losses,
+                    env_metrics={
+                        k: float(jnp.mean(total) / metric_iters)
+                        for k, total in metric_sums.items()
+                    } if metric_iters > 0 else None,
+                    noise_abs=(float(noise_abs_sum / noise_iters)
+                               if noise_iters > 0 else None),
+                    # Read before the refresh below, which zeroes the counters.
+                    mining_stats=(mining_env.mining_stats(
                         mining_weights, mining_counts
-                    ).items():
-                        logger.store(k, float(v))
-                # A no-op on hosts without nvidia-smi.
-                for k, v in logger.gpu_stats().items():
-                    logger.store(k, v)
-                # Host-memory watch: resident set plus live JAX buffer count, so
-                # creep toward an OOM is visible in the logs. /proc is Linux-only.
-                try:
-                    page = os.sysconf("SC_PAGE_SIZE")
-                    rss_pages = int(open("/proc/self/statm").read().split()[1])
-                    logger.store("mem/rss_gb", rss_pages * page / 1e9)
-                    logger.store("mem/live_arrays", len(jax.live_arrays()))
-                except (OSError, ValueError):
-                    pass
+                    ) if mining_on else None),
+                )
                 logger.dump(step=self.steps)
 
                 actor_losses = []
@@ -635,6 +611,95 @@ class Trainer:
             return scores, lengths
 
         return eval_fn
+
+    def _store_epoch_metrics(
+        self, *, agent, epochs, ep_n, episodes, start_time, last_epoch_time, sps,
+        epoch_score, epoch_score_std, epoch_length, epoch_length_std,
+        tot_gradient_steps, actor_losses, critic_losses, env_metrics=None,
+        noise_abs=None, mining_stats=None,
+    ):
+        """Store one epoch's metrics under the shared namespace scheme.
+
+        Both training loops (`_run_jax` and `_run_envpool`) funnel through here
+        so the two paths cannot drift into logging different key sets for the
+        same quantities — they previously carried two hand-maintained copies of
+        this block.
+
+        THE SCHEME. Every metric is namespaced by what produced it, so wandb's
+        sidebar and the console dump group the same way and a panel definition
+        written against one run works for any other:
+
+          ``epoch`` / ``steps``   the run axes, ungrouped
+          ``train/*``             the behaviour policy and the learner
+          ``test/*``              the held-out eval (see `_test`)
+          ``sys/*``               throughput, wall-clock, host and device health
+
+        Anything a producer already prefixes for itself — env reward components
+        (``reward/``), agent diagnostics (``td3/``, ``ppo/``), start-state mining
+        (``mining/``) — is nested UNDER ``train/`` rather than left at the top
+        level. The agents and envs stay unaware of the logging namespace; this is
+        the only place that knows it.
+        """
+        logger.store("epoch", epochs)
+        logger.store("steps", self.steps)
+
+        logger.store("train/score", epoch_score)
+        logger.store("train/score/std", epoch_score_std)
+        logger.store("train/length", epoch_length)
+        logger.store("train/length/std", epoch_length_std)
+        logger.store("train/episodes/epoch", ep_n)
+        logger.store("train/episodes/total", int(episodes))
+        logger.store("train/gradient_steps", tot_gradient_steps)
+        # None, not 0.0, when the epoch ran no gradient bursts. A logged zero is
+        # indistinguishable from a real converged loss, and that ambiguity is
+        # precisely what hid the v1 release grid's zero-gradient-step bug for a
+        # full 21-run overnight sweep. The backends render an absent metric as a
+        # gap (see `WandbBackend.log`).
+        logger.store(
+            "train/loss/actor",
+            float(np.mean(actor_losses)) if actor_losses else None,
+        )
+        logger.store(
+            "train/loss/critic",
+            float(np.mean(critic_losses)) if critic_losses else None,
+        )
+        # Epoch-mean of each env metric, e.g. `train/reward/upright`.
+        for k, v in (env_metrics or {}).items():
+            logger.store(f"train/{k}", float(v))
+        # Post-clip noise in normalized [-1, 1] action units. Compare against the
+        # noise module's scheduled scale to see how much clipping eats.
+        if noise_abs is not None:
+            logger.store("train/noise/per_joint_abs", float(noise_abs))
+        # Optional per-agent diagnostics (TD3's saturation/value block, PPO's
+        # trust-region block); agents without the hook contribute nothing.
+        pop_diagnostics = getattr(agent, "pop_diagnostics", None)
+        if pop_diagnostics is not None:
+            for k, v in pop_diagnostics().items():
+                logger.store(f"train/{k}", float(v))
+        # `train/mining/effective_bins` collapsing toward 1 means the start
+        # distribution has degenerated onto a single region.
+        for k, v in (mining_stats or {}).items():
+            logger.store(f"train/{k}", float(v))
+
+        logger.store("sys/sps", sps)
+        logger.store("sys/time/total_s", time.time() - start_time)
+        logger.store("sys/time/epoch_s", time.time() - last_epoch_time)
+        # Device telemetry is WHOLE-CARD, so logging it from a run that is not on
+        # the GPU attributes another process's memory and utilisation to this
+        # one. Gate on this process actually holding a GPU device — that is what
+        # makes the numbers belong to the run. A no-op without nvidia-smi.
+        if any(d.platform == "gpu" for d in jax.devices()):
+            for k, v in logger.gpu_stats().items():
+                logger.store(k, v)
+        # Host-memory watch: resident set plus live JAX buffer count, so creep
+        # toward an OOM is visible in the logs. /proc is Linux-only.
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+            rss_pages = int(open("/proc/self/statm").read().split()[1])
+            logger.store("sys/mem/rss_gb", rss_pages * page / 1e9)
+            logger.store("sys/mem/live_arrays", len(jax.live_arrays()))
+        except (OSError, ValueError):
+            pass
 
     def _test(self, rng, v_reset, v_step):
         """Run the held-out eval rollouts. `rng` is accepted for call-site
@@ -771,6 +836,8 @@ class Trainer:
             agent_key, warm_key = jax.random.split(agent_key)
             agent.update(steps=agent.steps_before_learning, agent_rng=warm_key)
             jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
+            # See the sync path: give back the boundary the precompile consumed.
+            agent._last_update_boundary = -1
             print(f"  {time.time() - t0:.1f}s", flush=True)
 
         # --- Optional async learner (overlap CPU acting + GPU learning) ---
@@ -963,57 +1030,37 @@ class Trainer:
                     epoch_score_std = float(np.std(scores))
                     epoch_length_std = float(np.std(lengths))
 
-                logger.store("epoch", epochs)
-                logger.store("steps", self.steps)
-                logger.store("episodes/epoch", ep_n)
-                logger.store("episodes/total", int(episodes))
-                logger.store("time/total_s", time.time() - start_time)
-                logger.store("time/epoch_s", time.time() - last_epoch_time)
-                logger.store("sps", sps)
-                logger.store("score", epoch_score)
-                logger.store("score/std", epoch_score_std)
-                logger.store("length", epoch_length)
-                logger.store("length/std", epoch_length_std)
-                logger.store("gradient_steps", tot_gradient_steps)
-                logger.store(
-                    "loss/actor",
-                    float(np.mean([float(x) for x in actor_losses])) if actor_losses else 0.0,
+                # Read before the mining refresh below zeroes the counters.
+                mining_stats = env.mining_stats() if mining_on else None
+                self._store_epoch_metrics(
+                    agent=agent,
+                    epochs=epochs,
+                    ep_n=ep_n,
+                    episodes=episodes,
+                    start_time=start_time,
+                    last_epoch_time=last_epoch_time,
+                    sps=sps,
+                    epoch_score=epoch_score,
+                    epoch_score_std=epoch_score_std,
+                    epoch_length=epoch_length,
+                    epoch_length_std=epoch_length_std,
+                    tot_gradient_steps=tot_gradient_steps,
+                    actor_losses=[float(x) for x in actor_losses],
+                    critic_losses=[float(x) for x in critic_losses],
+                    env_metrics={
+                        k: total / metric_iters for k, total in metric_sums.items()
+                    } if metric_iters > 0 else None,
+                    noise_abs=(noise_abs_sum / noise_iters
+                               if noise_iters > 0 else None),
+                    mining_stats=mining_stats,
                 )
-                logger.store(
-                    "loss/critic",
-                    float(np.mean([float(x) for x in critic_losses])) if critic_losses else 0.0,
-                )
-                if metric_iters > 0:
-                    for k, total in metric_sums.items():
-                        logger.store(k, total / metric_iters)
-                if noise_iters > 0:
-                    logger.store("noise/per_joint_abs", noise_abs_sum / noise_iters)
-                # Same per-agent diagnostics hook the MJX loop drains.
-                pop_diagnostics = getattr(agent, "pop_diagnostics", None)
-                if pop_diagnostics is not None:
-                    for k, v in pop_diagnostics().items():
-                        logger.store(k, float(v))
-                # Logged before the refresh below zeroes the counters, as in
-                # _run_jax.
                 if mining_on:
-                    for k, v in env.mining_stats().items():
-                        logger.store(k, float(v))
                     env.mining_refresh()
                 # Regenerate the auto-reset pool AFTER the mining refresh, so the
                 # new pool reflects this epoch's terminations.
                 refresh_pool = getattr(env, "refresh_reset_pool", None)
                 if refresh_pool is not None:
                     refresh_pool()
-                for k, v in logger.gpu_stats().items():
-                    logger.store(k, v)
-                # Host-memory watch, as in _run_jax. /proc is Linux-only.
-                try:
-                    page = os.sysconf("SC_PAGE_SIZE")
-                    rss_pages = int(open("/proc/self/statm").read().split()[1])
-                    logger.store("mem/rss_gb", rss_pages * page / 1e9)
-                    logger.store("mem/live_arrays", len(jax.live_arrays()))
-                except (OSError, ValueError):
-                    pass
                 logger.dump(step=self.steps)
 
                 actor_losses = []

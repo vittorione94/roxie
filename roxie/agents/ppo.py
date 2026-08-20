@@ -464,7 +464,7 @@ class PPO(Agent):
 
     def update(self, steps, agent_rng):
         # Losses are summed over every gradient pass actually executed and averaged
-        # at the end, so `loss/actor` / `loss/critic` summarize the whole update
+        # at the end, so `train/loss/actor` / `train/loss/critic` summarize the whole update
         # rather than one arbitrary minibatch (which, when the KL early stop fires,
         # would specifically be the threshold-crossing one).
         gradient_steps = 0

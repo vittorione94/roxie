@@ -139,6 +139,13 @@ def serialize_bound(x):
         if x.shape == ():
             return float(x)
         return np.asarray(x, dtype=np.float32).tolist()
+    # A list/tuple arrives when the agent was built FROM a checkpoint: this
+    # function wrote per-actuator bounds out as a list, and `Agent.load` feeds
+    # that list straight back into the constructor, which re-serializes it on
+    # its way to the hyperparameter banner. Without this branch the round trip
+    # dies in `float([...])` — train fine, crash on every `play.py`.
+    if isinstance(x, (list, tuple)):
+        return [serialize_bound(v) for v in x]
     if hasattr(x, "item"):
         return x.item()
     return float(x)

@@ -7,12 +7,22 @@
 #   optimisation  adam, lr 3e-4 (actor and critic), global grad-norm clip 1
 #   targets       gamma 0.99, tau 0.005
 #   replay        flat buffer 500k, min 10k, batch 512
-#   warmup        memory_warmup 30k = steps_before_learning 30k
+#   warmup        memory_warmup 30_720 = steps_before_learning 30_720
 #   schedule      steps_between_updates 2_048 env steps x learning_steps 20
 #                 grad steps at batch 512  =>  replay ratio 5.0, and ~48.8k
 #                 gradient steps over the 5M-step budget. 2_048 is 8 trainer
 #                 iterations at parallel_envs 256; keep it a multiple of the env
 #                 count or the update boundary silently rounds up to one.
+#
+#                 BOTH numbers are multiples of parallel_envs 256, and 30_720
+#                 (= 120 x 256) is why the warmup figure is not a round 30k. The
+#                 trainer advances `steps` in strides of parallel_envs, so an
+#                 unaligned OFFSET used to disarm the schedule outright: at
+#                 30_000 the v1 release grid ran all six off-policy arms for 5M
+#                 env steps at ZERO gradient steps. `Agent.due_for_update` no
+#                 longer depends on that alignment, so this is now only about
+#                 warmup landing on an iteration boundary rather than 48 steps
+#                 past one — but keep the multiples anyway, they are free.
 #   returns       n_step 5 wherever the agent takes it (MPO/PPO do not)
 #   init          seed 0
 #   obs           running normalization on, clip 5.0
@@ -35,8 +45,8 @@ critic_learning_rate: 3e-4
 # is what the td3_bench arm adds on top of this file).
 target_policy_noise: 0.0
 target_noise_clip: 0.0
-memory_warmup: 30_000
-steps_before_learning: 30_000
+memory_warmup: 30_720
+steps_before_learning: 30_720
 steps_between_updates: 2_048
 learning_steps: 20
 n_step: 5

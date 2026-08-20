@@ -21,14 +21,21 @@ _GPU_QUERY_FIELDS = (
 )
 
 
-def gpu_stats(prefix="gpu"):
+def gpu_stats(prefix="sys/gpu"):
     """Sample per-GPU telemetry via ``nvidia-smi`` as a flat metric dict.
 
     Returns ``{}`` when no NVIDIA GPU is queryable (and disables itself so later
     calls are free). Cheap enough to call once per epoch. Keys are nested under
     ``prefix`` (and the GPU index when more than one device is present) so the
-    logger backends group them: e.g. ``gpu/util_pct``, ``gpu/temp_c``, or
-    ``gpu/0/util_pct`` on multi-GPU hosts.
+    logger backends group them: e.g. ``sys/gpu/util_pct``, ``sys/gpu/temp_c``,
+    or ``sys/gpu/0/util_pct`` on multi-GPU hosts.
+
+    These are WHOLE-DEVICE readings, not this process's share: `nvidia-smi`
+    reports the card, so anything else resident on it is included. Callers must
+    not log them for a run that is not itself on the GPU — the v1 release grid
+    did, and its deliberately GPU-free `mjx_cpu` cell published 2.6 GB of GPU
+    memory and 6% utilisation belonging to an unrelated process. `Trainer` gates
+    the call on the process actually holding a GPU device.
     """
     global _gpu_stats_enabled
     if not _gpu_stats_enabled:
@@ -109,48 +116,47 @@ class Backend:
 class ConsoleBackend(Backend):
     """Pretty-prints metrics to stdout as an indented, ``/``-nested table.
 
-    Flat metric keys are first grouped into ordered sections — ``training`` /
-    ``test`` / ``system`` (with ``epoch`` and ``gradient_steps`` ungrouped on
-    top) — so the epoch dump reads as a clear hierarchy instead of one
-    alphabetical block. A ``mean``/``std`` pair (a key ``K`` stored alongside
-    ``K/std``) collapses onto a single ``mean +- std`` line. Keys not named in
-    the layout still appear — sorted after the known ones within their group —
-    so new metrics are never silently dropped.
+    Metric keys carry their own section as the first ``/`` segment — ``train/``,
+    ``test/`` or ``sys/`` — so the epoch dump reads as a clear hierarchy instead
+    of one alphabetical block. Only the run axes (``epoch``, ``steps``) sit
+    ungrouped on top. A ``mean``/``std`` pair (a key ``K`` stored alongside
+    ``K/std``) collapses onto a single ``mean +- std`` line. Keys outside the
+    known sections still appear — sorted after the known ones — so new metrics
+    are never silently dropped.
     """
 
     INDENT = "  "
 
-    # Shown ungrouped at the top, in this order.
-    TOP_KEYS = ("epoch", "gradient_steps")
-    # A key is placed under ``system`` when its first ``/`` segment is one of
-    # these, or when it is named exactly in SYSTEM_KEYS. ``test/*`` keys keep
-    # their own section; everything else lands under ``training``.
-    SYSTEM_GROUPS = ("gpu", "mem", "time", "episodes")
-    SYSTEM_KEYS = ("sps", "steps")
+    # Shown ungrouped at the top, in this order. Everything else is expected to
+    # arrive already namespaced by its producer (see `Trainer`), so this backend
+    # no longer guesses which section a bare key belongs to.
+    TOP_KEYS = ("epoch", "steps")
 
-    # Display order of node paths (after remapping into sections). Any path not
-    # listed here sorts alphabetically after its listed siblings, so the layout
-    # degrades gracefully as new metrics appear.
+    # Display order of node paths. Any path not listed here sorts alphabetically
+    # after its listed siblings, so the layout degrades gracefully as new
+    # metrics appear.
     ORDER = (
         "epoch",
-        "gradient_steps",
-        "training",
-        "training/length",
-        "training/score",
-        "training/reward",
-        "training/root_dist",
-        "training/loss",
-        "training/noise",
+        "steps",
+        "train",
+        "train/score",
+        "train/length",
+        "train/episodes",
+        "train/gradient_steps",
+        "train/loss",
+        "train/reward",
+        "train/root_dist",
+        "train/noise",
+        "train/mining",
         "test",
-        "test/length",
         "test/score",
-        "system",
-        "system/gpu",
-        "system/mem",
-        "system/time",
-        "system/episodes",
-        "system/sps",
-        "system/steps",
+        "test/length",
+        "test/distinct_starts",
+        "sys",
+        "sys/sps",
+        "sys/time",
+        "sys/gpu",
+        "sys/mem",
     )
 
     def __init__(self, width=60):
@@ -162,15 +168,8 @@ class ConsoleBackend(Backend):
         self.rows = []
 
     def _display_path(self, key):
-        """Remap a flat metric key to its sectioned display path."""
-        if key in self.TOP_KEYS:
-            return key
-        first = key.split("/", 1)[0]
-        if key in self.SYSTEM_KEYS or first in self.SYSTEM_GROUPS:
-            return "system/" + key
-        if first == "test":
-            return key
-        return "training/" + key
+        """The key IS its display path — producers namespace their own metrics."""
+        return key
 
     def _sort_key(self, path):
         """Order path segments among siblings via ORDER, then alphabetically."""
@@ -207,6 +206,11 @@ class ConsoleBackend(Backend):
 
     @staticmethod
     def _fmt(val, pad=False):
+        # A metric can be deliberately absent for an epoch — `train/loss/*`
+        # before the first gradient burst, say. Render the gap rather than
+        # crashing on the type check below (or, worse, printing it as a 0).
+        if val is None:
+            return f"{'-':>8}" if pad else "-"
         if np.issubdtype(type(val), np.floating):
             return f"{val:8.3g}" if pad else f"{val:.3g}"
         if np.issubdtype(type(val), np.integer):
@@ -345,7 +349,12 @@ class WandbBackend(Backend):
         )
 
     def log(self, data, step):
-        self.run.log(data, step=int(step))
+        # Drop absent metrics rather than sending nulls: wandb renders a missing
+        # key as a gap in the series, which is the honest picture for something
+        # that genuinely did not happen this epoch (no gradient burst yet, so no
+        # loss). Sending 0 instead is what let the v1 release grid publish 50
+        # epochs of `loss/actor = 0.0` that read as a real, converged loss.
+        self.run.log({k: v for k, v in data.items() if v is not None}, step=int(step))
 
     def close(self):
         self.run.finish()
@@ -419,6 +428,16 @@ class Logger:
         keys = list(self.epoch_dict.keys())
         for key in keys:
             values = self.epoch_dict[key]
+            # A metric can be stored as None to mean "did not happen this
+            # epoch" (see `Trainer._store_epoch_metrics`). Averaging Nones is a
+            # TypeError, and coercing them to 0 would reintroduce exactly the
+            # fake-zero the None is there to avoid, so drop them and only report
+            # a value when something real was stored.
+            present = [v for v in values if v is not None]
+            if not present:
+                self.epoch_dict[key] = None
+                continue
+            values = present
             if key in self.stat_keys:
                 self.epoch_dict[key + "/mean"] = np.mean(values)
                 self.epoch_dict[key + "/std"] = np.std(values)

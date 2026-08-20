@@ -474,10 +474,7 @@ class DDPG(Agent):
     def update(self, steps, agent_rng):
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
 
-        if (
-            steps >= self.steps_before_learning
-            and (steps - self.steps_before_learning) % self.steps_between_updates == 0
-        ):
+        if self.due_for_update(steps):
             actor_loss, critic_loss = self.learn(agent_rng)
             gradient_steps += self.learning_steps
 

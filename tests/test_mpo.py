@@ -175,12 +175,28 @@ class TestFusedBurst:
         assert not hasattr(agent, "select_action")
 
     def test_update_gate_respects_schedule(self, agent):
+        """One burst per `steps_between_updates` of ELAPSED env steps.
+
+        This used to assert that `update(105)` fires nothing because 105 is not
+        exactly a boundary. That is the behaviour that broke the v1 release grid:
+        the trainer advances `steps` in strides of `parallel_envs` and only ever
+        lands exactly on a boundary when the stride divides the offset, so an
+        unaligned `steps_before_learning` disarmed learning completely. The gate
+        now serves a boundary on the first call at or past it — see
+        tests/test_update_schedule.py.
+        """
         _fill_buffer(agent)
         agent.steps_before_learning = 100
         agent.steps_between_updates = 10
 
+        # Before warmup: nothing, regardless of where the stride lands.
         assert agent.update(99, jax.random.PRNGKey(0))[0] == 0
-        assert agent.update(105, jax.random.PRNGKey(0))[0] == 0
+        # First call past warmup serves the boundary at 100 even though the
+        # stride overshot it by 5.
+        assert agent.update(105, jax.random.PRNGKey(0))[0] == agent.learning_steps
+        # Still inside the same window — no second burst.
+        assert agent.update(108, jax.random.PRNGKey(0))[0] == 0
+        # Next window opens at 110.
         assert agent.update(110, jax.random.PRNGKey(0))[0] == agent.learning_steps
 
 

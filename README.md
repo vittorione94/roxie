@@ -13,6 +13,7 @@ The interesting part of this repo is not the algorithms, which are standard; it 
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Backends: CPU vs GPU](docs/backends.md) — the design centrepiece
+- [Release benchmark](#release-benchmark) — every agent, both tasks, CPU and GPU
 - [Configuration](#configuration)
 - [Agents](#agents)
 - [Mocap tracking example](#mocap-tracking-example)
@@ -43,23 +44,30 @@ uv run python scripts/check_warp.py     # exit 0 = warp usable
 
 ### Train
 
-Every run is a self-contained experiment YAML under [`experiments/`](experiments/), grouped by environment (`walker/`, `mocap/`, `envpool/`). The folder is part of the config name:
+Every run is a self-contained experiment YAML under [`experiments/`](experiments/), grouped by environment (`walker/`, `mocap/`). The folder is part of the config name:
 
 ```bash
-uv run python roxie/train.py --config-name walker/walker_sac
-uv run python roxie/train.py --config-name mocap/sweep_ppo           # GPU (Warp) physics
-uv run python roxie/train.py --config-name mocap/sweep_ppo_envpool   # CPU physics
-uv run python roxie/train.py --config-name envpool/halfcheetah_td3   # CPU, gym-style task
+uv run python roxie/train.py --config-name walker/bench_sac    # simple task
+uv run python roxie/train.py --config-name mocap/bench_ppo     # humanoid tracking
 ```
+
+Those configs are the [release benchmark](experiments/README.md): one launchable per agent per task, at matched hyperparameters. Move a run between devices by switching its `backend` group — the physics and the learner move together, and nothing else changes:
+
+```bash
+uv run python roxie/train.py --config-name walker/bench_sac walker/backend@backend=mjx_cpu
+uv run python roxie/train.py --config-name mocap/bench_ppo  mocap/backend@backend=envpool_cpu
+```
+
+(The group lives in a subdirectory of the search path, so it needs the full `<dir>/backend@backend=` form; a bare `backend=` is rejected by Hydra's struct check.)
 
 Any key can be overridden from the command line (Hydra):
 
 ```bash
-uv run python roxie/train.py --config-name walker/walker_sac \
+uv run python roxie/train.py --config-name walker/bench_sac \
     env.parallel_envs=400 trainer.save_steps=100_000
 ```
 
-`device=cpu` (or `device=gpu`) is a special override parsed before JAX is imported, and forces the JAX platform for the whole process regardless of what the config says — see [Ordering gotchas](docs/backends.md#ordering-gotchas-env-vars-vs-jaxconfig).
+`device=cpu` (or `device=gpu`) is a special override, parsed out of `sys.argv` before JAX is imported and hidden from Hydra, which forces the JAX platform for the whole process regardless of what the config says. The configs express the same thing durably as `runtime.jax_platform` — see [Ordering gotchas](docs/backends.md#ordering-gotchas-env-vars-vs-jaxconfig).
 
 Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch metrics to console + CSV, checkpoints under `checkpoints/`, and optionally Weights & Biases (`logging.wandb.enabled: true`).
 
@@ -80,6 +88,31 @@ Roxie can put the *physics* on the GPU or the CPU, and — independently — the
 **→ [docs/backends.md](docs/backends.md)**
 
 It covers the three physics backends (MJX, mujoco_warp, native CPU MuJoCo) and how they are selected; why there are two trainer loops and what they must agree on; auto-reset, truncation vs termination, and contact budgets; the memory trade that is the actual reason to run on CPU; Warp's CUDA graph-mode leak; where the agent runs relative to the physics, with measured throughput; CPU threading limits; determinism; the env-var vs `jax.config` ordering gotchas; the parity check that keeps the backends honest; and a short guide to [choosing a backend](docs/backends.md#choosing-a-backend).
+
+---
+
+## Release benchmark
+
+The launchable configs in [`experiments/`](experiments/) are one benchmark, and it is what the release figure is made of: **all seven agents on a simple task and on a hard one, across the CPU/GPU placements each task can express.**
+
+```bash
+scripts/run_release_benchmark.sh --dry-run   # the grid, with time estimates
+scripts/run_release_benchmark.sh --smoke     # tiny budgets: does everything launch?
+scripts/run_release_benchmark.sh             # the real thing, ~14 h, strictly sequential
+uv run python roxie/report.py                # assemble the W&B report
+uv run python roxie/plot.py --path outputs/release_v1 --output release.pdf
+```
+
+| Suite | Task | Cells |
+|---|---|---|
+| `walker_walk` | mujoco_playground WalkerWalk, 256 envs, 5M steps | `warp_gpu`, `mjx_gpu`, `mjx_cpu` |
+| `mocap_cmu_006_13` | CMU humanoid tracking, one clip, 1000 envs, 50M steps | `warp_gpu`, `envpool_cpu`, `envpool_gpu` |
+
+A *cell* is a (physics device, learner device) placement; between the two suites they cover all four combinations, including two that are **fully GPU-free**. Within a suite everything except the algorithm and the cell is held identical — env, budget, network shape, batch size, replay ratio, exploration schedule — so score-vs-steps ranks the algorithms and the wall-clock panels price the backends. Runs stream to one W&B project with `group` = suite and `job_type` = cell, which is the structure [`roxie/report.py`](roxie/report.py) rebuilds the report from.
+
+The script is resumable (a manifest records each finished run), it refuses to start a GPU cell while another process holds the card, and it checks the W&B credential up front — because the benchmark configs set `relogin: false`, and an interactive login prompt would deadlock an overnight grid.
+
+**→ [experiments/README.md](experiments/README.md)** — the grid, what is held fixed, what necessarily differs, and how to read the result.
 
 ---
 
@@ -163,7 +196,7 @@ Two features shape the training distribution:
 
 The canonical eval protocol is fixed and deliberate: **start at frame 0, no reset noise, run the clip to its end.** That is the task as stated ("track this clip"), not a sample of it, and `play.py` starts at frame 0 too — so what you watch is what the metric measured.
 
-See [`experiments/mocap/sweep/README.md`](experiments/mocap/sweep/README.md) for the single-clip overfit sweep that compares every agent on identical settings, and the helper scripts alongside the env: `check_envpool_parity.py`, `check_mocap_reward.py`, `check_openloop_tracking.py`, `check_cmu_mocap_data.py`.
+See [`experiments/README.md`](experiments/README.md) for the single-clip benchmark that compares every agent on identical settings, and the helper scripts alongside the env: `check_envpool_parity.py`, `check_mocap_reward.py`, `check_openloop_tracking.py`, `check_cmu_mocap_data.py`.
 
 ## Tests
 

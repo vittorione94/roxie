@@ -69,18 +69,63 @@ def discover_runs(paths):
 def wallclock_unit(runs):
     """Pick a wall-clock unit ('s' / 'min' / 'h') that suits the longest run.
 
-    Returns ``(name, divisor)``; runs without a ``time/total_s`` column are
+    Returns ``(name, divisor)``; runs without a ``sys/time/total_s`` column are
     ignored, and the fallback is seconds when no run logged wall-clock time.
     """
     longest = 0.0
     for _, df in runs:
-        if 'time/total_s' in df.columns and len(df):
-            longest = max(longest, float(df['time/total_s'].max()))
+        if 'sys/time/total_s' in df.columns and len(df):
+            longest = max(longest, float(df['sys/time/total_s'].max()))
     if longest >= 2 * 3600:
         return 'hours', 3600.0
     if longest >= 120:
         return 'minutes', 60.0
     return 'seconds', 1.0
+
+
+# Metrics were renamed to a `train/` `test/` `sys/` scheme (see
+# `Trainer._store_epoch_metrics`). Runs logged before that carry the old bare
+# names, and this tool is routinely pointed at an outputs/ tree holding both, so
+# map the old spelling forward on load rather than silently drawing empty axes
+# for every pre-rename run.
+_LEGACY_COLUMNS = {
+    "score": "train/score",
+    "score/std": "train/score/std",
+    "length": "train/length",
+    "length/std": "train/length/std",
+    "episodes/epoch": "train/episodes/epoch",
+    "episodes/total": "train/episodes/total",
+    "gradient_steps": "train/gradient_steps",
+    "loss/actor": "train/loss/actor",
+    "loss/critic": "train/loss/critic",
+    "sps": "sys/sps",
+    "time/total_s": "sys/time/total_s",
+    "time/epoch_s": "sys/time/epoch_s",
+}
+
+
+def normalize_columns(df):
+    """Rename legacy metric columns to the current scheme, in place-ish.
+
+    Only fills a target that is not already present, so a run that somehow has
+    both spellings keeps the current one. Prefix families (`reward/`, `noise/`,
+    `gpu/`, `mem/`, agent diagnostics) are remapped by their first segment.
+    """
+    renames = {
+        old: new for old, new in _LEGACY_COLUMNS.items()
+        if old in df.columns and new not in df.columns
+    }
+    for col in df.columns:
+        head = col.split("/", 1)[0]
+        if head in ("reward", "noise", "mining", "td3", "ppo"):
+            target = f"train/{col}"
+        elif head in ("gpu", "mem"):
+            target = f"sys/{col}"
+        else:
+            continue
+        if target not in df.columns:
+            renames[col] = target
+    return df.rename(columns=renames) if renames else df
 
 
 def load_runs(paths):
@@ -92,6 +137,7 @@ def load_runs(paths):
         except Exception as e:
             print(f"Warning: skipping '{csv_path}' (error reading CSV: {e})")
             continue
+        df = normalize_columns(df)
         print(f"Loaded {len(df)} rows from {csv_path}")
         runs.append((label, df))
     return runs
@@ -127,42 +173,42 @@ def main():
     for (label, df), color in zip(runs, colors):
         prefix = f"{label}: " if multi else ""
 
-        if 'score' in df.columns and 'test/score' in df.columns:
-            axs[0, 0].plot(df['steps'], df['score'], label=f'{prefix}Train Score',
+        if 'train/score' in df.columns and 'test/score' in df.columns:
+            axs[0, 0].plot(df['steps'], df['train/score'], label=f'{prefix}Train Score',
                            color=color, alpha=0.8, linewidth=2)
             axs[0, 0].plot(df['steps'], df['test/score'], label=f'{prefix}Test Score',
                            color=color, alpha=0.8, linewidth=2, linestyle='--')
 
-        if 'length' in df.columns and 'test/length' in df.columns:
-            axs[0, 1].plot(df['steps'], df['length'], label=f'{prefix}Train Length',
+        if 'train/length' in df.columns and 'test/length' in df.columns:
+            axs[0, 1].plot(df['steps'], df['train/length'], label=f'{prefix}Train Length',
                            color=color, alpha=0.8, linewidth=2)
             axs[0, 1].plot(df['steps'], df['test/length'], label=f'{prefix}Test Length',
                            color=color, alpha=0.8, linewidth=2, linestyle='--')
 
-        if 'loss/actor' in df.columns:
-            axs[1, 0].plot(df['steps'], df['loss/actor'], label=f'{prefix}Actor Loss',
+        if 'train/loss/actor' in df.columns:
+            axs[1, 0].plot(df['steps'], df['train/loss/actor'], label=f'{prefix}Actor Loss',
                            color=color if multi else 'green', alpha=0.8, linewidth=2)
 
-        if 'loss/critic' in df.columns:
-            axs[1, 1].plot(df['steps'], df['loss/critic'], label=f'{prefix}Critic Loss',
+        if 'train/loss/critic' in df.columns:
+            axs[1, 1].plot(df['steps'], df['train/loss/critic'], label=f'{prefix}Critic Loss',
                            color=color if multi else 'red', alpha=0.8, linewidth=2)
 
-        if 'sps' in df.columns:
-            axs[2, 0].plot(df['steps'], df['sps'], label=f'{prefix}SPS',
+        if 'sys/sps' in df.columns:
+            axs[2, 0].plot(df['steps'], df['sys/sps'], label=f'{prefix}SPS',
                            color=color if multi else 'purple', alpha=0.8, linewidth=2)
 
-        if 'gradient_steps' in df.columns:
-            axs[2, 1].plot(df['steps'], df['gradient_steps'], label=f'{prefix}Gradient Steps',
+        if 'train/gradient_steps' in df.columns:
+            axs[2, 1].plot(df['steps'], df['train/gradient_steps'], label=f'{prefix}Gradient Steps',
                            color=color if multi else 'orange', alpha=0.8, linewidth=2)
 
         # The wall-clock panels: what actually ranks runs that reach the same
         # score at very different throughputs.
-        if 'time/total_s' not in df.columns:
+        if 'sys/time/total_s' not in df.columns:
             continue
-        wall = df['time/total_s'] / time_div
+        wall = df['sys/time/total_s'] / time_div
 
-        if 'score' in df.columns and 'test/score' in df.columns:
-            axs[3, 0].plot(wall, df['score'], label=f'{prefix}Train Score',
+        if 'train/score' in df.columns and 'test/score' in df.columns:
+            axs[3, 0].plot(wall, df['train/score'], label=f'{prefix}Train Score',
                            color=color, alpha=0.8, linewidth=2)
             axs[3, 0].plot(wall, df['test/score'], label=f'{prefix}Test Score',
                            color=color, alpha=0.8, linewidth=2, linestyle='--')

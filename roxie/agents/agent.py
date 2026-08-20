@@ -179,6 +179,44 @@ class Agent(abc.ABC):
             ),
         }
 
+    # Highest update boundary already served. Class-level default so every
+    # off-policy agent inherits it without touching its __init__; the first
+    # firing shadows it with an instance attribute.
+    _last_update_boundary = -1
+
+    def due_for_update(self, steps: int) -> bool:
+        """True at most once per `steps_between_updates` env steps past warmup.
+
+        Do NOT write this as `(steps - steps_before_learning) % between == 0`.
+        The trainer advances `steps` in strides of `parallel_envs` from a
+        warmup-aligned start, so that test only ever fires if the OFFSET
+        `steps_before_learning` is itself a multiple of the stride. It silently
+        was not for the v1 release grid (30_000 % 256 == 48), the residue cycled
+        208, 464, ... 2000 without ever reaching 0, and all six off-policy arms
+        ran 5M env steps at exactly zero gradient steps.
+
+        Tracking the last boundary served instead makes the schedule depend only
+        on how many env steps have elapsed, not on whether the stride happens to
+        divide the offset. A stride wider than `steps_between_updates` still
+        collapses to one burst per trainer iteration (the schedule cannot run
+        faster than it is called) — that is the pre-existing "rounds up to one"
+        behaviour the bench configs warn about, and it is unchanged here.
+
+        No backlog is queued: the boundary jumps to wherever `steps` now is, so
+        a restored checkpoint resumes on schedule rather than firing a catch-up
+        storm.
+        """
+        if steps < self.steps_before_learning:
+            return False
+        elapsed = steps - self.steps_before_learning
+        boundary = self.steps_before_learning + (
+            (elapsed // self.steps_between_updates) * self.steps_between_updates
+        )
+        if boundary <= self._last_update_boundary:
+            return False
+        self._last_update_boundary = boundary
+        return True
+
     def update(self, old_states, new_states, steps, agent_rng):
         """Informs the agent of the latest transitions during training."""
         gradient_steps, actor_loss, critic_loss = 0, 0, 0
@@ -299,6 +337,17 @@ class Agent(abc.ABC):
             for k, v in (hyper or {}).items()
             if k in valid_params and k not in explicit_keys
         }
+        # Action bounds were serialized to a plain list (one entry per actuator,
+        # so an env with differing ranges is not recorded as just the first
+        # one's). Rebuild the array the agent had at train time rather than
+        # handing the constructor a list of 0-d arrays: everything downstream —
+        # scale_to_env, the noise clip, the actor's output bounds — is written
+        # against an ndarray of shape (action_dim,).
+        for key in ("action_low", "action_high"):
+            if key in filtered_hyper:
+                filtered_hyper[key] = jnp.asarray(
+                    filtered_hyper[key], dtype=jnp.float32
+                )
 
         init_kwargs = dict(
             env_obs_size=env_obs_size,

@@ -129,8 +129,32 @@ def _runset(wr, entity, project, name, suite, cell=None, agent=None):
 
 
 def _curve_panels(wr, suite):
-    """The four panels every cell gets, in a 2x2 grid."""
+    """The four panels every cell gets, in a 2x2 grid.
+
+    The second panel is task-dependent. Episode length is only a metric where
+    the env can terminate early: on the mocap task it IS the survival time the
+    score is mostly made of, but WalkerWalk never terminates, so `test/length`
+    sits pinned at the 1000-step cap and plots nothing but eval noise. The
+    walker suite gets the behaviour-vs-deterministic comparison there instead,
+    which is the diagnostic that actually matters for the deterministic arms:
+    eval scoring BELOW the noisy training policy is the signature of an actor
+    that has saturated its tanh and stopped learning.
+    """
     score_axis = dict(log_x=False, ignore_outliers=False)
+    if suite == "mocap_cmu_006_13":
+        second = wr.LinePlot(
+            title="Eval episode length vs env steps (survival)",
+            x="steps", y=["test/length"],
+            title_x="environment steps", title_y="test/length",
+            layout=wr.Layout(x=12, y=0, w=12, h=8), **score_axis,
+        )
+    else:
+        second = wr.LinePlot(
+            title="Behaviour vs deterministic policy",
+            x="steps", y=["train/score", "test/score"],
+            title_x="environment steps", title_y="score",
+            layout=wr.Layout(x=12, y=0, w=12, h=8), **score_axis,
+        )
     return [
         wr.LinePlot(
             title="Eval score vs env steps",
@@ -138,21 +162,16 @@ def _curve_panels(wr, suite):
             title_x="environment steps", title_y="test/score",
             layout=wr.Layout(x=0, y=0, w=12, h=8), **score_axis,
         ),
-        wr.LinePlot(
-            title="Eval episode length vs env steps",
-            x="steps", y=["test/length"],
-            title_x="environment steps", title_y="test/length",
-            layout=wr.Layout(x=12, y=0, w=12, h=8), **score_axis,
-        ),
+        second,
         wr.LinePlot(
             title="Eval score vs wall-clock",
-            x="time/total_s", y=["test/score"],
+            x="sys/time/total_s", y=["test/score"],
             title_x="wall-clock seconds", title_y="test/score",
             layout=wr.Layout(x=0, y=8, w=12, h=8), **score_axis,
         ),
         wr.LinePlot(
             title="Throughput (steps/s)",
-            x="steps", y=["sps"],
+            x="steps", y=["sys/sps"],
             title_x="environment steps", title_y="steps/s",
             layout=wr.Layout(x=12, y=8, w=12, h=8), **score_axis,
         ),

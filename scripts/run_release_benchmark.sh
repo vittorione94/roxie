@@ -86,7 +86,7 @@ sps_prior() {
     case "$1:$2" in
         walker_walk:warp_gpu)        echo 60000 ;;
         walker_walk:mjx_gpu)         echo 45000 ;;
-        walker_walk:mjx_cpu)         echo  3000 ;;
+        walker_walk:mjx_cpu)         echo  2400 ;;   # measured, TD3, 256 envs
         mocap_cmu_006_13:warp_gpu)   echo 15000 ;;
         mocap_cmu_006_13:envpool_cpu) echo 13600 ;;
         mocap_cmu_006_13:envpool_gpu) echo 17200 ;;
@@ -183,10 +183,14 @@ cells_for() {
     echo "$cells"
 }
 
+# A run counts as done only if it finished AT THE SAME STEP BUDGET. Matching on
+# (suite, cell, agent) alone would let a --smoke run — which is recorded `ok`
+# with a tiny budget — suppress the real one, quietly leaving a truncated arm in
+# the middle of the release grid.
 already_done() {
     [[ $FORCE -eq 1 ]] && return 1
     [[ -f "$MANIFEST" ]] || return 1
-    grep -qP "^ok\t$1\t$2\t$3\t" "$MANIFEST"
+    grep -qP "^ok\t$1\t$2\t$3\t$4\t" "$MANIFEST"
 }
 
 # ------------------------------------------------------------ preflight -----
@@ -253,7 +257,31 @@ preflight() {
     # be in place or the very first run dies after building its env.
     if [[ "${WANDB_MODE:-online}" != "offline" && "${WANDB_MODE:-online}" != "disabled" ]]; then
         if [[ -n "${WANDB_API_KEY:-}" ]] || grep -q "api.wandb.ai" "${NETRC:-$HOME/.netrc}" 2>/dev/null; then
-            say "  wandb       ok"
+            # Resolve and PRINT the account, don't just assert a credential
+            # exists. With relogin:false the cached ~/.netrc key is used
+            # silently, so on a machine with more than one wandb account the
+            # grid can publish 32 runs to the wrong org without a single
+            # prompt. Naming the entity up front is the only warning you get.
+            local who
+            who=$(uv run python -c "
+import wandb
+try:
+    api = wandb.Api()
+    print(f'{api.default_entity}')
+except Exception as e:
+    print(f'UNRESOLVED ({type(e).__name__})')
+" 2>/dev/null | tail -1)
+            local src="~/.netrc"
+            [[ -n "${WANDB_API_KEY:-}" ]] && src="WANDB_API_KEY"
+            if [[ "$who" == UNRESOLVED* || -z "$who" ]]; then
+                err "wandb credential ($src) did not resolve to an account: $who"
+                err "  uv run wandb login --relogin     # or export WANDB_API_KEY"
+                status=1
+            else
+                say "  wandb       ok — publishing as '${who}' (from $src)"
+                warn "not the account you want? 'uv run wandb login --relogin', or"
+                warn "  export WANDB_API_KEY=<key>, or pass --offline to log locally."
+            fi
         else
             err "wandb is enabled in the benchmark configs but no credential was found."
             err "  run 'uv run wandb login' once, or export WANDB_API_KEY, or pass --offline."
@@ -308,7 +336,7 @@ for item in "${QUEUE[@]}"; do
     sps=$(sps_prior "$suite" "$cell")
     est=$( (( sps > 0 )) && hms $(( steps / sps )) || echo "?" )
     mark=""
-    already_done "$suite" "$cell" "$agent" && { mark=" (done, skipping)"; }
+    already_done "$suite" "$cell" "$agent" "$steps" && { mark=" (done, skipping)"; }
     printf '%-18s %-13s %-6s %14s %12s%s\n' "$suite" "$cell" "$agent" "$steps" "$est" "$mark"
 done
 say ""
@@ -324,7 +352,7 @@ grid_t0=$SECONDS
 for item in "${QUEUE[@]}"; do
     IFS='|' read -r suite agent cell steps <<< "$item"
 
-    if already_done "$suite" "$cell" "$agent"; then
+    if already_done "$suite" "$cell" "$agent" "$steps"; then
         skip_count=$((skip_count + 1))
         echo "-- skip $suite/$cell/$agent (already in the manifest; --force to redo)"
         continue
@@ -361,8 +389,9 @@ for item in "${QUEUE[@]}"; do
 
     # Actual throughput, read back from the run's own CSV rather than computed
     # from wall-clock, so compile time is excluded the same way the trainer
-    # excludes it.
-    sps_actual=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="sps") c=i; next} c&&$c!="None"{v=$c} END{if(v!="") printf "%.0f", v}' \
+    # excludes it. Accepts the bare `sps` of pre-namespace runs as well as the
+    # current `sys/sps`, so re-reading an older manifest's run dirs still works.
+    sps_actual=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="sys/sps" || $i=="sps") c=i; next} c&&$c!="None"{v=$c} END{if(v!="") printf "%.0f", v}' \
                  "$run_dir/log.csv" 2>/dev/null)
     [[ -z "$sps_actual" ]] && sps_actual="-"
 
