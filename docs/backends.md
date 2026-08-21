@@ -80,6 +80,10 @@ Collision handling is where the backends diverge most sharply, and it drives con
 
 Note that the collision setting is not purely a performance knob: it changes the task. The mocap sweep runs `collisions: ground` because the retargeted CMU reference interpenetrates its own limbs, so under full self-collision the solver pushes the body out of the very pose the tracking reward is asking it to hold.
 
+## The Warp version pin
+
+The `cuda` dependency group pins `warp-lang>=1.11,<1.13`. This is not conservatism: MuJoCo's vendored Warp bridge imports `warp._src.jax_experimental.ffi.GraphMode` and reads `warp.types.warp_type_to_np_dtype`. Warp 1.13 dropped the latter from the public API and 1.14 graduated `jax_experimental` into `jax`, moving both out from under the bridge. `uv run python scripts/check_warp.py` exits 0 when the installed Warp is usable.
+
 ## Warp's CUDA graph mode
 
 `mjx.put_model(impl='warp')` defaults to `GraphMode.WARP`, whose graph-capture cache is keyed on per-step buffer *addresses*. Under JAX those addresses change every step, so a new CUDA graph is captured per step; the cache is bounded but eviction only drops the Python reference — the native host descriptors are never reclaimed. The result is ~0.25 GB of host-RAM growth per 1M steps, invisible to `jax.live_arrays()` and to GPU memory counters, which OOM-kills long runs (typically during a checkpoint save, since that adds a transient spike).
