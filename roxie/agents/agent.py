@@ -233,36 +233,74 @@ class Agent(abc.ABC):
     def _export_hyperparams(self) -> Dict[str, Any]:
         return {}
 
+    def _checkpoint_modules(self) -> Dict[str, nnx.Module]:
+        """Agent-owned nnx modules that live OUTSIDE `self.state`.
+
+        `self.state` is what `save`/`restore` serialize wholesale, but several
+        agents keep stateful modules next to it: DDPG's exploration noise (whose
+        step counter drives the decay schedule), SAC's temperature plus its
+        optimizer, MPO's Lagrange duals plus theirs. A resumed run that dropped
+        them would restart exploration at the initial noise scale and the duals
+        at their init values — a different algorithm from the one the checkpoint
+        stopped in the middle of.
+
+        Keys are attribute names on the agent, restored with `setattr`. Default
+        is empty: an agent whose whole learnable state is in `self.state` (PPO)
+        overrides nothing.
+        """
+        return {}
+
     def save(
         self,
         path: str | Path,
         *,
         format_version: int = 1,
+        include_buffer: bool = False,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ):
+        """Write the agent's state to `path`.
+
+        `include_buffer` also writes the replay buffer. It defaults to False
+        because the buffer dominates the state, and `device_get`'ing it to host
+        on every save spikes host RAM (orbax holds its own serialization copies
+        on top) hard enough to risk an OOM mid-write on a large run. Off without
+        it, a resumed off-policy run has to refill the buffer through the
+        trainer's warmup; on, resume is exact but every checkpoint costs the
+        buffer's full size on disk. See `Trainer(save_buffer=...)`.
+        """
         try:
             if not hasattr(self, "state"):
                 raise AttributeError("Agent must define `self.state` (an nnx.Module).")
 
             path = Path(path).resolve()
 
-            # The replay buffer dominates the state, and `device_get`'ing it to host
-            # on every save spikes host RAM (orbax holds its own serialization copies
-            # on top) hard enough to risk an OOM mid-write. It is not needed to
-            # resume, so it is detached for the duration of the save and `load()`
-            # treats it as optional. `_export_hyperparams` reads the buffer's
-            # obs/action shapes, so it must be called *before* detaching.
+            # `_export_hyperparams` reads the buffer's obs/action shapes, so it
+            # must be called *before* the detach below.
             hyperparams = self._export_hyperparams()
             saved_buffer = getattr(self.state, "buffer_state", None)
-            self.state.buffer_state = None
+            if not include_buffer:
+                self.state.buffer_state = None
             try:
                 graphdef, state_tree = nnx.split(self.state)
+
+                # Modules the agent keeps outside `self.state`, each split on its
+                # own so restore can merge them back one at a time against a live
+                # graphdef (see `_checkpoint_modules`).
+                extra_state = {
+                    name: jax.device_get(nnx.split(module)[1])
+                    for name, module in self._checkpoint_modules().items()
+                }
 
                 payload = {
                     "format_version": format_version,
                     "trainstate_graphdef": graphdef,  # serialized topology
                     "trainstate_state": jax.device_get(state_tree),  # numeric pytree
+                    "extra_state": extra_state,
                     "hyperparams": hyperparams,
+                    # Where the update schedule stands, so a resume neither
+                    # re-fires the boundary it already served nor queues a
+                    # catch-up storm (see `due_for_update`).
+                    "last_update_boundary": int(self._last_update_boundary),
                     "metadata": (extra_metadata or {}),
                 }
                 checkpointer = ocp.StandardCheckpointer()
@@ -300,21 +338,15 @@ class Agent(abc.ABC):
         new block (or drops one it never had, like SAC and `noise_config`) needs
         no change here; `play.py` passes whichever blocks the config declares.
         Everything else comes from the checkpoint's `hyperparams`.
+
+        This is the *playback* entry point (`play.py`): the checkpoint is the
+        only source of truth, so it also dictates the hyperparameters. To resume
+        TRAINING, build the agent from its run config as usual and call
+        `restore` on it — there the yaml is authoritative, so a resume may
+        legitimately extend `trainer.steps` or retune a knob.
         """
         path = Path(path).resolve()
-        # Restore weights to host memory (numpy) rather than onto the device sharding
-        # baked into the checkpoint: a GPU-trained run pins arrays to cuda:0, which a
-        # CPU-only process could not load. Host arrays are placement-agnostic, and the
-        # numpy->jax conversion below puts them on whatever device is active.
-        checkpointer = ocp.PyTreeCheckpointer()
-        restore_args = jax.tree.map(
-            lambda _a: ocp.RestoreArgs(restore_type=np.ndarray),
-            ocp.checkpoint_utils.construct_restore_args(
-                checkpointer.metadata(path).item_metadata
-            ),
-            is_leaf=lambda a: isinstance(a, ocp.RestoreArgs),
-        )
-        loaded = checkpointer.restore(path, restore_args=restore_args)
+        loaded = _read_checkpoint(path)
 
         ckpt_state = loaded["trainstate_state"]
         hyper = loaded.get("hyperparams", {})
@@ -358,34 +390,65 @@ class Agent(abc.ABC):
             **(filtered_hyper or {}),
         )
         agent = cls(**init_kwargs)
+        agent.restore(path, _payload=loaded)
+        return agent
 
-        hyper = ckpt_state.get("hyperparams", {}) or {}
-        agent.exploration_noise = float(hyper.get("exploration_noise", 0.0))
+    def restore(
+        self,
+        path: str | Path,
+        *,
+        restore_optimizers: bool = True,
+        _payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Load a checkpoint's numeric state INTO this already-built agent.
 
-        import numpy as _np
+        This is what resuming training goes through: the agent is constructed
+        from the run's config (so the yaml stays the source of truth for every
+        hyperparameter, and a resume may legitimately raise `trainer.steps` or
+        retune a knob), and only the numbers come from disk — networks, targets,
+        optimizer slots, observation statistics, the modules listed by
+        `_checkpoint_modules`, and the replay buffer when the checkpoint carries
+        one.
 
-        def _to_jax(x):
-            return jnp.asarray(x) if isinstance(x, _np.ndarray) else x
+        `restore_optimizers=False` reloads the policy but starts the optimizers
+        cold; that is a fine-tune, not a resume, so it is not the default —
+        dropping Adam's moments mid-run makes the first updates after the resume
+        behave nothing like the ones before it.
 
-        def _restore_submodule(name: str):
-            if not (isinstance(ckpt_state, dict) and name in ckpt_state):
+        Returns the trainer-progress metadata the checkpoint was written with
+        (`steps`, `epochs`, `episodes`, `gradient_steps`), plus
+        `buffer_restored`. Fields the checkpoint lacks are simply absent.
+        """
+        path = Path(path).resolve()
+        loaded = _read_checkpoint(path) if _payload is None else _payload
+        ckpt_state = loaded.get("trainstate_state", {})
+        if not isinstance(ckpt_state, dict):
+            ckpt_state = {}
+
+        if not hasattr(self, "state"):
+            # A non-learning baseline (Constant, NormalRandom, ...): there is
+            # nothing numeric to load, but the run's progress metadata is still
+            # what the trainer resumes its step counter from.
+            print(f"[Agent.restore] No `state` on {type(self).__name__}; "
+                  "restoring progress metadata only.")
+            return dict(loaded.get("metadata") or {}, buffer_restored=False)
+
+        def _restore_module(owner, name: str, source: Dict[str, Any]):
+            """Merge one checkpointed subtree into the live module at `name`."""
+            if name not in source:
                 print(f"Info: '{name}' not in checkpoint; keeping live {name}.")
                 return
-            sub_ckpt = jax.tree.map(
-                _to_jax, ckpt_state[name], is_leaf=lambda x: isinstance(x, _np.ndarray)
-            )
-            sub_live = getattr(agent.state, name)
+            sub_ckpt = _to_jax(source[name])
+            sub_live = getattr(owner, name)
             gdef, _ = nnx.split(sub_live)
             try:
-                restored = nnx.merge(gdef, sub_ckpt)
-                setattr(agent.state, name, restored)
+                setattr(owner, name, nnx.merge(gdef, sub_ckpt))
             except ValueError as e:
                 # Architecture drift or partial state: fall back to params only.
                 print(
                     f"Warning: merge({name}) failed ({e}). Falling back to param-only copy."
                 )
                 try:
-                    dst_params = nnx.state(sub_live, nnx.Param)
                     src_params = (
                         sub_ckpt.get("params", None)
                         if isinstance(sub_ckpt, dict)
@@ -401,36 +464,134 @@ class Agent(abc.ABC):
                         f"Warning: param-only update for {name} failed ({ee}). Skipping."
                     )
 
-        for name in ("actor", "critic", "target_actor", "target_critic"):
-            _restore_submodule(name)
+        names = ["actor", "critic", "target_actor", "target_critic"]
+        if restore_optimizers:
+            names += ["actor_optimizer", "critic_optimizer"]
+        for name in names:
+            # `target_actor` is None for SAC/PPO and absent from their
+            # checkpoints, so a missing entry is normal, not a warning-worthy
+            # loss of state.
+            if getattr(self.state, name, None) is not None:
+                _restore_module(self.state, name, ckpt_state)
+
+        # Modules the agent keeps outside `self.state` (SAC's temperature, MPO's
+        # duals, the exploration noise schedule). Skipped wholesale for a
+        # checkpoint written before `extra_state` existed.
+        extra_ckpt = loaded.get("extra_state") or {}
+        for name in self._checkpoint_modules():
+            # `restore_optimizers` covers every optimizer, including the ones
+            # kept outside `self.state` (SAC's temperature optimizer, MPO's dual
+            # optimizer), so a fine-tune starts all of them cold consistently.
+            if restore_optimizers or not name.endswith("optimizer"):
+                _restore_module(self, name, extra_ckpt)
 
         # Replaced wholesale rather than partial-updated.
-        if isinstance(ckpt_state, dict) and "obs_stats" in ckpt_state:
+        if "obs_stats" in ckpt_state:
             try:
                 obs = ckpt_state["obs_stats"]
                 if isinstance(obs, dict):
-                    agent.state.obs_stats = ObsStats(
+                    self.state.obs_stats = ObsStats(
                         count=jnp.asarray(obs["count"]),
                         sum=jnp.asarray(obs["sum"]),
                         sumsq=jnp.asarray(obs["sumsq"]),
                     )
                 else:
                     # Already a struct-compatible tree.
-                    agent.state.obs_stats = jax.tree_map(
-                        _to_jax, obs, is_leaf=lambda x: isinstance(x, _np.ndarray)
-                    )
+                    self.state.obs_stats = _to_jax(obs)
             except Exception as e:
                 print(f"Warning: could not restore obs_stats ({e}); using live stats.")
 
-        # Only present if the checkpoint was written with the buffer attached.
-        if isinstance(ckpt_state, dict) and "buffer_state" in ckpt_state:
-            agent.state.buffer_state = ckpt_state["buffer_state"]
+        # Only present if the checkpoint was written with the buffer attached
+        # (`save(include_buffer=True)`).
+        buffer_restored = False
+        if "buffer_state" in ckpt_state:
+            buffer_restored = self._restore_buffer(ckpt_state["buffer_state"])
 
-        # Optimizer internals are deliberately not restored; they are reinitialized.
+        boundary = loaded.get("last_update_boundary", None)
+        if boundary is not None:
+            self._last_update_boundary = int(boundary)
 
-        if "exploration_noise" in hyper:
-            agent.exploration_noise = float(hyper["exploration_noise"])
+        metadata = dict(loaded.get("metadata") or {})
+        metadata["buffer_restored"] = buffer_restored
+        print(f"Agent state restored from {path}")
+        return metadata
 
-        print(f"Agent state loaded from {path}")
-        return agent
+    def _restore_buffer(self, ckpt_buffer) -> bool:
+        """Rebuild the replay buffer from its checkpointed leaves.
+
+        The checkpoint stores the buffer as a plain nested dict, so it cannot be
+        assigned to `state.buffer_state` as-is — flashbax needs its own
+        `TrajectoryBufferState` dataclass back. The live (freshly initialized)
+        buffer is the template: every leaf is looked up by path and shape-checked
+        against it, which is also what catches a checkpoint saved with a
+        different `parallel_envs` or buffer capacity. Any mismatch keeps the
+        empty live buffer and returns False, so the trainer falls back to
+        refilling it through warmup rather than training on a malformed one.
+        """
+        live = getattr(self.state, "buffer_state", None)
+        if live is None:
+            return False
+
+        def take(path, leaf):
+            node = ckpt_buffer
+            for key in path:
+                node = node[_path_key(key)]
+            value = jnp.asarray(node)
+            if value.shape != jnp.shape(leaf):
+                raise ValueError(
+                    f"buffer leaf {jax.tree_util.keystr(path)} has shape "
+                    f"{value.shape} in the checkpoint but {jnp.shape(leaf)} live"
+                )
+            return value.astype(jnp.result_type(leaf))
+
+        try:
+            self.state.buffer_state = jax.tree_util.tree_map_with_path(take, live)
+        except (KeyError, TypeError, ValueError) as e:
+            print(
+                f"Warning: could not restore the replay buffer ({e}); "
+                "keeping the empty one — the trainer will refill it."
+            )
+            return False
+        return True
+
+
+def _read_checkpoint(path: Path) -> Dict[str, Any]:
+    """Read a checkpoint payload off disk as host (numpy) arrays.
+
+    Restoring to host memory rather than onto the device sharding baked into the
+    checkpoint is what lets a GPU-trained run load in a CPU-only process: the
+    saved arrays are pinned to cuda:0, host arrays are placement-agnostic, and
+    the numpy->jax conversion at use puts them on whatever device is active.
+    """
+    checkpointer = ocp.PyTreeCheckpointer()
+    restore_args = jax.tree.map(
+        lambda _a: ocp.RestoreArgs(restore_type=np.ndarray),
+        ocp.checkpoint_utils.construct_restore_args(
+            checkpointer.metadata(path).item_metadata
+        ),
+        is_leaf=lambda a: isinstance(a, ocp.RestoreArgs),
+    )
+    return checkpointer.restore(path, restore_args=restore_args)
+
+
+def _to_jax(tree):
+    """Device-put every numpy leaf of a restored subtree."""
+    return jax.tree.map(
+        lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x,
+        tree,
+        is_leaf=lambda x: isinstance(x, np.ndarray),
+    )
+
+
+def _path_key(key):
+    """The dict key a `tree_map_with_path` path entry corresponds to.
+
+    Buffer states nest dataclasses (attribute keys) inside dicts (dict keys);
+    orbax flattens both to plain nested dicts, so restoring needs the name
+    whichever kind of node it came from.
+    """
+    for attr in ("key", "name", "idx"):
+        if hasattr(key, attr):
+            return getattr(key, attr)
+    raise TypeError(f"Unsupported pytree key: {key!r}")
 

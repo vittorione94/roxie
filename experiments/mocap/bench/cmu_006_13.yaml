@@ -68,6 +68,11 @@ trainer:
   test_episodes: 4
   show_progress: true
   replace_checkpoint: false
+  # Checkpoint the replay buffer too. Off: a checkpoint stays small and cheap to
+  # write, and a run resumed with `resume=` refills the buffer through its warmup
+  # before learning again. On, a resume is exact — at the cost of the buffer's
+  # full size on disk per save, which is gigabytes here.
+  save_buffer: false
 
 runtime:
   # Precision of every f32 matmul, applied globally (agent networks AND MJX

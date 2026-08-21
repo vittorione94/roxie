@@ -1,0 +1,49 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a branch supersedes the run already in flight for it.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Runners are CPU-only; pin the backend so JAX never probes for a GPU.
+  # Safe as a process-level var: it is set before python starts, unlike an
+  # in-process os.environ write, which lands too late for `import jax`.
+  JAX_PLATFORMS: cpu
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two versions claimed by the pyproject classifiers.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Default (CPU) resolution: MJX on CPU plus the EnvPool/native-MuJoCo
+      # path. The `cuda` group is deliberately left out -- no NVIDIA runner.
+      # `--locked` fails the run if uv.lock is stale rather than silently
+      # re-resolving.
+      - name: Install dependencies
+        run: uv sync --locked
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+
+      - name: Run tests
+        run: uv run --no-sync pytest tests/ -q --durations=10

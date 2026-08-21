@@ -4,6 +4,8 @@
 
 # Roxie
 
+[![tests](https://github.com/vittorione94/roxie/actions/workflows/tests.yml/badge.svg)](https://github.com/vittorione94/roxie/actions/workflows/tests.yml)
+
 A reinforcement learning framework in JAX for continuous control in MuJoCo. Roxie trains across hundreds to thousands of parallel environments, and it runs the *same task* on three different physics backends — MJX, mujoco_warp, and native CPU MuJoCo — so that a result can be reproduced (and a bottleneck diagnosed) on either a GPU or a many-core CPU box.
 
 The interesting part of this repo is not the algorithms, which are standard; it is that the CPU and GPU paths are deliberately kept semantically identical while being structurally very different. [docs/backends.md](docs/backends.md) is the document to read.
@@ -16,8 +18,9 @@ The interesting part of this repo is not the algorithms, which are standard; it 
 - [Release benchmark](#release-benchmark) — every agent, both tasks, CPU and GPU
 - [Configuration](#configuration)
 - [Agents](#agents)
-- [Mocap tracking example](#mocap-tracking-example)
+- [Examples](#examples)
 - [Tests](#tests)
+- [Citation](#citation)
 
 ## Installation
 
@@ -70,6 +73,22 @@ uv run python roxie/train.py --config-name walker/bench_sac \
 `device=cpu` (or `device=gpu`) is a special override, parsed out of `sys.argv` before JAX is imported and hidden from Hydra, which forces the JAX platform for the whole process regardless of what the config says. The configs express the same thing durably as `runtime.jax_platform` — see [Ordering gotchas](docs/backends.md#ordering-gotchas-env-vars-vs-jaxconfig).
 
 Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch metrics to console + CSV, checkpoints under `checkpoints/`, and optionally Weights & Biases (`logging.wandb.enabled: true`).
+
+### Resume
+
+```bash
+uv run python roxie/train.py --config-name walker/bench_td3 resume=outputs/<run>
+```
+
+`resume=` takes the run directory, its `checkpoints/` dir, or one `step_<N>` dir; given a directory it picks the **highest** step. Like `device=`, it is parsed out of `sys.argv` before Hydra and is not a config key (a run that wants it recorded can set `resume.path` in its yaml instead).
+
+The agent is built from the **config**, and only its numbers come from the checkpoint — so a resume may legitimately raise `trainer.steps` or retune a knob, unlike `play.py`, which rebuilds the agent from the checkpoint's own hyperparameters. What comes back: the networks and their targets, the optimizer moments, the observation-normalization statistics, each agent's own extra state (the exploration schedule's step counter, SAC's temperature, MPO's Lagrange duals — see `Agent._checkpoint_modules`), and the trainer's progress. `trainer.steps` is a **total**, so the resumed leg runs until the whole budget is spent and the logged x-axis continues the same curve rather than starting a second one at 0.
+
+The replay buffer is the one thing not saved by default — it dominates a checkpoint's size and its host RAM while writing. Without it a resumed off-policy run replays its warmup to refill the buffer before learning again; with `trainer.save_buffer: true` the checkpoint carries it and the resume is exact:
+
+```bash
+uv run python roxie/train.py --config-name walker/bench_td3 trainer.save_buffer=true
+```
 
 ### Play
 
@@ -157,6 +176,7 @@ trainer:
   test_episodes: 5
   show_progress: true
   replace_checkpoint: false
+  save_buffer: false   # checkpoint the replay buffer too (exact resume, big files)
 
 hydra:
   run:
@@ -181,22 +201,12 @@ The off-policy agents pick their buffer from `n_step`: a flashbax **flat buffer*
 
 Two caveats when comparing them: **PPO is not replay-ratio comparable** (on-policy — judge it on score-vs-env-steps and score-vs-wall-clock, not gradient steps), and **MPO is ~20× more expensive per gradient step** (20 action samples per state at batch 512). MPO runs 1-step returns because `mpo.py` takes no `n_step`; that is an implementation gap, not a chosen handicap.
 
-## Mocap tracking example
+## Examples
 
-A humanoid motion-capture tracking task on dm_control's CMU Humanoid (V2020), living under [`examples/mocap/`](examples/mocap/) rather than in the core package — the dependency direction is one-way, examples import from `roxie` and never the reverse.
+Everything under [`examples/`](examples/) sits outside the core package: examples import from `roxie`, never the reverse.
 
-Clips are retargeted CMU data fetched from DeepMind's public HDF5 and cached in `~/.cache/roxie`; no manual conversion step is needed. Each clip is grounded by shifting it down until the lowest foot *collision surface* (not the geom origin — the feet are 25 mm-radius capsules, and grounding on origins buries them) rests on the floor.
-
-The env computes a weighted reward from pose matching, joint velocities, end-effector positions, and split root position/orientation/velocity terms, with early termination on NaN, tracking collapse and root drift. Rotations are exchanged with the network in the **6D continuous representation** (Zhou et al.), never quaternions or Euler angles.
-
-Two features shape the training distribution:
-
-- **Negative mining over start phases.** Uniform random starts spend most of their budget on clip regions already tracked well. The env keeps a per-bin failure *rate* over the clip (a rate, not a count — dying early means later phases are visited less, and a count would mistake that for competence), EMA-smoothed, and biases reset toward the failing bins as a mixture against uniform (`alpha`, kept well below 1: this is a re-weighting, not a curriculum). Watch `mining/effective_bins` — collapse toward 1 means coverage is being lost.
-- **GPU clip residency.** `gpu_clip_budget` caps how many clips are resident on the GPU at once, reshuffled per epoch (`clip_swap`). A real swap invalidates in-progress episodes, whose stored clip indices reference the old chunk, so the trainer resets live envs only then. The CPU backend has no such budget — the full dataset always lives in host RAM.
-
-The canonical eval protocol is fixed and deliberate: **start at frame 0, no reset noise, run the clip to its end.** That is the task as stated ("track this clip"), not a sample of it, and `play.py` starts at frame 0 too — so what you watch is what the metric measured.
-
-See [`experiments/README.md`](experiments/README.md) for the single-clip benchmark that compares every agent on identical settings, and the helper scripts alongside the env: `check_envpool_parity.py`, `check_mocap_reward.py`, `check_openloop_tracking.py`, `check_cmu_mocap_data.py`.
+- **[Mocap tracking](docs/mocap.md)** ([`examples/mocap/`](examples/mocap/)) — humanoid motion-capture tracking on dm_control's CMU Humanoid, the hard task in the release benchmark. Clip fetching and grounding, the tracking reward, negative mining over start phases, GPU clip residency, and the fixed eval protocol.
+- **Flashbax buffers** ([`examples/flashbax/`](examples/flashbax/)) — two standalone walkthroughs of the replay structures the agents use: the flat buffer and the trajectory queue.
 
 ## Tests
 
@@ -205,3 +215,37 @@ uv run pytest tests/
 ```
 
 Covering models (actor/critic shapes and bounds), loss functions, exploration noise, n-step returns, agent utilities, per-agent behaviour, and — importantly — that every agent config constructs and that no `__init__` keyword is missing from its YAML.
+
+CI ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) runs the same suite on every push and pull request, on Python 3.11 and 3.12. The runners are CPU-only, so it exercises the default `uv sync` resolution — the MJX-on-CPU and EnvPool paths — and never the `cuda` group.
+
+## Citation
+
+If Roxie is useful in your research, please cite it:
+
+```bibtex
+@software{labarbera2026roxie,
+  author  = {La Barbera, Vittorio},
+  title   = {Roxie: reinforcement learning in {JAX} for continuous control in {MuJoCo}},
+  year    = {2026},
+  version = {0.1.0},
+  url     = {https://github.com/vittorione94/roxie},
+  license = {MIT}
+}
+```
+
+When citing a *result* rather than the code, please also say which backend cell produced it — `warp_gpu`, `mjx_gpu`, `mjx_cpu`, `envpool_cpu` or `envpool_gpu` — and the commit hash. The backends are kept semantically identical but not bitwise identical, so the cell is part of the experimental setup; see [Determinism](docs/backends.md#determinism-and-reproducibility).
+
+### Acknowledgements
+
+Roxie would not exist without [Tonic](https://github.com/fabiopardo/tonic) by Fabio Pardo, whose design is the direct inspiration for this codebase — one agent interface shared across algorithms, configuration as the thing you actually launch, and a benchmark that holds everything but the algorithm fixed. Please cite it too:
+
+```bibtex
+@article{pardo2020tonic,
+  author  = {Pardo, Fabio},
+  title   = {Tonic: A Deep Reinforcement Learning Library for Fast Prototyping and Benchmarking},
+  journal = {arXiv preprint arXiv:2011.07537},
+  year    = {2020}
+}
+```
+
+Roxie is MIT-licensed ([LICENSE](LICENSE)). It builds on work that has its own citations — please cite those directly where relevant: [JAX](https://github.com/jax-ml/jax), [MuJoCo](https://github.com/google-deepmind/mujoco) and MJX, [mujoco_warp](https://github.com/google-deepmind/mujoco_warp), [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground), [EnvPool](https://github.com/sail-sg/envpool), [Flax](https://github.com/google/flax), [Optax](https://github.com/google-deepmind/optax) and [flashbax](https://github.com/instadeepai/flashbax), and the [CMU Motion Capture Database](http://mocap.cs.cmu.edu/) as retargeted by [dm_control](https://github.com/google-deepmind/dm_control) for the [mocap example](docs/mocap.md).

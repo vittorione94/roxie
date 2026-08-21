@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import os
+import shutil
 import time
 
 import numpy as np
@@ -34,7 +35,7 @@ class Trainer:
     def __init__(
         self, output_dir, steps=int(1e7), epoch_steps=int(3e5), save_steps=int(1e5),
         test_episodes=5, show_progress=True, replace_checkpoint=False,
-        async_learner=False, learner_chunk=8,
+        async_learner=False, learner_chunk=8, save_buffer=False, resume=None,
     ):
         self.max_steps = steps
         self.epoch_steps = epoch_steps
@@ -43,6 +44,25 @@ class Trainer:
         self.show_progress = show_progress
         self.replace_checkpoint = replace_checkpoint
         self.output_dir = output_dir
+        # Write the replay buffer into every checkpoint. Off by default: it
+        # dominates the checkpoint's size on disk and its host-RAM cost while
+        # writing (see `Agent.save`). On, a resumed off-policy run skips warmup
+        # and continues from the exact data it stopped on.
+        self.save_buffer = bool(save_buffer)
+        # Progress metadata from `Agent.restore`, or None for a fresh run. The
+        # counters below are what make a resumed run continue the SAME curve —
+        # env steps keyed identically in the logs, the save cadence and the
+        # `trainer.steps` budget both measured against the total, not against
+        # what this process happens to have added.
+        resume = resume or {}
+        self.initial_steps = int(resume.get("steps") or 0)
+        self.initial_epochs = int(resume.get("epochs") or 0)
+        self.initial_episodes = int(resume.get("episodes") or 0)
+        self.initial_gradient_steps = int(resume.get("gradient_steps") or 0)
+        # The replay buffer is only in the checkpoint when the run that wrote it
+        # set `save_buffer`. Without it a resumed off-policy agent would sample a
+        # buffer of zeros, so the trainer re-runs its warmup fill instead.
+        self.skip_warmup = bool(resume.get("buffer_restored", False))
         # Overlap CPU env-stepping with GPU gradient bursts via a background
         # learner thread (envpool loop only). Only pays off when the learner is
         # the dominant cost and the env is on CPU while the learner is on GPU.
@@ -56,6 +76,42 @@ class Trainer:
         self.agent = agent
         self.environment = environment
         self.test_environment = test_environment
+
+    def _warmup_iters(self, memory_warmup, num_envs):
+        """Warmup iterations to run before the training loop.
+
+        Zero when a resume restored a populated replay buffer: the buffer is
+        already past `memory_warmup` and refilling it would prepend a block of
+        RANDOM-action transitions to a trained policy's data. Without a restored
+        buffer the warmup runs exactly as for a fresh run — it is what makes the
+        buffer samplable at all.
+        """
+        if self.skip_warmup:
+            print("Resumed with a restored replay buffer: skipping warmup.",
+                  flush=True)
+            return 0
+        return memory_warmup // num_envs
+
+    def _save(self, agent, epochs, episodes, gradient_steps):
+        """Write a checkpoint, tagged with the progress needed to resume it."""
+        path = os.path.join(self.output_dir, "checkpoints")
+        if os.path.isdir(path) and self.replace_checkpoint:
+            for file in os.listdir(path):
+                if file.startswith("step_"):
+                    # A checkpoint is a DIRECTORY (orbax writes a tree of files),
+                    # so this needs rmtree — `os.remove` raises IsADirectoryError
+                    # and took the whole run down with it.
+                    shutil.rmtree(os.path.join(path, file), ignore_errors=True)
+        agent.save(
+            os.path.join(path, f"step_{self.steps}"),
+            include_buffer=self.save_buffer,
+            extra_metadata={
+                "steps": int(self.steps),
+                "epochs": int(epochs),
+                "episodes": int(episodes),
+                "gradient_steps": int(gradient_steps),
+            },
+        )
 
     def _timed(self, fn, *args, label=""):
         print(f"Compiling {label}...", flush=True)
@@ -205,13 +261,17 @@ class Trainer:
 
         agent_key = rngs.agent()
         memory_warmup = getattr(agent, 'memory_warmup', 0)
-        warmup_iters = memory_warmup // NUM_ENVS
-        self.steps = 0
-        epoch_steps = 0
-        epochs = 0
-        episodes = 0
-        tot_gradient_steps = 0
-        steps_since_save = 0
+        warmup_iters = self._warmup_iters(memory_warmup, NUM_ENVS)
+        # A resumed run continues its predecessor's counters (all zero for a
+        # fresh one), so `steps` keeps meaning TOTAL env steps: the epoch and
+        # save cadences stay phase-aligned across the restart and the logs
+        # continue the same x-axis instead of starting a second curve at 0.
+        self.steps = self.initial_steps
+        epoch_steps = self.steps % self.epoch_steps
+        epochs = self.initial_epochs
+        episodes = self.initial_episodes
+        tot_gradient_steps = self.initial_gradient_steps
+        steps_since_save = self.steps % self.save_steps
         actor_losses = []
         critic_losses = []
 
@@ -298,9 +358,12 @@ class Trainer:
                 ], axis=0)
                 agent.state.obs_stats = Agent.update_obs_stats(agent.state.obs_stats, all_obs)
 
-            self.steps = warmup_iters * NUM_ENVS
+            # Warmup transitions are real env steps, so they count — on a resume
+            # they are added on top of the restored total rather than replacing
+            # it.
+            self.steps = self.initial_steps + warmup_iters * NUM_ENVS
             epoch_steps = self.steps % self.epoch_steps
-            episodes = int(jnp.sum(transitions.terminal))
+            episodes = episodes + int(jnp.sum(transitions.terminal))
             steps_since_save = self.steps % self.save_steps
             print(f"  Done: {self.steps:,} steps, {episodes} episodes", flush=True)
 
@@ -547,13 +610,7 @@ class Trainer:
 
             stop_training = self.steps >= self.max_steps
             if stop_training or steps_since_save >= self.save_steps:
-                path = os.path.join(self.output_dir, 'checkpoints')
-                if os.path.isdir(path) and self.replace_checkpoint:
-                    for file in os.listdir(path):
-                        if file.startswith('step_'):
-                            os.remove(os.path.join(path, file))
-                save_path = os.path.join(path, f'step_{self.steps}')
-                agent.save(save_path)
+                self._save(agent, epochs, episodes, tot_gradient_steps)
                 steps_since_save = self.steps % self.save_steps
 
             if stop_training:
@@ -803,13 +860,14 @@ class Trainer:
         # --- Warmup: fill replay buffer with random actions ---
 
         memory_warmup = getattr(agent, "memory_warmup", 0)
-        warmup_iters = memory_warmup // NUM_ENVS
-        self.steps = 0
-        epoch_steps = 0
-        epochs = 0
-        episodes = 0
-        tot_gradient_steps = 0
-        steps_since_save = 0
+        warmup_iters = self._warmup_iters(memory_warmup, NUM_ENVS)
+        # See `_run_jax`: a resumed run continues its predecessor's counters.
+        self.steps = self.initial_steps
+        epoch_steps = self.steps % self.epoch_steps
+        epochs = self.initial_epochs
+        episodes = self.initial_episodes
+        tot_gradient_steps = self.initial_gradient_steps
+        steps_since_save = self.steps % self.save_steps
         actor_losses = []
         critic_losses = []
 
@@ -824,7 +882,7 @@ class Trainer:
                 state = env.step(old_state, actions)
                 agent.add(old_state.env_state, state.env_state)
             jax.block_until_ready(jax.tree.leaves(agent.state.buffer_state))
-            self.steps = warmup_iters * NUM_ENVS
+            self.steps = self.initial_steps + warmup_iters * NUM_ENVS
             epoch_steps = self.steps % self.epoch_steps
             steps_since_save = self.steps % self.save_steps
             print(f"  {time.time() - t0:.1f}s — {self.steps:,} steps", flush=True)
@@ -1081,17 +1139,11 @@ class Trainer:
 
             stop_training = self.steps >= self.max_steps
             if stop_training or steps_since_save >= self.save_steps:
-                path = os.path.join(self.output_dir, "checkpoints")
-                if os.path.isdir(path) and self.replace_checkpoint:
-                    for file in os.listdir(path):
-                        if file.startswith("step_"):
-                            os.remove(os.path.join(path, file))
-                save_path = os.path.join(path, f"step_{self.steps}")
                 # Checkpointing reads (and momentarily detaches) agent.state;
                 # pause the learner so it can't grad-step a half-detached state.
                 if learner is not None:
                     learner.pause()
-                agent.save(save_path)
+                self._save(agent, epochs, episodes, tot_gradient_steps)
                 if learner is not None:
                     learner.resume()
                 steps_since_save = self.steps % self.save_steps

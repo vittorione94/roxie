@@ -419,6 +419,16 @@ class MPO(Agent):
         print("MPO agent initialized.")
         print("Hyper Params:", self._export_hyperparams())
 
+    def _checkpoint_modules(self) -> dict:
+        # The Lagrange duals and their optimizer live outside `self.state`. They
+        # are learned, and they are what enforce the KL trust region: resuming
+        # with them reset to `init_temperature` / `init_alpha_*` would re-open
+        # the trust region on an already-converged policy.
+        return {
+            "dual_params": self.dual_params,
+            "dual_optimizer": self.dual_optimizer,
+        }
+
     def step(
         self,
         observation: jnp.ndarray,

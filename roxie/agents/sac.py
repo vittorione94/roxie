@@ -445,6 +445,16 @@ class SAC(Agent):
         print("SAC agent initialized.")
         print("Hyper Params:", self._export_hyperparams())
 
+    def _checkpoint_modules(self) -> dict:
+        # The entropy temperature and its Adam slots live outside `self.state`,
+        # so a resume that dropped them would restart alpha from
+        # `init_log_alpha` — re-running the whole temperature annealing against
+        # an already-trained policy.
+        return {
+            "log_alpha_module": self.log_alpha_module,
+            "alpha_optimizer": self.alpha_optimizer,
+        }
+
     def replay_add(self, buffer_state, transitions):
         """Add one env-step batch of transitions (leaves shaped (B, ...)).
 

@@ -331,6 +331,13 @@ class DDPG(Agent):
         print("Noise module hyperparameters:", self.noise_module.hyperparameters())
         print("Hyper Params:", self._export_hyperparams())
 
+    def _checkpoint_modules(self) -> dict:
+        # The noise module carries the step counter its decay schedule reads, so
+        # without it a resumed run would explore at the initial scale again —
+        # after a checkpoint taken deep into the decay, that is a much noisier
+        # behaviour policy than the one that produced the restored weights.
+        return {"noise_module": self.noise_module}
+
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
         """Build the critic network. Overridden by TD3 to return a TwinCritic."""
         return hydra.utils.instantiate(

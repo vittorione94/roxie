@@ -55,6 +55,11 @@ trainer:
   test_episodes: 10
   show_progress: true
   replace_checkpoint: false
+  # Checkpoint the replay buffer too. Off: a checkpoint stays small and cheap to
+  # write, and a run resumed with `resume=` refills the buffer through its warmup
+  # before learning again. On, a resume is exact — at the cost of the buffer's
+  # full size on disk per save, which is gigabytes here.
+  save_buffer: false
 
 # Metric logging. Console + CSV (log.csv in the run's output dir) are always on
 # — the CSV is what roxie/plot.py reads for the offline figure. wandb is on for

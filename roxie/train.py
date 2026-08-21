@@ -7,11 +7,21 @@ import sys
 # `device` is not a config key, so the arg is consumed (dropped from sys.argv)
 # rather than merely read: leaving it in argv makes Hydra reject the launch.
 # Both `device=` and `+device=` are accepted and hidden from Hydra.
+#
+# `resume=<path>` is consumed the same way and for the same reason: it is not a
+# config key either, so Hydra would reject it (and `+resume=` would only work
+# where the config is not struct-locked). Handling both here keeps the two
+# process-level switches — where to run, and what to continue from — spelled the
+# same way on the command line.
 _device = None
+_resume = None
 for _arg in list(sys.argv[1:]):
     _bare = _arg.lstrip("+")
     if _bare.startswith("device="):
         _device = _bare.split("=", 1)[1]
+        sys.argv.remove(_arg)
+    elif _bare.startswith("resume="):
+        _resume = _bare.split("=", 1)[1]
         sys.argv.remove(_arg)
 if _device:
     os.environ["JAX_PLATFORMS"] = _device
@@ -31,6 +41,7 @@ from roxie.environment.loader import (
     log_loaded_backend,
 )
 from roxie.utils import hydra_searchpath, logger
+from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
 from roxie.utils.trainer import Trainer
 
 # Launchable experiment configs live in top-level experiments/, grouped by env.
@@ -137,8 +148,6 @@ def main(cfg: DictConfig):
         )
     logger.initialize(path=output_dir, backends=backends)
 
-    training_rngs = nnx.Rngs(envs=cfg.env.seed, agent=3)
-
     # Action bounds: MuJoCo/Playground envs expose mj_model.actuator_ctrlrange;
     # EnvPool and other non-MuJoCo envs provide action_low/action_high directly.
     if hasattr(env, "mj_model"):
@@ -170,6 +179,42 @@ def main(cfg: DictConfig):
 
     agent = hydra.utils.instantiate(cfg.agent, _recursive_=False, **agent_kwargs)
 
+    # Resume: the agent was just built from the CONFIG, and only its numbers come
+    # from the checkpoint — so the yaml stays authoritative and a resume may
+    # legitimately raise `trainer.steps` or retune a knob (unlike `play.py`,
+    # which rebuilds the agent from the checkpoint's own hyperparameters).
+    #
+    # `resume=` accepts a run dir, its `checkpoints/` dir, or one `step_<N>` dir;
+    # `resume.path` in a config does the same for a run that wants it recorded.
+    # The returned metadata is the trainer's progress: env steps, epochs,
+    # episodes, gradient steps, and whether a replay buffer came back with it.
+    resume_cfg = cfg.get("resume") or {}
+    if isinstance(resume_cfg, str):  # `resume: <path>` rather than `resume.path`
+        resume_cfg = {"path": resume_cfg}
+    resume_path = _resume or resume_cfg.get("path", None)
+    resume_metadata = None
+    if resume_path:
+        checkpoint = find_checkpoint(resume_path)
+        resume_metadata = agent.restore(checkpoint)
+        # `Trainer.save` has recorded `steps` in the metadata since resume
+        # existed; older checkpoints only have it in the directory name.
+        if not resume_metadata.get("steps"):
+            resume_metadata["steps"] = checkpoint_steps(checkpoint) or 0
+        print(
+            f"Resuming from {checkpoint} at {int(resume_metadata['steps']):,} "
+            f"env steps (target {int(cfg.trainer.steps):,}).",
+            flush=True,
+        )
+
+    # Seeded from the config, but a resume offsets the env stream by the steps
+    # already taken: replaying the identical reset/exploration key sequence the
+    # first leg consumed would make the resumed segment revisit exactly the start
+    # states it has already trained on, which a run that never stopped would
+    # never do. `agent` is untouched — its stream feeds gradient-step keys, whose
+    # value comes from being reproducible.
+    resumed_steps = int((resume_metadata or {}).get("steps") or 0)
+    training_rngs = nnx.Rngs(envs=cfg.env.seed + resumed_steps, agent=3)
+
     trainer = Trainer(
         output_dir=output_dir,
         steps=int(cfg.trainer.steps),
@@ -180,6 +225,11 @@ def main(cfg: DictConfig):
         replace_checkpoint=cfg.trainer.replace_checkpoint,
         async_learner=bool(cfg.trainer.get("async_learner", False)),
         learner_chunk=int(cfg.trainer.get("learner_chunk", 8)),
+        # Opt-in: checkpoints then carry the replay buffer, which makes a resumed
+        # off-policy run exact (no warmup refill) at the cost of the buffer's
+        # full size on disk per save.
+        save_buffer=bool(cfg.trainer.get("save_buffer", False)),
+        resume=resume_metadata,
     )
     test_environment = test_env if test_env is not None else env
     trainer.initialize(
