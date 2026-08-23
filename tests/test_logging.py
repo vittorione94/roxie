@@ -67,9 +67,11 @@ class TestNamespaceScheme:
 
         from roxie.utils.trainer import Trainer
 
+        # These two are now the ONLY places the trainer calls store(): the eval
+        # rollout moved to `roxie.utils.rollout` and hands back plain arrays, so
+        # every key name is still decided here.
         literals = []
-        for fn in (Trainer._store_epoch_metrics, Trainer._store_test_metrics,
-                   Trainer._test):
+        for fn in (Trainer._store_epoch_metrics, Trainer._store_test_metrics):
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
@@ -93,6 +95,25 @@ class TestNamespaceScheme:
             assert key in TOP_LEVEL or key.startswith(SECTIONS), (
                 f"Trainer logs unsectioned key {key!r}; put it under "
                 f"train/, test/ or sys/ (or add it to the run axes)"
+            )
+
+    def test_backends_do_not_log_for_themselves(self):
+        """The namespace is the trainer's alone.
+
+        The rollouts run the eval and own the mining tables, so either could
+        quietly start logging its own keys — and a backend-specific key would be
+        exactly the drift that splitting the loop was meant to prevent. They
+        return values instead; `_store_*` names them.
+        """
+        import inspect
+
+        from roxie.utils import learner, rollout
+
+        for module in (rollout, learner):
+            src = inspect.getsource(module)
+            assert "logger.store" not in src, (
+                f"{module.__name__} logs its own metrics; hand the values back "
+                f"to Trainer._store_* instead, so one place owns the namespace"
             )
 
     def test_no_bare_legacy_names(self):

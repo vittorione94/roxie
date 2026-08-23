@@ -15,7 +15,7 @@ from pathlib import Path
 
 CHECKPOINTS_DIRNAME = "checkpoints"
 
-# `step_<env steps>` — written by `Trainer._run_jax` / `_run_envpool`.
+# `step_<env steps>` — written by `Trainer._checkpoint_if_due`.
 _STEP_RE = re.compile(r"^step_(\d+)$")
 
 

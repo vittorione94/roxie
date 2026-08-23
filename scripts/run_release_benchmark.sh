@@ -11,14 +11,20 @@
 #     mjx_cpu     CPU physics (MJX)         + CPU learner   <- fully GPU-free
 #
 #   mocap_cmu_006_13 (complex, CMU humanoid tracking)       7 agents x 1 cell
-#                                                         + subset x 2 cells
+#                                                         + subset x 1 cell
 #     warp_gpu      GPU physics + GPU learner
-#     envpool_cpu   CPU physics (native MuJoCo pool) + CPU learner  <- GPU-free
-#     envpool_gpu   CPU physics + GPU learner (async learner on)
+#     envpool_gpu   CPU physics (native MuJoCo pool) + GPU learner (async on)
+#     envpool_cpu   CPU physics + CPU learner  <- GPU-free, NOT IN THE DEFAULT
+#                   GRID: at ~13.6k sps the 1B budget is ~20 h per run, so the
+#                   fully GPU-free claim is carried by the walker suite's
+#                   mjx_cpu cell and discussed rather than re-measured here.
+#                   Still runnable on demand: --cells envpool_cpu (and give it
+#                   a shorter --steps-mocap unless you mean to wait).
 #
 #   Between the two suites that covers all four physics x learner placements.
-#   The mocap CPU cells run a subset of agents (MOCAP_CPU_AGENTS) because each
-#   mocap run is ~an hour; the walker suite carries the full-width cross.
+#   The mocap envpool_gpu cell runs a subset of agents (MOCAP_HYBRID_AGENTS)
+#   because each mocap run is ~10-16 h; the walker suite carries the full-width
+#   cross.
 #
 #   WHAT IS HELD FIXED
 #
@@ -39,12 +45,15 @@
 #
 #   Runs execute STRICTLY SEQUENTIALLY: every cell wants either the whole card
 #   or every core, so overlapping two of them measures contention rather than
-#   the backend. Expect the full grid to take most of a day — start with
-#   --dry-run, which prints the projection.
+#   the backend. At the 1B-step mocap budget the full grid is ~4-5 DAYS, not an
+#   overnight sweep — start with --dry-run, which prints the projection.
 #
-#   The script is resumable: each completed run is appended to
-#   outputs/release_v1/manifest.tsv and skipped on a later invocation unless
+#   The script is resumable at RUN granularity: each completed run is appended
+#   to outputs/release_v1/manifest.tsv and skipped on a later invocation unless
 #   --force is passed. A failed run is recorded too, and retried next time.
+#   A 10-hour run that dies is expensive to retry from zero, so on failure the
+#   script prints the `resume=` command for the last checkpoint it wrote
+#   (checkpoints land every trainer.save_steps env steps).
 #
 #   AFTERWARDS
 #
@@ -60,18 +69,29 @@ cd "$REPO_ROOT" || exit 1
 
 ALL_AGENTS="ddpg td3 td4 d4pg sac mpo ppo"
 WALKER_CELLS="warp_gpu mjx_gpu mjx_cpu"
-MOCAP_CELLS="warp_gpu envpool_cpu envpool_gpu"
-# Which agents get the expensive mocap CPU cells. Both are deliberate: PPO is
-# the arm the CPU path was originally validated on, TD3 is the reference
-# off-policy arm and exercises the replay buffer that the CPU path moves into
-# system RAM.
-MOCAP_CPU_AGENTS="${MOCAP_CPU_AGENTS:-td3 ppo}"
+MOCAP_CELLS="warp_gpu envpool_gpu envpool_cpu"
+
+# Cells the DEFAULT grid runs. A cell listed above but not here is supported and
+# configured, just too expensive to include unasked; naming it with --cells runs
+# it anyway. mocap/envpool_cpu is out for that reason — ~20 h per run at the 1B
+# budget, for a GPU-free claim the walker suite's mjx_cpu cell already carries.
+WALKER_DEFAULT_CELLS="${WALKER_DEFAULT_CELLS:-$WALKER_CELLS}"
+MOCAP_DEFAULT_CELLS="${MOCAP_DEFAULT_CELLS:-warp_gpu envpool_gpu}"
+
+# Which agents get the second (non-headline) mocap cell. Both are deliberate:
+# PPO is the arm the envpool path was originally validated on, TD3 is the
+# reference off-policy arm and exercises the replay buffer that the envpool
+# path moves into system RAM.
+MOCAP_HYBRID_AGENTS="${MOCAP_HYBRID_AGENTS:-td3 ppo}"
 
 # Step budgets. Identical across every agent and every cell of a suite — that
 # equality is what makes score-vs-env-steps a comparison. If you shorten one,
-# shorten it for the whole suite and re-run all of its cells.
+# shorten it for the whole suite and re-run all of its cells. Anything measured
+# in env steps inside the configs is tied to these numbers too (the mocap noise
+# anneal is 40% of MOCAP_STEPS) — see experiments/mocap/bench/cmu_006_13.yaml
+# before overriding either of them for a real result.
 WALKER_STEPS="${WALKER_STEPS:-5000000}"
-MOCAP_STEPS="${MOCAP_STEPS:-50000000}"
+MOCAP_STEPS="${MOCAP_STEPS:-1000000000}"
 # --smoke budgets: enough for two epochs and a first eval, i.e. enough to prove
 # the config composes, the env builds, the agent compiles and the trainer logs.
 SMOKE_WALKER_STEPS=100000
@@ -81,15 +101,18 @@ SMOKE_MOCAP_EPOCH=250000
 
 # Throughput priors used ONLY for the --dry-run projection (steps/s, measured on
 # a 12-core 7900X + RTX 5080). They are estimates; the manifest records what
-# each run actually achieved.
+# each run actually achieved. The walker numbers and mocap:warp_gpu are now read
+# back off the 2026-08-20 grid in manifest.tsv rather than guessed, which is why
+# they are lower than the original priors — those were physics-only ceilings and
+# did not carry a learner.
 sps_prior() {
     case "$1:$2" in
-        walker_walk:warp_gpu)        echo 60000 ;;
-        walker_walk:mjx_gpu)         echo 45000 ;;
-        walker_walk:mjx_cpu)         echo  2400 ;;   # measured, TD3, 256 envs
-        mocap_cmu_006_13:warp_gpu)   echo 15000 ;;
-        mocap_cmu_006_13:envpool_cpu) echo 13600 ;;
+        walker_walk:warp_gpu)        echo  6500 ;;   # measured, 7-agent grid
+        walker_walk:mjx_gpu)         echo  8500 ;;   # measured, 7-agent grid
+        walker_walk:mjx_cpu)         echo  5000 ;;   # measured, 7-agent grid
+        mocap_cmu_006_13:warp_gpu)   echo 28000 ;;   # measured, ddpg + td3
         mocap_cmu_006_13:envpool_gpu) echo 17200 ;;
+        mocap_cmu_006_13:envpool_cpu) echo 13600 ;;
         *)                           echo     0 ;;
     esac
 }
@@ -163,20 +186,28 @@ launchable() {
     esac
 }
 
-# Cells for a suite, honouring --cells and (for mocap) the CPU-subset rule.
+# Cells for a suite, honouring --cells and (for mocap) the subset rule.
+#
+# --cells is an ESCAPE HATCH, not just a filter: naming a cell explicitly runs
+# it for every selected agent, including the cells the default grid leaves out
+# (mocap/envpool_cpu) and the agents the non-headline cells otherwise skip. That
+# is what makes an excluded cell reachable without editing this file.
 cells_for() {
-    local suite="$1" agent="$2" all cells=""
+    local suite="$1" agent="$2" all default cells=""
     case "$suite" in
-        walker_walk)      all="$WALKER_CELLS" ;;
-        mocap_cmu_006_13) all="$MOCAP_CELLS" ;;
+        walker_walk)      all="$WALKER_CELLS"; default="$WALKER_DEFAULT_CELLS" ;;
+        mocap_cmu_006_13) all="$MOCAP_CELLS";  default="$MOCAP_DEFAULT_CELLS" ;;
     esac
     for cell in $all; do
-        [[ -n "$CELL_FILTER" ]] && ! in_list "$cell" "$CELL_FILTER" && continue
-        # The mocap CPU cells are ~an hour each; only the subset gets them
-        # unless the caller asked for a cell explicitly.
-        if [[ "$suite" == "mocap_cmu_006_13" && "$cell" != "warp_gpu" \
-              && -z "$CELL_FILTER" ]] && ! in_list "$agent" "$MOCAP_CPU_AGENTS"; then
-            continue
+        if [[ -n "$CELL_FILTER" ]]; then
+            in_list "$cell" "$CELL_FILTER" || continue
+        else
+            in_list "$cell" "$default" || continue
+            # The non-headline mocap cell is 16 h a run; only the subset gets it.
+            if [[ "$suite" == "mocap_cmu_006_13" && "$cell" != "warp_gpu" ]] \
+               && ! in_list "$agent" "$MOCAP_HYBRID_AGENTS"; then
+                continue
+            fi
         fi
         cells="$cells $cell"
     done
@@ -404,6 +435,24 @@ for item in "${QUEUE[@]}"; do
         fail_count=$((fail_count + 1))
         err "FAILED (exit $rc) after $(hms $elapsed) — last lines of $log:"
         tail -n 15 "$log" >&2
+        # A mocap arm is 10-16 h; if it got far enough to checkpoint, say so, so
+        # the retry is a resume rather than a restart from zero. `resume=` takes
+        # the run dir and picks the highest step_<N> under it (see
+        # roxie/utils/checkpoint.py), so the bare path is all that is needed.
+        #
+        # It must NOT resume into the dead run's own dir: the CSV backend opens
+        # log.csv with "w" on its first row, so a second run pointed at that dir
+        # truncates the curve the first leg wrote. `.resume` keeps both halves
+        # on disk; the resumed leg logs TOTAL env steps (the trainer seeds its
+        # counters from the checkpoint metadata), so the two concatenate into
+        # one curve.
+        if compgen -G "$run_dir/checkpoints/step_*" > /dev/null; then
+            resume_cmd=("${cmd[@]/#hydra.run.dir=*/hydra.run.dir=$run_dir.resume}")
+            warn "it checkpointed before dying — resume instead of restarting:"
+            warn "  ${resume_cmd[*]} resume=$run_dir"
+            warn "(the manifest records this as 'fail', so a plain re-invocation"
+            warn " of this script would start the arm over from zero.)"
+        fi
         printf 'fail\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                "$suite" "$cell" "$agent" "$steps" "$elapsed" "$sps_actual" "$run_dir" >> "$MANIFEST"
         # Deliberately NOT fatal: one agent failing a cell should not cost the

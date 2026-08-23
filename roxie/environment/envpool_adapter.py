@@ -85,13 +85,13 @@ class EnvPoolWrapper:
         "mining_bins", "mining_refresh", "mining_stats", "refresh_reset_pool",
     )
 
-    def __init__(self, pool: Any, max_episode_steps: int = 1000):
-        self._pool = pool
+    def __init__(self, pool: Any, max_episode_steps: int = 1000, rebuild=None):
         self.max_episode_steps = max_episode_steps
-        for name in self._POOL_HOOKS:
-            attr = getattr(pool, name, None)
-            if attr is not None:
-                setattr(self, name, attr)
+        # `rebuild(seed) -> pool` when the builder can reconstruct this pool; see
+        # `reseed`. None for pools built some other way, which simply keeps
+        # whatever reset determinism they already have.
+        self._rebuild = rebuild
+        self._bind_pool(pool)
 
         obs_space = pool.observation_space
         act_space = pool.action_space
@@ -100,6 +100,33 @@ class EnvPoolWrapper:
         self.action_size: int = int(np.prod(act_space.shape))
         self.action_low: jnp.ndarray = jnp.array(act_space.low, dtype=jnp.float32)
         self.action_high: jnp.ndarray = jnp.array(act_space.high, dtype=jnp.float32)
+
+    def _bind_pool(self, pool: Any) -> None:
+        self._pool = pool
+        for name in self._POOL_HOOKS:
+            attr = getattr(pool, name, None)
+            if attr is not None:
+                setattr(self, name, attr)
+
+    def reseed(self, seed: int) -> bool:
+        """Rebuild the pool at `seed` so the next `reset()` is reproducible.
+
+        EnvPool's own `seed()` is a documented no-op as of 1.2.5 and `reset()`
+        advances the pool's RNG, so a pool reset once per epoch for evaluation
+        starts from different states every time — a change in `test/score` could
+        then be a different draw rather than a better policy. The JAX eval path
+        pins its reset keys for exactly this reason; rebuilding (~3ms for a
+        5-env pool) is how a C++ pool gets the same guarantee.
+
+        Returns whether it could. Pools built outside `build_envpool_env` have
+        no rebuild thunk and keep whatever determinism they already have — which
+        for an eval pool that pins its own start state (mocap: frame 0, no reset
+        noise) is already total.
+        """
+        if self._rebuild is None:
+            return False
+        self._bind_pool(self._rebuild(seed))
+        return True
 
     def reset(self) -> EnvPoolWrapperState:
         obs, _ = self._pool.reset()
@@ -163,24 +190,25 @@ def build_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
     })
     extra = {k: v for k, v in cfg_env.items() if k not in _reserved}
 
-    train_pool = envpool.make(
-        task_id,
-        env_type="gymnasium",
-        num_envs=num_envs,
-        seed=seed,
-        max_episode_steps=max_episode_steps,
-        **extra,
-    )
-    test_pool = envpool.make(
-        task_id,
-        env_type="gymnasium",
-        num_envs=test_episodes,
-        seed=seed + 1,
-        max_episode_steps=max_episode_steps,
-        **extra,
-    )
+    def make_pool(n: int, pool_seed: int):
+        return envpool.make(
+            task_id,
+            env_type="gymnasium",
+            num_envs=n,
+            seed=pool_seed,
+            max_episode_steps=max_episode_steps,
+            **extra,
+        )
 
-    train_env = EnvPoolWrapper(train_pool, max_episode_steps=max_episode_steps)
-    test_env = EnvPoolWrapper(test_pool, max_episode_steps=max_episode_steps)
+    train_env = EnvPoolWrapper(
+        make_pool(num_envs, seed), max_episode_steps=max_episode_steps,
+    )
+    # The eval pool carries a rebuild thunk so the trainer can pin its start
+    # states to a fixed seed before every eval (see `EnvPoolWrapper.reseed`).
+    test_env = EnvPoolWrapper(
+        make_pool(test_episodes, seed + 1),
+        max_episode_steps=max_episode_steps,
+        rebuild=lambda s: make_pool(test_episodes, s),
+    )
 
     return EnvBundle(env=train_env, test_env=test_env, env_cfg=None)

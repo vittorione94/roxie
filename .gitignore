@@ -72,3 +72,9 @@ Thumbs.db
 logs/
 
 outputs/
+
+# Exported release policies (scripts/export_release_weights.py). Half a gigabyte
+# of orbax checkpoints — these are attached to a release, not committed. The
+# index and README the export generates are regenerated with them, so they are
+# ignored too rather than left to go stale against uncommitted bundles.
+weights/

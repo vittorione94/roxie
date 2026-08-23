@@ -93,6 +93,45 @@ class AsyncLearner:
             target=self._loop, name="async-learner", daemon=True
         )
 
+        # Behaviour-side state, owned by the ACTING thread (see `act`). Held here
+        # rather than in the training loop so the snapshot-versioning protocol
+        # stays this class's business — the loop just calls `act`.
+        self._behavior_actor = None
+        self._behavior_stats = None
+        self._behavior_version = -1
+
+    # -- construction -------------------------------------------------------
+
+    @classmethod
+    def started(cls, agent, agent_key, state, *, initial_steps=0, chunk=8):
+        """Build, warm the two programs the two threads will race on, and start.
+
+        Both compiles happen HERE, on the calling thread, before the learner
+        exists: the acting thread's behaviour path and the learner thread's
+        fixed-size chunk burst are different programs from anything compiled so
+        far, and a cold compile of either mid-run would stall the other.
+        """
+        import copy
+
+        agent_key, learner_key, chunk_key = jax.random.split(agent_key, 3)
+        learner = cls(agent, learner_key, initial_steps=initial_steps, chunk=chunk)
+
+        learner._behavior_actor = copy.deepcopy(agent.state.actor)
+        learner._behavior_stats = agent.state.obs_stats
+        warm_action, _ = agent.select_action(
+            learner._behavior_actor, learner._behavior_stats,
+            state.env_state.obs, agent_key, evaluate=False,
+        )
+        jax.block_until_ready(warm_action)
+
+        agent.learn(chunk_key, n_steps=learner._chunk)
+        jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
+
+        learner.start()
+        print("Async learner started "
+              "(CPU acting overlaps GPU gradient bursts).", flush=True)
+        return learner
+
     # -- main-thread API ----------------------------------------------------
 
     def start(self):
@@ -101,6 +140,35 @@ class AsyncLearner:
         self._publish_snapshot()
         self._thread.start()
 
+    def act(self, obs, key):
+        """Select actions from the behaviour snapshot — decoupled from the
+        learner's live, mutating networks — re-syncing only when it advances."""
+        version, snapshot = self._latest_snapshot()
+        if version != self._behavior_version and snapshot is not None:
+            nnx.update(self._behavior_actor, snapshot[0])
+            self._behavior_stats = snapshot[1]
+            self._behavior_version = version
+        return self._agent.select_action(
+            self._behavior_actor, self._behavior_stats, obs, key, evaluate=False,
+        )
+
+    def observe(self, prev_env_state, next_env_state, actions, steps):
+        """Hand the transition to the learner thread. The action travels WITH it
+        rather than being read off `agent.last_action` — `select_action` never
+        sets that, and the acting thread would overwrite it anyway. `steps` is
+        unused: the learner paces itself off the transitions it has actually
+        buffered, not the acting thread's count.
+        """
+        del steps
+        self.push(
+            prev_env_state.obs,
+            actions,
+            next_env_state.reward,
+            next_env_state.info["termination"],
+            next_env_state.info["truncation"],
+            next_env_state.obs,
+        )
+
     def push(self, prev_obs, action, reward, termination, truncation, next_obs):
         """Hand one env-step transition batch to the learner. Blocks only if the
         learner has fallen far behind (bounded queue = natural backpressure)."""
@@ -108,13 +176,13 @@ class AsyncLearner:
             (prev_obs, action, reward, termination, truncation, next_obs)
         )
 
-    def latest_snapshot(self):
+    def _latest_snapshot(self):
         """`(version, (actor_params, obs_stats))`; snapshot is None before start."""
         with self._lock:
             return self._snapshot_version, self._snapshot
 
-    def drain_metrics(self):
-        """Return `(cumulative_grad_steps, [(actor_loss, critic_loss), ...])` and
+    def drain(self):
+        """Return `(grad_steps_since_start, [(actor_loss, critic_loss), ...])` and
         clear the loss buffer. Losses are device arrays; the caller reduces them
         host-side at epoch boundaries exactly like the sync path."""
         with self._lock:

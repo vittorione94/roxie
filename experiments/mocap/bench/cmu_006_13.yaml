@@ -10,7 +10,8 @@
 # The task: overfit ONE clip — CMU_006_13, the hard 40.8s / 1631-frame one —
 # and answer "which algorithm gets furthest, per env step and per wall-clock
 # hour?". A single clip rather than the 800-clip set because the release figure
-# has to be reproducible in an overnight window on one box.
+# has to be reproducible on one box — at the 1B-step budget below that is a
+# multi-day grid already, and the 800-clip set would make it a multi-week one.
 #
 # Pair it with `agent: <name>_bench`, `env_config: cmu`, `reward: cmu_tracking`
 # and `backend: <cell>` — one of warp / envpool / envpool_gpu.
@@ -52,13 +53,29 @@ env:
   collisions: ground
 
 trainer:
-  # 50 epochs of curve at ~15k sps on the GPU cell ≈ 55 min/agent. Same budget
-  # for every agent and every cell: score-vs-env-steps ranks the algorithms and
-  # the wall-clock panel shows what each backend cost to get there. Override for
-  # a pilot with `trainer.steps=...`; do not edit it per-cell.
-  steps: 50_000_000
-  epoch_steps: 1_000_000
-  save_steps: 10_000_000
+  # 1B env steps — the release budget. At the measured 28k sps of the warp_gpu
+  # cell that is ~10 h/agent, and ~16 h on the envpool_gpu hybrid (17.2k sps);
+  # the whole mocap suite is a multi-day sequential grid, not an overnight one.
+  # Same budget for every agent and every cell that runs: score-vs-env-steps
+  # ranks the algorithms and the wall-clock panel shows what each backend cost
+  # to get there. Override for a pilot with `trainer.steps=...`; do not edit it
+  # per-cell.
+  #
+  # ANYTHING MEASURED IN ENV STEPS IS TIED TO THIS NUMBER and has to move with
+  # it. Today that is `noise/bench_gaussian.yaml`'s `decay_steps` (held at 40%
+  # of the budget) plus the two cadences below. `memory_warmup` and the replay
+  # capacity deliberately do NOT scale: they are matched hyperparameters shared
+  # with the walker suite, so a longer budget means more turnover through the
+  # same buffer, which is the intended reading.
+  steps: 1_000_000_000
+  # 200 points of curve. 1M (the 50M-budget value) would be 1000 epochs, and an
+  # epoch boundary is not free — it pauses the learner and runs the eval — so
+  # the eval overhead would be ~10% of a 10 h run for resolution nobody reads.
+  epoch_steps: 5_000_000
+  # 20 checkpoints per run at ~50 MB each ≈ 1 GB/run with `replace_checkpoint:
+  # false` below. The old 10M cadence would write 100 of them (5 GB/run, ~55 GB
+  # across the grid) to publish exactly one policy per agent.
+  save_steps: 50_000_000
   # 4, not 100: under the canonical eval protocol (frame 0, no reset noise, run
   # the whole clip) a single-clip run makes every eval episode the SAME rollout,
   # so 96 of 100 would re-measure one start state. 4 rather than 1 only because

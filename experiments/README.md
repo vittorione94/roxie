@@ -12,8 +12,9 @@ questions for the v1 release:
 ```bash
 scripts/run_release_benchmark.sh --dry-run   # the grid, with time estimates
 scripts/run_release_benchmark.sh --smoke     # tiny budgets: does it all launch?
-scripts/run_release_benchmark.sh             # the real thing (~14 h, sequential)
+scripts/run_release_benchmark.sh             # the real thing (~4-5 DAYS, sequential)
 uv run python roxie/report.py                # assemble the W&B report
+uv run python scripts/export_release_weights.py   # package the policies
 ```
 
 ## The grid
@@ -21,7 +22,7 @@ uv run python roxie/report.py                # assemble the W&B report
 | Suite | Task | Cells | Runs |
 |---|---|---|---|
 | `walker_walk` | mujoco_playground WalkerWalk, 256 envs, 5M steps | `warp_gpu`, `mjx_gpu`, `mjx_cpu` | 7 agents × 3 |
-| `mocap_cmu_006_13` | CMU humanoid tracking, single clip, 1000 envs, 50M steps | `warp_gpu`, `envpool_cpu`, `envpool_gpu` | 7 agents × 1, + 2 agents × 2 |
+| `mocap_cmu_006_13` | CMU humanoid tracking, single clip, 1000 envs, **1B steps** | `warp_gpu`, `envpool_gpu` | 7 agents × 1, + 2 agents × 1 |
 
 A **cell** is a (physics device, learner device) placement:
 
@@ -30,13 +31,33 @@ A **cell** is a (physics device, learner device) placement:
 | `warp_gpu` | GPU (mujoco_warp) | GPU | The headline configuration. |
 | `mjx_gpu` | GPU (MJX) | GPU | Same card, physics traced into XLA instead of Warp kernels. |
 | `mjx_cpu` | CPU (MJX) | CPU | **Fully GPU-free.** Same env class, same trainer loop as the two above — only the device changes. |
-| `envpool_cpu` | CPU (native MuJoCo pool) | CPU | **Fully GPU-free.** A genuinely different implementation of the task; see [docs/backends.md](../docs/backends.md). |
-| `envpool_gpu` | CPU (native MuJoCo pool) | GPU | The hybrid, with `trainer.async_learner` on so the two devices overlap. |
+| `envpool_cpu` | CPU (native MuJoCo pool) | CPU | **Fully GPU-free.** A genuinely different implementation of the task; see [docs/backends.md](../docs/backends.md). Configured, but **not in the default mocap grid** — see below. |
+| `envpool_gpu` | CPU (native MuJoCo pool) | GPU | The hybrid, with `trainer.async_learner` on so the two devices overlap. The fastest mocap cell measured (17.2k sps). |
 
-Between the two suites that covers all four physics × learner placements. The
-walker suite carries the full-width agent cross because its runs are minutes;
-the mocap CPU cells run a subset (`MOCAP_CPU_AGENTS`, default `td3 ppo`) because
-each mocap run is about an hour.
+The walker suite carries the full-width agent cross because its runs are
+minutes; the mocap `envpool_gpu` cell runs a subset (`MOCAP_HYBRID_AGENTS`,
+default `td3 ppo`) because each mocap run is 10–16 hours.
+
+### Why `envpool_cpu` is not in the default mocap grid
+
+At the 1B-step budget it is ~20 h per run, and it would buy a claim the grid
+already makes elsewhere: `walker_walk/mjx_cpu` demonstrates a fully GPU-free
+run of the whole stack, and the mocap CPU **physics** path is exercised by
+`envpool_gpu`, which shares its env builder, stepper and thread pool and differs
+only in `runtime.jax_platform`. So the fourth placement (CPU physics + CPU
+learner on the hard task) is discussed in the release notes from the measured
+throughput rather than re-paid for at a 1B budget.
+
+It stays fully supported and one flag away:
+
+```bash
+scripts/run_release_benchmark.sh --suite mocap --cells envpool_cpu \
+    --agents td3 --steps-mocap 50000000
+```
+
+`--cells` is an escape hatch, not just a filter: naming a cell explicitly runs
+it even when the default grid omits it, and even for agents the non-headline
+cells otherwise skip.
 
 The mocap task has no `mjx_*` cell on purpose: MJX sizes contact arrays
 statically to *all* potential geom pairs (~980 on this humanoid, ~75× heavier
@@ -101,6 +122,23 @@ Verified by composing all seven configs and diffing the resolved blocks.
 `mocap` runs nets `[1024, 512, 256]`, replay ratio ~4, 8 000-step boundary. The
 two suites differ from each other — they are different tasks — but never within
 themselves.
+
+### Settings that are tied to the step budget
+
+Anything measured in **env steps** silently changes meaning when the budget
+moves. Changing `trainer.steps` means changing these with it:
+
+| Setting | Rule | mocap @ 1B |
+|---|---|---|
+| `noise.decay_schedule.decay_steps` | 40% of the budget, so noise reaches its floor with more than half the run left to exploit it | 400 M |
+| `trainer.epoch_steps` | ~200 points of curve; an epoch boundary pauses the learner and runs an eval, so it is not free | 5 M |
+| `trainer.save_steps` | ~20 checkpoints per run, which is what the weights export picks the best of | 50 M |
+
+`memory_warmup` and the replay capacity deliberately do **not** scale: they are
+matched hyperparameters shared with the walker suite, so a longer budget means
+more turnover through the same buffer. `tests/test_release_weights.py` pins the
+anneal ratio and the cadence divisibility so a budget change cannot quietly
+leave them behind.
 
 ## What necessarily differs (algorithmic, not tuning)
 
@@ -182,6 +220,65 @@ WALKER_STEPS=2000000 MOCAP_STEPS=20000000 scripts/run_release_benchmark.sh
 
 Change one for a *whole suite*, never for a single cell — a per-cell budget
 makes score-vs-steps incomparable, which is the one thing the grid exists to
-compare. The exploration-noise anneal is expressed in env steps and is sized at
-40% of the budget, so if you change a budget substantially, move
-`noise/bench_gaussian.yaml` with it.
+compare. And move the budget-linked settings with it (table above); the
+exploration-noise anneal is the one that bites, because a run with a stale
+anneal completes normally and just scores worse.
+
+At 1B steps a mocap arm is 10–16 h, so a crash is expensive. The trainer
+checkpoints every `save_steps` and the benchmark script prints the exact
+`resume=` command when a run dies with a checkpoint on disk. Resume into a
+*different* run dir than the dead leg — the CSV backend opens `log.csv` with
+`"w"` on its first row, so resuming in place truncates the curve the first leg
+wrote. The resumed leg logs total env steps (the trainer seeds its counters from
+the checkpoint metadata), so the two halves concatenate into one curve.
+
+## Released weights
+
+The grid's real output is not only the figure — it is seven trained policies.
+`scripts/export_release_weights.py` packages them:
+
+```bash
+uv run python scripts/export_release_weights.py --dry-run   # what would ship
+uv run python scripts/export_release_weights.py --verify    # export + read back
+uv run python scripts/export_release_weights.py --archive   # + .tar.gz + SHA256SUMS
+```
+
+It publishes one bundle per agent from the headline `mocap_cmu_006_13` /
+`warp_gpu` arm. Two selection rules do the work:
+
+- **Only `ok` runs from the manifest.** A run that crashed at 40% leaves
+  checkpoints that load perfectly and are not a release result. `--steps` narrows
+  further, so a 50M pilot cannot be published as a 1B policy.
+- **The best checkpoint, not the last.** Highest `test/score` among the steps
+  that actually have a checkpoint. On a saturating arm the final checkpoint is
+  measurably worse than the run's own peak — both existing mocap runs in the
+  manifest peak before their last save.
+
+A bundle mirrors a run dir's shape, because `play.py` resolves its config as
+`<checkpoint>/../../.hydra/config.yaml`:
+
+```
+weights/mocap_cmu_006_13/td3.warp_gpu/
+  .hydra/config.yaml     resolved run config (play.py reads this)
+  .hydra/overrides.yaml  the CLI condition the run was launched with
+  checkpoints/step_<N>/  the orbax checkpoint
+  metadata.json          score, provenance, source run, git commit
+```
+
+It is self-contained — copy it anywhere and it still opens:
+
+```bash
+uv run python roxie/play.py \
+    --checkpoint-path weights/mocap_cmu_006_13/td3.warp_gpu/checkpoints/step_<N>
+```
+
+Playback forces CPU and MJX physics, so a warp-trained bundle needs neither a
+GPU nor a warp install. The checkpoint carries target networks, optimizer slots
+and the observation normalizer as well as the policy, so a bundle also works as
+a training restart: `resume=<bundle dir>`. That is also why one is ~50–80 MB
+rather than the few MB the actor alone would be.
+
+`--verify` reads each exported checkpoint back off disk and checks the payload
+against the directory it landed in. That is a copy check, not a behavioural one:
+confirming the policy is the one that scored means rolling it out, which is what
+`play.py` is for.
