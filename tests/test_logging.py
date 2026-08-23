@@ -68,7 +68,8 @@ class TestNamespaceScheme:
         from roxie.utils.trainer import Trainer
 
         literals = []
-        for fn in (Trainer._store_epoch_metrics, Trainer._test):
+        for fn in (Trainer._store_epoch_metrics, Trainer._store_test_metrics,
+                   Trainer._test):
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
