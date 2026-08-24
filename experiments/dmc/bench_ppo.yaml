@@ -1,0 +1,28 @@
+# @package _global_
+#
+# dm_control release benchmark — PPO arm. On-policy, GAE, V critic — NO noise group, no replay buffer. Not replay-ratio comparable with the other six.
+#
+#   uv run python roxie/train.py --config-name dmc/bench_ppo
+#   uv run python roxie/train.py --config-name dmc/bench_ppo release.task=CheetahRun
+#   uv run python roxie/train.py --config-name dmc/bench_ppo dmc/backend@backend=envpool_cpu
+#
+# The agent block, the noise block (where there is one) and the whole bench/dmc
+# block are shared VERBATIM with every other bench_*.yaml; agent/ppo_bench
+# holds the only algorithmic difference. Nothing is overridden below on purpose
+# — put ad-hoc tweaks on the CLI so this file keeps recording the benchmark
+# condition.
+#
+# TWO things the grid varies over this launchable, neither of them a file:
+# `release.task` (one of the 25 in roxie.environment.suites.DMC_TASKS) and the
+# `backend` group (warp_gpu / envpool_cpu). scripts/run_release_benchmark.sh
+# walks the cross product.
+defaults:
+  - agent: ppo_bench
+  # bench BEFORE backend: the shared block declares release.cell as MISSING
+  # and the backend group is what fills it in, so the order is load-bearing.
+  - bench: dmc
+  - backend: warp_gpu
+  - _self_
+
+release:
+  agent: ppo

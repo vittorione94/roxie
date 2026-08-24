@@ -27,21 +27,21 @@ The `cuda` group pins `warp-lang>=1.11,<1.13`, which is a hard constraint rather
 ## Quick start
 
 ```bash
-uv run python roxie/train.py --config-name walker/bench_sac    # simple task
-uv run python roxie/train.py --config-name mocap/bench_ppo     # humanoid tracking
-uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/step_500000
+uv run python roxie/train.py --config-name dmc/bench_sac                          # WalkerWalk, GPU
+uv run python roxie/train.py --config-name dmc/bench_sac release.task=CheetahRun  # any of the 25
+uv run python roxie/train.py --config-name dmc/bench_sac dmc/backend@backend=envpool_cpu  # GPU-free
+uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/step_5000000
 ```
 
-Every run is a self-contained experiment YAML under [`experiments/`](experiments/), grouped by environment; the folder is part of the config name. Any key can be overridden on the command line, and switching the `backend` group moves the physics *and* the learner between devices without touching anything else.
+Every run is a self-contained experiment YAML under [`experiments/`](experiments/), grouped by environment; the folder is part of the config name. Any key can be overridden on the command line, and switching the `backend` group moves the physics *and* the learner between devices — and, in the benchmark's case, between two entirely different implementations of the same task — without touching anything else.
 
 **→ [docs/training.md](docs/training.md)** — overrides, `device=`, resuming a run, what a checkpoint carries, playback.
 
 ## Highlights
 
 - **[Backends: CPU vs GPU](docs/backends.md)** — the design centrepiece. Three physics backends and two rollouts; the memory trade that is the actual reason to run on CPU; where the agent runs relative to the physics, with measured throughput; determinism; and the parity check that keeps the backends honest.
-- **[Release benchmark](experiments/README.md)** — all seven agents on a simple task and a hard one, across the CPU/GPU placements each task can express: `walker_walk` (WalkerWalk, 256 envs, 5M steps) over `warp_gpu`/`mjx_gpu`/`mjx_cpu`, and `mocap_cmu_006_13` (CMU humanoid tracking, 1000 envs, **1B steps**) over `warp_gpu`/`envpool_gpu`. Between them the two suites cover all four (physics device, learner device) combinations, two of them **fully GPU-free**. Run it with `scripts/run_release_benchmark.sh`; package the resulting policies with `scripts/export_release_weights.py`.
+- **[Release benchmark](experiments/README.md)** — all seven agents on the **whole dm_control suite**, twice: 25 tasks × 7 agents × 2 cells at 50M env steps each. `warp_gpu` runs mujoco_playground on the card; `envpool_cpu` runs the same 25 tasks through EnvPool's native MuJoCo pool, **fully GPU-free**. Those are two independent implementations of one task specification on a shared 0–1000 return scale, so a score gap between them is a finding and a wall-clock gap is the point. Run it with `scripts/run_release_benchmark.sh`; package the resulting policies with `scripts/export_release_weights.py`.
 - **[Environments](docs/environments.md)** — there are two ways to attach an environment, both shaped like Gymnasium's `functional_jax_env`: write a stateless `FuncEnv` and roxie batches it, or bring something already vectorized (EnvPool) that speaks the Gymnasium 5-tuple and it is driven as-is. Why the driver is roxie's own rather than upstream's, and what `terminal` versus `truncal` mean.
-- **[Mocap tracking](docs/mocap.md)** — the hard task, under [`examples/mocap/`](examples/mocap/): humanoid motion-capture tracking on dm_control's CMU Humanoid, with negative mining over start phases and a fixed eval protocol.
 
 ## Agents
 
@@ -67,7 +67,9 @@ Hydra, with a strict convention: **the agent YAML *is* the constructor call.** `
 
 ## Examples
 
-Everything under [`examples/`](examples/) sits outside the core package: examples import from `roxie`, never the reverse. [`mocap/`](examples/mocap/) is the tracking task ([docs](docs/mocap.md)); [`flashbax/`](examples/flashbax/) holds two standalone walkthroughs of the replay structures the agents use.
+Everything under [`examples/`](examples/) sits outside the core package: examples import from `roxie`, never the reverse. [`flashbax/`](examples/flashbax/) holds two standalone walkthroughs of the replay structures the agents use.
+
+A task can live outside this repo entirely and still be launched through `roxie.train` — roxie's Hydra search-path plugin picks up `./experiments` as well as its own. [roxie-mocap](https://github.com/vittorione94/roxie-mocap) is that arrangement: humanoid motion-capture tracking on dm_control's CMU Humanoid, with negative mining over start phases and a fixed eval protocol. It lived here as `examples/mocap/` until the v1 benchmark narrowed to the standard dm_control suite.
 
 ## Tests
 

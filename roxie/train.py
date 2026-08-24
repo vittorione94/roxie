@@ -36,6 +36,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import get_method
 
+from roxie.environment import suites
 from roxie.environment.functional import space_size
 from roxie.environment.loader import (
     DEFAULT_BUILDER,
@@ -49,12 +50,15 @@ from roxie.utils.trainer import Trainer
 # Registering that dir lets `--config-name <env>/<name>` resolve there while
 # config groups stay in roxie/configs.
 hydra_searchpath.register()
+# ${envpool_task:<Task>} — the benchmark's playground-name -> envpool-id map,
+# used by the envpool backend group. Must be registered before Hydra composes.
+suites.register_resolvers()
 # examples/ is not part of the installed roxie package; put the repo root on the
 # path so example env builders are importable from anywhere.
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="walker/bench_td3")
+@hydra.main(version_base=None, config_path="configs", config_name="dmc/bench_td3")
 def main(cfg: DictConfig):
     print("Agent:", cfg.agent._target_)
 

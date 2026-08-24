@@ -2,7 +2,7 @@
 """One-shot check that the mujoco_warp (impl='warp') backend is usable.
 
 Roxie's environments dispatch the physics backend through mjx's pluggable
-``impl`` argument (see examples/mocap/mocap_tracking.py). The "warp" path
+``impl`` argument. The "warp" path
 only works when three pieces line up:
 
   1. ``mujoco`` ships its warp bridge (``mujoco.mjx.warp``),

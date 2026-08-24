@@ -10,18 +10,18 @@ Hydra, with a strict convention: **the agent YAML *is* the constructor call.**
 
 Only four arguments are injected by `train.py` rather than coming from YAML — `env_obs_size`, `env_action_size`, `action_low`, `action_high` — because only the env knows them. Nested `*_config` blocks stay unresolved (`_recursive_=False`) so each agent instantiates its own actor/critic/memory/optimizers, injecting shapes the trainer cannot know.
 
-The env factory itself is a dotted path (`env.builder`, resolved with `hydra.utils.get_method`), so the core training loop never branches on an env-type string and never names "mocap". Same for the viewer hook (`env.viewer`).
+The env factory itself is a dotted path (`env.builder`, resolved with `hydra.utils.get_method`), so the core training loop never branches on an env-type string and never names a specific task — the builder can even live in another repo. Same for the viewer hook (`env.viewer`).
 
 ## Layout
 
 - [`roxie/configs/agent/`](../roxie/configs/agent/) — one file per algorithm (`ddpg`, `td3`, `td4`, `d4pg`, `sac`, `mpo`, `ppo`, plus baselines).
 - [`roxie/configs/noise/`](../roxie/configs/noise/) — exploration noise modules (`ou`, `gaussian`, `composite`, `adaptive`). Agents that explore from their own policy (SAC, MPO, PPO) take **no** noise group; adding one to them is a launch-time error.
 - [`experiments/<env>/`](../experiments/) — launchable experiments. `--config-name` includes the folder.
-- [`experiments/mocap/`](../experiments/mocap/) — additionally carries its own config groups: `agent/` (per-task tunings), `reward/`, `env_config/`, `backend/`, `sweep/` (shared blocks).
+- [`experiments/dmc/`](../experiments/dmc/) — the release benchmark, carrying its own config groups: `agent/` (matched hyperparameters), `backend/` (the device cells), `bench/` and `noise/` (shared blocks).
 
 ## A launchable
 
-The benchmark launchables are the worked examples — [`experiments/walker/bench_sac.yaml`](../experiments/walker/bench_sac.yaml) is one file of `defaults:`, because everything else is a shared group. A standalone experiment spells its own settings out instead:
+The benchmark launchables are the worked examples — [`experiments/dmc/bench_sac.yaml`](../experiments/dmc/bench_sac.yaml) is one file of `defaults:`, because everything else is a shared group. A standalone experiment spells its own settings out instead:
 
 ```yaml
 # @package _global_

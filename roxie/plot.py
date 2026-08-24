@@ -1,4 +1,20 @@
+"""Figures from run CSVs.
+
+Two modes, because the benchmark asks two different questions:
+
+``--path <run(s)>``     the per-run diagnostic sheet — score, losses, throughput,
+                        gradient steps, and the wall-clock panels — with every
+                        discovered run overlaid.
+``--grid --path <root>``  the release figure: one cell per ENV, every agent's
+                        eval curve inside it. Reads an ``outputs/release_v1``
+                        tree laid out as ``<task>/<cell>/<agent>/<stamp>/log.csv``.
+
+Both read ``log.csv``, which the CSV logger writes for every run whether or not
+wandb was enabled — so the figure never depends on a network round-trip.
+"""
+
 import argparse
+import math
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -143,14 +159,132 @@ def load_runs(paths):
     return runs
 
 
+# ------------------------------------------------------------- the grid -----
+
+# Line style per backend cell, so a task's panel shows GPU and CPU curves of the
+# same agent in the same colour and tells them apart by stroke. That is the
+# reading the figure exists for: the pair should overlap.
+CELL_STYLE = {
+    "warp_gpu": ("-", 1.6),
+    "mjx_gpu": ("-", 1.6),
+    "envpool_cpu": ("--", 1.3),
+    "mjx_cpu": ("--", 1.3),
+}
+
+
+def discover_grid(root: Path):
+    """Walk a release tree into {task: {(agent, cell): DataFrame}}.
+
+    Expects ``<root>/<task>/<cell>/<agent>/<stamp>/log.csv``, which is the
+    layout `experiments/dmc/bench/dmc.yaml` gives `hydra.run.dir`. When an arm
+    was run more than once (a resume, a re-run), the LAST timestamp wins —
+    the tree is sorted, and a later stamp is the later attempt.
+    """
+    grid: dict[str, dict[tuple[str, str], pd.DataFrame]] = {}
+    for csv_path in sorted(root.rglob(LOG_NAME)):
+        rel = csv_path.parent.relative_to(root).parts
+        if len(rel) != 4:
+            continue
+        task, cell, agent, _stamp = rel
+        try:
+            df = normalize_columns(pd.read_csv(csv_path))
+        except Exception as e:
+            print(f"Warning: skipping '{csv_path}' ({e})")
+            continue
+        if "test/score" not in df.columns or not len(df):
+            continue
+        grid.setdefault(task, {})[(agent, cell)] = df
+    return grid
+
+
+def plot_grid(root: Path, output: str, metric: str = "test/score"):
+    """The release figure: one panel per env, every agent's curve inside it."""
+    grid = discover_grid(root)
+    if not grid:
+        print(f"Error: no runs found under '{root}' "
+              f"(expected <task>/<cell>/<agent>/<stamp>/{LOG_NAME}).")
+        return
+
+    tasks = sorted(grid)
+    agents = sorted({agent for cells in grid.values() for agent, _ in cells})
+    prop = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    # Colour is the AGENT and nothing else, so the same arm is the same colour
+    # in all 25 panels — which is what makes the figure readable as one object
+    # rather than 25 unrelated plots.
+    color = {a: (prop[i % len(prop)] if prop else None) for i, a in enumerate(agents)}
+
+    ncols = min(5, len(tasks))
+    nrows = math.ceil(len(tasks) / ncols)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.2 * nrows),
+                            squeeze=False)
+
+    cells_seen = set()
+    for index, (ax, task) in enumerate(zip(axs.flat, tasks)):
+        for (agent, cell), df in sorted(grid[task].items()):
+            style, width = CELL_STYLE.get(cell, ("-", 1.4))
+            cells_seen.add(cell)
+            ax.plot(df["steps"], df[metric], color=color[agent],
+                    linestyle=style, linewidth=width, alpha=0.9)
+        ax.set_title(task, fontsize=10)
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.tick_params(labelsize=8)
+        # dm_control returns are bounded by construction, so pinning the axis
+        # makes the panels comparable at a glance instead of each auto-scaling
+        # to its own best arm.
+        ax.set_ylim(0, 1000)
+        # Axis labels only on the outside edge — 25 copies of "environment
+        # steps" is 25 copies of the same word.
+        if index % ncols == 0:
+            ax.set_ylabel(metric, fontsize=9)
+        if index >= len(tasks) - ncols:
+            ax.set_xlabel("environment steps", fontsize=9)
+    for ax in axs.flat[len(tasks):]:
+        ax.axis("off")
+
+    # One legend for the whole figure: agents by colour, cells by stroke.
+    from matplotlib.lines import Line2D
+    handles = [Line2D([], [], color=color[a], label=a) for a in agents]
+    handles += [
+        Line2D([], [], color="0.35", linestyle=CELL_STYLE.get(c, ("-", 1.4))[0],
+               label=c)
+        for c in sorted(cells_seen)
+    ]
+    fig.legend(handles=handles, loc="lower center",
+               ncol=min(len(handles), 10), frameon=False, fontsize=9)
+    fig.suptitle(f"{metric} vs environment steps — {len(tasks)} tasks, "
+                 f"{len(agents)} agents", fontsize=14, fontweight="bold")
+    # Leave room at the bottom for the legend — it is a figure-level artist and
+    # tight_layout does not account for it.
+    bottom = 0.9 / fig.get_figheight()
+    fig.tight_layout(rect=[0, bottom, 1, 1 - 0.4 / fig.get_figheight()])
+
+    try:
+        fig.savefig(output, format="pdf", bbox_inches="tight")
+        print(f"Wrote {len(tasks)}x{len(agents)} grid to: {output}")
+    except Exception as e:
+        print(f"Error saving PDF: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate learning curves from one or more run log CSVs.")
     parser.add_argument("--csv-path", "--path", dest="csv_path", required=True, nargs="+", type=str,
                         help="Path(s) to log.csv files and/or directories, which are searched "
                              "recursively for log.csv. All discovered runs are overlaid.")
+    parser.add_argument("--grid", action="store_true",
+                        help="Release figure: one panel per env, every agent inside it. "
+                             "Takes a single release tree (outputs/release_v1) as --path.")
+    parser.add_argument("--metric", default="test/score",
+                        help="Metric plotted in --grid mode (default: test/score)")
     parser.add_argument("--output", type=str, default="learning_curves.pdf",
                         help="Path to save the output PDF (default: learning_curves.pdf)")
     args = parser.parse_args()
+
+    if args.grid:
+        if len(args.csv_path) != 1:
+            print("Error: --grid takes exactly one --path (a release tree root).")
+            return
+        plot_grid(Path(args.csv_path[0]), args.output, args.metric)
+        return
 
     runs = load_runs(args.csv_path)
     if not runs:

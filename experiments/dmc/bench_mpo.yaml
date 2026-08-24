@@ -1,0 +1,28 @@
+# @package _global_
+#
+# dm_control release benchmark — MPO arm. Gaussian policy, E-step sampling + KL duals — NO noise group. ~20x more expensive per gradient step than the deterministic arms (20 action samples per state).
+#
+#   uv run python roxie/train.py --config-name dmc/bench_mpo
+#   uv run python roxie/train.py --config-name dmc/bench_mpo release.task=CheetahRun
+#   uv run python roxie/train.py --config-name dmc/bench_mpo dmc/backend@backend=envpool_cpu
+#
+# The agent block, the noise block (where there is one) and the whole bench/dmc
+# block are shared VERBATIM with every other bench_*.yaml; agent/mpo_bench
+# holds the only algorithmic difference. Nothing is overridden below on purpose
+# — put ad-hoc tweaks on the CLI so this file keeps recording the benchmark
+# condition.
+#
+# TWO things the grid varies over this launchable, neither of them a file:
+# `release.task` (one of the 25 in roxie.environment.suites.DMC_TASKS) and the
+# `backend` group (warp_gpu / envpool_cpu). scripts/run_release_benchmark.sh
+# walks the cross product.
+defaults:
+  - agent: mpo_bench
+  # bench BEFORE backend: the shared block declares release.cell as MISSING
+  # and the backend group is what fills it in, so the order is load-bearing.
+  - bench: dmc
+  - backend: warp_gpu
+  - _self_
+
+release:
+  agent: mpo

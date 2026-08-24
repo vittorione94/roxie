@@ -14,14 +14,14 @@ that state in completely different ways. That split is the class split::
 
     FuncEnv                  the interface; knows nothing about MuJoCo
     └── MuJoCoFuncEnv        + "my state is an mjx_env.State" -> the 6 accessors
-        ├── PlaygroundFuncEnv    + initial/transition by WRAPPING a playground env
-        └── MocapTrackingEnv     + initial/transition of its OWN (examples/mocap)
+        └── PlaygroundFuncEnv    + initial/transition by WRAPPING a playground env
 
-The middle class exists for exactly one reason: playground and mocap must never
-drift on what ``terminal`` versus ``truncal`` means. That is the rule where a
-mistake is silent and expensive — call the clip-end cutoff a termination and the
-critic zeroes its bootstrap there — so the two share one implementation of it
-rather than each writing their own.
+The middle class carries no ``initial``/``transition`` deliberately, so a
+bespoke MuJoCo env — one living in another repo, like roxie-mocap's tracking
+task — inherits the six accessors instead of writing them again. That matters
+most for ``terminal`` versus ``truncal``, the rule where a mistake is silent and
+expensive: call an env's own non-failure cutoff a termination and the critic
+zeroes its bootstrap there.
 
 Why the accessors read fields back rather than computing them: Playground (like
 Brax, and like Waymax) computes physics, observation, reward and termination in a
@@ -55,7 +55,7 @@ class MuJoCoFuncEnv(FuncEnv):
 
     Deliberately does NOT implement ``initial``/``transition`` — a subclass
     supplies those, either by wrapping an env (``PlaygroundFuncEnv``) or by being
-    one (``MocapTrackingEnv``). See the module docstring for the hierarchy.
+    one. See the module docstring for the hierarchy.
     """
 
     def observation(self, state, rng, params=None):
@@ -71,7 +71,7 @@ class MuJoCoFuncEnv(FuncEnv):
         return state.done.astype(jnp.bool_)
 
     def truncal(self, state, rng, params=None):
-        # The mocap clip end is the case that matters. `.get` runs at TRACE time
+        # An env's own non-failure cutoff. `.get` runs at TRACE time
         # on a plain Python dict, so an env without the key costs nothing and
         # simply never truncates for its own reasons.
         return jnp.asarray(state.info.get("truncation", False), dtype=jnp.bool_)
@@ -207,6 +207,26 @@ class EnvBundle(NamedTuple):
 # experiment yaml names one.
 DEFAULT_MAX_EPISODE_STEPS = 1000
 
+# Every key roxie itself gives meaning to under ``env:``. It exists for
+# ``build_envpool_env``, which forwards anything it does not recognise straight
+# into ``envpool.make()`` as a task kwarg — a useful escape hatch, and a trap
+# once one experiment composes a shared block with a backend group: the release
+# grid's two cells sit under the same ``env:`` block, so a playground-only key
+# like ``env_name`` would otherwise reach the pool and fail the launch with an
+# unknown-argument error from inside EnvPool.
+#
+# Keys are listed whether or not the envpool path uses them, because the point
+# is "roxie owns this name", not "this builder reads it".
+ROXIE_ENV_KEYS = frozenset({
+    # generic / trainer-facing
+    "builder", "impl", "seed", "parallel_envs", "test_episodes",
+    "max_episode_steps", "viewer", "player",
+    # envpool
+    "task_id",
+    # mujoco_playground
+    "env_name", "naconmax", "njmax", "list_envs", "xml_path",
+})
+
 
 def build_playground_env(
     cfg_env: Any, mode: str = "train", num_envs: int = 1, test_episodes: int = 1,
@@ -265,7 +285,8 @@ def build_envpool_env(
       task_id (str):            envpool task identifier, e.g. "HalfCheetah-v4".
       max_episode_steps (int):  episode time-limit (default 1000).
       seed (int):               RNG seed (default 0).
-      (any other non-reserved key is forwarded to ``envpool.make()``)
+      (any key not in ``ROXIE_ENV_KEYS`` is forwarded to ``envpool.make()`` as a
+      task kwarg — see that constant for why the list is explicit)
 
     ``num_envs``/``test_episodes`` come from the trainer, not from cfg_env: they
     size the two pools, and the eval pool MUST match ``trainer.test_episodes``.
@@ -283,11 +304,7 @@ def build_envpool_env(
         cfg_env.get("max_episode_steps", None) or DEFAULT_MAX_EPISODE_STEPS
     )
 
-    _reserved = frozenset({
-        "task_id", "parallel_envs", "seed", "max_episode_steps",
-        "test_episodes", "builder", "impl", "viewer", "player",
-    })
-    extra = {k: v for k, v in cfg_env.items() if k not in _reserved}
+    extra = {k: v for k, v in cfg_env.items() if k not in ROXIE_ENV_KEYS}
 
     def make_pool(n: int, pool_seed: int):
         return envpool.make(

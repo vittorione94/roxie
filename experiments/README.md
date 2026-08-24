@@ -3,142 +3,196 @@
 Every launchable config in this repo belongs to one benchmark, which answers two
 questions for the v1 release:
 
-1. **Does every agent work?** — all seven (DDPG, TD3, TD4, D4PG, SAC, MPO, PPO)
-   on a simple task and on a hard one, at matched hyperparameters and a matched
-   step budget.
-2. **Does it work on CPU as well as GPU?** — the same agent, the same task, the
-   same budget, with the physics and the learner moved between devices.
+1. **Does every agent work, everywhere?** — all seven (DDPG, TD3, TD4, D4PG,
+   SAC, MPO, PPO) on the *whole* dm_control suite, at matched hyperparameters
+   and a matched step budget.
+2. **Does it work on CPU as well as GPU?** — the same 25 tasks, the same agents,
+   the same budget, on two independent implementations of the physics: GPU
+   through `mujoco_playground`, and fully GPU-free through EnvPool's native
+   MuJoCo pool.
 
 ```bash
 scripts/run_release_benchmark.sh --dry-run   # the grid, with time estimates
 scripts/run_release_benchmark.sh --smoke     # tiny budgets: does it all launch?
-scripts/run_release_benchmark.sh             # the real thing (~4-5 DAYS, sequential)
+scripts/run_release_benchmark.sh             # the real thing (WEEKS, sequential)
 uv run python roxie/report.py                # assemble the W&B report
+uv run python roxie/plot.py --grid --path outputs/release_v1 --output grid.pdf
 uv run python scripts/export_release_weights.py   # package the policies
 ```
 
 ## The grid
 
-| Suite | Task | Cells | Runs |
+**25 tasks × 7 agents × 2 cells = 350 runs**, every one of them at 50M env steps
+and 256 parallel envs.
+
+| Cell | Physics | Learner | In the default grid |
 |---|---|---|---|
-| `walker_walk` | mujoco_playground WalkerWalk, 256 envs, 5M steps | `warp_gpu`, `mjx_gpu`, `mjx_cpu` | 7 agents × 3 |
-| `mocap_cmu_006_13` | CMU humanoid tracking, single clip, 1000 envs, **1B steps** | `warp_gpu`, `envpool_gpu` | 7 agents × 1, + 2 agents × 1 |
+| `warp_gpu` | GPU — `mujoco_playground` + mujoco_warp | GPU | yes |
+| `envpool_cpu` | CPU — EnvPool's native MuJoCo pool | CPU | yes — **fully GPU-free** |
+| `mjx_gpu` | GPU — `mujoco_playground` + MJX | GPU | no, one flag away |
+| `mjx_cpu` | CPU — `mujoco_playground` + MJX | CPU | no, one flag away |
 
-A **cell** is a (physics device, learner device) placement:
+The tasks are `roxie.environment.suites.DMC_TASKS` — the 25 that
+`mujoco_playground.registry.dm_control_suite` registers. Every one of them has an
+EnvPool counterpart, which is what makes the two cells a comparison:
 
-| Cell | Physics | Learner | Notes |
-|---|---|---|---|
-| `warp_gpu` | GPU (mujoco_warp) | GPU | The headline configuration. |
-| `mjx_gpu` | GPU (MJX) | GPU | Same card, physics traced into XLA instead of Warp kernels. |
-| `mjx_cpu` | CPU (MJX) | CPU | **Fully GPU-free.** Same env class, same trainer loop as the two above — only the device changes. |
-| `envpool_cpu` | CPU (native MuJoCo pool) | CPU | **Fully GPU-free.** A genuinely different implementation of the task; see [docs/backends.md](../docs/backends.md). Configured, but **not in the default mocap grid** — see below. |
-| `envpool_gpu` | CPU (native MuJoCo pool) | GPU | The hybrid, with `trainer.async_learner` on so the two devices overlap. The fastest mocap cell measured (17.2k sps). |
-
-The walker suite carries the full-width agent cross because its runs are
-minutes; the mocap `envpool_gpu` cell runs a subset (`MOCAP_HYBRID_AGENTS`,
-default `td3 ppo`) because each mocap run is 10–16 hours.
-
-### Why `envpool_cpu` is not in the default mocap grid
-
-At the 1B-step budget it is ~20 h per run, and it would buy a claim the grid
-already makes elsewhere: `walker_walk/mjx_cpu` demonstrates a fully GPU-free
-run of the whole stack, and the mocap CPU **physics** path is exercised by
-`envpool_gpu`, which shares its env builder, stepper and thread pool and differs
-only in `runtime.jax_platform`. So the fourth placement (CPU physics + CPU
-learner on the hard task) is discussed in the release notes from the measured
-throughput rather than re-paid for at a 1B budget.
-
-It stays fully supported and one flag away:
-
-```bash
-scripts/run_release_benchmark.sh --suite mocap --cells envpool_cpu \
-    --agents td3 --steps-mocap 50000000
+```
+AcrobotSwingup   AcrobotSwingupSparse  BallInCup       CartpoleBalance
+CartpoleBalanceSparse  CartpoleSwingup CartpoleSwingupSparse  CheetahRun
+FingerSpin       FingerTurnEasy        FingerTurnHard  FishSwim
+HopperHop        HopperStand           HumanoidStand   HumanoidWalk
+HumanoidRun      PendulumSwingup       PointMass       ReacherEasy
+ReacherHard      SwimmerSwimmer6       WalkerRun       WalkerStand
+WalkerWalk
 ```
 
-`--cells` is an escape hatch, not just a filter: naming a cell explicitly runs
-it even when the default grid omits it, and even for agents the non-headline
-cells otherwise skip.
+### The two cells are not the same code
 
-The mocap task has no `mjx_*` cell on purpose: MJX sizes contact arrays
-statically to *all* potential geom pairs (~980 on this humanoid, ~75× heavier
-than Warp's budgeted arena), so it is not a sensible cell for that body.
+This is the point worth being precise about. `mujoco_playground` *reimplements*
+the dm_control tasks as JAX/MJX programs; EnvPool *wraps* dm_control's own C++
+physics. Same task specification, two independent implementations, one 0–1000
+return scale.
+
+- A **score** gap between cells on a task is a finding about one of the two
+  implementations, not a hardware artefact.
+- A **wall-clock** gap is the cells doing their job.
+- Their **observation vectors are not always identical** — playground omits some
+  of dm_control's observation groups on a few tasks (`HumanoidRun` is 67-dim vs
+  EnvPool's 95, `FingerSpin` 9 vs 12; most tasks match exactly). Both are
+  self-consistent, so each cell trains and evaluates against its own spec. It
+  also means **a policy trained on one cell cannot be loaded against the other**,
+  which is why the weights export publishes one cell and says which.
+
+### Escape hatches
+
+`--cells` is a filter *and* an override: naming a cell runs it even when the
+default grid omits it.
+
+```bash
+# Warp vs MJX on the same card, on a couple of tasks
+scripts/run_release_benchmark.sh --cells mjx_gpu --tasks CheetahRun,WalkerWalk
+# The same JAX program with no card at all
+scripts/run_release_benchmark.sh --cells mjx_cpu --tasks CheetahRun
+```
+
+## Wall-clock
+
+Measured with a learner attached on a 12-core 7900X + RTX 5080 (CheetahRun,
+TD3, 256 envs):
+
+| Cell | sps | 50M steps | × 175 runs |
+|---|---:|---:|---:|
+| `warp_gpu` | 6 600 | ~2h06m | ~15 days |
+| `envpool_cpu` | 13 700 | ~1h00m | ~7 days |
+
+**The whole grid is ~23 days sequential**, and runs *are* sequential on purpose —
+every cell wants either the whole card or every core, so overlapping two of them
+measures contention rather than the backend. Run it in task batches with
+`--tasks`; the manifest makes the whole thing resumable at run granularity.
+
+Note the direction of that table, which is the least intuitive number in the
+benchmark: **on this suite the GPU cell is the slower one.** dm_control bodies
+are tiny, so at 256 envs the card is nowhere near saturated and Warp's per-step
+dispatch dominates, while EnvPool runs 256 cheap envs across 24 threads very
+happily. The GPU wins on env *count*, not env *size* — and `parallel_envs` is
+held fixed at 256 precisely so that this is visible rather than tuned away.
 
 ## Layout
 
 ```
-experiments/
-  walker/
-    bench_<agent>.yaml     launchable, one per agent — this is what you run
-    agent/<agent>_bench.yaml   matched hyperparameters, one per agent
-    backend/<cell>.yaml    the three device cells
-    bench/walker_walk.yaml shared env + trainer + logging block
-    noise/bench_gaussian.yaml  exploration noise for the deterministic arms
-  mocap/
-    bench_<agent>.yaml     launchable, one per agent
-    agent/<agent>_bench.yaml
-    backend/<cell>.yaml
-    bench/cmu_006_13.yaml  shared env + trainer + logging block
-    env_config/cmu.yaml    physics/obs/termination settings
-    reward/cmu_tracking.yaml   reward weights and kernel bandwidths
-    noise/bench_gaussian.yaml
+experiments/dmc/
+  bench_<agent>.yaml         launchable, one per agent — this is what you run
+  agent/<agent>_bench.yaml   matched hyperparameters, one per agent
+  backend/<cell>.yaml        the four device cells
+  bench/dmc.yaml             shared env + trainer + logging block
+  noise/bench_gaussian.yaml  exploration noise for the deterministic arms
 ```
 
-Run one arm directly:
+**The task is an override, not a file.** 25 × 7 × 2 launchables would be 350
+yamls saying "same thing, different `env_name`". `release.task` names one of the
+25 and the backend group turns it into either a playground registry name or an
+EnvPool task id — those differ for two of the 25 (`BallInCup` →
+`BallInCupCatch-v1`, `PointMass` → `PointMassEasy-v1`), which is why the mapping
+lives in `roxie/environment/suites.py` with a test on it rather than being
+spelled out in yaml.
 
 ```bash
-uv run python roxie/train.py --config-name walker/bench_td3
-uv run python roxie/train.py --config-name mocap/bench_ppo
+uv run python roxie/train.py --config-name dmc/bench_td3                        # WalkerWalk, warp_gpu
+uv run python roxie/train.py --config-name dmc/bench_td3 release.task=CheetahRun
+uv run python roxie/train.py --config-name dmc/bench_ppo release.task=HumanoidRun \
+    dmc/backend@backend=envpool_cpu
 ```
 
-Switch the cell — note the override syntax, because the group lives in a
-subdirectory of the search path:
+Note the backend override's syntax, because the group lives in a subdirectory of
+the search path. A bare `backend=envpool_cpu` is rejected (`Key 'backend' is not
+in struct`) and `+backend=envpool_cpu` appends a second entry instead of
+replacing the default; `dmc/backend@backend=` is the form that works.
 
-```bash
-uv run python roxie/train.py --config-name walker/bench_td3 walker/backend@backend=mjx_cpu
-uv run python roxie/train.py --config-name mocap/bench_ppo  mocap/backend@backend=envpool_cpu
-```
+## Where the results go
 
-A bare `backend=mjx_cpu` is rejected (`Key 'backend' is not in struct`) and
-`+backend=mjx_cpu` appends a second entry instead of replacing the default;
-`<dir>/backend@backend=` is the form that works.
+**One W&B project per env** — `roxie-CheetahRun`, `roxie-WalkerWalk`, 25 of them
+— with the run identity inside a project being `<agent>.<cell>`, `job_type` the
+cell and `group` the grid (`release-v1`).
 
-## Held identical across every arm of a suite
+A project is the unit W&B gives a workspace, a run table and cross-run charts
+to. Making it the env means a project's default view is already the comparison
+that means something: same task, same budget, 7 agents × 2 cells. The previous
+scheme — one project for the whole grid with the env carried as a *tag* — put
+runs with incomparable score scales on shared axes by default and needed a
+filter applied before any chart said anything.
+
+Two figures come out of it:
+
+- `roxie/report.py` — one W&B report, a section per task, reaching across all 25
+  projects.
+- `roxie/plot.py --grid` — the release figure, read from the local `log.csv`
+  files rather than the API: **one panel per env, every agent's curve inside
+  it**, colour by agent and stroke by cell, y-axis pinned to 0–1000 so the
+  panels are comparable at a glance.
+
+## Held identical across every arm
 
 Verified by composing all seven configs and diffing the resolved blocks.
 
 | Held fixed | Where |
 |---|---|
-| env, parallel_envs, seed | `bench/<suite>.yaml` |
-| step budget, epoch size, eval protocol | `bench/<suite>.yaml` |
-| matmul precision (global — reaches networks *and* physics) | `bench/<suite>.yaml` |
-| actor + critic MLP shape, layer norm | every `agent/*_bench.yaml` |
+| step budget, epoch size, eval protocol | `bench/dmc.yaml` |
+| parallel_envs (256), seed | `bench/dmc.yaml` |
+| actor + critic MLP `[256, 256]`, layer norm | every `agent/*_bench.yaml` |
 | batch size, replay ratio, buffer capacity, warmup | every off-policy `agent/*_bench.yaml` |
 | gamma, tau, learning rates, grad-norm clip | every `agent/*_bench.yaml` |
 | n-step horizon (where the agent takes one) | every `agent/*_bench.yaml` |
 | exploration noise + its anneal (deterministic arms) | `noise/bench_gaussian.yaml` |
 | actor saturation penalty (deterministic arms) | every deterministic `agent/*_bench.yaml` |
 
-`walker` runs nets `[256, 256]`, replay ratio 5.0, 2 048-step update boundary;
-`mocap` runs nets `[1024, 512, 256]`, replay ratio ~4, 8 000-step boundary. The
-two suites differ from each other — they are different tasks — but never within
-themselves.
+**Nothing is tuned per task.** That is deliberate and it is the benchmark's
+central methodological choice: the grid ranks *algorithms* at matched
+hyperparameters, so a task where an arm would need a different learning rate or
+a wider net is a task where it scores badly and says so. Per-task tuning would
+turn the figure into a tuning result.
+
+One hyperparameter is genuinely task-shaped and survives anyway: the categorical
+critics' support (`v_min`/`v_max` in `d4pg_bench.yaml` / `td4_bench.yaml`). Every
+dm_control reward is a normalised tolerance in [0, 1], so at gamma 0.99 the
+discounted return is bounded by ~100 on all 25 — one support covers the suite by
+a property of dm_control, not by luck. A task from outside dm_control needs it
+rechecked.
 
 ### Settings that are tied to the step budget
 
 Anything measured in **env steps** silently changes meaning when the budget
 moves. Changing `trainer.steps` means changing these with it:
 
-| Setting | Rule | mocap @ 1B |
+| Setting | Rule | @ 50M |
 |---|---|---|
-| `noise.decay_schedule.decay_steps` | 40% of the budget, so noise reaches its floor with more than half the run left to exploit it | 400 M |
-| `trainer.epoch_steps` | ~200 points of curve; an epoch boundary pauses the learner and runs an eval, so it is not free | 5 M |
-| `trainer.save_steps` | ~20 checkpoints per run, which is what the weights export picks the best of | 50 M |
+| `noise.decay_schedule.decay_steps` | 40% of the budget, so noise reaches its floor with more than half the run left to exploit it | 20 M |
+| `trainer.epoch_steps` | ~100 points of curve; an epoch boundary pauses the learner and runs an eval, so it is not free | 500 k |
+| `trainer.save_steps` | ~10 checkpoints per run, which is what the weights export picks the best of | 5 M |
 
 `memory_warmup` and the replay capacity deliberately do **not** scale: they are
-matched hyperparameters shared with the walker suite, so a longer budget means
-more turnover through the same buffer. `tests/test_release_weights.py` pins the
-anneal ratio and the cadence divisibility so a budget change cannot quietly
-leave them behind.
+matched hyperparameters, so a longer budget means more turnover through the same
+buffer. `tests/test_release_weights.py` pins the anneal ratio and the cadence
+divisibility so a budget change cannot quietly leave them behind.
 
 ## What necessarily differs (algorithmic, not tuning)
 
@@ -153,9 +207,7 @@ leave them behind.
 | ppo | V critic | GAE(0.95), on-policy | policy entropy |
 
 Twin vs single critic is part of the algorithm, so **per-network width** is what
-is equalized, not total parameter count. The categorical support (`v_min`/
-`v_max`) is task-dependent and shared by the two distributional arms within a
-suite.
+is equalized, not total parameter count.
 
 ## What gets logged
 
@@ -167,7 +219,7 @@ through it so the two paths cannot drift apart.
 | Prefix | Contents |
 | --- | --- |
 | `epoch`, `steps` | the run axes, ungrouped. `steps` is also the wandb x-axis. |
-| `train/` | behaviour policy and learner: `score`, `length`, `episodes/`, `gradient_steps`, `loss/`, `reward/` (env components), `noise/`, `mining/`, and per-agent diagnostics (`train/td3/`, `train/ppo/`). |
+| `train/` | behaviour policy and learner: `score`, `length`, `episodes/`, `gradient_steps`, `loss/`, `reward/` (env components), `noise/`, and per-agent diagnostics (`train/td3/`, `train/ppo/`). |
 | `test/` | held-out eval: `score`, `length`, `distinct_starts`, `score_per_step`. Fixed reset keys, so a change here is a change in the policy. |
 | `sys/` | `sps`, `time/`, `mem/`, and `gpu/` — throughput and health, never a result. |
 
@@ -179,12 +231,8 @@ Two rules the logging itself enforces, both learned from the v1 grid:
   bug in which all six off-policy arms ran 5M steps at zero gradient steps
   through a full overnight sweep.
 - **`sys/gpu/*` is only logged by runs actually on the GPU.** `nvidia-smi`
-  reports the whole card, so the GPU-free `mjx_cpu` cell previously published
-  another process's memory and utilisation as its own.
-
-Runs logged before this scheme carry bare names (`score`, `sps`, `loss/actor`).
-`roxie/plot.py` maps them forward on load, so an `outputs/` tree holding both
-still plots; `roxie/report.py` panels are written against the current names only.
+  reports the whole card, so the GPU-free cells previously published another
+  process's memory and utilisation as their own.
 
 ## Reading the results
 
@@ -198,71 +246,47 @@ still plots; `roxie/report.py` panels are written against the current names only
 - **Rank on the back-half mean ± std, never on a peak epoch.** Warp's atomic
   contact reductions are not bit-reproducible, and a single seed per arm is a
   demonstration, not a significance claim.
-- On the mocap task, `test/score / test/length ≈ 0.60` historically — score is
-  substantially survival time, so read `test/length` alongside it. Health checks
-  per arm: `train/loss/critic` roughly 1–3, `|train/loss/actor|` (≈ mean Q) under
-  ~90, and for the deterministic arms `train/td3/tanh_grad` ≈ 0.6 (collapse below 0.05 means
-  the actor has saturated its tanh and stopped learning).
-- Across cells, the *score* curves should land in the same place — it is the
-  same algorithm on the same task — while wall-clock and throughput are where
-  the cells genuinely differ. A score gap between cells is a bug, not a result;
-  `examples/mocap/check_envpool_parity.py` is the executable statement of that
-  contract for the mocap task.
-
-## Budgets
-
-Both budgets live in the shared block of their suite and are overridable per
-invocation:
-
-```bash
-WALKER_STEPS=2000000 MOCAP_STEPS=20000000 scripts/run_release_benchmark.sh
-```
-
-Change one for a *whole suite*, never for a single cell — a per-cell budget
-makes score-vs-steps incomparable, which is the one thing the grid exists to
-compare. And move the budget-linked settings with it (table above); the
-exploration-noise anneal is the one that bites, because a run with a stale
-anneal completes normally and just scores worse.
-
-At 1B steps a mocap arm is 10–16 h, so a crash is expensive. The trainer
-checkpoints every `save_steps` and the benchmark script prints the exact
-`resume=` command when a run dies with a checkpoint on disk. Resume into a
-*different* run dir than the dead leg — the CSV backend opens `log.csv` with
-`"w"` on its first row, so resuming in place truncates the curve the first leg
-wrote. The resumed leg logs total env steps (the trainer seeds its counters from
-the checkpoint metadata), so the two halves concatenate into one curve.
+- **The sparse tasks are the ones to read carefully.** One noise schedule covers
+  all 25, and `AcrobotSwingupSparse` / `CartpoleSwingupSparse` are where an arm
+  that needed more exploration than that will simply sit at zero. That is a
+  reportable result about exploration under matched settings, not a broken run —
+  say which it is rather than quietly retuning one task.
+- **`test/length` is only a metric where the env can terminate early.** Most
+  dm_control tasks run to the 1000-step cap regardless, so `test/length` pins
+  there and carries no information; on `HopperHop`/`HumanoidRun` and friends it
+  is real. `test/score_per_step` divides it out.
 
 ## Released weights
 
-The grid's real output is not only the figure — it is seven trained policies.
+The grid's real output is not only the figure — it is trained policies.
 `scripts/export_release_weights.py` packages them:
 
 ```bash
 uv run python scripts/export_release_weights.py --dry-run   # what would ship
 uv run python scripts/export_release_weights.py --verify    # export + read back
 uv run python scripts/export_release_weights.py --archive   # + .tar.gz + SHA256SUMS
+uv run python scripts/export_release_weights.py --tasks CheetahRun,WalkerWalk
 ```
 
-It publishes one bundle per agent from the headline `mocap_cmu_006_13` /
-`warp_gpu` arm. Two selection rules do the work:
+It publishes one bundle per (task, agent) from the headline `warp_gpu` cell, for
+every task the manifest has a finished run for — so a partial grid exports what
+it has. Two selection rules do the work:
 
-- **Only `ok` runs at the longest completed budget.** A run that crashed at 40%
-  leaves checkpoints that load perfectly and are not a release result — and
-  `--smoke` records its 500k runs `ok` in the same ledger, so "the newest `ok`
-  run" would publish a smoke policy the moment anyone validated the grid after
-  training it. The export prints the budget it selected on every invocation;
-  pin it with `--steps 1000000000` if you want that spelled out, or
+- **Only `ok` runs at the longest completed budget**, resolved per task. A run
+  that crashed at 40% leaves checkpoints that load perfectly and are not a
+  release result — and `--smoke` records its 100k runs `ok` in the same ledger,
+  so "the newest `ok` run" would publish a smoke policy the moment anyone
+  validated the grid after training it. Pin it with `--steps 50000000`, or
   `--any-budget` to opt out.
 - **The best checkpoint, not the last.** Highest `test/score` among the steps
   that actually have a checkpoint. On a saturating arm the final checkpoint is
-  measurably worse than the run's own peak — both existing mocap runs in the
-  manifest peak before their last save.
+  measurably worse than the run's own peak.
 
 A bundle mirrors a run dir's shape, because `play.py` resolves its config as
 `<checkpoint>/../../.hydra/config.yaml`:
 
 ```
-weights/mocap_cmu_006_13/td3.warp_gpu/
+weights/CheetahRun/td3.warp_gpu/
   .hydra/config.yaml     resolved run config (play.py reads this)
   .hydra/overrides.yaml  the CLI condition the run was launched with
   checkpoints/step_<N>/  the orbax checkpoint
@@ -273,16 +297,25 @@ It is self-contained — copy it anywhere and it still opens:
 
 ```bash
 uv run python roxie/play.py \
-    --checkpoint-path weights/mocap_cmu_006_13/td3.warp_gpu/checkpoints/step_<N>
+    --checkpoint-path weights/CheetahRun/td3.warp_gpu/checkpoints/step_<N>
 ```
 
 Playback forces CPU and MJX physics, so a warp-trained bundle needs neither a
 GPU nor a warp install. The checkpoint carries target networks, optimizer slots
 and the observation normalizer as well as the policy, so a bundle also works as
-a training restart: `resume=<bundle dir>`. That is also why one is ~50–80 MB
-rather than the few MB the actor alone would be.
+a training restart: `resume=<bundle dir>`.
 
 `--verify` reads each exported checkpoint back off disk and checks the payload
 against the directory it landed in. That is a copy check, not a behavioural one:
 confirming the policy is the one that scored means rolling it out, which is what
 `play.py` is for.
+
+## Resuming
+
+At 50M steps an arm is 1–2 h, and the grid is weeks, so a crash is expensive.
+The trainer checkpoints every `save_steps` and the benchmark script prints the
+exact `resume=` command when a run dies with a checkpoint on disk. Resume into a
+*different* run dir than the dead leg — the CSV backend opens `log.csv` with
+`"w"` on its first row, so resuming in place truncates the curve the first leg
+wrote. The resumed leg logs total env steps (the trainer seeds its counters from
+the checkpoint metadata), so the two halves concatenate into one curve.

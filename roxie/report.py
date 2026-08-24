@@ -1,17 +1,29 @@
 """Assemble the W&B release report from the benchmark runs.
 
-`scripts/run_release_benchmark.sh` streams every run to one W&B project with a
-fixed identity — group = suite, job_type = backend cell, name = "<agent>.<cell>",
-plus a `release-v1` tag. This script reads that structure back and builds a
-report out of it: one section per suite, a panel grid per backend cell, and the
-cross-cell comparison for the agents that ran on more than one.
+`scripts/run_release_benchmark.sh` streams every run to a project named after
+its ENV — `roxie-CheetahRun`, `roxie-WalkerWalk`, one per task — with the agent
+and the backend cell as the run identity inside it (`name = "<agent>.<cell>"`,
+`job_type = <cell>`) and `group` naming the grid. This script reads that
+structure back across all 25 projects and builds one report out of it: a section
+per task, each holding the agent comparison for that task.
 
     uv run python roxie/report.py                       # build and publish
     uv run python roxie/report.py --dry-run             # print structure only
-    uv run python roxie/report.py --project my-project --entity my-team
+    uv run python roxie/report.py --tasks CheetahRun,WalkerWalk
+    uv run python roxie/report.py --entity my-team
+
+Why one project per env rather than one project with env tags: a project is the
+unit W&B gives a workspace, a run table and cross-run charts to. Making it the
+env means its default view is already the comparison that means something — same
+task, same budget, every agent — instead of 350 runs on incomparable score
+scales needing a filter before any chart says anything.
+
+The report has to live in ONE project, though, so it is written into whichever
+project `--report-project` names (by default the first task's). Its runsets
+reach across the others; that is a normal cross-project report.
 
 It is idempotent in the sense that re-running it after more runs land rebuilds
-the report from whatever is now in the project — nothing here is hand-placed.
+the report from whatever is now in the projects — nothing here is hand-placed.
 W&B has no "overwrite report by title" API, so each invocation publishes a NEW
 report and prints its URL; delete superseded ones in the UI.
 
@@ -26,41 +38,36 @@ import argparse
 import sys
 from collections import defaultdict
 
-DEFAULT_PROJECT = "roxie-release-v1"
-DEFAULT_TAG = "release-v1"
+from roxie.environment.suites import DMC_TASKS
 
-# Presentation order and prose for the suites the benchmark defines. A suite
-# found in the project but missing here still renders — it just gets no blurb —
-# so adding a third task to the grid does not require editing this file.
-SUITE_INFO = {
-    "walker_walk": (
-        "Simple task — WalkerWalk",
-        "mujoco_playground's WalkerWalk (dm_control walker, planar, 6 actuators). "
-        "Every agent runs the same matched hyperparameters (nets [256, 256] + layer "
-        "norm, replay ratio 5.0, batch 512) at 256 parallel envs, and every backend "
-        "cell runs the same step budget. Score is the dm_control episode return, so "
-        "1000 is the ceiling.",
-    ),
-    "mocap_cmu_006_13": (
-        "Complex task — CMU_006_13 motion tracking",
-        "Single-clip overfit of CMU_006_13 (40.8 s, 1631 frames) on the dm_control "
-        "CMU humanoid: 56 position-servo actuators, ~1069-dim observation, weighted "
-        "pose/velocity/end-effector/root tracking reward with early termination. "
-        "Eval is the canonical protocol — start at frame 0, no reset noise, run the "
-        "clip to its end — so `test/score` tracks `test/length` closely and both "
-        "belong in the reading.",
-    ),
-}
+# Projects the grid writes to are exactly f"{PROJECT_PREFIX}{task}".
+DEFAULT_PROJECT_PREFIX = "roxie-"
+# `group` on every run of the v1 grid (release.grid in experiments/dmc/bench).
+DEFAULT_GRID = "release-v1"
 
 # Backend cells, in the order they should appear, with the one-liner that says
 # what the cell actually IS. Keys are job_type values.
 CELL_INFO = {
     "warp_gpu": "GPU physics (mujoco_warp) + GPU learner",
+    "envpool_cpu": "CPU physics (native MuJoCo pool) + CPU learner — fully GPU-free",
     "mjx_gpu": "GPU physics (MJX) + GPU learner",
     "mjx_cpu": "CPU physics (MJX) + CPU learner — fully GPU-free",
-    "envpool_cpu": "CPU physics (native MuJoCo pool) + CPU learner — fully GPU-free",
-    "envpool_gpu": "CPU physics (native MuJoCo pool) + GPU learner, async",
 }
+
+HOW_TO_READ = (
+    "One section per dm_control task, and inside it every agent at matched "
+    "hyperparameters and a matched step budget, on both physics "
+    "implementations. Score is the dm_control episode return, so 1000 is the "
+    "ceiling on every task here and the sections are directly comparable to "
+    "each other. Three caveats belong in any ranking: PPO is on-policy and "
+    "therefore not replay-ratio comparable (judge it on score-vs-steps and "
+    "score-vs-wall-clock, never on gradient steps); MPO pays ~20x per gradient "
+    "step for its 20 action samples; and ranks should come from the back-half "
+    "mean of a curve, not a peak epoch. Where the two cells disagree on SCORE "
+    "that is a finding about one of the two implementations of the task — they "
+    "are independent codebases, not the same program on different hardware. "
+    "Where they disagree on WALL-CLOCK, that is the cells doing their job."
+)
 
 
 def _import_workspaces():
@@ -75,31 +82,41 @@ def _import_workspaces():
     return wr
 
 
-def discover(entity, project, tag):
-    """Group the project's tagged runs into {suite: {cell: [agent, ...]}}.
+def discover(entity, prefix, grid_name, tasks=None):
+    """Group the grid's runs into {task: {cell: [agent, ...]}}.
 
     Reading the grid back from W&B rather than from the shell script's own list
-    means the report describes what actually RAN — a cell that failed or was
-    never launched simply does not get a panel, instead of getting an empty one.
+    means the report describes what actually RAN — a task or cell that failed or
+    was never launched simply does not get a section, instead of an empty one.
+
+    Projects are probed by NAME rather than listed, because `Api().projects()`
+    needs an entity and returns everything in it; asking for the 25 the suite
+    defines is both cheaper and immune to unrelated projects that happen to
+    share the prefix. A project that does not exist yet raises, which here just
+    means "this task has not run".
     """
     import wandb
 
     api = wandb.Api()
-    path = f"{entity}/{project}" if entity else project
-    runs = api.runs(path, filters={"tags": tag})
-
     grid = defaultdict(lambda: defaultdict(list))
     found = 0
-    for run in runs:
-        # `group`/`job_type` are set from release.suite / release.cell in the
-        # benchmark yamls; a run missing them was not launched by the grid.
-        suite, cell = run.group, run.job_type
-        if not suite or not cell:
+    for task in tasks or DMC_TASKS:
+        project = f"{prefix}{task}"
+        path = f"{entity}/{project}" if entity else project
+        try:
+            runs = list(api.runs(path, filters={"group": grid_name}))
+        except Exception:
             continue
-        agent = run.name.split(".", 1)[0]
-        if agent not in grid[suite][cell]:
-            grid[suite][cell].append(agent)
-        found += 1
+        for run in runs:
+            # `job_type` is set from release.cell; a run missing it was not
+            # launched by the grid.
+            cell = run.job_type
+            if not cell:
+                continue
+            agent = run.name.split(".", 1)[0]
+            if agent not in grid[task][cell]:
+                grid[task][cell].append(agent)
+            found += 1
     return grid, found
 
 
@@ -109,146 +126,83 @@ def _ordered(keys, order):
     return known + sorted(k for k in keys if k not in order)
 
 
-def _runset(wr, entity, project, name, suite, cell=None, agent=None):
-    filters = [f'Group = "{suite}"']
+def _runset(wr, entity, task, prefix, grid_name, name, cell=None):
+    filters = [f'Group = "{grid_name}"']
     if cell:
         filters.append(f'JobType = "{cell}"')
-    if agent:
-        # Run names are exactly "<agent>.<cell>" (set in the benchmark yamls),
-        # so with the cell already known this is an exact match rather than a
-        # prefix search — no dependence on how the filter language handles
-        # partial strings.
-        assert cell, "filtering by agent requires the cell (run names are agent.cell)"
-        filters.append(f'Name = "{agent}.{cell}"')
     return wr.Runset(
         entity=entity or "",
-        project=project,
+        project=f"{prefix}{task}",
         name=name,
         filters=" and ".join(filters),
     )
 
 
-def _curve_panels(wr, suite):
-    """The four panels every cell gets, in a 2x2 grid.
+def _task_panels(wr):
+    """The two panels every task gets, side by side.
 
-    The second panel is task-dependent. Episode length is only a metric where
-    the env can terminate early: on the mocap task it IS the survival time the
-    score is mostly made of, but WalkerWalk never terminates, so `test/length`
-    sits pinned at the 1000-step cap and plots nothing but eval noise. The
-    walker suite gets the behaviour-vs-deterministic comparison there instead,
-    which is the diagnostic that actually matters for the deterministic arms:
-    eval scoring BELOW the noisy training policy is the signature of an actor
-    that has saturated its tanh and stopped learning.
+    Deliberately two and not four: at 25 tasks a four-panel grid each is 100
+    panels in one report, which nobody scrolls. Score-vs-steps ranks the
+    algorithms and score-vs-wall-clock ranks the (algorithm, backend) pairs;
+    the per-run diagnostics live in each project's own workspace, which is
+    exactly what one-project-per-env buys.
     """
-    score_axis = dict(log_x=False, ignore_outliers=False)
-    if suite == "mocap_cmu_006_13":
-        second = wr.LinePlot(
-            title="Eval episode length vs env steps (survival)",
-            x="steps", y=["test/length"],
-            title_x="environment steps", title_y="test/length",
-            layout=wr.Layout(x=12, y=0, w=12, h=8), **score_axis,
-        )
-    else:
-        second = wr.LinePlot(
-            title="Behaviour vs deterministic policy",
-            x="steps", y=["train/score", "test/score"],
-            title_x="environment steps", title_y="score",
-            layout=wr.Layout(x=12, y=0, w=12, h=8), **score_axis,
-        )
+    axis = dict(log_x=False, ignore_outliers=False)
     return [
         wr.LinePlot(
             title="Eval score vs env steps",
             x="steps", y=["test/score"],
             title_x="environment steps", title_y="test/score",
-            layout=wr.Layout(x=0, y=0, w=12, h=8), **score_axis,
+            layout=wr.Layout(x=0, y=0, w=12, h=8), **axis,
         ),
-        second,
         wr.LinePlot(
             title="Eval score vs wall-clock",
             x="sys/time/total_s", y=["test/score"],
             title_x="wall-clock seconds", title_y="test/score",
-            layout=wr.Layout(x=0, y=8, w=12, h=8), **score_axis,
-        ),
-        wr.LinePlot(
-            title="Throughput (steps/s)",
-            x="steps", y=["sys/sps"],
-            title_x="environment steps", title_y="steps/s",
-            layout=wr.Layout(x=12, y=8, w=12, h=8), **score_axis,
+            layout=wr.Layout(x=12, y=0, w=12, h=8), **axis,
         ),
     ]
 
 
-def build(wr, grid, entity, project, title, description):
+def build(wr, grid, entity, prefix, grid_name, report_project, title, description):
     blocks = [
         wr.H1("What this is"),
         wr.P(description),
+        wr.P(HOW_TO_READ),
+        wr.H1("The cells"),
         wr.P(
-            "Every run in a suite shares one env config, one step budget and one "
-            "matched set of agent hyperparameters; the only variables are the "
-            "algorithm and the backend cell. Two caveats belong in any ranking: "
-            "PPO is on-policy and therefore not replay-ratio comparable (judge it "
-            "on score-vs-steps and score-vs-wall-clock, never on gradient steps), "
-            "and MPO pays ~20x per gradient step for its 20 action samples. Ranks "
-            "should come from the back-half mean of a curve, not a peak epoch."
+            " · ".join(
+                f"{cell}: {blurb}" for cell, blurb in CELL_INFO.items()
+                if any(cell in cells for cells in grid.values())
+            )
         ),
     ]
 
-    for suite in _ordered(grid.keys(), list(SUITE_INFO)):
-        cells = grid[suite]
-        heading, blurb = SUITE_INFO.get(suite, (suite, ""))
-        blocks += [wr.H1(heading)]
-        if blurb:
-            blocks.append(wr.P(blurb))
-
+    for task in _ordered(grid.keys(), list(DMC_TASKS)):
+        cells = grid[task]
         ordered_cells = _ordered(cells.keys(), list(CELL_INFO))
-
-        # One panel grid per cell: all agents of that cell overlaid.
-        for cell in ordered_cells:
-            agents = sorted(cells[cell])
-            blocks += [
-                wr.H2(f"{cell} — {CELL_INFO.get(cell, 'backend cell')}"),
-                wr.P(f"{len(agents)} agents: {', '.join(agents)}."),
-                wr.PanelGrid(
-                    runsets=[
-                        _runset(wr, entity, project, cell, suite, cell=cell)
-                    ],
-                    panels=_curve_panels(wr, suite),
-                ),
-            ]
-
-        # Cross-cell comparison, for the agents that ran on more than one cell:
-        # one runset per cell so the same agent's curves are directly overlaid.
-        multi = sorted(
-            {a for cell in ordered_cells for a in cells[cell]
-             if sum(a in cells[c] for c in ordered_cells) > 1}
-        )
-        if len(ordered_cells) > 1 and multi:
-            blocks += [
-                wr.H2("Same agent, different device placement"),
-                wr.P(
-                    "The backend A/B: identical agent, identical budget, identical "
-                    "task — only where the physics and the learner execute changes. "
-                    "The score curves should land in the same place (they are the "
-                    "same algorithm); the wall-clock and throughput panels are where "
-                    "the cells actually differ. Agents shown: "
-                    f"{', '.join(multi)}."
-                ),
-            ]
-            for agent in multi:
-                blocks += [
-                    wr.H3(agent),
-                    wr.PanelGrid(
-                        runsets=[
-                            _runset(wr, entity, project, cell, suite,
-                                    cell=cell, agent=agent)
-                            for cell in ordered_cells if agent in cells[cell]
-                        ],
-                        panels=_curve_panels(wr, suite),
-                    ),
-                ]
+        agents = sorted({a for cell in ordered_cells for a in cells[cell]})
+        blocks += [
+            wr.H1(task),
+            wr.P(
+                f"{len(agents)} agents ({', '.join(agents)}) over "
+                f"{len(ordered_cells)} cell(s) ({', '.join(ordered_cells)}). "
+                f"Project: {prefix}{task}."
+            ),
+            # One runset PER CELL rather than one for the task: the two are
+            # different implementations, so they get their own colour groups
+            # instead of being averaged into one line per agent.
+            wr.PanelGrid(
+                runsets=[
+                    _runset(wr, entity, task, prefix, grid_name, cell, cell=cell)
+                    for cell in ordered_cells
+                ],
+                panels=_task_panels(wr),
+            ),
+        ]
 
     return wr.Report(
-        project=project,
+        project=report_project,
         # "" (not None) means "my default entity" — the pydantic model rejects
         # None here.
         entity=entity or "",
@@ -263,19 +217,26 @@ def main():
     parser = argparse.ArgumentParser(
         description="Build the W&B release report from the benchmark runs."
     )
-    parser.add_argument("--project", default=DEFAULT_PROJECT,
-                        help=f"W&B project holding the runs (default: {DEFAULT_PROJECT})")
+    parser.add_argument("--project-prefix", default=DEFAULT_PROJECT_PREFIX,
+                        help="projects are <prefix><Task> "
+                             f"(default: {DEFAULT_PROJECT_PREFIX})")
+    parser.add_argument("--grid", default=DEFAULT_GRID,
+                        help="only include runs whose wandb group is this "
+                             f"(default: {DEFAULT_GRID})")
+    parser.add_argument("--tasks", default=None,
+                        help="comma-separated subset of the suite to report on")
     parser.add_argument("--entity", default=None,
                         help="W&B entity; defaults to your default entity")
-    parser.add_argument("--tag", default=DEFAULT_TAG,
-                        help=f"only include runs carrying this tag (default: {DEFAULT_TAG})")
+    parser.add_argument("--report-project", default=None,
+                        help="project the report itself is filed under "
+                             "(default: the first task's project)")
     parser.add_argument("--title", default="Roxie v1 — release benchmark")
     parser.add_argument(
         "--description",
         default=(
-            "Every agent in roxie, on a simple continuous-control task and on a "
-            "humanoid motion-tracking task, across the CPU/GPU backend cells each "
-            "task can express."
+            "Every agent in roxie on the whole dm_control suite, run twice: "
+            "once on GPU through mujoco_playground, once fully GPU-free through "
+            "EnvPool's native-MuJoCo pool."
         ),
     )
     parser.add_argument("--dry-run", action="store_true",
@@ -284,19 +245,26 @@ def main():
 
     wr = _import_workspaces()
 
-    grid, n_runs = discover(args.entity, args.project, args.tag)
+    tasks = [t.strip() for t in args.tasks.split(",")] if args.tasks else None
+    grid, n_runs = discover(args.entity, args.project_prefix, args.grid, tasks)
     if not grid:
         sys.exit(
-            f"no runs tagged '{args.tag}' found in project '{args.project}'.\n"
+            f"no runs in group '{args.grid}' found in any "
+            f"'{args.project_prefix}<Task>' project.\n"
             "Run scripts/run_release_benchmark.sh first (without --offline)."
         )
 
-    print(f"found {n_runs} runs in {len(grid)} suite(s):")
-    for suite, cells in grid.items():
-        for cell, agents in cells.items():
-            print(f"  {suite:<18} {cell:<13} {len(agents)} agents: {' '.join(sorted(agents))}")
+    print(f"found {n_runs} runs across {len(grid)} task(s):")
+    for task in _ordered(grid.keys(), list(DMC_TASKS)):
+        for cell, agents in grid[task].items():
+            print(f"  {task:<22} {cell:<13} {len(agents)} agents: "
+                  f"{' '.join(sorted(agents))}")
 
-    report = build(wr, grid, args.entity, args.project, args.title, args.description)
+    report_project = args.report_project or (
+        f"{args.project_prefix}{_ordered(grid.keys(), list(DMC_TASKS))[0]}"
+    )
+    report = build(wr, grid, args.entity, args.project_prefix, args.grid,
+                   report_project, args.title, args.description)
 
     if args.dry_run:
         print("\ndry run — report structure:")

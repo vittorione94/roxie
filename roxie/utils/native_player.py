@@ -34,7 +34,7 @@ class NativeSteppable(Protocol):
 
     ``info`` is an opaque per-episode dict owned by the env (phase counters,
     filter state, last action, ...); the player carries it between calls but
-    never inspects it. Any keys the viewer needs (e.g. the mocap ghost reads
+    never inspects it. Any keys the viewer needs (e.g. a reference-motion ghost reads
     ``clip_start``/``phase_idx``) simply ride along inside it.
     """
 
@@ -58,7 +58,7 @@ class NativeSteppable(Protocol):
 def _unwrap(env: Any) -> Any:
     """Peel adapters (``PlaygroundFuncEnv``, ...) off to the base env.
 
-    An env that implements the ``native_*`` protocol itself (mocap) is already
+    An env that implements the ``native_*`` protocol itself is already
     the base and comes straight back out.
     """
     base = env

@@ -1,0 +1,72 @@
+# D4PG arm of the dm_control release benchmark: a single CATEGORICAL critic and
+# no target-policy smoothing (as in the paper), n-step returns.
+#
+# ddpg_bench.yaml is the reference file and lists the invariants held identical
+# across every arm.
+#
+# D4PG-specific: the critic predicts a distribution over `num_atoms` fixed atoms
+# spanning [v_min, v_max] instead of a scalar Q, so the support has to bracket
+# the achievable return or the projection clips and the critic learns a
+# saturated distribution. This is the one hyperparameter here that is genuinely
+# task-dependent — and the reason ONE support works for the whole suite is a
+# property of dm_control, not luck: every suite task's per-step reward is a
+# normalised tolerance in [0, 1], so at gamma 0.99 the discounted return is
+# bounded by ~100 on all 25. The support below leaves headroom on both sides.
+# A task outside dm_control needs this rechecked.
+_target_: roxie.agents.D4PG
+
+gamma: 0.99
+tau: 0.005
+actor_learning_rate: 3e-4
+critic_learning_rate: 3e-4
+target_policy_noise: 0.0        # D4PG paper doesn't smooth the target policy
+target_noise_clip: 0.0
+n_step: 5
+v_min: -5.0
+v_max: 120.0
+num_atoms: 101
+memory_warmup: 30_720
+steps_before_learning: 30_720
+steps_between_updates: 2_048
+learning_steps: 20
+max_grad_norm: 1
+pre_activation_coef: 1e-1       # see ddpg_bench.yaml
+normalize_observations: true
+obs_norm_clip: 5.0
+obs_norm_eps: 1e-08
+
+actor_config:
+  _target_: roxie.models.actors.DeterministicActor
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+  output_init_scale: 0.01
+
+critic_config:
+  # num_atoms is injected by the agent from the top-level `num_atoms` above —
+  # don't set it here.
+  _target_: roxie.models.critics.DistributionalQCritic
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+
+memory_config:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 10_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
+
+seed: 0
+
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

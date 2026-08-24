@@ -17,7 +17,7 @@ from roxie.models.actors import distribution_entropy
 # tanh(1) = 0.76, so the policy keeps the whole useful range of the action
 # space for free and is only pushed back once it heads for the rails, where
 # d(tanh u)/du collapses and the DPG gradient dies. A two-sided u^2 penalty
-# would instead bias every action toward zero, which fights tasks (like mocap
+# would instead bias every action toward zero, which fights tasks (like motion
 # position servos) that legitimately need targets near the joint limits.
 PRE_ACTIVATION_THRESHOLD = 1.0
 

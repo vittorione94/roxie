@@ -23,10 +23,10 @@ those three methods.
 
 One deliberate deviation from Gymnasium: ``truncal``. Gymnasium's driver
 hardcodes ``truncated = steps >= time_limit`` and its ``FuncEnv`` has no way to
-say "this episode ended for a non-failure reason of the env's own". The mocap
-env has exactly that — the reference clip runs out — and it must stay OUT of
-``terminal``, or the critic zeroes the bootstrap at the cutoff and Q collapses
-there. It defaults to False, so a plain Gymnasium ``FuncEnv`` is unaffected.
+say "this episode ended for a non-failure reason of the env's own". A motion-
+tracking env has exactly that — the reference clip runs out — and it must stay
+OUT of ``terminal``, or the critic zeroes the bootstrap at the cutoff and Q
+collapses there. It defaults to False, so a plain Gymnasium ``FuncEnv`` is unaffected.
 """
 
 from __future__ import annotations

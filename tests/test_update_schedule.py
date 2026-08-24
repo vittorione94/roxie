@@ -1,6 +1,6 @@
 """The update schedule must not depend on stride/offset alignment.
 
-Regression test for the v1 release grid, where all six off-policy walker arms
+Regression test for the v1 release grid, where all six off-policy arms of the walker suite
 ran 5M env steps at exactly zero gradient steps. `steps_before_learning` was
 30_000 and the trainer advances `steps` in strides of `parallel_envs` = 256;
 30_000 % 256 == 48, so `(steps - 30_000) % 2_048` cycled 208, 464, ... 2_000 and
@@ -94,18 +94,18 @@ class TestBenchConfigsAligned:
     """The configs no longer *need* alignment, but drift back toward a round
     30_000 is a smell worth catching — it was the original defect."""
 
-    def test_walker_offsets_are_multiples_of_parallel_envs(self):
+    def test_bench_offsets_are_multiples_of_parallel_envs(self):
         import glob
         import re
 
         from omegaconf import OmegaConf
 
         parallel_envs = OmegaConf.load(
-            "experiments/walker/bench/walker_walk.yaml"
+            "experiments/dmc/bench/dmc.yaml"
         ).env.parallel_envs
 
         checked = 0
-        for path in glob.glob("experiments/walker/agent/*_bench.yaml"):
+        for path in glob.glob("experiments/dmc/agent/*_bench.yaml"):
             text = open(path).read()
             for key in ("memory_warmup", "steps_before_learning",
                         "steps_between_updates"):

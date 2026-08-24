@@ -462,7 +462,7 @@ class EnvPoolRollout:
         # could be a different draw rather than a better policy. `reseed`
         # rebuilds the pool at a fixed seed (~3ms), matching the JAX path's
         # fixed eval keys. Envs whose eval reset is already deterministic
-        # (mocap pins frame 0 with no reset noise) are unaffected either way.
+        # (an env that pins a single deterministic start) are unaffected either way.
         reseed = getattr(test_env, "reseed", None)
         if reseed is not None:
             reseed(_EVAL_SEED)

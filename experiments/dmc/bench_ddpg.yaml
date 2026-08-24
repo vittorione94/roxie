@@ -1,0 +1,29 @@
+# @package _global_
+#
+# dm_control release benchmark — DDPG arm. Deterministic policy, single Q critic, n-step returns — the reference arm the other three deterministic ones are deltas against.
+#
+#   uv run python roxie/train.py --config-name dmc/bench_ddpg
+#   uv run python roxie/train.py --config-name dmc/bench_ddpg release.task=CheetahRun
+#   uv run python roxie/train.py --config-name dmc/bench_ddpg dmc/backend@backend=envpool_cpu
+#
+# The agent block, the noise block (where there is one) and the whole bench/dmc
+# block are shared VERBATIM with every other bench_*.yaml; agent/ddpg_bench
+# holds the only algorithmic difference. Nothing is overridden below on purpose
+# — put ad-hoc tweaks on the CLI so this file keeps recording the benchmark
+# condition.
+#
+# TWO things the grid varies over this launchable, neither of them a file:
+# `release.task` (one of the 25 in roxie.environment.suites.DMC_TASKS) and the
+# `backend` group (warp_gpu / envpool_cpu). scripts/run_release_benchmark.sh
+# walks the cross product.
+defaults:
+  - agent: ddpg_bench
+  - noise: bench_gaussian
+  # bench BEFORE backend: the shared block declares release.cell as MISSING
+  # and the backend group is what fills it in, so the order is load-bearing.
+  - bench: dmc
+  - backend: warp_gpu
+  - _self_
+
+release:
+  agent: ddpg

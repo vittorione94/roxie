@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 
 from hydra.utils import get_class, get_method
 
+from roxie.environment import suites
 from roxie.environment.functional import space_size
 from roxie.environment.loader import (
     DEFAULT_BUILDER,
@@ -26,9 +27,14 @@ from roxie.environment.loader import (
 )
 from roxie.utils import hydra_searchpath
 
-# examples/ is not part of the installed roxie package; put the repo root on the
-# path so the mocap example (imported lazily for mocap checkpoints) is importable.
+# examples/ and any out-of-repo task tree are not part of the installed roxie
+# package; put the repo root and the working directory on the path so an env
+# builder named by a checkpoint's config stays importable.
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
+sys.path.insert(0, os.getcwd())
+# A checkpoint's stored config can hold ${envpool_task:...}, so the resolver has
+# to exist before that config is loaded back.
+suites.register_resolvers()
 
 
 @click.command(context_settings=dict(ignore_unknown_options=True))

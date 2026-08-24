@@ -18,7 +18,7 @@ Upstream's vector env is unusable here for three independent reasons, all
 visible in its source:
 
   1. ``step`` branches on ``if jnp.any(self.prev_done):`` — a device-to-host
-     sync EVERY step. The mocap release cell runs 1e9 env steps; that one line
+     sync EVERY step. A release cell runs 5e7 env steps; that one line
      would dominate the loop.
   2. It resets with ``self.state.at[to_reset].set(...)``, which assumes the
      state is a single array. Roxie's states are pytrees (``mjx.Data``), and
@@ -93,11 +93,11 @@ class JaxVectorEnv:
     Args:
         func_env: the environment. NOT mutated — unlike Gymnasium, which calls
             ``func_env.transform(jax.vmap)`` in place, this builds its vmapped
-            callables locally. The mocap loader shares one env object between
-            the train and eval drivers (a shallow copy, so the reference clips
-            and the mjx model are not loaded twice), and mutating it would
-            double-vmap the second one. It also keeps the env callable on single
-            states, which ``play.py`` needs.
+            callables locally. A builder may hand the SAME env object to the
+            train and the eval driver — that is the point of doing so, since the
+            mjx model and any per-env reference data are then loaded once — and
+            mutating it in place would double-vmap the second driver. It also
+            keeps the env callable on single states, which ``play.py`` needs.
         num_envs: worlds stepped per call.
         max_episode_steps: the driver's step limit; 0 disables it. Reported as
             TRUNCATION, never termination.
@@ -227,14 +227,37 @@ class JaxVectorEnv:
         return jax.tree.map(_leaf, reset_pool, stepped)
 
 
+def _dict_obs_keys(space: Any) -> tuple[str, ...] | None:
+    """The observation keys, in order, when a pool's obs space is a ``Dict``.
+
+    ``None`` for the flat case. EnvPool's gym-MuJoCo tasks declare a single Box;
+    its dm_control tasks declare dm_control's own OrderedDict of named
+    observation groups (``position``, ``velocity``, ``touch``, ...), which is
+    what a policy has to be handed as one vector. The ORDER is the space's, i.e.
+    dm_control's declaration order — not sorted — because that is the order
+    dm_control itself flattens in, and a policy trained against one ordering
+    cannot be evaluated against another.
+    """
+    spaces = getattr(space, "spaces", None)
+    if not isinstance(spaces, dict):
+        return None
+    return tuple(spaces)
+
+
 def _as_box(space: Any, unbounded: bool = False) -> Any:
     """Normalize a pool's space object to a ``gymnasium.spaces.Box``.
 
-    Pools hand back either a real Box (EnvPool) or a minimal stand-in carrying
-    only ``shape``/``low``/``high``. ``unbounded`` supplies +-inf bounds for a
+    Pools hand back a real Box (EnvPool), a ``Dict`` of Boxes (EnvPool's
+    dm_control tasks — flattened here to the concatenated vector the pool's
+    observations are flattened to), or a minimal stand-in carrying only
+    ``shape``/``low``/``high``. ``unbounded`` supplies +-inf bounds for a
     stand-in that declares none, which is the honest space for an unclipped
     MuJoCo observation vector.
     """
+    keys = _dict_obs_keys(space)
+    if keys is not None:
+        size = sum(int(np.prod(space.spaces[k].shape)) for k in keys)
+        return functional.unbounded_box(size)
     low, high = getattr(space, "low", None), getattr(space, "high", None)
     if low is None or high is None:
         if not unbounded:
@@ -244,7 +267,7 @@ def _as_box(space: Any, unbounded: bool = False) -> Any:
 
 
 class EnvPoolVectorEnv:
-    """A C++ pool (EnvPool, or the mocap CPU pool) behind the same surface.
+    """A C++ pool (EnvPool, or a hand-written one) behind the same surface.
 
     The pool already batches, auto-resets and time-limits internally and already
     returns ``(obs, reward, terminated, truncated, info)`` — this class is
@@ -282,12 +305,14 @@ class EnvPoolVectorEnv:
         self._bind_pool(pool)
 
         # Both pool flavours expose the SINGLE-env spaces (EnvPool's gymnasium
-        # API does; the mocap CPU pool mirrors it), so they are the single_*
-        # spaces directly.
+        # API does), so they are the single_* spaces directly.
         self.single_observation_space = _as_box(
             pool.observation_space, unbounded=True,
         )
         self.single_action_space = _as_box(pool.action_space)
+        # Non-None when this pool reports observations as named groups rather
+        # than one vector; see `_flat_obs`.
+        self._obs_keys = _dict_obs_keys(pool.observation_space)
 
     def _bind_pool(self, pool: Any) -> None:
         self._pool = pool
@@ -317,10 +342,28 @@ class EnvPoolVectorEnv:
         self._bind_pool(self._rebuild(seed))
         return True
 
+    def _flat_obs(self, obs: Any) -> np.ndarray:
+        """The pool's observation as one ``(num_envs, obs_dim)`` float32 array.
+
+        A dm_control pool hands back a mapping of named groups; concatenating
+        them in the space's declared order is what dm_control's own
+        ``flatten_observation`` does, and it is the only step in this class that
+        is more than a dtype cast. Leaves are reshaped rather than assumed
+        2-D — a scalar group like walker's ``height`` arrives as ``(n,)``.
+        """
+        if self._obs_keys is None:
+            return np.asarray(obs, dtype=np.float32)
+        parts = []
+        for key in self._obs_keys:
+            leaf = obs[key] if hasattr(obs, "__getitem__") else getattr(obs, key)
+            leaf = np.asarray(leaf, dtype=np.float32)
+            parts.append(leaf.reshape(leaf.shape[0], -1))
+        return np.concatenate(parts, axis=1)
+
     def reset(self, key=None, params=None, num_envs: int | None = None):
         del key, params, num_envs  # the pool owns its own RNG and batch size
         obs, info = self._pool.reset()
-        obs = np.asarray(obs, dtype=np.float32)
+        obs = self._flat_obs(obs)
         n = obs.shape[0]
         self.num_envs = n
         false = np.zeros(n, dtype=bool)
@@ -335,7 +378,7 @@ class EnvPoolVectorEnv:
         obs, reward, terminated, truncated, info = self._pool.step(
             np.asarray(action)
         )
-        obs = np.asarray(obs, dtype=np.float32)
+        obs = self._flat_obs(obs)
         timestep = Timestep(
             obs=obs,
             reward=np.asarray(reward, dtype=np.float32),

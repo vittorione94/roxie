@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "chex>=0.1.90",
+    "click>=8.1",
     "distrax>=0.1.5",
     "flashbax>=0.1.3",
     "flax>=0.8.5",
@@ -27,14 +28,17 @@ dependencies = [
     "rlax>=0.1.7",
     "termcolor>=3.1.0",
     "etils>=1.13.0",
-    "dm-control>=1.0.41",
-    "h5py>=3.16.0",
     "mujoco-mjx>=3.9.0",
     "wandb>=0.18.0",
     "pandas>=3.0.3",
-    "labmaze>=1.0.6",
+    "matplotlib>=3.8",
+    # The benchmark's second physics implementation: the same dm_control tasks
+    # through native MuJoCo on CPU threads. Not optional — it is half the grid.
     "envpool>=1.2.5",
 ]
+# dm-control / h5py / labmaze were direct dependencies only for the CMU mocap
+# task, which now lives in its own repo (roxie-mocap) and declares them itself.
+# mujoco_playground pulls in whatever of dm_control it needs on its own.
 
 [project.urls]
 Homepage = "https://github.com/vittorione94/roxie"

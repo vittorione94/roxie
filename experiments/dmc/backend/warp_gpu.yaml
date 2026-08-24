@@ -1,0 +1,42 @@
+# @package _global_
+
+# The GPU cell of the release grid: mujoco_playground's dm_control-suite envs,
+# stepped by mujoco_warp on the card, with the learner on the card too.
+#
+# This is one half of the benchmark's central claim. The other half is
+# backend/envpool_cpu.yaml, which runs the SAME 25 dm_control tasks through a
+# completely independent implementation (native MuJoCo on CPU threads) at the
+# same budget. Their score curves should land in the same place; where they
+# differ is throughput.
+#
+# Requires warp-lang <1.13; verify with `uv run python scripts/check_warp.py`.
+#
+# Carries only backend-mechanical settings. The task, parallel_envs, the agent
+# and the step budget are held identical across cells by bench/dmc.yaml — this
+# group is the ONLY thing that differs between them.
+
+release:
+  cell: warp_gpu
+
+env:
+  builder: roxie.environment.loader.build_playground_env
+  # `release.task` is a playground registry name as-is; the envpool cell is the
+  # one that needs translating.
+  env_name: ${release.task}
+  impl: warp
+  # null keeps mujoco_playground's own upstream-tuned Warp budgets per env. The
+  # dm_control bodies are small enough that the global contact arena is not a
+  # constraint at 256 envs; the humanoid tasks are the ones to watch for
+  # "broadphase/narrowphase/nefc overflow" warnings (docs/backends.md).
+  naconmax: null
+  njmax: null
+
+runtime:
+  # Agent on the GPU (JAX's own choice, which is the card when one is visible).
+  jax_platform: null
+  # Measured on the RTX 5080: JAX's default f32 matmul resolves to the bf16
+  # path, which is both slower AND less accurate than tf32 (~1.7x, rel err
+  # 6.5e-5 vs 4.1e-5). Set on every GPU cell so they agree; the CPU cells leave
+  # it null because a CPU matmul is true f32 either way and tf32 is meaningless
+  # there. See docs/backends.md#ordering-gotchas-env-vars-vs-jaxconfig.
+  matmul_precision: tensorfloat32

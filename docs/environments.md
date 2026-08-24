@@ -11,7 +11,7 @@ There are exactly two ways to attach an environment to roxie, both shaped like [
 | Defined in | [`roxie/environment/functional.py`](../roxie/environment/functional.py) | [`roxie/environment/vector.py`](../roxie/environment/vector.py) |
 | For | anything functional and JAX-traceable | anything already batched |
 | State | passed explicitly, one env at a time | carried by the caller, batched |
-| Examples | MuJoCo Playground, the mocap env, Waymax | EnvPool, the mocap CPU pool |
+| Examples | MuJoCo Playground, Waymax | EnvPool |
 
 Write a `FuncEnv` and `JaxVectorEnv` batches it. Bring something that already speaks Gymnasium's 5-tuple and `EnvPoolVectorEnv` fronts it directly — no translation, because that *is* the interface.
 
@@ -64,7 +64,7 @@ step(state, action, key, reset_pool, params)    -> (VecState, Timestep)
 
 The state is threaded through the call rather than kept on the driver, which is the one substantive difference from Gymnasium's `FunctionalJaxVectorEnv` and the reason roxie does not use it. Upstream's implementation is unusable here for three independent reasons, all visible in its source:
 
-1. `step` branches on `if jnp.any(self.prev_done):` — a device-to-host sync **every step**. The mocap release cell runs 1e9 env steps.
+1. `step` branches on `if jnp.any(self.prev_done):` — a device-to-host sync **every step**. A release cell runs 5e7 env steps.
 2. It resets with `self.state.at[to_reset].set(...)`, which assumes the state is a single array. Roxie's states are pytrees (`mjx.Data`); `.at[]` does not exist on a pytree.
 3. Keeping the state on `self` makes a `lax.scan` warmup impossible.
 
@@ -80,7 +80,7 @@ def build_my_env(cfg_env, mode="train", num_envs=1, test_episodes=1) -> EnvBundl
 
 `num_envs` and `test_episodes` are passed in by the trainer rather than read off `cfg_env`, because they are trainer quantities: the same env definition is driven at `env.parallel_envs` worlds for training and at `trainer.test_episodes` for evaluation. `mode` is `"train"` or `"play"`, letting a builder apply playback-specific tweaks (shrinking a GPU clip pool, falling back from a CPU pool to a single jitted world).
 
-The three shipped builders are `build_playground_env` and `build_envpool_env` in [`roxie/environment/loader.py`](../roxie/environment/loader.py), and `build_mocap_env` / `build_mocap_envpool_env` under [`examples/mocap/`](../examples/mocap/).
+The two shipped builders are `build_playground_env` and `build_envpool_env` in [`roxie/environment/loader.py`](../roxie/environment/loader.py). A builder can live outside this repo — [roxie-mocap](https://github.com/vittorione94/roxie-mocap) ships two of its own and is launched through `roxie.train` unchanged.
 
 ## Spaces
 
