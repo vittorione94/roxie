@@ -159,6 +159,30 @@ def test_steps_filter_excludes_a_shorter_pilot(tmp_path):
     assert set(runs) == {"td3"}
 
 
+def test_default_budget_is_the_longest_completed_one(tmp_path):
+    """`--smoke` records its 500k runs as `ok` in the same ledger. Defaulting to
+    "newest ok run" would publish a smoke policy the moment someone validated
+    the grid after training it — the run that finished the longest budget is the
+    release run by construction."""
+    rows = _manifest(tmp_path)
+    rows.append({"status": "ok", "suite": "mocap_cmu_006_13", "cell": "warp_gpu",
+                 "agent": "td3", "steps": "500000", "seconds": "1", "sps": "1",
+                 "run_dir": "outputs/smoke"})
+    assert export.budget_for(rows, "mocap_cmu_006_13", "warp_gpu") == 1_000_000_000
+    runs = export.latest_ok_runs(
+        rows, "mocap_cmu_006_13", "warp_gpu",
+        steps=export.budget_for(rows, "mocap_cmu_006_13", "warp_gpu"),
+    )
+    assert runs["td3"]["run_dir"] != "outputs/smoke"
+
+
+def test_default_budget_is_none_when_nothing_completed(tmp_path):
+    """No `ok` row for the cell: the caller must report "nothing to export"
+    rather than silently fall through to an unfiltered export."""
+    assert export.budget_for(_manifest(tmp_path), "mocap_cmu_006_13",
+                             "mjx_cpu") is None
+
+
 def test_other_cells_and_suites_are_excluded(tmp_path):
     runs = export.latest_ok_runs(_manifest(tmp_path), "mocap_cmu_006_13",
                                  "warp_gpu", steps=None)

@@ -68,13 +68,17 @@ trainer:
   # with the walker suite, so a longer budget means more turnover through the
   # same buffer, which is the intended reading.
   steps: 1_000_000_000
-  # 200 points of curve. 1M (the 50M-budget value) would be 1000 epochs, and an
-  # epoch boundary is not free — it pauses the learner and runs the eval — so
-  # the eval overhead would be ~10% of a 10 h run for resolution nobody reads.
+  # 200 points of curve. Holding 1M (the 50M-budget value) would mean 1000
+  # epochs, and an epoch boundary is not free: it pauses the learner and runs
+  # `test_episodes` full-clip evals. 5x fewer boundaries for resolution nobody
+  # reads off a 200-point curve anyway.
   epoch_steps: 5_000_000
-  # 20 checkpoints per run at ~50 MB each ≈ 1 GB/run with `replace_checkpoint:
-  # false` below. The old 10M cadence would write 100 of them (5 GB/run, ~55 GB
-  # across the grid) to publish exactly one policy per agent.
+  # 20 checkpoints per run — enough for the weights export to pick a best from,
+  # and with `replace_checkpoint: false` below they all stay. Measured size on
+  # this task is 52 MB (ddpg) to 79 MB (td3, twin critics + their optimizer
+  # slots), so ~1-1.6 GB per run. The 50M-budget cadence of 10M would write 100
+  # per run — 5-8 GB each, ~55 GB across the grid — to publish exactly one
+  # policy per agent.
   save_steps: 50_000_000
   # 4, not 100: under the canonical eval protocol (frame 0, no reset noise, run
   # the whole clip) a single-clip run makes every eval episode the SAME rollout,

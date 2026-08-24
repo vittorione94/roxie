@@ -246,9 +246,13 @@ uv run python scripts/export_release_weights.py --archive   # + .tar.gz + SHA256
 It publishes one bundle per agent from the headline `mocap_cmu_006_13` /
 `warp_gpu` arm. Two selection rules do the work:
 
-- **Only `ok` runs from the manifest.** A run that crashed at 40% leaves
-  checkpoints that load perfectly and are not a release result. `--steps` narrows
-  further, so a 50M pilot cannot be published as a 1B policy.
+- **Only `ok` runs at the longest completed budget.** A run that crashed at 40%
+  leaves checkpoints that load perfectly and are not a release result — and
+  `--smoke` records its 500k runs `ok` in the same ledger, so "the newest `ok`
+  run" would publish a smoke policy the moment anyone validated the grid after
+  training it. The export prints the budget it selected on every invocation;
+  pin it with `--steps 1000000000` if you want that spelled out, or
+  `--any-budget` to opt out.
 - **The best checkpoint, not the last.** Highest `test/score` among the steps
   that actually have a checkpoint. On a saturating arm the final checkpoint is
   measurably worse than the run's own peak — both existing mocap runs in the

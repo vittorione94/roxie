@@ -59,6 +59,7 @@
 #
 #     uv run python roxie/report.py                     # W&B report
 #     uv run python roxie/plot.py --path outputs/release_v1 --output release.pdf
+#     uv run python scripts/export_release_weights.py   # publishable policies
 #
 set -uo pipefail
 
@@ -127,7 +128,14 @@ SMOKE=0; DRY_RUN=0; FORCE=0; OFFLINE=0; ALLOW_BUSY_GPU=0
 SUITES="walker mocap"
 AGENT_FILTER=""; CELL_FILTER=""
 
-usage() { sed -n '2,60p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; exit 0; }
+# The whole header block, whatever length it is. The fixed line range this used
+# to carry silently truncated --help every time the header grew.
+usage() {
+    awk 'NR == 1 { next }
+         /^#/    { sub(/^#+ ?/, ""); print; next }
+                 { exit }' "$0"
+    exit 0
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

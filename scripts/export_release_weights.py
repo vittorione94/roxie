@@ -1,10 +1,10 @@
 """Package trained policies out of the release grid into publishable bundles.
 
 The benchmark leaves ~20 checkpoints per run buried in a timestamped output tree
-that also holds the replay-free optimizer state, the wandb dir and a 200-row
-log.csv. None of that is what you attach to a release. This script picks ONE
-checkpoint per agent — the best-scoring one, not the last — and copies it into a
-self-contained bundle that `roxie/play.py` can open with no other files present:
+alongside the wandb dir, the console log and a 200-row log.csv, one such tree
+per (suite, cell, agent). None of that is what you attach to a release. This
+script picks ONE checkpoint per agent — the best-scoring one, not the last — and
+copies it into a self-contained bundle `roxie/play.py` can open on its own:
 
     weights/mocap_cmu_006_13/td3.warp_gpu/
       .hydra/config.yaml        the run's resolved config (play.py reads this)
@@ -24,8 +24,11 @@ its `checkpoints/step_<N>/` nesting instead of being flattened.
 WHICH RUN. The manifest (`outputs/release_v1/manifest.tsv`) is the source of
 truth, and only rows recorded `ok` are eligible — a run that crashed at 40% has
 checkpoints on disk that look perfectly loadable and are not a release result.
-`--steps` narrows further to runs that finished at a specific budget, so a
-50M-step pilot cannot be published as a 1B-step policy.
+Among those, only runs at the LONGEST completed budget for the suite/cell, which
+is what keeps a `--smoke` run out: smoke records itself `ok` in the same ledger
+at 500k steps, and "the newest ok run" would publish that the moment anyone
+validated the grid after training it. `--steps` pins a specific budget instead;
+`--any-budget` opts out and takes the newest run whatever it is.
 
 WHICH CHECKPOINT. The best `test/score` in the run's own log.csv, among the
 steps that actually have a checkpoint. Taking the last checkpoint instead would
@@ -176,6 +179,24 @@ def _epoch_tolerance(rows: list[dict]) -> float:
     return max(b - a for a, b in zip(steps, steps[1:])) / 2
 
 
+def budget_for(manifest_rows: list[dict], suite: str, cell: str) -> int | None:
+    """The largest completed step budget for a (suite, cell), or None.
+
+    This is the default `--steps`, and it exists because `--smoke` records its
+    tiny runs as `ok` in the same ledger. Publishing "the newest ok run" would
+    then hand out a 500k-step smoke policy the moment anyone validated the grid
+    after training it — a bundle that loads perfectly and is worthless. The
+    longest budget present is the release run by construction.
+    """
+    budgets = [
+        int(row["steps"])
+        for row in manifest_rows
+        if row.get("status") == "ok" and row.get("suite") == suite
+        and row.get("cell") == cell and (row.get("steps") or "").isdigit()
+    ]
+    return max(budgets) if budgets else None
+
+
 def latest_ok_runs(manifest_rows: list[dict], suite: str, cell: str,
                    steps: int | None) -> dict[str, dict]:
     """The newest `ok` run per agent for one (suite, cell), as {agent: row}.
@@ -183,6 +204,9 @@ def latest_ok_runs(manifest_rows: list[dict], suite: str, cell: str,
     Newest by manifest ORDER, not by parsing the timestamp out of the path: the
     ledger is append-only, so a later line is a later run by construction, and
     that stays true if the run-dir naming ever changes.
+
+    `steps=None` accepts any budget; callers should pass `budget_for(...)`
+    instead unless they mean to mix budgets in one export.
     """
     chosen: dict[str, dict] = {}
     for row in manifest_rows:
@@ -428,7 +452,12 @@ def main() -> int:
     parser.add_argument("--metric", default=DEFAULT_METRIC,
                         help="log.csv column the best checkpoint is chosen by")
     parser.add_argument("--steps", type=int, default=None,
-                        help="only publish runs that finished at this budget")
+                        help="only publish runs that finished at this budget "
+                             "(default: the longest budget completed for the "
+                             "suite/cell, so a --smoke run cannot be published)")
+    parser.add_argument("--any-budget", action="store_true",
+                        help="publish the newest ok run per agent whatever its "
+                             "budget, mixing budgets in one export")
     parser.add_argument("--archive", action="store_true",
                         help="also write one .tar.gz per bundle + SHA256SUMS")
     parser.add_argument("--verify", action="store_true",
@@ -444,14 +473,18 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    runs = latest_ok_runs(rows, args.suite, args.cell, args.steps)
+    budget = None if args.any_budget else (
+        args.steps if args.steps is not None
+        else budget_for(rows, args.suite, args.cell)
+    )
+    runs = latest_ok_runs(rows, args.suite, args.cell, budget)
     if args.agents:
         wanted = {a.strip() for a in args.agents.split(",") if a.strip()}
         runs = {a: r for a, r in runs.items() if a in wanted}
     if not runs:
-        budget = f" at {args.steps:,} steps" if args.steps else ""
-        print(f"No `ok` runs for {args.suite}/{args.cell}{budget} in the "
-              f"manifest.", file=sys.stderr)
+        at = f" at {budget:,} steps" if budget else ""
+        print(f"No `ok` runs for {args.suite}/{args.cell}{at} in the manifest.",
+              file=sys.stderr)
         return 1
 
     commit = git_commit()
@@ -459,7 +492,8 @@ def main() -> int:
     exported: list[dict] = []
     skipped: list[tuple[str, str]] = []
 
-    print(f"{args.suite} / {args.cell} — {len(runs)} run(s), "
+    print(f"{args.suite} / {args.cell} — {len(runs)} run(s) at "
+          f"{f'{budget:,} steps' if budget else 'any budget'}, "
           f"selecting by {args.metric}\n")
     for agent in sorted(runs):
         manifest_row = runs[agent]
@@ -484,16 +518,21 @@ def main() -> int:
             continue
 
         bundle = dest_root / args.suite / f"{agent}.{args.cell}"
-        exported.append(export_one(
+        metadata = export_one(
             run_dir, checkpoint, row, bundle,
             suite=args.suite, cell=args.cell, agent=agent, metric=args.metric,
             manifest_row=manifest_row, commit=commit,
-        ))
+        )
         if args.verify:
             problem = verify(bundle)
             print(f"         verify: {problem or 'ok'}")
             if problem:
+                # Left on disk to be looked at, but kept OUT of the index and
+                # the archives: a bundle that did not read back is not something
+                # to hand anyone, and an index entry is exactly that handing.
                 skipped.append((agent, f"exported but failed verification: {problem}"))
+                continue
+        exported.append(metadata)
 
     if args.dry_run:
         print("\ndry run — nothing written.")
