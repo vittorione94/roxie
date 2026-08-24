@@ -1,5 +1,3 @@
-import types
-
 import jax
 import jax.numpy as jnp
 import pytest
@@ -7,6 +5,7 @@ from omegaconf import OmegaConf
 
 import roxie.agents  # noqa: F401  (avoid circular import)
 from roxie.agents.ppo import PPO
+from roxie.environment.vector import Timestep
 
 NUM_ENVS = 4
 OBS_DIM = 6
@@ -48,14 +47,15 @@ def _make_agent(**kwargs):
     return PPO(**params)
 
 
-def _env_state(key, scale):
-    return types.SimpleNamespace(
+def _timestep(key, scale):
+    """One batched env step, as `JaxVectorEnv.step` would report it."""
+    false = jnp.zeros((NUM_ENVS,), jnp.bool_)
+    return Timestep(
         obs=jax.random.normal(key, (NUM_ENVS, OBS_DIM)) * scale + scale,
         reward=jax.random.normal(key, (NUM_ENVS,)),
-        info={
-            "termination": jnp.zeros((NUM_ENVS,), jnp.bool_),
-            "truncation": jnp.zeros((NUM_ENVS,), jnp.bool_),
-        },
+        terminated=false,
+        truncated=false,
+        info={},
     )
 
 
@@ -63,14 +63,14 @@ def _collect_and_update(agent, drift=2.0, unfreeze_norm=False):
     """Roll out under a deliberately drifting observation distribution."""
     key = jax.random.PRNGKey(0)
     key, k0 = jax.random.split(key)
-    state = _env_state(k0, 1.0)
+    obs = _timestep(k0, 1.0).obs
 
     for t in range(ROLLOUT):
         key, act_key, step_key = jax.random.split(key, 3)
-        agent.step(state.obs, evaluate=False, key=act_key)
-        nxt = _env_state(step_key, 1.0 + drift * t)
-        agent.add(state, nxt)
-        state = nxt
+        agent.step(obs, evaluate=False, key=act_key)
+        timestep = _timestep(step_key, 1.0 + drift * t)
+        agent.add(obs, timestep)
+        obs = timestep.obs
 
     if unfreeze_norm:
         # Throw away the acting snapshot so the update re-derives mean/std from the

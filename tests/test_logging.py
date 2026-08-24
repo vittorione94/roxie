@@ -100,7 +100,7 @@ class TestNamespaceScheme:
     def test_backends_do_not_log_for_themselves(self):
         """The namespace is the trainer's alone.
 
-        The rollouts run the eval and own the mining tables, so either could
+        The rollouts run the eval and carry the env's params, so either could
         quietly start logging its own keys — and a backend-specific key would be
         exactly the drift that splitting the loop was meant to prevent. They
         return values instead; `_store_*` names them.

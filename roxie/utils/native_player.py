@@ -14,9 +14,9 @@ implementation) is used is decided entirely by the Hydra ``env.builder`` config;
 nothing here knows about any particular task.
 
 ``reset(key)`` / ``step(state, action)`` mirror the jitted env's signatures and
-return objects duck-typed like the trainer's ``WrapperState`` (``.env_state`` with
-``obs``/``data``/``reward``/``done``/``metrics``/``info``), so ``play.py`` drives
-this through the exact same loop it uses for the MJX path.
+return an object shaped like the ``mjx_env.State`` that path produces
+(``obs``/``data``/``reward``/``done``/``metrics``/``info``), so ``play.py``
+drives this through the exact same loop it uses for the MJX path.
 """
 
 from __future__ import annotations
@@ -56,7 +56,11 @@ class NativeSteppable(Protocol):
 
 
 def _unwrap(env: Any) -> Any:
-    """Peel wrappers (TerminationWrapper, ...) off to the base env."""
+    """Peel adapters (``PlaygroundFuncEnv``, ...) off to the base env.
+
+    An env that implements the ``native_*`` protocol itself (mocap) is already
+    the base and comes straight back out.
+    """
     base = env
     while hasattr(base, "env"):
         base = base.env
@@ -90,7 +94,10 @@ class NativePlayer:
         return self._state(obs, reward, done, metrics)
 
     def _state(self, obs, reward, done, metrics):
-        env_state = SimpleNamespace(
+        # Shaped like the `mjx_env.State` the jitted FuncEnv path produces, so
+        # `play.py` reads `state.obs` / `state.data` / `state.done` without
+        # knowing which stepper produced it.
+        return SimpleNamespace(
             obs=np.asarray(obs, dtype=np.float32),
             data=self._data,
             reward=float(reward),
@@ -98,7 +105,6 @@ class NativePlayer:
             metrics={k: float(v) for k, v in metrics.items()},
             info=self._info,
         )
-        return SimpleNamespace(env_state=env_state)
 
 
 def make_native_player(env: Any):

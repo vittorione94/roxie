@@ -436,28 +436,28 @@ class PPO(Agent):
             self._obs_norm = Agent.obs_mean_std(self.state.obs_stats, self.obs_eps)
         return self._obs_norm
 
-    def add(self, prev_states, states):
+    def add(self, prev_obs, timestep):
         # A length-1 time axis is inserted to match the trajectory buffer's
         # (NUM_ENVS, TIME, ...) layout.
         experiences = Transition(
-            observation=prev_states.obs[:, None, :],
+            observation=prev_obs[:, None, :],
             action=self.last_action[:, None, :],
-            reward=states.reward[:, None],
+            reward=timestep.reward[:, None],
             # Store termination and truncation separately, NOT `done` (= either):
             # GAE bootstraps the value at a truncation but zeroes it at a true
             # termination (see _compute_gae). Folding them into one `done` would
             # treat a time-limit/clip-end cut as a hard terminal and bias returns.
-            terminal=states.info["termination"][:, None],
+            terminal=timestep.terminated[:, None],
             log_probs=self.last_log_prob[:, None],
             value=self.last_values,
-            truncation=states.info["truncation"][:, None],
+            truncation=timestep.truncated[:, None],
         )
         self.state.buffer_state = self._jit_replay_add(
             self.state.buffer_state, experiences
         )
 
         if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_states.obs, states.obs], axis=0)
+            obs_batch = jnp.concatenate([prev_obs, timestep.obs], axis=0)
             self.state.obs_stats = Agent.update_obs_stats(
                 self.state.obs_stats, obs_batch
             )

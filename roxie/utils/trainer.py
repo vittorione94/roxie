@@ -200,7 +200,7 @@ class Trainer:
         state = rollout.prepare()
         agent_key, compile_key = jax.random.split(agent_key)
         timed(functools.partial(agent.step, evaluate=False, key=compile_key),
-              state.env_state.obs, label="agent step")
+              state.obs, label="agent step")
 
         # --- Warmup: fill the replay buffer with random actions ---
 
@@ -243,15 +243,15 @@ class Trainer:
 
         while True:
             action_rng, action_key = jax.random.split(action_rng)
-            actions, last_noise = learner.act(state.env_state.obs, action_key)
+            actions, last_noise = learner.act(state.obs, action_key)
             # Mean |noise| per joint in normalized action units. Only
             # deterministic agents (DDPG/TD3) expose it.
             if last_noise is not None:
                 acc["noise"] += xp.mean(xp.abs(last_noise))
                 acc["noise_iters"] += 1
 
-            state, prev_env_state, next_env_state = rollout.step(state, actions)
-            learner.observe(prev_env_state, next_env_state, actions, self.steps)
+            state, prev_obs, timestep = rollout.step(state, actions)
+            learner.observe(prev_obs, timestep, actions, self.steps)
 
             grad_steps, new_losses = learner.drain()
             tot_gradient_steps = self.initial_gradient_steps + grad_steps
@@ -259,13 +259,16 @@ class Trainer:
                 acc["actor_losses"].append(actor_loss)
                 acc["critic_losses"].append(critic_loss)
 
-            reward = xp.asarray(next_env_state.reward)
-            done = xp.asarray(next_env_state.done)
+            reward = xp.asarray(timestep.reward)
+            # An episode ends on EITHER flag; the two are kept apart only for the
+            # Bellman bootstrap, which is the agent's business, not the
+            # bookkeeping's.
+            done = xp.asarray(timestep.terminated) | xp.asarray(timestep.truncated)
             scores = scores + reward
             lengths = lengths + 1
             # Per-env vectors; the mean is deferred to the epoch boundary to
             # avoid one dispatch per metric per step.
-            for k, v in next_env_state.metrics.items():
+            for k, v in timestep.info.get("metrics", {}).items():
                 acc["metrics"][k] = acc["metrics"].get(k, 0.0) + v
             acc["metric_iters"] += 1
 
@@ -279,7 +282,7 @@ class Trainer:
             )
 
             if bench_steps == NUM_ENVS * 20:
-                self._bench(bench_steps, bench_t0, state.env_state.obs)
+                self._bench(bench_steps, bench_t0, state.obs)
 
             if self.show_progress:
                 logger.show_progress(self.steps, self.epoch_steps, self.max_steps)
@@ -292,12 +295,13 @@ class Trainer:
                     gradient_steps=tot_gradient_steps,
                     start_time=start_time, last_epoch_time=last_epoch_time,
                 )
-                # After the metrics are stored: the refresh zeroes the mining
-                # counters those diagnostics are read from.
+                # After the metrics are stored: the refresh is where the env
+                # gets to change itself, and this epoch's numbers describe the
+                # env as it was.
                 state, invalidated = rollout.epoch_refresh(state)
                 if invalidated:
-                    # The backend reset the live envs (a clip swap), so the
-                    # part-scored episodes in flight are no longer meaningful.
+                    # The backend reset the live envs, so the part-scored
+                    # episodes in flight are no longer meaningful.
                     scores = xp.zeros(NUM_ENVS)
                     lengths = xp.zeros(NUM_ENVS, dtype=xp.int32)
                 last_epoch_time = time.time()
@@ -321,9 +325,9 @@ class Trainer:
         """The epoch boundary: reset exploration noise, run the held-out eval,
         store and dump the epoch's metrics, hand back a fresh accumulator.
 
-        Whatever the backend must refresh afterwards (reset pool, mining table,
-        clip subset) is the caller's next move — only it knows which loop state
-        that invalidates. Returns `(epochs, acc)`.
+        Whatever the backend must refresh afterwards (reset pool, plus whatever
+        the env changes about itself) is the caller's next move — only it knows
+        which loop state that invalidates. Returns `(epochs, acc)`.
         """
         if hasattr(agent, "noise_module"):
             agent.noise_module.reset_noise()
@@ -343,8 +347,6 @@ class Trainer:
             sps=self.steps / (time.time() - start_time),
             gradient_steps=gradient_steps,
             times=(start_time, last_epoch_time),
-            # Read before the caller's refresh, which zeroes the counters.
-            mining_stats=rollout.mining_stats(),
         )
         logger.dump(step=self.steps)
         return epochs, _new_epoch_acc()
@@ -392,16 +394,16 @@ class Trainer:
 
     def _store_epoch_metrics(
         self, agent, stats, acc, *, epochs, episodes, sps, gradient_steps,
-        times, mining_stats=None,
+        times,
     ):
         """Store one epoch's metrics under the shared namespace scheme.
 
         Every metric is namespaced by its producer: ``epoch``/``steps`` are the
         run axes, ``train/*`` the behaviour policy and learner, ``test/*`` the
         held-out eval, ``sys/*`` throughput and host/device health. Anything a
-        producer already prefixes for itself (``reward/``, ``td3/``, ``ppo/``,
-        ``mining/``) nests UNDER ``train/`` — this is the only place that knows
-        the namespace.
+        producer already prefixes for itself (``reward/``, ``noise/``, ``td3/``,
+        ``ppo/``) nests UNDER ``train/`` — this is the only place that knows the
+        namespace.
         """
         ep_n, score, score_std, length, length_std = stats
         start_time, last_epoch_time = times
@@ -437,9 +439,6 @@ class Trainer:
         # Optional per-agent diagnostics (TD3 saturation/value, PPO trust region).
         diagnostics = getattr(agent, "pop_diagnostics", None)
         extra.update(diagnostics() if diagnostics is not None else {})
-        # `mining/effective_bins` collapsing toward 1 means the start distribution
-        # has degenerated onto a single region.
-        extra.update(mining_stats or {})
         for k, v in extra.items():
             logger.store(f"train/{k}", float(v))
 

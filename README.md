@@ -38,8 +38,9 @@ Every run is a self-contained experiment YAML under [`experiments/`](experiments
 
 ## Highlights
 
-- **[Backends: CPU vs GPU](docs/backends.md)** — the design centrepiece. Three physics backends and two trainer loops; the memory trade that is the actual reason to run on CPU; where the agent runs relative to the physics, with measured throughput; determinism; and the parity check that keeps the backends honest.
+- **[Backends: CPU vs GPU](docs/backends.md)** — the design centrepiece. Three physics backends and two rollouts; the memory trade that is the actual reason to run on CPU; where the agent runs relative to the physics, with measured throughput; determinism; and the parity check that keeps the backends honest.
 - **[Release benchmark](experiments/README.md)** — all seven agents on a simple task and a hard one, across the CPU/GPU placements each task can express: `walker_walk` (WalkerWalk, 256 envs, 5M steps) over `warp_gpu`/`mjx_gpu`/`mjx_cpu`, and `mocap_cmu_006_13` (CMU humanoid tracking, 1000 envs, **1B steps**) over `warp_gpu`/`envpool_gpu`. Between them the two suites cover all four (physics device, learner device) combinations, two of them **fully GPU-free**. Run it with `scripts/run_release_benchmark.sh`; package the resulting policies with `scripts/export_release_weights.py`.
+- **[Environments](docs/environments.md)** — there are two ways to attach an environment, both shaped like Gymnasium's `functional_jax_env`: write a stateless `FuncEnv` and roxie batches it, or bring something already vectorized (EnvPool) that speaks the Gymnasium 5-tuple and it is driven as-is. Why the driver is roxie's own rather than upstream's, and what `terminal` versus `truncal` mean.
 - **[Mocap tracking](docs/mocap.md)** — the hard task, under [`examples/mocap/`](examples/mocap/): humanoid motion-capture tracking on dm_control's CMU Humanoid, with negative mining over start phases and a fixed eval protocol.
 
 ## Agents

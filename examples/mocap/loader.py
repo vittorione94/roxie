@@ -15,7 +15,8 @@ import numpy as np
 from ml_collections import config_dict
 
 from examples.mocap.cmu_mocap_data import build_cmu_humanoid, load_cmu_clips
-from roxie.environment.loader import EnvBundle, TerminationWrapper
+from roxie.environment.loader import EnvBundle
+from roxie.environment.vector import JaxVectorEnv
 from roxie.utils import hydra_searchpath
 import xml.etree.ElementTree as ET
 
@@ -104,7 +105,11 @@ def load_mocap_env(
         actuation_kv_ratio=actuation_kv_ratio,
     )
     env._xml_path = xml_path
-    train_wrapper = TerminationWrapper(env, max_episode_steps=config.episode_length)
+    # The step limit the driver will enforce. Carried on the env because it is
+    # a property of the TASK (this clip set, this protocol) rather than of the
+    # batch size, and `build_mocap_env` is what turns it into a
+    # `JaxVectorEnv(max_episode_steps=...)`.
+    env.max_episode_steps = int(config.episode_length)
 
     # Evaluation env: a shallow copy of the training env, so it SHARES the heavy GPU
     # arrays (reference clips + mjx model) rather than loading them twice, but runs
@@ -132,13 +137,14 @@ def load_mocap_env(
     eval_config.reset_noise_scale = 0.0
     eval_env._config = eval_config
     # +1 so the final frame is reachable: `step` truncates at
-    # phase >= clip_len - look_ahead, and the wrapper cap must not bind first.
-    eval_horizon = int(max(dataset["clip_lengths"])) + 1
-    test_wrapper = TerminationWrapper(eval_env, max_episode_steps=eval_horizon)
-    return train_wrapper, test_wrapper, xml_path
+    # phase >= clip_len - look_ahead, and the driver's cap must not bind first.
+    eval_env.max_episode_steps = int(max(dataset["clip_lengths"])) + 1
+    return env, eval_env, xml_path
 
 
-def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
+def build_mocap_env(
+    cfg_env: Any, mode: str = "train", num_envs: int = 1, test_episodes: int = 1,
+) -> EnvBundle:
     """Builder for the CMU mocap-tracking env (see ``env.builder`` in configs).
 
     Pulls everything it needs off ``cfg_env`` so the core train/play loops stay
@@ -243,7 +249,19 @@ def build_mocap_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         actuation_kp_scale=float(cfg_env.get("actuation_kp_scale", 1.0)),
         actuation_kv_ratio=float(cfg_env.get("actuation_kv_ratio", 0.1)),
     )
-    return EnvBundle(env=env, test_env=test_env, env_cfg=None)
+    # Two drivers over two shallow-copied envs (they share the reference clips
+    # and the mjx model). The eval driver runs at `test_episodes` worlds and
+    # carries the longer horizon the canonical protocol needs — see
+    # `load_mocap_env` for why the two horizons differ.
+    return EnvBundle(
+        env=JaxVectorEnv(
+            env, num_envs, max_episode_steps=env.max_episode_steps,
+        ),
+        test_env=JaxVectorEnv(
+            test_env, test_episodes, max_episode_steps=test_env.max_episode_steps,
+        ),
+        env_cfg=None,
+    )
 
 
 class GhostViewerExtras(NamedTuple):

@@ -535,14 +535,14 @@ class SAC(Agent):
                 self.state.obs_stats, obs_batch
             )
 
-    def add(self, prev_states, states):
+    def add(self, prev_obs, timestep):
         self.add_transitions(
-            prev_states.obs,
+            prev_obs,
             self.last_action,
-            states.reward,
-            states.info["termination"],
-            states.info["truncation"],
-            states.obs,
+            timestep.reward,
+            timestep.terminated,
+            timestep.truncated,
+            timestep.obs,
         )
 
     def learn(self, agent_rng, n_steps=None):

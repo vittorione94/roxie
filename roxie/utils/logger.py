@@ -147,7 +147,6 @@ class ConsoleBackend(Backend):
         "train/reward",
         "train/root_dist",
         "train/noise",
-        "train/mining",
         "test",
         "test/score",
         "test/length",

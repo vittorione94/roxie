@@ -12,19 +12,19 @@ Roxie can put the *physics* on the GPU or the CPU, and — independently — the
 | Vectorization | `jax.vmap` over a traced step | `jax.vmap` → Warp kernels | C++/Python thread pool, one `MjData` per env |
 | Batch dim lives in | the XLA program | the XLA program | native code; Python sees `(N, ...)` numpy |
 | Contact allocation | **static**, sized to *all* potential geom pairs | **budgeted** — `naconmax` / `njmax` / `naccdmax` | **dynamic**, MuJoCo allocates as needed |
-| Trainer loop | `Trainer._run_jax` | `Trainer._run_jax` | `Trainer._run_envpool` |
+| Rollout | `JaxRollout` | `JaxRollout` | `EnvPoolRollout` |
 | Bounded by | VRAM | VRAM | system RAM + core count |
-| Built by | `roxie.environment.loader.build_playground_env` | `examples.mocap.loader.build_mocap_env` | `roxie.environment.envpool_adapter.build_envpool_env` / `examples.mocap.mocap_envpool.build_mocap_envpool_env` |
+| Built by | `roxie.environment.loader.build_playground_env` | `examples.mocap.loader.build_mocap_env` | `roxie.environment.loader.build_envpool_env` / `examples.mocap.mocap_envpool.build_mocap_envpool_env` |
 
 Selection is a Hydra config group. For the mocap task, [`experiments/mocap/backend/`](../experiments/mocap/backend/) holds `warp_gpu.yaml`, `envpool_cpu.yaml` and `envpool_gpu.yaml`, and a launchable picks one in its `defaults:`. Everything backend-mechanical (builder, `impl`, solver budgets, graph mode, thread count) lives in that group; per-experiment tuning stays in the launchable. That is what makes the three cells of the [release benchmark](../experiments/README.md) a genuine A/B: they differ in exactly one line.
 
 `train.py` prints a loud banner at startup reporting the backend that *actually* loaded (read off the constructed env, not echoed from config) and flags a mismatch against what was requested.
 
-## Why there are two trainer loops
+## Why there are two rollouts
 
-`Trainer.run()` dispatches on the env type: `EnvPoolWrapper` → `_run_envpool`, everything else → `_run_jax`. They are not gratuitously duplicated; the two loops obey opposite constraints.
+Every env in roxie — playground, mocap, EnvPool — presents the same interface, described in [environments.md](environments.md). `Trainer._run` is therefore a single loop, and the only thing that varies is the *rollout*: `build_rollout` picks `EnvPoolRollout` for an `EnvPoolVectorEnv` and `JaxRollout` for everything else. They are not gratuitously duplicated; the two obey opposite constraints.
 
-**`_run_jax` must never touch the host.** Every quantity that a Python `if` would want to branch on — episode-done flags, buffer occupancy, episode returns — lives in a device array, and reading one forces a blocking device→host sync that serializes the whole asynchronous GPU pipeline. So the JAX loop is written to keep the host out of the way:
+**`JaxRollout` must never touch the host.** Every quantity that a Python `if` would want to branch on — episode-done flags, buffer occupancy, episode returns — lives in a device array, and reading one forces a blocking device→host sync that serializes the whole asynchronous GPU pipeline. So the JAX loop is written to keep the host out of the way:
 
 - **Auto-reset is branchless.** Instead of resetting done envs on demand, the loop pre-builds a *reset pool* of `parallel_envs` fresh states and, each step, gathers a random pool entry per env and `jnp.where`s it in against the done mask. No control flow, no sync, one fused kernel. The pool is regenerated once per epoch.
 - **Statistics accumulate on-device.** Per-episode return/length means *and standard deviations* are computed from running sums and sums-of-squares reduced only at the epoch boundary, rather than keeping a host-side list of episodes (which would sync every step).
@@ -32,30 +32,35 @@ Selection is a Hydra config group. For the mocap task, [`experiments/mocap/backe
 - **Agents gate their own updates.** The trainer calls `agent.update(steps=...)` unconditionally and the agent decides internally whether to run gradient steps. The trainer is explicitly forbidden from reading buffer device state (e.g. a flashbax `can_sample`) to make that decision.
 - **Everything is precompiled up front**, with timings printed: reset, reset pool, train step, agent step, replay add, warmup rollout, replay fill, gradient step. A cold compile mid-run is a stall.
 
-**`_run_envpool` has none of those constraints and should not pretend to.** The pool steps in C++, hands back numpy, and Python branching is free. So it is a plain loop with numpy accumulators and a Python `for` eval loop. Trying to force the JAX idioms here would only add dispatch overhead.
+**`EnvPoolRollout` has none of those constraints and should not pretend to.** The pool steps in C++, hands back numpy, and Python branching is free. So it is a plain loop with numpy accumulators and a Python `for` eval loop. Trying to force the JAX idioms here would only add dispatch overhead.
 
-What the two loops *must* agree on is semantics, and that agreement is maintained by hand:
+What the two *must* agree on is semantics. The termination rule is now shared code (`JaxVectorEnv.step`, mirrored explicitly in the CPU pool), but the rest is still maintained by hand:
 
 - both update observation-normalization statistics from the live policy's state distribution every step (not just during warmup);
-- both log the same keys, including `test/distinct_starts`, `test/score_per_step`, the env's own `metrics` dict, per-agent diagnostics (`pop_diagnostics`), negative-mining health, GPU telemetry and the host-memory watch;
-- both refresh the negative-mining table and *then* rebuild the reset pool, in that order, at the epoch boundary.
+- both log the same keys, including `test/distinct_starts`, `test/score_per_step`, the env's own `metrics` dict, per-agent diagnostics (`pop_diagnostics`), GPU telemetry and the host-memory watch;
+- both let the env refresh whatever it adapts about itself and *then* rebuild the reset pool, in that order, at the epoch boundary.
 
-The split of labour for negative mining is the clearest illustration of the structural difference. A JAX env cannot own mutable state inside a trace, so the trainer threads `mining_weights` through `reset` as a **traced argument** — precisely so that refreshing it each epoch does not retrigger compilation. A CPU pool resets in plain Python and simply owns its own table, so the trainer only has to tell it *when* to refresh. Same algorithm, opposite ownership.
+An env that adapts its own state is the clearest illustration of the structural difference. A JAX env cannot own mutable state inside a trace, so the rollout threads the env's **`params`** through every call and through the env's own `observe_params`/`epoch_refresh` hooks; `params` stays traced, precisely so that refreshing it each epoch does not retrigger compilation. A CPU pool resets in plain Python and simply owns its state, so the rollout only has to tell it *when* to refresh — a bare `epoch_refresh()`. Same feature, opposite ownership, and in neither case does roxie know what the state *is*: the mocap env's negative mining ([docs/mocap.md](mocap.md)) is written entirely against those hooks, and its diagnostics ride out with the ordinary per-step metrics rather than through a channel of their own.
 
 ## Auto-reset: the same trick, for two different reasons
 
-The GPU path uses a reset pool to avoid host synchronization. The CPU mirror ended up using one too, for an unrelated reason: an on-demand reset pays a full `mj_forward` purely to build the observation, and an untrained policy on the mocap task resets ~20% of envs *per step* (mean episode length ≈ 4). Precomputing a pool turns a reset into a memcpy. This was the single biggest CPU throughput win — and, incidentally, a parity fix, since it is what `_run_jax` had always done.
+The GPU path uses a reset pool to avoid host synchronization. The CPU mirror ended up using one too, for an unrelated reason: an on-demand reset pays a full `mj_forward` purely to build the observation, and an untrained policy on the mocap task resets ~20% of envs *per step* (mean episode length ≈ 4). Precomputing a pool turns a reset into a memcpy. This was the single biggest CPU throughput win — and, incidentally, a parity fix, since it is what the JAX path had always done.
 
-Auto-reset is same-step on both backends (EnvPool convention): the observation returned on a done step is the *reset* observation. The JAX trainer acts from the auto-reset state, so the entry following a `done` in the trajectory buffer is the reset obs on both sides, and nothing bootstraps off the true final observation. It differs in exactly one place — on the JAX path the true final obs feeds the obs-normalization statistics, on the CPU path the reset obs does.
+Auto-reset is same-step on both backends (EnvPool convention), and deliberately *not* Gymnasium's `AutoresetMode.NEXT_STEP`: the reason is mechanical, in that a real reset of "however many envs happen to be done" has a data-dependent shape and cannot be jitted, whereas a gather from a fixed-size pool can.
+
+The JAX driver returns two things from a step for exactly this reason — a `Timestep` holding the *pre*-reset observation (the true next state, which is what the replay buffer must store) and a `VecState` holding the *post*-reset observation (what the next action is selected from). A C++ pool resets internally and hands back only the post-reset observation, so there the two are the same array. That is the one place the backends genuinely differ: on the JAX path the true final obs feeds the obs-normalization statistics, on the CPU path the reset obs does.
 
 ## Truncation is not termination
 
-Shared by both paths, and worth stating because it is easy to get wrong. `TerminationWrapper` separates:
+Shared by both paths, and worth stating because it is easy to get wrong. An env declares three things and `JaxVectorEnv.step` combines them:
 
-- **termination** — a genuine failure (NaN, tracking collapse, root drift). Zeroes the bootstrap in the Bellman target.
-- **truncation** — a time-out (episode step limit, or clip end). Must *still* bootstrap the next-state value; marking it terminal collapses Q at the cutoff.
+- **`terminal`** — a genuine failure (NaN, tracking collapse, root drift). Zeroes the bootstrap in the Bellman target.
+- **`truncal`** — the env's *own* non-failure cutoff (the reference clip ran out). Must *still* bootstrap the next-state value; marking it terminal collapses Q at the cutoff.
+- **the step limit** — the driver's `max_episode_steps`.
 
-Both are surfaced in `info` and `done` is their union so the trainer still auto-resets. The env's own internal truncation is pulled back *out* of `done` before the termination flag is computed. Negative mining observes `info["termination"]`, never `done`, so clip-end and step-limit cutoffs are not mined for as if they were failures.
+The reported flags are `terminated = terminal & ~truncal` and `truncated = truncal | step_limit`; an episode ends on either. Note the asymmetry: an env-internal truncation *clears* termination, but the step limit does not — a genuine fall on the very last step is still a fall. `observe_params` is handed `terminated`, never the union, so an env adapting to failure never mistakes a clip-end or step-limit cutoff for one.
+
+[`tests/test_env_protocol.py`](../tests/test_env_protocol.py) pins all of this against a toy env.
 
 ## Memory: the actual reason to run on CPU
 

@@ -2,32 +2,34 @@
 
 `Trainer._run` is a single loop that serves both backends. Everything that
 genuinely differs between a vmapped JAX env (device-side physics, auto-reset by
-gather from a pre-built pool, mining state threaded through `reset` as traced
-arguments) and an EnvPool pool (C++ physics, auto-reset and mining owned by the
-pool) lives behind the small surface below. The two loops this replaced were
-~150 lines each and had already drifted apart in five places; the trainer now
-has no idea which backend it is driving.
-
-The surface is exactly the set of things that differed, nothing more:
+gather from a pre-built pool, env `params` threaded through the trainer because
+a traced env cannot own mutable state) and a C++ pool (native physics,
+auto-reset and any such state owned by the pool itself) lives behind the small
+surface below. The trainer has no idea which backend it is driving.
 
     xp              array namespace for the trainer's per-step accumulation
     supports_async  whether an async learner can overlap acting and learning
     prepare()       compile/reset, return the first carry state
     warmup()        fill the replay buffer with random-action transitions
     step()          advance the envs by one step
-    epoch_refresh() regenerate whatever is per-epoch (reset pool, mining table)
-    mining_stats()  the negative-mining diagnostics, or None
+    epoch_refresh() the epoch boundary: let the env refresh itself, rebuild the
+                    reset pool, report whether live episodes were invalidated
     evaluate()      the held-out eval rollout
 
-`step` returns `(carry, prev_env_state, next_env_state)`. `next_env_state` is
-the *pre-auto-reset* state — the true next observation for the replay buffer —
-while `carry` is what the next action is selected from, which for a done env is
-a fresh start state. On the JAX path these are two distinct trees; EnvPool
-resets in C++ and hands back only the post-reset observation, so there they are
-the same object. That difference predates this module and is preserved: the
-terminal transition's stored `next_obs` is the reset obs on the EnvPool path,
-which is harmless because `terminal` zeroes the bootstrap for true
-terminations.
+`step` returns `(state, prev_obs, timestep)`. `prev_obs` is the observation the
+action was selected from; `timestep` is the Gymnasium 5-tuple with PRE-auto-reset
+values — the true next observation for the replay buffer — while `state.obs` is
+what the NEXT action is selected from, which for a done env is a fresh start.
+On the JAX path those are two distinct arrays; a C++ pool resets internally and
+hands back only the post-reset observation, so there they are the same object.
+That difference predates this module and is preserved: the terminal transition's
+stored `next_obs` is the reset obs on the pool path, which is harmless because
+`terminated` zeroes the bootstrap for true terminations.
+
+The two classes stay two classes on purpose. One traces its whole step into XLA
+and scans its warmup into a single dispatch; the other steps C++ from a Python
+loop with the arrays already host-side. That is irreducible — what they now
+share is the env protocol, not the loop.
 """
 
 import dataclasses
@@ -41,6 +43,8 @@ from flax import nnx
 
 from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
+from roxie.environment.functional import space_size
+from roxie.environment.vector import EnvPoolVectorEnv
 from roxie.models.actors import deterministic_action
 
 # Constant across epochs and runs so every eval rollout starts from the same
@@ -68,7 +72,7 @@ def _agent_replay_add(agent, buffer_state, transitions):
 
 
 class JaxRollout:
-    """Vmapped JAX environments: physics, auto-reset and mining all on device."""
+    """Vmapped JAX environments: physics and auto-reset all on device."""
 
     xp = jnp
     # The env step is GPU-bound here, so a background learner thread would
@@ -84,73 +88,57 @@ class JaxRollout:
         self.num_envs = num_envs
         self.num_test_episodes = int(test_episodes)
         self.rng = rngs.envs()
-        self.action_size = environment.action_size
+        self.action_size = space_size(environment.single_action_space)
         self.action_low, self.action_high = agent.action_low, agent.action_high
         # The auto-reset pool is gathered from, so it need not match num_envs;
         # keeping them equal makes one reset program serve both.
         self.pool_size = num_envs
         self._eval_fn = None
 
-        # Optional negative mining over start states (mocap). The env owns the
-        # difficulty table; `mining_weights` is a TRACED reset argument so
-        # refreshing it each epoch does not retrigger compilation.
-        self.mining_env = getattr(environment, "unwrapped", environment)
-        self.mining_on = (hasattr(self.mining_env, "mining_init")
-                          and self.mining_env.mining_bins > 0)
-        if self.mining_on:
-            self.mining_weights, self.mining_counts = self.mining_env.mining_init()
-            v_reset = jax.vmap(environment.reset, in_axes=(0, None))
-            print(f"Negative mining ON: {self.mining_env.mining_bins} phase bins",
-                  flush=True)
-        else:
-            self.mining_weights, self.mining_counts = None, None
-            _plain_reset = jax.vmap(environment.reset)
+        # `params` for an env that adapts its own (see FuncEnv.init_params);
+        # None for every other env. It travels as the FuncEnv `params` argument,
+        # which is TRACED — so refreshing it each epoch does not retrigger a
+        # compile of the reset. The three hooks are bound once, defaulted to
+        # no-ops, so nothing below branches on whether this env has them.
+        func_env = environment.func_env
+        self.params = getattr(func_env, "init_params", lambda: None)()
+        self._observe_params = getattr(
+            func_env, "observe_params", lambda params, info, terminated: params,
+        )
+        self._env_epoch_refresh = getattr(
+            func_env, "epoch_refresh", lambda params: (params, False),
+        )
 
-            # Uniform signature at every call site; the weights are ignored.
-            def v_reset(keys, _w=None):
-                return _plain_reset(keys)
-
-        self._v_step = jax.vmap(environment.step)
-        self._jit_v_reset = jax.jit(v_reset)
-        self._train_step = jax.jit(self._step_and_autoreset)
+        self._jit_reset = jax.jit(
+            self.environment.reset, static_argnames=("num_envs",),
+        )
+        self._train_step = jax.jit(self._step_and_observe)
 
     # -- core ---------------------------------------------------------------
 
-    def _step_and_autoreset(self, states, actions, rng, reset_pool, mining_counts):
-        step_key, pool_key = jax.random.split(rng)
-        new_states = self._v_step(states, actions)
-        dones = new_states.env_state.done
-        idx = jax.random.randint(pool_key, (self.num_envs,), 0, self.pool_size)
+    def _step_and_observe(self, state, actions, rng, reset_pool, params):
+        """One env step plus the env's own `params` update, fused into one
+        dispatch.
 
-        # Here because this is the only place that sees every env's phase and
-        # done flag on-device. `termination` is done-minus-truncation: clip-end
-        # and step-limit cutoffs are not failures and must not be mined for.
-        if mining_counts is not None:
-            es = new_states.env_state
-            mining_counts = self.mining_env.mining_observe(
-                mining_counts, es.info, es.info["termination"]
-            )
-
-        def _autoreset_leaf(pool_leaf, s):
-            # Leaves without a per-env leading dim (e.g. warp's world-flattened
-            # contact arena) would be indexed out of bounds by the pool gather;
-            # the physics recomputes them each step, so keep the stepped value.
-            if not (isinstance(s, jnp.ndarray) and s.shape[:1] == dones.shape):
-                return s
-            return jnp.where(
-                dones.reshape(dones.shape + (1,) * (s.ndim - 1)),
-                pool_leaf[idx], s,
-            )
-
-        auto_states = jax.tree.map(_autoreset_leaf, reset_pool, new_states)
-        return new_states, auto_states, mining_counts
+        The update lives here rather than in the driver because this is the only
+        place that sees every env's info and termination flag on device at once.
+        It passes `terminated` — done MINUS truncation — so a non-failure cutoff
+        is never presented to the env as a failure.
+        """
+        state, timestep = self.environment.step(
+            state, actions, rng, reset_pool, params,
+        )
+        params = self._observe_params(
+            params, timestep.info, timestep.terminated,
+        )
+        return state, timestep, params
 
     def _random_actions(self, key):
         u = jax.random.uniform(key, (self.num_envs, self.action_size))
         return self.action_low + (self.action_high - self.action_low) * u
 
     def _reset(self, n, key):
-        return self._jit_v_reset(jax.random.split(key, n), self.mining_weights)
+        return self._jit_reset(key, self.params, num_envs=n)[0]
 
     # -- trainer-facing surface ---------------------------------------------
 
@@ -162,14 +150,14 @@ class JaxRollout:
         agent = self.agent
 
         self.rng, reset_key, pool_key = jax.random.split(self.rng, 3)
-        states = timed(self._reset, self.num_envs, reset_key, label="reset")
+        state = timed(self._reset, self.num_envs, reset_key, label="reset")
         self.reset_pool = timed(
             self._reset, self.pool_size, pool_key, label="reset pool",
         )
 
         dummy_actions = jnp.zeros((self.num_envs, self.action_size))
-        timed(self._train_step, states, dummy_actions, self.rng, self.reset_pool,
-              self.mining_counts, label="train step")
+        timed(self._train_step, state, dummy_actions, self.rng, self.reset_pool,
+              self.params, label="train step")
 
         # Off-policy replay add precompile. Skipped for on-policy agents (PPO),
         # whose buffer uses a different Transition layout and has no warmup.
@@ -197,37 +185,44 @@ class JaxRollout:
         costs minutes at the step counts warmup needs.
         """
         @jax.jit
-        def warmup_rollout(state, rng, reset_pool):
+        def warmup_rollout(state, rng, reset_pool, params):
             def body(carry, _):
                 state, rng = carry
                 rng, act_key, step_key = jax.random.split(rng, 3)
                 actions = self._random_actions(act_key)
-                new_states, auto_states, _ = self._step_and_autoreset(
-                    state, actions, step_key, reset_pool, None,
+                prev_obs = state.obs
+                # `observe_params` is deliberately NOT called here: these are
+                # random-action terminations, and an env adapting itself to them
+                # would be adapting to failures no policy caused. `params` still
+                # travels, since the env is entitled to read it in `transition`.
+                state, timestep = self.environment.step(
+                    state, actions, step_key, reset_pool, params,
                 )
                 transition = Transition(
-                    observation=state.env_state.obs,
+                    observation=prev_obs,
                     action=actions,
-                    reward=new_states.env_state.reward,
-                    terminal=new_states.env_state.info["termination"],
+                    reward=timestep.reward,
+                    terminal=timestep.terminated,
                     # Only stored by agents whose prototype carries it
                     # (DDPG/TD3 n-step); pruned below for the others.
-                    truncation=new_states.env_state.info["truncation"],
+                    truncation=timestep.truncated,
                 )
-                return (auto_states, rng), (transition, new_states.env_state.obs)
+                return (state, rng), (transition, timestep.obs)
             return jax.lax.scan(body, (state, rng), None, length=iters)
 
         print("Compiling warmup rollout...", flush=True)
         t0 = time.time()
-        compiled = warmup_rollout.lower(state, self.rng, self.reset_pool).compile()
+        compiled = warmup_rollout.lower(
+            state, self.rng, self.reset_pool, self.params,
+        ).compile()
         print(f"  {time.time() - t0:.1f}s", flush=True)
 
         print("Running warmup rollout...", flush=True)
         t0 = time.time()
         (state, self.rng), (transitions, next_obs) = compiled(
-            state, self.rng, self.reset_pool,
+            state, self.rng, self.reset_pool, self.params,
         )
-        state.env_state.obs.block_until_ready()
+        state.obs.block_until_ready()
         print(f"  {time.time() - t0:.1f}s", flush=True)
 
         # Prune to the fields the agent's buffer actually stores (SAC's
@@ -277,44 +272,33 @@ class JaxRollout:
 
     def step(self, state, actions):
         self.rng, step_key = jax.random.split(self.rng)
-        new_states, auto_states, self.mining_counts = self._train_step(
-            state, actions, step_key, self.reset_pool, self.mining_counts,
+        prev_obs = state.obs
+        state, timestep, self.params = self._train_step(
+            state, actions, step_key, self.reset_pool, self.params,
         )
-        return auto_states, state.env_state, new_states.env_state
+        return state, prev_obs, timestep
 
     def epoch_refresh(self, state):
-        """Regenerate the reset pool (fresh random starts for auto-reset) and
-        reshuffle the GPU clip subset if the env supports it.
+        """Let the env refresh itself, then regenerate the reset pool (fresh
+        random starts for auto-reset) from the refreshed `params`.
 
-        Only a real clip swap invalidates in-progress episodes (their stored clip
-        indices reference the old chunk), so only then are the live envs reset —
-        reported back as `invalidated` so the trainer drops their part-scored
-        episodes. Terminations fold into the start distribution first, so the new
-        pool already reflects them.
+        An env that reports `invalidated` has changed something its in-progress
+        episodes referred to, so the live envs are reset and the trainer is told
+        to drop their part-scored episodes.
         """
-        if self.mining_on:
-            self.mining_weights, self.mining_counts = self.mining_env.mining_refresh(
-                self.mining_weights, self.mining_counts,
-            )
+        self.params, invalidated = self._env_epoch_refresh(self.params)
 
         self.rng, pool_key = jax.random.split(self.rng)
         self.reset_pool = self._reset(self.pool_size, pool_key)
 
-        swapped = (hasattr(self.environment, "swap_clips")
-                   and bool(self.environment.swap_clips()))
-        if swapped:
+        if invalidated:
             self.rng, reset_key = jax.random.split(self.rng)
             state = self._reset(self.num_envs, reset_key)
-        return state, swapped
-
-    def mining_stats(self):
-        if not self.mining_on:
-            return None
-        return self.mining_env.mining_stats(self.mining_weights, self.mining_counts)
+        return state, invalidated
 
     # -- eval ---------------------------------------------------------------
 
-    def _make_eval_fn(self, v_step, num_tests, max_steps):
+    def _make_eval_fn(self, num_tests, max_steps):
         """Build a single compiled eval rollout.
 
         The episode loop runs inside ``jax.lax.while_loop`` so the termination
@@ -324,17 +308,21 @@ class JaxRollout:
         """
         agent = self.agent
         normalize = agent.normalize_observations
+        test_env = self.test_environment
+        # Deterministic: the env's own stochasticity rides in its state, so a
+        # fixed key here makes consecutive evals of the same policy identical.
+        eval_key = jax.random.PRNGKey(0)
 
         @nnx.jit
-        def eval_fn(actor, obs_stats, states):
+        def eval_fn(actor, obs_stats, state):
             def cond(carry):
-                i, _states, dones, _scores, _lengths = carry
+                i, _state, dones, _scores, _lengths = carry
                 return (i < max_steps) & (~jnp.all(dones))
 
             def body(carry):
-                i, states, dones, scores, lengths = carry
+                i, state, dones, scores, lengths = carry
 
-                obs = states.env_state.obs
+                obs = state.obs
                 if normalize:
                     mean, std = Agent.obs_mean_std(obs_stats, agent.obs_eps)
                     obs = Agent.normalize_obs(obs, mean, std, agent.obs_clip)
@@ -345,16 +333,21 @@ class JaxRollout:
                 action = jnp.clip(deterministic_action(actor(obs)), -1.0, 1.0)
                 action = Agent.scale_to_env(action, agent.action_low, agent.action_high)
 
-                next_states = v_step(states, action)
+                # reset_pool=None: no auto-reset. Each episode runs to its own
+                # end and finished worlds are masked out below.
+                state, timestep = test_env.step(state, action, eval_key, None)
                 not_done = ~dones
-                scores = scores + next_states.env_state.reward * not_done.astype(jnp.float32)
+                scores = scores + timestep.reward * not_done.astype(jnp.float32)
                 lengths = lengths + not_done.astype(jnp.int32)
-                dones = jnp.logical_or(dones, next_states.env_state.done)
-                return (i + 1, next_states, dones, scores, lengths)
+                dones = jnp.logical_or(
+                    dones,
+                    jnp.logical_or(timestep.terminated, timestep.truncated),
+                )
+                return (i + 1, state, dones, scores, lengths)
 
             init = (
                 jnp.int32(0),
-                states,
+                state,
                 jnp.zeros((num_tests,), dtype=bool),
                 jnp.zeros((num_tests,), dtype=jnp.float32),
                 jnp.zeros((num_tests,), dtype=jnp.int32),
@@ -365,31 +358,29 @@ class JaxRollout:
         return eval_fn
 
     def evaluate(self, agent):
-        num_tests = int(self.num_test_episodes)
-        max_steps = int(getattr(self.test_environment, "max_episode_steps", 1000))
+        num_tests = int(self.test_environment.num_envs)
+        max_steps = int(self.test_environment.max_episode_steps or 1000)
 
         if self._eval_fn is None:
-            self._v_test_reset = jax.jit(jax.vmap(self.test_environment.reset))
-            self._v_test_step = jax.jit(jax.vmap(self.test_environment.step))
-            self._eval_fn = self._make_eval_fn(
-                self._v_test_step, num_tests, max_steps,
-            )
+            # Jitted, not eager: this runs once per epoch and an eager vmapped
+            # reset re-dispatches the whole physics op by op every time.
+            self._jit_test_reset = jax.jit(self.test_environment.reset)
+            self._eval_fn = self._make_eval_fn(num_tests, max_steps)
 
-        # Fixed keys, not a fresh draw: the eval env pins its own start state, so
-        # the keys only decide WHICH clip. Holding them constant means a change in
+        # Fixed key, not a fresh draw: the eval env pins its own start state, so
+        # the key only decides WHICH clip. Holding it constant means a change in
         # test/score is a change in the POLICY, not a different draw of clips.
-        states = self._v_test_reset(
-            jax.random.split(jax.random.PRNGKey(_EVAL_SEED), num_tests)
-        )
+        state, _ = self._jit_test_reset(jax.random.PRNGKey(_EVAL_SEED))
         scores, lengths = self._eval_fn(
-            agent.state.actor, agent.state.obs_stats, states,
+            agent.state.actor, agent.state.obs_stats, state,
         )
-        start_obs = np.asarray(states.env_state.obs).reshape(num_tests, -1)
+        start_obs = np.asarray(state.obs).reshape(num_tests, -1)
         return np.array(scores), np.array(lengths), start_obs
 
 
 class EnvPoolRollout:
-    """EnvPool pools: C++ physics, auto-reset and mining owned by the pool.
+    """C++ pools: native physics, auto-reset and any adaptive state owned by
+    the pool itself.
 
     No vmap/jit wrapping of the env step is needed — the pool batches natively —
     so the whole rollout is a plain Python loop and the arrays are already
@@ -408,18 +399,8 @@ class EnvPoolRollout:
         self.num_envs = num_envs
         self.num_test_episodes = int(test_episodes)
         self.rng = rngs.envs()
-        self.action_size = environment.action_size
+        self.action_size = space_size(environment.single_action_space)
         self.action_low, self.action_high = agent.action_low, agent.action_high
-
-        # Only the location of the difficulty table differs from the JAX path: a
-        # JAX env cannot own mutable state inside a trace, so there the trainer
-        # threads `mining_weights` through reset, whereas a CPU pool resets in
-        # plain Python and owns its own table.
-        self.mining_on = (hasattr(environment, "mining_refresh")
-                          and getattr(environment, "mining_bins", 0) > 0)
-        if self.mining_on:
-            print(f"Negative mining ON: {environment.mining_bins} phase bins",
-                  flush=True)
 
     def _random_actions(self, key):
         u = jax.random.uniform(key, (self.num_envs, self.action_size))
@@ -428,7 +409,7 @@ class EnvPoolRollout:
     def prepare(self):
         print("Resetting environment...", flush=True)
         t0 = time.time()
-        state = self.environment.reset()
+        state, _ = self.environment.reset()
         print(f"  {time.time() - t0:.1f}s", flush=True)
         return state
 
@@ -445,61 +426,55 @@ class EnvPoolRollout:
             self.rng, act_key = jax.random.split(self.rng)
             actions = self._random_actions(act_key)
             agent.last_action = actions
-            old_state = state
-            state = self.environment.step(old_state, actions)
-            agent.add(old_state.env_state, state.env_state)
-            episodes += int(np.sum(np.asarray(state.env_state.done)))
+            prev_obs = state.obs
+            state, timestep = self.environment.step(state, actions)
+            agent.add(prev_obs, timestep)
+            episodes += int(np.sum(timestep.terminated | timestep.truncated))
         jax.block_until_ready(jax.tree.leaves(agent.state.buffer_state))
         print(f"  {time.time() - t0:.1f}s", flush=True)
         return state, episodes
 
     def step(self, state, actions):
-        new_state = self.environment.step(state, actions)
-        # The pool auto-resets in C++, so there is no separate pre-reset tree:
-        # the stepped state serves as both the buffer's next state and the next
-        # action's input. See the module docstring.
-        return new_state, state.env_state, new_state.env_state
+        prev_obs = state.obs
+        # The pool auto-resets in C++, so there is no separate pre-reset
+        # observation: `timestep.obs` and `state.obs` are the same array. See
+        # the module docstring.
+        state, timestep = self.environment.step(state, actions)
+        return state, prev_obs, timestep
 
     def epoch_refresh(self, state):
-        if self.mining_on:
-            self.environment.mining_refresh()
-        # Regenerate the auto-reset pool AFTER the mining refresh, so the new
-        # pool reflects this epoch's terminations.
-        refresh_pool = getattr(self.environment, "refresh_reset_pool", None)
-        if refresh_pool is not None:
-            refresh_pool()
-        # The pool keeps stepping its live envs across the refresh, so no
-        # in-progress episode is invalidated.
-        return state, False
-
-    def mining_stats(self):
-        return self.environment.mining_stats() if self.mining_on else None
+        # There is no `params` to thread here: a pool owns whatever it
+        # regenerates per epoch (its own auto-reset pool, a start distribution
+        # it adapts) and does the lot inside this one call. Nothing is
+        # invalidated unless the pool says so — it keeps stepping its live envs
+        # across the refresh.
+        refresh = getattr(self.environment, "epoch_refresh", None)
+        return state, (bool(refresh()) if refresh is not None else False)
 
     def evaluate(self, agent):
         """Eval rollout: a plain Python loop until all episodes are done or
         max_episode_steps is reached."""
         test_env = self.test_environment
-        max_steps = int(getattr(test_env, "max_episode_steps", 1000))
+        max_steps = int(test_env.max_episode_steps or 1000)
 
-        # EnvPool's `reset()` advances the pool's RNG, so consecutive evals would
+        # A pool's `reset()` advances its RNG, so consecutive evals would
         # otherwise start from different states and a change in `test/score`
-        # could be a different draw rather than a better policy. `reseed` rebuilds
-        # the pool at a fixed seed (~3ms), matching the JAX path's fixed eval
-        # keys. Envs whose eval reset is already deterministic (mocap pins frame 0
-        # with no reset noise) are unaffected either way.
+        # could be a different draw rather than a better policy. `reseed`
+        # rebuilds the pool at a fixed seed (~3ms), matching the JAX path's
+        # fixed eval keys. Envs whose eval reset is already deterministic
+        # (mocap pins frame 0 with no reset noise) are unaffected either way.
         reseed = getattr(test_env, "reseed", None)
         if reseed is not None:
             reseed(_EVAL_SEED)
 
-        state = test_env.reset()
-        # Size the eval buffers from the pool the reset actually returns, not from
-        # trainer.test_episodes: env.test_episodes and trainer.test_episodes are
-        # separate config keys and a mismatch would fail the broadcast below.
-        num_tests = int(np.asarray(state.env_state.reward).shape[0])
+        state, _ = test_env.reset()
+        # Size the eval buffers from the pool the reset actually returns, not
+        # from trainer.test_episodes: a mismatch would fail the broadcast below.
+        num_tests = int(state.obs.shape[0])
         scores = np.zeros(num_tests, dtype=np.float32)
         lengths = np.zeros(num_tests, dtype=np.int32)
         dones = np.zeros(num_tests, dtype=bool)
-        start_obs = np.asarray(state.env_state.obs).reshape(num_tests, -1)
+        start_obs = np.asarray(state.obs).reshape(num_tests, -1)
 
         # Fixed key for eval (noise is bypassed when evaluate=True).
         eval_key = jax.random.PRNGKey(0)
@@ -507,12 +482,12 @@ class EnvPoolRollout:
         for _ in range(max_steps):
             if np.all(dones):
                 break
-            actions = agent.step(state.env_state.obs, evaluate=True, key=eval_key)
-            state = test_env.step(state, actions)
+            actions = agent.step(state.obs, evaluate=True, key=eval_key)
+            state, timestep = test_env.step(state, actions)
             active = ~dones
-            scores += np.array(state.env_state.reward) * active
+            scores += np.asarray(timestep.reward) * active
             lengths += active.astype(np.int32)
-            dones |= np.array(state.env_state.done)
+            dones |= np.asarray(timestep.terminated | timestep.truncated)
 
         return scores, lengths, start_obs
 
@@ -521,7 +496,6 @@ def build_rollout(environment, test_environment, agent, num_envs, rngs,
                   test_episodes):
     """Pick the rollout for this environment. The only place the backend is
     named; everything downstream goes through the common surface."""
-    from roxie.environment.envpool_adapter import EnvPoolWrapper
-
-    cls = EnvPoolRollout if isinstance(environment, EnvPoolWrapper) else JaxRollout
+    cls = (EnvPoolRollout if isinstance(environment, EnvPoolVectorEnv)
+           else JaxRollout)
     return cls(environment, test_environment, agent, num_envs, rngs, test_episodes)

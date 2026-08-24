@@ -36,6 +36,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import get_method
 
+from roxie.environment.functional import space_size
 from roxie.environment.loader import (
     DEFAULT_BUILDER,
     log_loaded_backend,
@@ -118,9 +119,20 @@ def main(cfg: DictConfig):
     # setup (clip selection, Warp budget sizing, ...) and returns a normalized
     # bundle, so this stays env-agnostic. ``impl`` selects the physics backend and
     # is read here only for the load banner.
+    #
+    # ``num_envs``/``test_episodes`` are passed IN rather than read off
+    # ``cfg.env`` because they are trainer quantities that size the two drivers
+    # the builder returns: the same env definition is driven at
+    # ``env.parallel_envs`` worlds for training and at ``trainer.test_episodes``
+    # for evaluation. Deriving both from one place is what stops the eval batch
+    # from silently disagreeing with the eval loop's expectations.
     impl = cfg.env.get("impl", None)
     build_env = get_method(cfg.env.get("builder", DEFAULT_BUILDER))
-    env, test_env, env_cfg = build_env(cfg.env, mode="train")
+    env, test_env, env_cfg = build_env(
+        cfg.env, mode="train",
+        num_envs=int(cfg.env.parallel_envs),
+        test_episodes=int(cfg.trainer.test_episodes),
+    )
     log_loaded_backend(env, requested_impl=impl)
     print("Environment configuration:", env_cfg)
 
@@ -148,15 +160,12 @@ def main(cfg: DictConfig):
         )
     logger.initialize(path=output_dir, backends=backends)
 
-    # Action bounds: MuJoCo/Playground envs expose mj_model.actuator_ctrlrange;
-    # EnvPool and other non-MuJoCo envs provide action_low/action_high directly.
-    if hasattr(env, "mj_model"):
-        ctrl_range = jnp.array(env.mj_model.actuator_ctrlrange)  # shape (action_dim, 2)
-        action_low = ctrl_range[:, 0]
-        action_high = ctrl_range[:, 1]
-    else:
-        action_low = env.action_low
-        action_high = env.action_high
+    # Shapes and action bounds come from the env's gymnasium spaces — one
+    # spelling for every backend, whether the bounds originate in
+    # `mj_model.actuator_ctrlrange` or in a pool's declared action space.
+    obs_space, act_space = env.single_observation_space, env.single_action_space
+    action_low = jnp.asarray(act_space.low, dtype=jnp.float32)
+    action_high = jnp.asarray(act_space.high, dtype=jnp.float32)
 
     # The agent config IS the constructor call: `_target_` names the class and
     # every sibling key is one of its keywords, so a knob that exists in Python
@@ -167,8 +176,8 @@ def main(cfg: DictConfig):
     # agent instantiates its own actor/critic/memory/optimizers, injecting shapes
     # (in_features, action_dim, rngs, num_atoms) that are unknown out here.
     agent_kwargs = dict(
-        env_obs_size=env.observation_size,
-        env_action_size=env.action_size,
+        env_obs_size=space_size(obs_space),
+        env_action_size=space_size(act_space),
         action_low=action_low,
         action_high=action_high,
     )

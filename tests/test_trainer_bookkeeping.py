@@ -223,7 +223,7 @@ class _StubAgent:
         self.last_action = obs
         return obs
 
-    def add(self, prev_env_state, next_env_state):
+    def add(self, prev_obs, timestep):
         self.added += 1
 
     def update(self, steps, agent_rng):
@@ -296,7 +296,7 @@ def test_async_is_declined_for_an_agent_without_a_learn_burst():
 def test_the_two_rollouts_declare_matching_surfaces():
     """One loop drives both, so anything it calls must exist on each."""
     surface = ("xp", "supports_async", "prepare", "warmup", "step",
-               "epoch_refresh", "mining_stats", "evaluate")
+               "epoch_refresh", "evaluate")
     for name in surface:
         assert hasattr(JaxRollout, name), f"JaxRollout is missing {name}"
         assert hasattr(EnvPoolRollout, name), f"EnvPoolRollout is missing {name}"

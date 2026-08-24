@@ -29,6 +29,8 @@ from flax import nnx, struct
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
+from roxie.environment import functional
+from roxie.environment.vector import JaxVectorEnv, Timestep
 from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
 from roxie.utils.trainer import Trainer
 
@@ -112,57 +114,63 @@ def _build(name: str):
 
 @struct.dataclass
 class _Inner:
+    """The fake env's state: a position and an episode clock."""
+
     obs: jnp.ndarray
-    reward: jnp.ndarray
-    done: jnp.ndarray
     t: jnp.ndarray
-    info: dict
-    metrics: dict
-
-
-@struct.dataclass
-class _State:
-    env_state: _Inner
 
 
 _HORIZON = 5
 
 
-def _env_state(t, obs):
-    done = t >= _HORIZON
-    return _State(
-        env_state=_Inner(
-            obs=obs,
-            reward=jnp.sum(obs, axis=-1),
-            done=done,
-            t=t,
-            info={"termination": done, "truncation": jnp.zeros_like(done)},
-            metrics={"reward/alive": jnp.ones(obs.shape[:-1])},
+class _FakeEnv(functional.FuncEnv):
+    """Deterministic env with the surface the Trainer uses, and nothing else.
+
+    A plain `FuncEnv`: single-env, pure, vmappable. Every state leaf carries a
+    per-env leading axis once the driver batches it, so the auto-reset gather
+    applies to all of them.
+    """
+
+    observation_space = functional.unbounded_box(OBS)
+    action_space = functional.box(-1.0, 1.0, shape=(ACT,))
+
+    def initial(self, rng, params=None):
+        return _Inner(obs=jax.random.uniform(rng, (OBS,)) * 0.1, t=jnp.int32(0))
+
+    def transition(self, state, action, rng, params=None):
+        return _Inner(
+            obs=jnp.tanh(state.obs + 0.01 * jnp.sum(action)), t=state.t + 1,
         )
+
+    def observation(self, state, rng, params=None):
+        return state.obs
+
+    def reward(self, state, action, next_state, rng, params=None):
+        return jnp.sum(next_state.obs, axis=-1)
+
+    def terminal(self, state, rng, params=None):
+        return state.t >= _HORIZON
+
+    def transition_info(self, state, action, next_state, params=None):
+        return {"metrics": {"reward/alive": jnp.ones(())}}
+
+
+def _fake_vector_env(num_envs=NUM_ENVS):
+    return JaxVectorEnv(
+        _FakeEnv(), num_envs, max_episode_steps=2 * _HORIZON,
     )
 
 
-class _FakeEnv:
-    """Deterministic batched env with the surface the Trainer uses.
-
-    Everything the training loops touch and nothing else: `reset`/`step` are
-    pure and vmappable, the state exposes `obs` / `reward` / `done` /
-    `info["termination"]` / `info["truncation"]` / `metrics`, and every leaf
-    carries a per-env leading axis so the trainer's auto-reset gather applies.
-    """
-
-    observation_size = OBS
-    action_size = ACT
-    max_episode_steps = 2 * _HORIZON
-
-    def reset(self, key):
-        obs = jax.random.uniform(key, (OBS,)) * 0.1
-        return _env_state(jnp.int32(0), obs)
-
-    def step(self, state, action):
-        t = state.env_state.t + 1
-        obs = jnp.tanh(state.env_state.obs + 0.01 * jnp.sum(action))
-        return _env_state(t, obs)
+def _timestep(obs, t):
+    """A batched `Timestep` as the driver would produce it."""
+    done = t >= _HORIZON
+    return Timestep(
+        obs=obs,
+        reward=jnp.sum(obs, axis=-1),
+        terminated=done,
+        truncated=jnp.zeros_like(done),
+        info={"metrics": {"reward/alive": jnp.ones(obs.shape[:-1])}},
+    )
 
 
 def _drive(agent, iterations, key, num_envs=NUM_ENVS):
@@ -174,17 +182,16 @@ def _drive(agent, iterations, key, num_envs=NUM_ENVS):
     to carry.
     """
     obs = jnp.zeros((num_envs, OBS))
-    prev = _env_state(jnp.zeros(num_envs, jnp.int32), obs)
+    t = jnp.zeros(num_envs, jnp.int32)
     for i in range(iterations):
         step_key = jax.random.fold_in(key, i)
-        agent.step(prev.env_state.obs, evaluate=False, key=step_key)
-        nxt = _env_state(
-            prev.env_state.t + 1,
-            jnp.tanh(prev.env_state.obs + 0.05 * jax.random.normal(step_key, (num_envs, OBS))),
+        agent.step(obs, evaluate=False, key=step_key)
+        next_obs = jnp.tanh(
+            obs + 0.05 * jax.random.normal(step_key, (num_envs, OBS))
         )
-        agent.add(prev.env_state, nxt.env_state)
-        prev = nxt
-    return prev
+        agent.add(obs, _timestep(next_obs, t + 1))
+        obs, t = next_obs, t + 1
+    return obs
 
 
 # --------------------------------------------------------------------------
@@ -559,7 +566,7 @@ def test_trainer_resumes_the_run_end_to_end(tmp_path, logging_to):
     """The integration: train, checkpoint, rebuild, resume — and land on the
     total step budget rather than running it a second time from zero."""
     first, second = 16 * NUM_ENVS, 32 * NUM_ENVS
-    env, test_env = _FakeEnv(), _FakeEnv()
+    env, test_env = _fake_vector_env(), _fake_vector_env(num_envs=2)
 
     def run(output_dir, steps, agent, resume=None):
         trainer = Trainer(
@@ -595,7 +602,7 @@ def test_trainer_refills_the_buffer_when_the_checkpoint_has_none(tmp_path, loggi
     """Without `save_buffer`, a resumed off-policy run must re-run warmup —
     otherwise its first gradient steps sample an all-zero buffer."""
     steps = 16 * NUM_ENVS
-    env = _FakeEnv()
+    env = _fake_vector_env()
 
     agent = _build("td3")
     trainer = Trainer(

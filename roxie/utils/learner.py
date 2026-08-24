@@ -13,7 +13,7 @@ background thread. Two implementations:
 Shared surface:
 
     act(obs, key)                     -> (actions, last_noise)
-    observe(prev_env_state, next_env_state, steps, key)
+    observe(prev_obs, timestep, actions, steps)
     drain()                           -> (gradient_steps_since_start, [(a, c)])
     pause() / resume()                quiesce for eval and checkpointing
 
@@ -45,13 +45,13 @@ class SyncLearner:
         # (DDPG/TD3) expose `last_noise`.
         return actions, getattr(self._agent, "last_noise", None)
 
-    def observe(self, prev_env_state, next_env_state, actions, steps):
+    def observe(self, prev_obs, timestep, actions, steps):
         # `actions` is already on `agent.last_action` (set by `act` -> `step`),
         # which is what `add` reads; taken here only to share one signature with
         # the async learner, whose action travels through a queue.
         del actions
         agent = self._agent
-        agent.add(prev_env_state, next_env_state)
+        agent.add(prev_obs, timestep)
 
         # Track the CURRENT policy's state distribution rather than freezing
         # after warmup. Obs are stored raw and normalized at sample time, so
@@ -62,7 +62,7 @@ class SyncLearner:
         # every run logged so far.
         if getattr(agent, "normalize_observations", False):
             agent.state.obs_stats = Agent.update_obs_stats(
-                agent.state.obs_stats, next_env_state.obs,
+                agent.state.obs_stats, timestep.obs,
             )
 
         # The agent gates its own updates. The trainer must NOT read buffer

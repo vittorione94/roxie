@@ -120,8 +120,7 @@ def main(clip_ids, clip_index, noise_scales, num_seeds, impl, seed):
     clip_id_list = [c.strip() for c in clip_ids.split(",")] if clip_ids else None
     scales = [float(s) for s in noise_scales.split(",")]
 
-    env, _, _ = load_mocap_env(clip_ids=clip_id_list, impl=impl)
-    menv = env.env  # unwrap TerminationWrapper
+    menv, _, _ = load_mocap_env(clip_ids=clip_id_list, impl=impl)
 
     starts = np.asarray(menv._clip_starts)
     lengths = np.asarray(menv._clip_lengths)

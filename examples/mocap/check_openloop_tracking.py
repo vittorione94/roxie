@@ -76,7 +76,7 @@ def main(clip_ids, impl, kp_scale, kv_ratio, seed):
     config.random_start = False
     config.reset_noise_scale = 0.0
 
-    _, test_wrapper, _ = load_mocap_env(
+    _, menv, _ = load_mocap_env(
         config=config,
         clip_ids=clip_id_list,
         impl=impl,
@@ -84,7 +84,6 @@ def main(clip_ids, impl, kp_scale, kv_ratio, seed):
         actuation_kp_scale=kp_scale,
         actuation_kv_ratio=kv_ratio,
     )
-    menv = test_wrapper.env  # bare env: manual rollout, no autoreset
 
     cfg = menv._config.reward_config
     max_reward = float(cfg.w_pose + cfg.w_vel + cfg.w_ee + cfg.w_root + cfg.w_alive)

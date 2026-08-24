@@ -443,19 +443,19 @@ class MPO(Agent):
         self.last_action = Agent.scale_to_env(action, self.action_low, self.action_high)
         return self.last_action
 
-    def add(self, prev_states, states):
+    def add(self, prev_obs, timestep):
         experiences = Transition(
-            observation=prev_states.obs,
+            observation=prev_obs,
             action=self.last_action,
-            reward=states.reward,
+            reward=timestep.reward,
             # True termination only (not time-limit truncation) so truncated
             # transitions still bootstrap in the Bellman target.
-            terminal=states.info["termination"],
+            terminal=timestep.terminated,
         )
         self.state.buffer_state = self.replay.add(self.state.buffer_state, experiences)
 
         if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_states.obs, states.obs], axis=0)
+            obs_batch = jnp.concatenate([prev_obs, timestep.obs], axis=0)
             self.state.obs_stats = Agent.update_obs_stats(
                 self.state.obs_stats, obs_batch
             )

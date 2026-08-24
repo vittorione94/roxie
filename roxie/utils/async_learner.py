@@ -120,7 +120,7 @@ class AsyncLearner:
         learner._behavior_stats = agent.state.obs_stats
         warm_action, _ = agent.select_action(
             learner._behavior_actor, learner._behavior_stats,
-            state.env_state.obs, agent_key, evaluate=False,
+            state.obs, agent_key, evaluate=False,
         )
         jax.block_until_ready(warm_action)
 
@@ -152,7 +152,7 @@ class AsyncLearner:
             self._behavior_actor, self._behavior_stats, obs, key, evaluate=False,
         )
 
-    def observe(self, prev_env_state, next_env_state, actions, steps):
+    def observe(self, prev_obs, timestep, actions, steps):
         """Hand the transition to the learner thread. The action travels WITH it
         rather than being read off `agent.last_action` — `select_action` never
         sets that, and the acting thread would overwrite it anyway. `steps` is
@@ -161,12 +161,12 @@ class AsyncLearner:
         """
         del steps
         self.push(
-            prev_env_state.obs,
+            prev_obs,
             actions,
-            next_env_state.reward,
-            next_env_state.info["termination"],
-            next_env_state.info["truncation"],
-            next_env_state.obs,
+            timestep.reward,
+            timestep.terminated,
+            timestep.truncated,
+            timestep.obs,
         )
 
     def push(self, prev_obs, action, reward, termination, truncation, next_obs):

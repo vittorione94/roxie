@@ -133,11 +133,12 @@ class OrnsteinUhlenbeck(Agent):
         )
         return self.last_action
 
-    def add(self, prev_states, states):
+    def add(self, prev_obs, timestep):
         # Non-learning: nothing to store. Decorrelate the OU state for any env
         # whose episode just ended so a fresh episode starts from zero noise.
         if self.actions is not None:
-            keep = (1.0 - states.done.astype(self.actions.dtype))[:, None]
+            done = jnp.logical_or(timestep.terminated, timestep.truncated)
+            keep = (1.0 - done.astype(self.actions.dtype))[:, None]
             self.actions = self.actions * keep
 
     def update(self, steps, agent_rng):

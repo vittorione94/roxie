@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 
 from hydra.utils import get_class, get_method
 
+from roxie.environment.functional import space_size
 from roxie.environment.loader import (
     DEFAULT_BUILDER,
     log_loaded_backend,
@@ -61,9 +62,15 @@ def main(checkpoint_path, overrides):
     # Same builder protocol as train.py; ``mode="play"`` lets the builder apply
     # playback-specific tweaks, such as shrinking a GPU clip pool.
     build_env = get_method(cfg.env.get("builder", DEFAULT_BUILDER))
-    env, _, env_cfg = build_env(cfg.env, mode="play")
+    env, _, env_cfg = build_env(cfg.env, mode="play", num_envs=1, test_episodes=1)
 
     log_loaded_backend(env, requested_impl=cfg.env.get("impl", "jax"))
+
+    # Playback is SINGLE-WORLD, so it drives the `FuncEnv` directly rather than
+    # the batched driver the trainer uses. This is the payoff of not mutating
+    # the env with `transform(jax.vmap)` the way gymnasium's vector env does:
+    # the same object is callable batched and unbatched.
+    func_env = env.func_env
 
     # Same source of truth as train.py: the saved config's `_target_` names the
     # class. Every construction block it declares is forwarded, plus the separate
@@ -78,8 +85,8 @@ def main(checkpoint_path, overrides):
 
     agent = get_class(cfg.agent._target_).load(
         path=checkpoint_path,
-        env_obs_size=env.observation_size,
-        env_act_size=env.action_size,
+        env_obs_size=space_size(func_env.observation_space),
+        env_act_size=space_size(func_env.action_space),
         **agent_args,
     )
 
@@ -87,8 +94,8 @@ def main(checkpoint_path, overrides):
     # render a reference "ghost" alongside the policy; envs that don't set it just
     # render their own model.
     viewer_path = cfg.env.get("viewer", None)
-    ghost = get_method(viewer_path)(env) if viewer_path else None
-    model = ghost.model if ghost is not None else env.mj_model
+    ghost = get_method(viewer_path)(func_env) if viewer_path else None
+    model = ghost.model if ghost is not None else func_env.mj_model
 
     data = mujoco.MjData(model)
 
@@ -100,18 +107,23 @@ def main(checkpoint_path, overrides):
     # protocol and None for the rest, which fall back to the jitted-MJX path below.
     # ``env.player`` overrides it (dotted path, or null to force MJX).
     player_path = cfg.env.get("player", "roxie.utils.native_player.make_native_player")
-    player = get_method(player_path)(env) if player_path else None
+    player = get_method(player_path)(func_env) if player_path else None
     if player is not None:
         print("Playback stepper: native MuJoCo (CPU)", flush=True)
-        jit_reset = player.reset
-        jit_step = player.step
+        jit_reset, jit_step = player.reset, player.step
     else:
-        jit_reset = jax.jit(env.reset)
-        jit_step = jax.jit(env.step)
+        # The FuncEnv entry points. `transition` takes an rng that every MuJoCo
+        # env here ignores (its own stream rides in the state), so a fixed key
+        # keeps playback reproducible.
+        _step = jax.jit(func_env.transition)
+        jit_reset = jax.jit(func_env.initial)
+
+        def jit_step(state, action):
+            return _step(state, action, jax.random.PRNGKey(0))
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         key, reset_key = jax.random.split(key)
-        wrapped_state = jit_reset(key=reset_key)
+        state = jit_reset(reset_key)
         mujoco.mj_forward(model, data)
 
         score = 0.0
@@ -120,44 +132,44 @@ def main(checkpoint_path, overrides):
         while viewer.is_running():
             step_start = time.time()
 
-            obs_b = jnp.expand_dims(wrapped_state.env_state.obs, axis=0)
+            obs_b = jnp.expand_dims(state.obs, axis=0)
             action = agent.step(obs_b, evaluate=True, key=key)
 
-            wrapped_state = jit_step(wrapped_state, action[0])
+            state = jit_step(state, action[0])
 
             if ghost is not None:
-                info = wrapped_state.env_state.info
+                info = state.info
                 abs_idx = int(info["clip_start"]) + int(info["phase_idx"])
-                data.qpos[:ghost.nq] = wrapped_state.env_state.data.qpos
-                data.qvel[:ghost.nv] = wrapped_state.env_state.data.qvel
+                data.qpos[:ghost.nq] = state.data.qpos
+                data.qvel[:ghost.nv] = state.data.qvel
                 data.qpos[ghost.nq:] = ghost.ref_qpos[abs_idx]
                 data.qvel[ghost.nv:] = ghost.ref_qvel[abs_idx]
             else:
-                data.qpos = wrapped_state.env_state.data.qpos
-                data.qvel = wrapped_state.env_state.data.qvel
+                data.qpos = state.data.qpos
+                data.qvel = state.data.qvel
 
             data.ctrl = action
             mujoco.mj_forward(model, data)
 
-            score += wrapped_state.env_state.reward
+            score += state.reward
             actions.append(action)
 
             # Print the per-component rewards (envs expose these under
             # ``metrics["reward/*"]``) alongside the total step reward.
-            metrics = wrapped_state.env_state.metrics
+            metrics = state.metrics
             components = " ".join(
                 f"{k.split('/', 1)[1]}={float(v):+.3f}"
                 for k, v in metrics.items()
                 if k.startswith("reward/")
             )
-            print(f"reward={float(wrapped_state.env_state.reward):+.3f} {components}")
+            print(f"reward={float(state.reward):+.3f} {components}")
 
-            if wrapped_state.env_state.done:
+            if state.done:
                 print(f"Total score: {score}")
                 print(f"Actions mean: {jnp.mean(jnp.array(actions)):.2f}")
                 print(f"Actions std: {jnp.std(jnp.array(actions)):.2f}")
                 key, reset_key = jax.random.split(reset_key)
-                wrapped_state = jit_reset(key=reset_key)
+                state = jit_reset(reset_key)
                 mujoco.mj_resetData(model, data)
                 score = 0.0
                 actions = []

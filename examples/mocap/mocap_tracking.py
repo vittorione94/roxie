@@ -10,6 +10,8 @@ from mujoco import mjx
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src import reward
 
+from roxie.environment import functional
+from roxie.environment.loader import MuJoCoFuncEnv
 from roxie.utils.math import (
     batched_quat_diff,
     mat_to_rot6d,
@@ -198,7 +200,21 @@ def _configure_actuation(
         m.actuator_ctrllimited[i] = 1
 
 
-class MocapTrackingEnv(mjx_env.MjxEnv):
+class MocapTrackingEnv(mjx_env.MjxEnv, MuJoCoFuncEnv):
+    """CMU mocap tracking, as a ``FuncEnv``.
+
+    Two bases, each for one thing. ``mjx_env.MjxEnv`` supplies the playground
+    physics conveniences (``dt``/``sim_dt``/``n_substeps``/``observation_size``)
+    and is what ``reset``/``step`` below implement; ``MuJoCoFuncEnv`` supplies
+    the functional accessors that read observation, reward, termination and
+    truncation back off the ``mjx_env.State`` those two produce. ``initial`` and
+    ``transition`` are the FuncEnv entry points and delegate straight to them —
+    the env is genuinely both, rather than one wrapped in the other.
+
+    ``params`` is this env's negative-mining table (see ``init_params``). It
+    must stay TRACED: the table is regenerated every epoch, and re-tracing the
+    reset each time would cost more than the mining buys.
+    """
 
     def __init__(
         self,
@@ -359,6 +375,8 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             self._mining_alpha = float(mining.get("alpha", 0.5))
             self._mining_ema = float(mining.get("ema", 0.8))
             self._mining_lead_in = int(mining.get("lead_in", 0))
+            print(f"Negative mining ON: {self._mining_bins} phase bins",
+                  flush=True)
         else:
             self._mining_bins = 0
             self._mining_alpha = 0.0
@@ -398,86 +416,103 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
     # ------------------------------------------------------------------
     # Negative mining over start phases
     #
-    # Optional env hook, discovered by the trainer via `hasattr(env,
-    # "mining_init")`. Three pure functions so nothing mutable lives on the env
-    # and the whole thing stays jit-friendly:
+    # The env adapts its OWN start distribution: phases of a clip that episodes
+    # keep dying in get sampled more often. It rides entirely on the FuncEnv
+    # `params` hooks, so nothing mutable lives on the env and the whole thing
+    # stays jit-friendly. `params` is the difficulty table:
     #
-    #   mining_init()                     -> (weights, counts)   uniform, empty
-    #   mining_observe(counts, info, ...) -> counts              per step, on device
-    #   mining_refresh(weights, counts)   -> (weights, counts)   once per epoch
+    #   init_params()                       -> params  uniform, empty counters
+    #   observe_params(params, info, term)  -> params  per step, on device
+    #   epoch_refresh(params)               -> params  once per epoch
     #
     # The per-step piece is two scatter-adds on a (bins,) array; the expensive
     # part (normalisation, EMA) happens once per epoch on the epoch boundary.
+    # The diagnostics ride out with the ordinary per-step metrics — see
+    # `_mining_metrics` — so the driver needs no separate channel for them.
     # ------------------------------------------------------------------
 
-    @property
-    def mining_bins(self) -> int:
-        return self._mining_bins
-
-    def mining_init(self):
-        """Uniform start distribution and empty counters."""
-        w = jp.full((self._mining_bins,), 1.0 / self._mining_bins, dtype=jp.float32)
-        counts = {
-            "fail": jp.zeros((self._mining_bins,), dtype=jp.float32),
-            "visit": jp.zeros((self._mining_bins,), dtype=jp.float32),
+    def init_params(self):
+        """Uniform start distribution and empty counters — or None when mining
+        is off, which is also what any other env hands the driver."""
+        if not self._mining_enabled:
+            return None
+        n = self._mining_bins
+        return {
+            "weights": jp.full((n,), 1.0 / n, dtype=jp.float32),
+            "fail": jp.zeros((n,), dtype=jp.float32),
+            "visit": jp.zeros((n,), dtype=jp.float32),
         }
-        return w, counts
 
-    def mining_observe(self, counts, info, terminated):
+    def _phase_bin(self, phase_idx, clip_len):
+        """Which difficulty bin a clip-relative phase falls in."""
+        return jp.clip(
+            (phase_idx * self._mining_bins) // jp.maximum(clip_len, 1),
+            0, self._mining_bins - 1,
+        )
+
+    def observe_params(self, params, info, terminated):
         """Accumulate where episodes DIE, per clip-relative phase bin.
 
-        `terminated` must be GENUINE failure, not `done`: a clip that simply ran
-        out (or hit the step limit) is not a tracking failure, and counting it
-        would make the end of every clip look maximally hard and soak up the
-        whole start budget. `TerminationWrapper` already separates the two into
-        `info["termination"]`, and that is deliberately the same flag the critic
-        treats as terminal — mining and bootstrapping should never disagree
-        about what counts as a failure.
+        `terminated` is GENUINE failure, not `done` — that is the driver's
+        contract and this is why it matters: a clip that simply ran out (or hit
+        the step limit) is not a tracking failure, and counting it would make
+        the end of every clip look maximally hard and soak up the whole start
+        budget. It is deliberately the same flag the critic treats as terminal —
+        mining and bootstrapping must never disagree about what a failure is.
         """
-        phase = info["phase_idx"]
-        clip_len = jp.maximum(info["clip_len"], 1)
-        b = jp.clip(
-            (phase * self._mining_bins) // clip_len, 0, self._mining_bins - 1
-        )
+        if params is None:
+            return None
+        b = self._phase_bin(info["phase_idx"], info["clip_len"])
         return {
-            "visit": counts["visit"].at[b].add(1.0),
-            "fail": counts["fail"].at[b].add(
+            "weights": params["weights"],
+            "visit": params["visit"].at[b].add(1.0),
+            "fail": params["fail"].at[b].add(
                 jp.asarray(terminated, dtype=jp.bool_).astype(jp.float32)
             ),
         }
 
-    def mining_refresh(self, weights, counts):
-        """Fold this epoch's failure rates into the start distribution."""
-        # Rate, not count: a bin reached rarely (because we die before it) would
-        # otherwise look easy purely for lack of visits.
-        rate = counts["fail"] / jp.maximum(counts["visit"], 1.0)
-        total = jp.sum(rate)
-        # All-zero rate (nothing failed anywhere) => fall back to uniform rather
-        # than dividing by zero and mining noise.
-        hard = jp.where(
-            total > 0, rate / jp.maximum(total, 1e-12), 1.0 / self._mining_bins
-        )
-        uniform = 1.0 / self._mining_bins
-        target = (1.0 - self._mining_alpha) * uniform + self._mining_alpha * hard
-        new_w = self._mining_ema * weights + (1.0 - self._mining_ema) * target
-        new_w = new_w / jp.sum(new_w)
-        zeros = {k: jp.zeros_like(v) for k, v in counts.items()}
-        return new_w, zeros
+    def epoch_refresh(self, params):
+        """Fold this epoch's failure rates into the start distribution, then
+        reshuffle the on-GPU clip subset (which is what can invalidate the live
+        envs, so it is what decides the flag)."""
+        if params is not None:
+            # Rate, not count: a bin reached rarely (because we die before it)
+            # would otherwise look easy purely for lack of visits.
+            rate = params["fail"] / jp.maximum(params["visit"], 1.0)
+            total = jp.sum(rate)
+            # All-zero rate (nothing failed anywhere) => fall back to uniform
+            # rather than dividing by zero and mining noise.
+            hard = jp.where(
+                total > 0, rate / jp.maximum(total, 1e-12),
+                1.0 / self._mining_bins,
+            )
+            uniform = 1.0 / self._mining_bins
+            target = (1.0 - self._mining_alpha) * uniform + self._mining_alpha * hard
+            w = self._mining_ema * params["weights"] + (1.0 - self._mining_ema) * target
+            params = {
+                "weights": w / jp.sum(w),
+                "fail": jp.zeros_like(params["fail"]),
+                "visit": jp.zeros_like(params["visit"]),
+            }
+        return params, self.swap_clips()
 
-    def mining_stats(self, weights, counts) -> dict:
-        """Loggable scalars: is mining actually concentrating, and on what."""
+    def _mining_metrics(self, params) -> dict:
+        """Loggable scalars: is mining actually concentrating, and on what.
+
+        Emitted every step, as ordinary metrics, because the weights are
+        CONSTANT within an epoch — the trainer's epoch mean of each is therefore
+        exactly its value. (How often episodes actually fail is already reported
+        by the `term/*` metrics.)
+        """
         u = 1.0 / self._mining_bins
-        visits = jp.maximum(jp.sum(counts["visit"]), 1.0)
+        w = params["weights"]
         return {
             # 1.0 = uniform; higher = more concentrated on hard bins.
-            "mining/max_weight_ratio": jp.max(weights) / u,
-            "mining/hardest_bin": jp.argmax(weights).astype(jp.float32),
-            "mining/fail_rate": jp.sum(counts["fail"]) / visits,
+            "mining/max_weight_ratio": jp.max(w) / u,
+            "mining/hardest_bin": jp.argmax(w).astype(jp.float32),
             # Effective number of bins actually being sampled (exp of entropy);
             # if this collapses toward 1 the start distribution has degenerated.
-            "mining/effective_bins": jp.exp(
-                -jp.sum(weights * jp.log(weights + 1e-12))
-            ),
+            "mining/effective_bins": jp.exp(-jp.sum(w * jp.log(w + 1e-12))),
         }
 
     def swap_clips(self, seed=None):
@@ -514,10 +549,51 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         )
         return mjx.forward(self.mjx_model, data)
 
+    # ------------------------------------------------------------------
+    # FuncEnv entry points. The accessors (observation/reward/terminal/truncal)
+    # come from MuJoCoFuncEnv unchanged — sharing them with the playground
+    # adapter is what keeps the two backends from drifting on what a
+    # termination is.
+    # ------------------------------------------------------------------
+
+    @property
+    def observation_space(self):
+        # Cached: `observation_size` traces a whole reset via `jax.eval_shape`.
+        if getattr(self, "_obs_space", None) is None:
+            self._obs_space = functional.unbounded_box(self.observation_size)
+        return self._obs_space
+
+    @property
+    def action_space(self):
+        # Written by `_configure_actuation`: (-1, 1) per joint under position
+        # control, the raw motor range under torque control.
+        ctrl_range = self._mj_model.actuator_ctrlrange
+        return functional.box(ctrl_range[:, 0], ctrl_range[:, 1])
+
+    def initial(self, rng: jax.Array, params: jax.Array | None = None):
+        return self.reset(rng, params)
+
+    def transition(self, state, action, rng, params=None):
+        return self.step(state, action)
+
+    def transition_info(self, state, action, next_state, params=None) -> dict:
+        # `metrics` is what the trainer logs as `train/<key>`; the two phase
+        # fields are what `observe_params` bins failures by. Nothing else about
+        # the env's internal info (rng, filter state, last action) is anyone
+        # else's business, so it stays inside the state.
+        metrics = next_state.metrics
+        if params is not None:
+            metrics = {**metrics, **self._mining_metrics(params)}
+        return {
+            "metrics": metrics,
+            "phase_idx": next_state.info["phase_idx"],
+            "clip_len": next_state.info["clip_len"],
+        }
+
     def _abs_idx(self, info: dict[str, Any]) -> jax.Array:
         return info["clip_start"] + info["phase_idx"]
 
-    def reset(self, rng: jax.Array, mining_weights: jax.Array | None = None) -> mjx_env.State:
+    def reset(self, rng: jax.Array, params: dict | None = None) -> mjx_env.State:
         rng, clip_rng, start_rng, qpos_rng, qvel_rng = jax.random.split(rng, 5)
 
         clip_idx = jax.random.randint(clip_rng, (), 0, self._num_clips)
@@ -540,12 +616,12 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
         def _mined_start(r):
             """Draw a bin from the difficulty weights, then a frame within it.
 
-            `mining_weights` is a TRACED argument, not a closed-over constant, so
-            the trainer can refresh the table every epoch without retriggering a
+            `params` is a TRACED argument, not a closed-over constant, so the
+            driver can refresh the table every epoch without retriggering a
             recompile of the reset (which would cost more than the mining buys).
             """
             bin_rng, frac_rng = jax.random.split(r)
-            b = jax.random.categorical(bin_rng, jp.log(mining_weights + 1e-12))
+            b = jax.random.categorical(bin_rng, jp.log(params["weights"] + 1e-12))
             # Bins span the clip, so convert to a frame range and pick uniformly
             # inside the bin — the bin is the unit of *estimation*, not of start
             # granularity, so starts stay spread over every frame.
@@ -556,7 +632,7 @@ class MocapTrackingEnv(mjx_env.MjxEnv):
             # than being dropped at the failure point cold.
             return jp.clip(idx - self._mining_lead_in, 0, start_high - 1)
 
-        if mining_weights is not None and self._mining_enabled:
+        if params is not None and self._mining_enabled:
             start_sampler = _mined_start
         else:
             start_sampler = _uniform_start

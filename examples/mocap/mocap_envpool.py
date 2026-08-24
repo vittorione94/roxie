@@ -1,7 +1,7 @@
 """CPU EnvPool-style mirror of the CMU mocap-tracking task.
 
-This is a faithful re-implementation of ``MocapTrackingEnv`` (+ its
-``TerminationWrapper``) on native MuJoCo (``mujoco.mj_step``) and numpy,
+This is a faithful re-implementation of ``MocapTrackingEnv`` (+ the step limit
+its driver applies) on native MuJoCo (``mujoco.mj_step``) and numpy,
 exposed through the same pool protocol as EnvPool's gymnasium API so the
 Trainer's CPU loop (``_run_envpool``) drives it unchanged. Its purpose is a
 clean CPU-vs-GPU comparison against the MJX ("jax") and Warp backends: same
@@ -18,7 +18,7 @@ Semantics mirrored from the GPU path (see ``mocap_tracking.py``):
     termination-cause indicators and all their metric keys;
   - termination = NaN | tracking collapse | root drift; truncation = clip end
     (look_ahead guard) | episode step-limit, with clip-end truncation clearing
-    the termination flag exactly like ``TerminationWrapper`` does.
+    the termination flag exactly like ``JaxVectorEnv.step`` does.
 
 ``examples/mocap/check_envpool_parity.py`` is the executable statement of that
 contract — extend it whenever a term is added on either side.
@@ -65,7 +65,6 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 from typing import Any, Optional
 
 import mujoco
@@ -80,8 +79,9 @@ from examples.mocap.mocap_tracking import (
     _configure_collisions,
     resolve_collision_mode,
 )
-from roxie.environment.envpool_adapter import EnvPoolWrapper
+from roxie.environment import functional
 from roxie.environment.loader import EnvBundle
+from roxie.environment.vector import EnvPoolVectorEnv
 
 
 # Numpy mirrors of roxie.utils.math (the module is jax-only; this CPU path
@@ -172,11 +172,11 @@ _CTRL_SPEC = int(mujoco.mjtState.mjSTATE_CTRL)
 class MocapCpuPool:
     """Vectorized CPU mocap-tracking pool with EnvPool-style auto-reset.
 
-    Exposes the minimal gymnasium-pool surface the ``EnvPoolWrapper`` adapter
-    consumes: ``observation_space``/``action_space`` (shape/low/high only),
-    ``reset() -> (obs, info)`` and
-    ``step(actions) -> (obs, reward, terminated, truncated, info)``, with
-    per-step reward components under ``info["metrics"]``.
+    Exposes the gymnasium-pool surface ``EnvPoolVectorEnv`` presents to the
+    trainer: ``observation_space``/``action_space``, ``reset() -> (obs, info)``
+    and ``step(actions) -> (obs, reward, terminated, truncated, info)``, with
+    per-step reward components under ``info["metrics"]``. That is already the
+    repo's env protocol, so nothing translates it.
     """
 
     def __init__(
@@ -287,13 +287,11 @@ class MocapCpuPool:
             3 + 6 + 6 + (nq - 7) + (nv - 6) + 2 + n_proprio + nu
             + int(config.look_ahead) * ((nq - 7) + (nv - 6) + 6 + 3)
         )
-        # Minimal space stand-ins (shape/low/high are all the adapter reads);
-        # avoids a gymnasium dependency for what is a pure-numpy pool.
-        self.observation_space = SimpleNamespace(shape=(self._obs_size,))
-        self.action_space = SimpleNamespace(
-            shape=(nu,),
-            low=self._lowers.astype(np.float32),
-            high=self._uppers.astype(np.float32),
+        # Real gymnasium spaces, same as every other env in the repo. These
+        # are pure numpy, so the pool stays GPU-free.
+        self.observation_space = functional.unbounded_box(self._obs_size)
+        self.action_space = functional.box(
+            self._lowers, self._uppers, shape=(nu,),
         )
 
         # Tracking-collapse floor is static config, precomputed once (mirrors
@@ -319,15 +317,17 @@ class MocapCpuPool:
             self._mining_alpha = float(mining.get("alpha", 0.5))
             self._mining_ema = float(mining.get("ema", 0.8))
             self._mining_lead_in = int(mining.get("lead_in", 0))
+            print(f"Negative mining ON: {self._mining_bins} phase bins",
+                  flush=True)
         else:
             self._mining_bins = 0
             self._mining_alpha = 0.0
             self._mining_ema = 0.0
             self._mining_lead_in = 0
-        # Start-phase weights the pool draws from, owned by the trainer on the
-        # GPU path (a traced reset argument) but by the pool here — the CPU
-        # reset is plain Python, so there is nothing to keep out of a trace.
-        # `set_mining_weights` is how the trainer pushes each epoch's refresh.
+        # Start-phase weights the pool draws from — carried as traced `params`
+        # on the GPU path, but simply owned here: the CPU reset is plain Python,
+        # so there is nothing to keep out of a trace and nothing for anyone
+        # outside to thread. `epoch_refresh` is the only entry point.
         self._mining_weights = (
             np.full(self._mining_bins, 1.0 / self._mining_bins)
             if self._mining_enabled else None
@@ -639,12 +639,25 @@ class MocapCpuPool:
 
     # -- reset pool ----------------------------------------------------------
 
+    def epoch_refresh(self) -> bool:
+        """The pool's whole per-epoch update, in the order that matters.
+
+        This is the C++-pool counterpart of `MocapTrackingEnv.epoch_refresh`:
+        the mining table first, then the auto-reset pool, so the new pool is
+        already drawn from the updated start distribution. Returns whether any
+        in-progress episode was invalidated — never, here: the pool keeps
+        stepping its live envs straight across the refresh.
+        """
+        if self._mining_weights is not None:
+            self._mining_refresh()
+        self.refresh_reset_pool()
+        return False
+
     def refresh_reset_pool(self) -> None:
         """(Re)build the pool of reset states auto-reset gathers from.
 
-        Called once per epoch by the trainer, matching the JAX loop's per-epoch
-        `reset_pool = jit_v_reset(...)`, and after `mining_refresh` so the new
-        pool already reflects the updated start distribution. Each entry is a
+        Called once per epoch from `epoch_refresh`, matching the JAX loop's
+        per-epoch `reset_pool = jit_v_reset(...)`. Each entry is a
         fully forwarded reset state: the raw sampled qpos/qvel plus the derived
         kinematics and sensor readings the observation needs, so applying one
         later costs no solve.
@@ -798,19 +811,16 @@ class MocapCpuPool:
 
     # -- negative mining over start phases -----------------------------------
     #
-    # Same three-stage scheme as MocapTrackingEnv (mining_init / mining_observe
-    # / mining_refresh): accumulate where episodes DIE per clip-relative phase
-    # bin, and once per epoch fold those failure RATES into the start
-    # distribution. The split of work differs only in where the state lives —
-    # on the GPU path the weights are a traced reset argument threaded by the
-    # trainer (so refreshing them cannot retrigger a recompile), whereas the CPU
-    # reset is plain Python and the pool can just own them. The sampled
-    # distribution is identical; the RNG streams are not (numpy Generator vs
-    # jax.random), so parity here is distributional, not bit-for-bit.
-
-    @property
-    def mining_bins(self) -> int:
-        return self._mining_bins
+    # Same scheme as MocapTrackingEnv (init_params / observe_params /
+    # epoch_refresh): accumulate where episodes DIE per clip-relative phase bin,
+    # and once per epoch fold those failure RATES into the start distribution.
+    # The split of work differs only in where the state lives — on the GPU path
+    # the table is a traced reset argument threaded by the driver (so refreshing
+    # it cannot retrigger a recompile), whereas the CPU reset is plain Python
+    # and the pool can just own it, updating it in `step` and `epoch_refresh`
+    # with nobody outside needing to know. The sampled distribution is
+    # identical; the RNG streams are not (numpy Generator vs jax.random), so
+    # parity here is distributional, not bit-for-bit.
 
     def _mined_start(self, rng, start_high: int) -> int:
         """Draw a bin from the difficulty weights, then a frame within it."""
@@ -826,13 +836,13 @@ class MocapCpuPool:
         # than being dropped at the failure point cold.
         return int(np.clip(idx - self._mining_lead_in, 0, start_high - 1))
 
-    def mining_observe(self, phase_idx, clip_len, terminated) -> None:
+    def _mining_observe(self, phase_idx, clip_len, terminated) -> None:
         """Accumulate this step's visits and genuine failures per phase bin.
 
         `terminated` must be GENUINE failure, not `done` — see
-        MocapTrackingEnv.mining_observe for why a clip that merely ran out must
+        MocapTrackingEnv.observe_params for why a clip that merely ran out must
         not be mined for. Called from `step` with the post-step phase, which is
-        what the GPU trainer feeds `mining_observe` as well.
+        what the GPU driver hands `observe_params` as well.
         """
         b = np.clip(
             (phase_idx * self._mining_bins) // np.maximum(clip_len, 1),
@@ -841,7 +851,7 @@ class MocapCpuPool:
         np.add.at(self._mining_visit, b, 1.0)
         np.add.at(self._mining_fail, b, terminated.astype(np.float64))
 
-    def mining_refresh(self) -> None:
+    def _mining_refresh(self) -> None:
         """Fold this epoch's failure rates into the start distribution."""
         # Rate, not count: a bin reached rarely (because we die before it) would
         # otherwise look easy purely for lack of visits.
@@ -857,16 +867,20 @@ class MocapCpuPool:
         self._mining_visit[:] = 0.0
         self._mining_fail[:] = 0.0
 
-    def mining_stats(self) -> dict:
-        """Loggable scalars: is mining actually concentrating, and on what."""
+    def _mining_metrics(self) -> dict:
+        """Loggable scalars: is mining actually concentrating, and on what.
+
+        Emitted every step, with the ordinary metrics, because the weights are
+        CONSTANT within an epoch — the trainer's epoch mean of each is therefore
+        exactly its value. Mirrors `MocapTrackingEnv._mining_metrics`. (How
+        often episodes actually fail is already in the `term/*` metrics.)
+        """
         w = self._mining_weights
         u = 1.0 / self._mining_bins
-        visits = max(float(self._mining_visit.sum()), 1.0)
         return {
-            "mining/max_weight_ratio": float(w.max()) / u,
-            "mining/hardest_bin": float(np.argmax(w)),
-            "mining/fail_rate": float(self._mining_fail.sum()) / visits,
-            "mining/effective_bins": float(
+            "mining/max_weight_ratio": np.float32(w.max() / u),
+            "mining/hardest_bin": np.float32(np.argmax(w)),
+            "mining/effective_bins": np.float32(
                 np.exp(-np.sum(w * np.log(w + 1e-12)))
             ),
         }
@@ -1073,7 +1087,7 @@ class MocapCpuPool:
         mujoco.mj_step(self._model, d, nstep=self._n_substeps)
         self._phase_idx[i] = (self._phase_idx[i] + 1) % self._clip_len[i]
 
-    # -- pool protocol (what EnvPoolWrapper consumes) ------------------------
+    # -- pool protocol (what EnvPoolVectorEnv presents) ----------------------
 
     def _run_chunked(self, worker) -> None:
         if self._executor is None:
@@ -1186,7 +1200,7 @@ class MocapCpuPool:
             self._needs_reset[:] = False
             self._capture(range(self._num_envs))
         # Build the auto-reset pool off the same distribution, on first reset.
-        # `refresh_reset_pool` rebuilds it every epoch thereafter.
+        # `epoch_refresh` rebuilds it every epoch thereafter.
         if self._reset_pool_size > 0 and self._reset_pool is None:
             self.refresh_reset_pool()
         return self._gather_obs(), {}
@@ -1258,7 +1272,7 @@ class MocapCpuPool:
         self._step_count += 1
         step_truncated = self._step_count >= int(cfg.episode_length)
 
-        # Mirror TerminationWrapper: clip-end truncation clears the termination
+        # Mirror `JaxVectorEnv.step`: clip-end truncation clears the termination
         # flag; the step-limit does not (a genuine fall at the limit is terminal).
         terminated_final = terminated & ~clip_truncated
         truncated_final = clip_truncated | step_truncated
@@ -1266,10 +1280,10 @@ class MocapCpuPool:
 
         # 3. Negative mining reads the POST-step phase and the genuine
         #    termination flag — the same two quantities, at the same point in the
-        #    step, that the GPU trainer hands MocapTrackingEnv.mining_observe.
+        #    step, that the GPU driver hands MocapTrackingEnv.observe_params.
         #    Must run BEFORE the auto-reset overwrites phase_idx.
         if self._mining_weights is not None:
-            self.mining_observe(
+            self._mining_observe(
                 self._phase_idx, self._clip_len, terminated_final
             )
 
@@ -1289,25 +1303,29 @@ class MocapCpuPool:
         # 5. Observation from the post-reset state, batched over envs.
         obs = self._gather_obs()
         metrics = {k: comps[k].astype(np.float32) for k in _METRIC_KEYS}
+        if self._mining_weights is not None:
+            metrics.update(self._mining_metrics())
         return (
             obs, reward.astype(np.float32), terminated_final, truncated_final,
             {"metrics": metrics},
         )
 
 
-def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
+def build_mocap_envpool_env(
+    cfg_env: Any, mode: str = "train", num_envs: int = 1, test_episodes: int = 1,
+) -> EnvBundle:
     """Builder for the CPU EnvPool-style mocap env (see ``env.builder``).
 
     Reads from cfg_env (beyond the shared config/reward groups):
-      parallel_envs (int):   training pool size. Throughput is near-flat in this
-                             number (per-env cost, not dispatch, is the wall):
-                             measured 34.3k sps at 1000 and 38.5k at 4000.
+      num_threads/stepper below; the pool sizes come from ``num_envs`` and
+      ``test_episodes``, which the trainer passes in. Throughput is near-flat in
+      the env count (per-env cost, not dispatch, is the wall): measured 34.3k
+      sps at 1000 envs and 38.5k at 4000.
       num_threads (int?):    stepping threads; null = min(parallel_envs, cores).
       stepper (str):         "rollout" (default, native batched stepping) or
                              "threads" (per-env mj_step over a ThreadPoolExecutor,
                              the reference implementation). See the module
                              docstring.
-      test_episodes (int):   eval pool size; must match trainer.test_episodes.
       seed, clip_ids, collisions, actuation, actuation_kp_scale,
       actuation_kv_ratio: as in the GPU builder, and read with the SAME
       defaults — these change what task is being solved, so a silent
@@ -1328,7 +1346,8 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
         from examples.mocap.loader import build_mocap_env
 
         return build_mocap_env(
-            OmegaConf.merge(cfg_env, {"impl": "jax"}), mode="play"
+            OmegaConf.merge(cfg_env, {"impl": "jax"}), mode="play",
+            num_envs=num_envs, test_episodes=test_episodes,
         )
 
     from examples.mocap.cmu_mocap_data import (
@@ -1368,7 +1387,6 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
 
     seed = int(cfg_env.get("seed", 0))
     num_threads = cfg_env.get("num_threads", None)
-    test_episodes = int(cfg_env.get("test_episodes", 5))
 
     # The sensor-augmented twin the rollout stepper steps. Built from the SAME
     # cached XML and then given the same rewrites in the same order, so its
@@ -1389,12 +1407,12 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
 
     train_pool = MocapCpuPool(
         mj_model, dataset, config,
-        num_envs=int(cfg_env.parallel_envs),
+        num_envs=num_envs,
         seed=seed,
         num_threads=num_threads,
         actuation=actuation,
-        # POOL_SIZE == NUM_ENVS, the same sizing _run_jax uses.
-        reset_pool_size=int(cfg_env.parallel_envs),
+        # POOL_SIZE == NUM_ENVS, the same sizing the JAX rollout uses.
+        reset_pool_size=num_envs,
         rollout_model=rollout_model,
         rollout_addrs=rollout_addrs,
     )
@@ -1426,7 +1444,11 @@ def build_mocap_envpool_env(cfg_env: Any, mode: str = "train") -> EnvBundle:
 
     max_steps = int(config.episode_length)
     return EnvBundle(
-        env=EnvPoolWrapper(train_pool, max_episode_steps=max_steps),
-        test_env=EnvPoolWrapper(test_pool, max_episode_steps=eval_horizon),
+        env=EnvPoolVectorEnv(
+            train_pool, num_envs=num_envs, max_episode_steps=max_steps,
+        ),
+        test_env=EnvPoolVectorEnv(
+            test_pool, num_envs=test_episodes, max_episode_steps=eval_horizon,
+        ),
         env_cfg=None,
     )
