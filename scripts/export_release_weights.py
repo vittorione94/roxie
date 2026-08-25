@@ -492,6 +492,7 @@ def main() -> int:
     available = {
         row["task"] for row in rows
         if row.get("status") == "ok" and row.get("cell") == args.cell
+        and row.get("task")
     }
     if args.tasks:
         wanted_tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]

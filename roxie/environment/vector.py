@@ -50,6 +50,7 @@ observations are the same array; see ``EnvPoolVectorEnv``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 import jax
@@ -355,7 +356,10 @@ class EnvPoolVectorEnv:
             return np.asarray(obs, dtype=np.float32)
         parts = []
         for key in self._obs_keys:
-            leaf = obs[key] if hasattr(obs, "__getitem__") else getattr(obs, key)
+            # A Mapping is the normal case; the attribute fallback covers a pool
+            # that hands back a namedtuple, where `obs[key]` would index by
+            # position and raise on a string.
+            leaf = obs[key] if isinstance(obs, Mapping) else getattr(obs, key)
             leaf = np.asarray(leaf, dtype=np.float32)
             parts.append(leaf.reshape(leaf.shape[0], -1))
         return np.concatenate(parts, axis=1)

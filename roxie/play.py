@@ -57,6 +57,30 @@ def main(checkpoint_path, overrides):
     if cfg.env.get("impl", None) == "warp":
         cfg.env.impl = "jax"
 
+    # EnvPool cannot be played back at all: the pool steps native MuJoCo inside
+    # C++ and hands out nothing but observations — no `MjModel` to open a viewer
+    # on, no per-world state to draw. So an envpool-trained checkpoint is
+    # replayed on the playground twin of the same dm_control task. That is sound
+    # for the same reason the release grid compares the two cells at all: they
+    # are two implementations of one task definition, same observation layout
+    # and same action bounds (see `roxie.environment.suites`).
+    if cfg.env.get("impl", None) == "envpool":
+        task = suites.playground_task(cfg.env.task_id)
+        print(
+            f"EnvPool has no viewer; replaying {cfg.env.task_id} on the "
+            f"mujoco_playground env {task!r}.",
+            flush=True,
+        )
+        # Edited in place rather than replaced: the saved agent config
+        # interpolates `${env.parallel_envs}` (and a builder ignores every key
+        # it does not read), so dropping the block would break instantiation.
+        # Only the two keys that choose the env change, plus the pool-only ones
+        # that would otherwise send this straight back to envpool.
+        cfg.env.env_name = task
+        cfg.env.impl = "jax"
+        cfg.env.pop("builder", None)
+        cfg.env.pop("task_id", None)
+
     # Match the training run's matmul precision so playback evaluates the policy
     # the same way it was trained.
     matmul_precision = (cfg.get("runtime") or {}).get("matmul_precision", None)
@@ -104,6 +128,19 @@ def main(checkpoint_path, overrides):
     model = ghost.model if ghost is not None else func_env.mj_model
 
     data = mujoco.MjData(model)
+
+    # Wall-clock pacing: one loop iteration is one CONTROL step, which lasts
+    # ``sim timestep x n_substeps``. Read that off the env — playground's
+    # ``mjx_env`` publishes it as ``dt`` — rather than assuming a substep count,
+    # which is how this used to run a 1-substep dm_control task at 1/20 speed.
+    substeps = int(
+        getattr(func_env, "n_substeps", None)
+        or getattr(func_env, "native_n_substeps", None)
+        or 1
+    )
+    frame_dt = float(
+        getattr(func_env, "dt", None) or model.opt.timestep * substeps
+    )
 
     # Prefer a native-MuJoCo CPU stepper when the env provides one. MJX is GPU-first
     # and pathologically slow for a single world on CPU, so the native player steps
@@ -182,7 +219,7 @@ def main(checkpoint_path, overrides):
 
             viewer.sync()
 
-            time_until_next_step = model.opt.timestep * 20 - (time.time() - step_start)
+            time_until_next_step = frame_dt - (time.time() - step_start)
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
 

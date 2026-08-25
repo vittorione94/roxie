@@ -77,6 +77,24 @@ def envpool_task_id(task: str) -> str:
     return _ENVPOOL_EXCEPTIONS.get(task, f"{task}-v1")
 
 
+def playground_task(envpool_id: str) -> str:
+    """The playground task name for an envpool task id — ``envpool_task_id``
+    read backwards.
+
+    Playback is what needs this. An EnvPool pool steps its physics in C++ and
+    exposes no ``MjModel``, so there is nothing for the MuJoCo viewer to render;
+    ``play.py`` swaps an envpool-trained checkpoint onto the playground twin of
+    the same task, which the mapping above says is the same task.
+    """
+    for task in DMC_TASKS:
+        if envpool_task_id(task) == envpool_id:
+            return task
+    raise KeyError(
+        f"{envpool_id!r} is not an envpool id in the roxie benchmark suite. "
+        f"Known ids: {', '.join(envpool_task_id(t) for t in DMC_TASKS)}"
+    )
+
+
 def register_resolvers() -> None:
     """Register ``${envpool_task:<Task>}`` with OmegaConf. Idempotent."""
     from omegaconf import OmegaConf

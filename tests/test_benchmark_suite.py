@@ -71,6 +71,22 @@ def test_an_unknown_task_is_rejected_by_name():
         suites.envpool_task_id("CheetahWalk")
 
 
+def test_playground_task_inverts_the_mapping():
+    """`play.py` replays an envpool checkpoint on the playground twin, so the
+    mapping has to be readable in both directions — including for the two
+    exceptions, which are the only ones a naive de-suffixing would get wrong."""
+    for task in suites.DMC_TASKS:
+        assert suites.playground_task(suites.envpool_task_id(task)) == task
+
+
+def test_an_unknown_envpool_id_is_rejected_by_name():
+    """A checkpoint trained on a task outside the suite (envpool's gym-MuJoCo
+    ids, say) has no twin to render, and must say so rather than resolve to a
+    neighbouring task."""
+    with pytest.raises(KeyError, match="HalfCheetah-v4"):
+        suites.playground_task("HalfCheetah-v4")
+
+
 def test_resolver_is_registered_for_hydra():
     from omegaconf import OmegaConf
 

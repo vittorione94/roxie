@@ -85,10 +85,10 @@ trainer:
   # buffer's full size on disk per save, which is gigabytes here.
   save_buffer: false
 
-runtime:
-  # Precision of every f32 matmul, applied globally (agent networks AND MJX
-  # physics), so it lives in the backend group rather than here — it is a
-  # property of the device, and on CPU a matmul is true f32 either way.
+# No `runtime:` block here on purpose. Both of its keys — `jax_platform` and
+# `matmul_precision` (global: it reaches the agent's networks AND MJX physics) —
+# are properties of the DEVICE, so they belong to the backend group. A bare
+# `runtime:` in this file would compose to null and shadow nothing useful.
 
 logging:
   # Console + CSV (log.csv in the run's output dir) are always on — the CSV is

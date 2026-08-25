@@ -309,7 +309,27 @@ except Exception as e:
 # ------------------------------------------------------------- the grid -----
 
 mkdir -p "$LOG_DIR"
-[[ -f "$MANIFEST" ]] || printf 'status\ttask\tcell\tagent\tsteps\tseconds\tsps\trun_dir\n' > "$MANIFEST"
+MANIFEST_HEADER=$'status\ttask\tcell\tagent\tsteps\tseconds\tsps\trun_dir'
+
+# The ledger is append-only and read back by BOTH `already_done` (which greps
+# positionally) and scripts/export_release_weights.py (which reads it as a TSV
+# with named columns). A manifest written under an older schema — the v1 grid's
+# second column was `suite`, holding `walker_walk` / `mocap_cmu_006_13` — would
+# take new rows silently and then be half-parsed by both readers. Refuse rather
+# than append, and say exactly what to do about it.
+if [[ -f "$MANIFEST" ]]; then
+    existing=$(head -n 1 "$MANIFEST")
+    if [[ "$existing" != "$MANIFEST_HEADER" ]]; then
+        err "$MANIFEST was written under a different schema:"
+        err "    found:    $existing"
+        err "    expected: $MANIFEST_HEADER"
+        err "  Move it aside — the runs it lists are from a superseded grid:"
+        err "    mv $MANIFEST $MANIFEST.superseded"
+        exit 2
+    fi
+else
+    printf '%s\n' "$MANIFEST_HEADER" > "$MANIFEST"
+fi
 
 steps=$STEPS
 [[ $SMOKE -eq 1 ]] && steps=$SMOKE_STEPS
