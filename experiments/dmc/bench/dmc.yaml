@@ -50,9 +50,9 @@ env:
   # dm_control task, on both implementations). Named here rather than pinned to
   # 1000 so the two backends can only ever agree by construction.
   max_episode_steps: null
-  # `builder`, and the env-naming key it reads (`env_name` for playground,
-  # `task_id` for envpool), come from the `backend` group — that IS the variable
-  # under test, so it must not be pinned in this file.
+  # `_target_` (the builder), and the env-naming key it reads (`env_name` for
+  # playground, `task_id` for envpool), come from the `backend` group — that IS
+  # the variable under test, so it must not be pinned in this file.
 
 trainer:
   # 50M env steps per run. The suite spans tasks that saturate by 1M
@@ -67,7 +67,7 @@ trainer:
   # capacity deliberately do NOT scale: they are matched hyperparameters, so a
   # longer budget means more turnover through the same buffer, which is the
   # intended reading. tests/test_release_weights.py pins both relationships.
-  steps: 50_000_000
+  steps: 1_000_000_000
   # 100 points on the learning curve. Also the eval cadence: every epoch pauses
   # the learner and runs `test_episodes` deterministic rollouts.
   epoch_steps: 500_000
@@ -85,10 +85,11 @@ trainer:
   # buffer's full size on disk per save, which is gigabytes here.
   save_buffer: false
 
-# No `runtime:` block here on purpose. Both of its keys — `jax_platform` and
-# `matmul_precision` (global: it reaches the agent's networks AND MJX physics) —
-# are properties of the DEVICE, so they belong to the backend group. A bare
-# `runtime:` in this file would compose to null and shadow nothing useful.
+# No `runtime:` block here on purpose, and no `agent.device`/`env.device` either.
+# Which hardware each half of the run uses, and `matmul_precision` with it
+# (global: it reaches the agent's networks AND MJX physics), are properties of
+# the DEVICE, so they belong to the backend group — that group IS the hardware
+# choice, and this file is what is held identical across it.
 
 logging:
   # Console + CSV (log.csv in the run's output dir) are always on — the CSV is

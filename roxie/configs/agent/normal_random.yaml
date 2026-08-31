@@ -1,5 +1,12 @@
 _target_: roxie.agents.NormalRandom
 
+# Which hardware the agent — networks, optimizers, replay buffer — runs on.
+# `cpu`, `gpu`, or null for whatever JAX picks. Independent of `env.device`:
+# CPU physics with a GPU learner is a real configuration (docs/backends.md).
+# Applied by train.py before the first jax call, so it is a placement key rather
+# than a constructor argument, and the startup banner checks it against reality.
+device: null
+
 # Non-learning gaussian baseline. No networks, no replay, no optimizers — this
 # file is its complete __init__ surface.
 loc: 0.1

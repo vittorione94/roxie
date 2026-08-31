@@ -11,6 +11,9 @@
 #   - the critic is a V critic (state value), not Q(s, a).
 _target_: roxie.agents.PPO
 
+# Where the agent runs; the `backend` group sets it per cell (see env.device).
+device: null
+
 gamma: 0.99
 gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
 clip_eps: 0.2                   # PPO surrogate clip range

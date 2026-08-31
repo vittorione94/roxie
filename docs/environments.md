@@ -72,15 +72,37 @@ So roxie keeps the shape and writes the driver. Auto-reset is a gather from a pr
 
 ## Builders
 
-A builder turns a config block into an `EnvBundle` of two ready-to-drive vector envs — one for training, one for evaluation. It is named by `env.builder` in the experiment yaml (a dotted path resolved with `hydra.utils.get_method`), so the core loops never name a task:
+A builder turns the `env:` block into an `EnvBundle` of two ready-to-drive vector envs — one for training, one for evaluation. **The env yaml is the builder call**, exactly as an agent yaml is a constructor call: `env._target_` names the builder and every other key is one of its keywords, so the core loops never name a task:
 
 ```python
-def build_my_env(cfg_env, mode="train", num_envs=1, test_episodes=1) -> EnvBundle:
+def build_my_env(
+    task: str,                      # whatever this builder's yaml declares
+    *,
+    mode: str = "train",            # injected: "train" | "play"
+    num_envs: int = 1,              # injected: env.parallel_envs
+    test_episodes: int = 1,         # injected: trainer.test_episodes
+    max_episode_steps: int | None = None,
+) -> EnvBundle:
 ```
 
-`num_envs` and `test_episodes` are passed in by the trainer rather than read off `cfg_env`, because they are trainer quantities: the same env definition is driven at `env.parallel_envs` worlds for training and at `trainer.test_episodes` for evaluation. `mode` is `"train"` or `"play"`, letting a builder apply playback-specific tweaks (shrinking a GPU clip pool, falling back from a CPU pool to a single jitted world).
+The three injected arguments are supplied by [`loader.build_env`](../roxie/environment/loader.py), not by the yaml, and override any same-named key in it. `num_envs`/`test_episodes` are trainer quantities — the same env definition is driven at `env.parallel_envs` worlds for training and at `trainer.test_episodes` for evaluation, and injecting them is what stops the eval pool from drifting out of step with the eval loop. `mode` lets a builder apply playback-specific tweaks (shrinking a GPU clip pool, falling back from a CPU pool to a single jitted world).
 
-The two shipped builders are `build_playground_env` and `build_envpool_env` in [`roxie/environment/loader.py`](../roxie/environment/loader.py). A builder can live outside this repo — [roxie-mocap](https://github.com/vittorione94/roxie-mocap) ships two of its own and is launched through `roxie.train` unchanged.
+Everything else under `env:` is a keyword argument, so a stale key fails loudly at launch. The exceptions are `loader.TRAINER_ENV_KEYS` — `device`, `parallel_envs`, `test_episodes`, `viewer`, `player` (plus the pre-`_target_` `builder:` spelling, still honoured so an old checkpoint replays) — which roxie consumes itself and strips before instantiating; a builder never declares a parameter it does not use. `env.device` is the one that says which hardware the physics runs on, and it is applied long before a builder exists ([backends.md](backends.md#where-the-agent-runs-independent-of-where-the-physics-runs)). [`tests/test_env_configs.py`](../tests/test_env_configs.py) pins a config against its builder's signature in both directions.
+
+The two shipped builders are `build_playground_env` and `build_envpool_env` in [`roxie/environment/loader.py`](../roxie/environment/loader.py), with a config-group file each in [`roxie/configs/env/`](../roxie/configs/env/) — a complete `env:` block an experiment pulls in and overrides:
+
+```yaml
+defaults:
+  - /agent: sac
+  - /env: playground     # or /env: envpool
+  - _self_
+
+env:
+  env_name: CheetahRun
+  impl: warp
+```
+
+A builder can live outside this repo — [roxie-mocap](https://github.com/vittorione94/roxie-mocap) ships two of its own and is launched through `roxie.train` unchanged; it names them in `env._target_` and ships its own `env/` group file next to them.
 
 ## Spaces
 

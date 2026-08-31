@@ -1,6 +1,7 @@
 """Every agent knob must be reachable from yaml.
 
-`train.py` builds an agent as ``hydra.utils.instantiate(cfg.agent, ...)``, so the
+`train.py` builds an agent as ``agents.utils.build_agent(cfg.agent, ...)`` — one
+``hydra.utils.instantiate`` plus a drop of ``AGENT_PLACEMENT_KEYS`` — so the
 agent config IS the constructor call: `_target_` names the class and every
 sibling key is one of its keywords. A keyword absent from the yaml is silently
 pinned to its Python default — invisible in the run's config, invisible in
@@ -32,6 +33,14 @@ INJECTED = {
     "action_high",
     "noise_config",
 }
+
+# The one key in an agent yaml that is not a constructor argument: `device` says
+# which hardware the agent runs on, which has to be applied before the first
+# `jax.*` call — long before the agent is built — so train.py consumes and drops
+# it. It is the agent block's counterpart to `loader.TRAINER_ENV_KEYS`, and it is
+# required rather than merely tolerated: an experiment states where both of its
+# halves run (`env.device` is the other), and a config that omits it hides that.
+PLACEMENT_KEYS = {"device"}
 
 CONFIG_FILES = sorted(
     list((REPO / "roxie" / "configs" / "agent").glob("*.yaml"))
@@ -71,7 +80,12 @@ def test_agent_config_matches_constructor(path):
     cls = get_class(target)  # raises if the dotted path is stale
 
     expected = _constructor_kwargs(cls)
-    actual = set(cfg.keys()) - {"_target_"}
+    actual = set(cfg.keys()) - {"_target_"} - PLACEMENT_KEYS
+
+    assert PLACEMENT_KEYS <= set(cfg.keys()), (
+        f"{path} does not say where the agent runs — add "
+        f"{sorted(PLACEMENT_KEYS)} (null = whatever JAX picks)."
+    )
 
     missing = sorted(set(expected) - actual)
     assert not missing, (

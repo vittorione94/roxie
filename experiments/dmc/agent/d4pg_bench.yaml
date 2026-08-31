@@ -15,6 +15,9 @@
 # A task outside dm_control needs this rechecked.
 _target_: roxie.agents.D4PG
 
+# Where the agent runs; the `backend` group sets it per cell (see env.device).
+device: null
+
 gamma: 0.99
 tau: 0.005
 actor_learning_rate: 3e-4

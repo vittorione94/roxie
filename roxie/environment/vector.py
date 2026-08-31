@@ -14,17 +14,16 @@ is driving.
 WHY NOT ``gymnasium.envs.functional_jax_env.FunctionalJaxVectorEnv``
 --------------------------------------------------------------------
 The shape below is deliberately Gymnasium's; the implementation cannot be.
-Upstream's vector env is unusable here for three independent reasons, all
-visible in its source:
+Upstream's vector env is unusable here for three independent reasons:
 
   1. ``step`` branches on ``if jnp.any(self.prev_done):`` — a device-to-host
-     sync EVERY step. A release cell runs 5e7 env steps; that one line
-     would dominate the loop.
+     sync EVERY step. A release cell runs 5e7 env steps; that one line would
+     dominate the loop.
   2. It resets with ``self.state.at[to_reset].set(...)``, which assumes the
      state is a single array. Roxie's states are pytrees (``mjx.Data``), and
-     ``.at[]`` does not exist on a pytree — it raises on every env in this repo.
+     ``.at[]`` raises on every env in this repo.
   3. It keeps the state on ``self``, so warmup cannot be a ``lax.scan``. Roxie
-     fills the replay buffer in ONE dispatch; a per-step Python loop there costs
+     fills the replay buffer in ONE dispatch; a per-step Python loop costs
      minutes at the step counts warmup needs.
 
 Hence: same public shape, functional core. The caller carries the state, and a
@@ -34,12 +33,12 @@ function.
 AUTO-RESET
 ----------
 Roxie resets a done env IN THE SAME STEP, by gathering a fresh start from a
-pre-built pool of reset states, rather than on the next step the way
-Gymnasium's ``AutoresetMode.NEXT_STEP`` does. The reason is mechanical: a real
-reset of "however many envs happen to be done" has a data-dependent shape and
-cannot be jitted, whereas a gather from a fixed-size pool can. The pool is
-passed IN to ``step`` rather than read off ``self`` so that regenerating it each
-epoch does not invalidate the caller's compiled step.
+pre-built pool of reset states, rather than on the next step as Gymnasium's
+``AutoresetMode.NEXT_STEP`` does. The reason is mechanical: resetting "however
+many envs happen to be done" has a data-dependent shape and cannot be jitted,
+whereas a gather from a fixed-size pool can. The pool is passed IN to ``step``
+rather than read off ``self`` so regenerating it each epoch does not invalidate
+the caller's compiled step.
 
 This is why ``step`` returns two things. ``Timestep`` holds the PRE-reset
 values — the true next observation, which is what the replay buffer must
@@ -113,8 +112,8 @@ class JaxVectorEnv:
         self.single_action_space = func_env.action_space
         self.metadata = dict(getattr(func_env, "metadata", {}) or {})
 
-        # ``params`` broadcasts (in_axes None) so it stays a traced argument the
-        # caller can vary without recompiling — the whole point of ``params``.
+        # ``params`` broadcasts so it stays a traced argument the caller can
+        # vary without recompiling.
         self._v_initial = jax.vmap(func_env.initial, in_axes=(0, None))
         self._v_transition = jax.vmap(func_env.transition, in_axes=(0, 0, 0, None))
         self._v_observation = jax.vmap(func_env.observation, in_axes=(0, 0, None))
@@ -174,12 +173,11 @@ class JaxVectorEnv:
             prev_env_state, action, next_env_state, params,
         )
 
-        # The three-way split. `terminal` is failure, `truncal` is the env's own
-        # non-failure cutoff (a reference clip running out), and the step limit
-        # is the driver's. An env-internal truncation CLEARS termination —
-        # otherwise a value-based agent zeroes its bootstrap at the cutoff and Q
-        # collapses there — while the step limit does not, since a genuine fall
-        # on the very last step is still a fall.
+        # `terminal` is failure, `truncal` the env's own non-failure cutoff (a
+        # reference clip running out), and the step limit is the driver's. An
+        # env-internal truncation clears termination, or a value-based agent
+        # zeroes its bootstrap at the cutoff and Q collapses there; the step
+        # limit does not, since a fall on the last step is still a fall.
         terminal = self._v_terminal(next_env_state, keys, params)
         truncal = self._v_truncal(next_env_state, keys, params)
         steps = state.steps + 1
@@ -209,16 +207,14 @@ class JaxVectorEnv:
         fresh — and tracks whatever the env did to its own ``params`` at the
         epoch boundary.
         """
-        # The pool is gathered FROM, so its size need not match ``num_envs``;
-        # read it off the pool rather than assuming they are equal.
+        # The pool is gathered from, so its size need not match ``num_envs``.
         pool_size = reset_pool.obs.shape[0]
         idx = jax.random.randint(key, (self.num_envs,), 0, pool_size)
 
         def _leaf(pool_leaf, s):
-            # Leaves with no per-env leading dim — warp's world-flattened global
-            # contact arena is the real case — would be indexed out of bounds by
-            # the gather. The physics recomputes them every step, so keeping the
-            # stepped value is both correct and what the pre-refactor loop did.
+            # Leaves with no per-env leading dim (warp's world-flattened contact
+            # arena) would be gathered out of bounds. The physics recomputes them
+            # every step, so the stepped value stands.
             if not (isinstance(s, jnp.ndarray) and s.shape[:1] == done.shape):
                 return s
             return jnp.where(
@@ -283,15 +279,12 @@ class EnvPoolVectorEnv:
     """
 
     # Read by the startup banner in place of a physics ``impl``: a pool has no
-    # MJX backend, it IS the backend.
+    # MJX backend, it is the backend.
     metadata = {"jax": False, "impl": "envpool"}
 
-    # Optional pool hook, forwarded verbatim so it reaches the rollout through
-    # this class. ``epoch_refresh()`` is the pool's counterpart to
-    # ``FuncEnv.epoch_refresh``: whatever it regenerates once per epoch — its
-    # own reset pool, a start distribution it adapts — it does in there. There
-    # is no ``params`` to thread, because a C++ pool steps in plain Python and
-    # can just own the mutable state.
+    # The pool's counterpart to ``FuncEnv.epoch_refresh``, forwarded verbatim so
+    # it reaches the rollout. There is no ``params`` to thread, because a C++
+    # pool steps in plain Python and can just own the mutable state.
     _POOL_HOOKS = ("epoch_refresh",)
 
     def __init__(
@@ -299,14 +292,13 @@ class EnvPoolVectorEnv:
         max_episode_steps: int = 1000, rebuild=None,
     ):
         self.max_episode_steps = int(max_episode_steps)
-        # ``rebuild(seed) -> pool`` when the builder can reconstruct this pool;
-        # see ``reseed``. None keeps whatever reset determinism the pool has.
+        # ``rebuild(seed) -> pool`` when the builder can reconstruct this pool
+        # (see ``reseed``); None keeps whatever reset determinism the pool has.
         self._rebuild = rebuild
         self._num_envs = num_envs
         self._bind_pool(pool)
 
-        # Both pool flavours expose the SINGLE-env spaces (EnvPool's gymnasium
-        # API does), so they are the single_* spaces directly.
+        # Both pool flavours expose the single-env spaces.
         self.single_observation_space = _as_box(
             pool.observation_space, unbounded=True,
         )
@@ -356,9 +348,8 @@ class EnvPoolVectorEnv:
             return np.asarray(obs, dtype=np.float32)
         parts = []
         for key in self._obs_keys:
-            # A Mapping is the normal case; the attribute fallback covers a pool
-            # that hands back a namedtuple, where `obs[key]` would index by
-            # position and raise on a string.
+            # The attribute fallback covers a pool that hands back a namedtuple,
+            # where `obs[key]` would index by position and raise on a string.
             leaf = obs[key] if isinstance(obs, Mapping) else getattr(obs, key)
             leaf = np.asarray(leaf, dtype=np.float32)
             parts.append(leaf.reshape(leaf.shape[0], -1))

@@ -6,9 +6,8 @@ from typing import Any, Dict
 import jax
 import jax.numpy as jnp
 import numpy as np
-import orbax.checkpoint as ocp
 
-from roxie.agents.agent import Agent
+from roxie.agents.agent import Agent, _read_checkpoint
 
 
 class NormalRandom(Agent):
@@ -102,9 +101,7 @@ class OrnsteinUhlenbeck(Agent):
         # Folded into the externally supplied key each step so the noise still
         # advances when the caller passes a constant key (e.g. the play loop).
         self._t = 0
-        # No observation normalization / replay warmup for this baseline; the
-        # Trainer branches on these attributes.
-        self.normalize_observations = False
+        self.normalize_observations = False  # the Trainer branches on this
 
         print("OrnsteinUhlenbeck agent initialized.")
         print("Hyper Params:", self._export_hyperparams())
@@ -134,15 +131,14 @@ class OrnsteinUhlenbeck(Agent):
         return self.last_action
 
     def add(self, prev_obs, timestep):
-        # Non-learning: nothing to store. Decorrelate the OU state for any env
-        # whose episode just ended so a fresh episode starts from zero noise.
+        # Nothing to store, but the OU state is decorrelated for any env whose
+        # episode just ended so a fresh episode starts from zero noise.
         if self.actions is not None:
             done = jnp.logical_or(timestep.terminated, timestep.truncated)
             keep = (1.0 - done.astype(self.actions.dtype))[:, None]
             self.actions = self.actions * keep
 
     def update(self, steps, agent_rng):
-        # No gradients, ever.
         return 0, 0, 0
 
     def _export_hyperparams(self) -> Dict[str, Any]:
@@ -156,27 +152,22 @@ class OrnsteinUhlenbeck(Agent):
             "env_action_size": int(self.action_size),
         }
 
-    # --- Checkpointing -------------------------------------------------------
-    # There are no learned params; persist just the hyperparameters and the
-    # action bounds so ``play`` can rebuild an identical agent from a run dir.
-    def save(self, path, *, extra_metadata: Dict[str, Any] = None, **_):
-        path = Path(path).resolve()
-        payload = {
-            "format_version": 1,
+    # No learned params: just the hyperparameters and action bounds, so ``play``
+    # can rebuild an identical agent. Overriding only the payload leaves the
+    # writing to ``Agent.save``, so ``Agent``'s reader still reads it.
+    def checkpoint_payload(self, *, format_version: int = 1, extra_metadata=None, **_):
+        return {
+            "format_version": format_version,
             "hyperparams": self._export_hyperparams(),
             "action_low": np.asarray(jax.device_get(self.action_low)),
             "action_high": np.asarray(jax.device_get(self.action_high)),
             "metadata": (extra_metadata or {}),
         }
-        checkpointer = ocp.StandardCheckpointer()
-        checkpointer.save(path, payload)
-        checkpointer.wait_until_finished()
-        print(f"[OrnsteinUhlenbeck.save] Saved to {path}")
 
     @classmethod
     def load(cls, path, env_obs_size: int, env_act_size: int, **_):
         path = Path(path).resolve()
-        loaded = ocp.PyTreeCheckpointer().restore(path)
+        loaded = _read_checkpoint(path)
         hyper = loaded.get("hyperparams", {}) or {}
         agent = cls(
             env_obs_size=env_obs_size,

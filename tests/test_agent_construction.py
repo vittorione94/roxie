@@ -14,10 +14,10 @@ import jax.numpy as jnp
 import optax
 import pytest
 from flax import nnx
-from hydra.utils import get_class, instantiate
+from hydra.utils import get_class
 from omegaconf import OmegaConf
 
-from roxie.agents.utils import build_optimizer, network_rngs
+from roxie.agents.utils import build_agent, build_optimizer, network_rngs
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -65,7 +65,7 @@ def _build(agent_cfg):
         kwargs["noise_config"] = OmegaConf.load(
             REPO / "roxie" / "configs" / "noise" / "gaussian.yaml"
         )
-    return instantiate(cfg, _recursive_=False, **kwargs)
+    return build_agent(cfg, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -101,6 +101,46 @@ def test_seed_controls_network_init():
     # identical critics is just a single critic.
     assert not jnp.allclose(
         _params(a.state.critic.critic1), _params(a.state.critic.critic2)
+    )
+
+
+@pytest.mark.parametrize(
+    "path", CONFIG_FILES, ids=lambda p: str(p.relative_to(REPO))
+)
+def test_every_hyperparam_round_trips_through_the_checkpoint(path):
+    """Every constructor knob must appear in `_export_hyperparams`.
+
+    `Agent.load` rebuilds a checkpoint by filtering the exported block against
+    the constructor signature, so a knob that is accepted but never exported is
+    silently dropped on playback: the agent comes back with the default instead
+    of the value it trained with, and nothing warns. That failure is invisible
+    at save time and only shows up as a playback that scores differently from
+    the run it came from.
+
+    The exemptions mirror `Agent.load`'s own `explicit_keys`: the `*_config`
+    blocks are yaml-side wiring (`actor_config`, `memory_config`, the optimizer
+    blocks) that `play.py` forwards from the run config, and the env sizes come
+    from the environment being played rather than from disk — `load` filters
+    both back out even when a checkpoint happens to carry them.
+    """
+    exempt = {"self", "args", "kwargs", "env_obs_size", "env_action_size"}
+    agent = _build(OmegaConf.load(path))
+    if not hasattr(agent, "state"):
+        # A non-learning baseline (Constant, NormalRandom, ...) overrides
+        # `_export_hyperparams` outright and has nothing to round-trip.
+        pytest.skip(f"{type(agent).__name__} is not a learning agent")
+
+    exported = set(agent._export_hyperparams())
+    knobs = {
+        name
+        for klass in type(agent).__mro__
+        if "__init__" in klass.__dict__
+        for name in inspect.signature(klass.__dict__["__init__"]).parameters
+        if name not in exempt and not name.endswith("_config")
+    }
+    assert not (knobs - exported), (
+        f"{type(agent).__name__} accepts {sorted(knobs - exported)} but never "
+        "exports them; they will not survive `Agent.load`."
     )
 
 

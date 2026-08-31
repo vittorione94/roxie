@@ -41,31 +41,27 @@ class SyncLearner:
 
     def act(self, obs, key):
         actions = self._agent.step(obs, evaluate=False, key=key)
-        # Mean |noise| per joint is logged from this; only deterministic agents
-        # (DDPG/TD3) expose `last_noise`.
+        # Only deterministic agents (DDPG/TD3) expose `last_noise`.
         return actions, getattr(self._agent, "last_noise", None)
 
     def observe(self, prev_obs, timestep, actions, steps):
-        # `actions` is already on `agent.last_action` (set by `act` -> `step`),
-        # which is what `add` reads; taken here only to share one signature with
-        # the async learner, whose action travels through a queue.
+        # `actions` is already on `agent.last_action`, which is what `add` reads;
+        # taken here only to share the async learner's signature, where the
+        # action travels through a queue.
         del actions
         agent = self._agent
         agent.add(prev_obs, timestep)
 
-        # Track the CURRENT policy's state distribution rather than freezing
-        # after warmup. Obs are stored raw and normalized at sample time, so
-        # updated stats stay consistent for old and new data alike. This is on
-        # top of the update `add` performs; it looks redundant but must stay —
-        # dropping it changes the weighting of the statistics, and both backends
-        # have always done it, so removing it would break comparability with
-        # every run logged so far.
+        # Tracks the current policy's state distribution rather than freezing
+        # after warmup. On top of the update `add` performs, which looks
+        # redundant, but dropping it reweights the statistics and breaks
+        # comparability with every run logged so far.
         if getattr(agent, "normalize_observations", False):
             agent.state.obs_stats = Agent.update_obs_stats(
                 agent.state.obs_stats, timestep.obs,
             )
 
-        # The agent gates its own updates. The trainer must NOT read buffer
+        # The agent gates its own updates. The trainer must not read buffer
         # device state here: a Python branch on a device array forces a blocking
         # host sync every iteration and serializes the GPU pipeline.
         self._key, update_key = jax.random.split(self._key)

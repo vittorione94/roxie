@@ -1,10 +1,17 @@
 """Locating a run's checkpoints on disk.
 
-A run writes `<output_dir>/checkpoints/step_<N>/`, one directory per save. To
-resume, `train.py` needs the exact `step_<N>` directory — but the path a user
-has at hand is usually the run directory they copied out of the console, or the
-`checkpoints/` dir. This module reduces any of those three to the one directory
-`Agent.restore` reads, so `resume=` accepts all of them.
+A run writes `<output_dir>/checkpoints/<N>/`, one directory per save, where `N`
+is the env-step count. To resume, `train.py` needs the exact step directory —
+but the path a user has at hand is usually the run directory they copied out of
+the console, or the `checkpoints/` dir. This module reduces any of those three
+to the one directory `Agent.restore` reads, so `resume=` accepts all of them.
+
+`checkpoints/` is an `orbax.CheckpointManager` directory: it owns the step
+naming and the retention policy (`Trainer.replace_checkpoint` -> `max_to_keep`),
+and it nests the payload one level further down, under an item subdirectory.
+Everything here works on the step directory itself, which is the unit a user
+names, that `resume=` accepts, and that `play.py` resolves its run config
+relative to.
 
 Nothing here imports JAX: it is pure path arithmetic, so it stays usable (and
 testable) without a device.
@@ -15,29 +22,34 @@ from pathlib import Path
 
 CHECKPOINTS_DIRNAME = "checkpoints"
 
-# `step_<env steps>` — written by `Trainer._checkpoint_if_due`.
-_STEP_RE = re.compile(r"^step_(\d+)$")
+# The orbax item name the trainer saves under. A CheckpointManager step
+# directory holds one subdirectory per item; the trainer writes a single
+# unnamed item, which orbax files under "default".
+CHECKPOINT_ITEM = "default"
+
+# `<env steps>` — the step directory names a CheckpointManager writes.
+_STEP_RE = re.compile(r"^(\d+)$")
 
 
 def checkpoint_steps(path: str | Path) -> int | None:
-    """Env-step count encoded in a `step_<N>` directory name, or None.
+    """Env-step count encoded in a step directory's name, or None.
 
     The authoritative step count is the one the trainer wrote into the
-    checkpoint's metadata; this is the fallback for checkpoints saved before
-    that metadata existed.
+    checkpoint's metadata; this is the fallback for a checkpoint whose metadata
+    did not survive.
     """
     match = _STEP_RE.match(Path(path).name)
     return int(match.group(1)) if match else None
 
 
 def find_checkpoint(path: str | Path) -> Path:
-    """Resolve `path` to the `step_<N>` directory to restore from.
+    """Resolve `path` to the step directory to restore from.
 
     Accepts, in order of preference:
 
-    - a `step_<N>` directory                → itself
-    - a directory containing `step_<N>` dirs → the one with the HIGHEST N
-    - a run output directory                 → the same, under `checkpoints/`
+    - a `<N>` step directory              → itself
+    - a directory containing `<N>` dirs   → the one with the HIGHEST N
+    - a run output directory              → the same, under `checkpoints/`
 
     The highest N wins rather than the newest mtime: a run configured with
     `trainer.replace_checkpoint: false` keeps every save, and "latest" must mean
@@ -67,6 +79,6 @@ def find_checkpoint(path: str | Path) -> Path:
             return max(steps, key=lambda item: item[0])[1].resolve()
 
     raise FileNotFoundError(
-        f"No `step_<N>` checkpoint directory found under {path}. Pass a run "
-        f"output dir, its `{CHECKPOINTS_DIRNAME}/` dir, or one `step_<N>` dir."
+        f"No numbered checkpoint directory found under {path}. Pass a run "
+        f"output dir, its `{CHECKPOINTS_DIRNAME}/` dir, or one `<N>` step dir."
     )

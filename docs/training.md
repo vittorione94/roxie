@@ -31,7 +31,9 @@ uv run python roxie/train.py --config-name dmc/bench_sac \
     env.parallel_envs=400 trainer.save_steps=100_000
 ```
 
-`device=cpu` (or `device=gpu`) is a special override, parsed out of `sys.argv` before JAX is imported and hidden from Hydra, which forces the JAX platform for the whole process regardless of what the config says. The configs express the same thing durably as `runtime.jax_platform` — see [Ordering gotchas](backends.md#ordering-gotchas-env-vars-vs-jaxconfig).
+The env is a config group like the agent — [`roxie/configs/env/`](../roxie/configs/env/) holds one complete `env:` block per builder ([configuration.md](configuration.md)), pulled into a launchable's `defaults:` as `- /env: playground`. The benchmark launchables deliberately do **not** use it: their env block comes from the `backend` group, which is the variable under test there. Change their task with `release.task=` and anything else with a plain key override (`env.impl=warp`, `env.max_episode_steps=500`).
+
+`device=cpu` (or `device=gpu`) is a special override, parsed out of `sys.argv` before JAX is imported and hidden from Hydra, which forces the JAX platform for the whole process regardless of what the config says (and suppresses the device checks in the startup banner, since it *is* the deliberate override). The configs express where each half runs durably as `agent.device` and `env.device` — see [Where the agent runs](backends.md#where-the-agent-runs-independent-of-where-the-physics-runs) and [Ordering gotchas](backends.md#ordering-gotchas-env-vars-vs-jaxconfig).
 
 Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch metrics to console + CSV, checkpoints under `checkpoints/`, and optionally Weights & Biases (`logging.wandb.enabled: true`).
 
@@ -41,7 +43,7 @@ Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch 
 uv run python roxie/train.py --config-name dmc/bench_td3 resume=outputs/<run>
 ```
 
-`resume=` takes the run directory, its `checkpoints/` dir, or one `step_<N>` dir; given a directory it picks the **highest** step. Like `device=`, it is parsed out of `sys.argv` before Hydra and is not a config key (a run that wants it recorded can set `resume.path` in its yaml instead).
+`resume=` takes the run directory, its `checkpoints/` dir, or one `<N>` step dir; given a directory it picks the **highest** step. Like `device=`, it is parsed out of `sys.argv` before Hydra and is not a config key (a run that wants it recorded can set `resume.path` in its yaml instead).
 
 The agent is built from the **config**, and only its numbers come from the checkpoint — so a resume may legitimately raise `trainer.steps` or retune a knob, unlike `play.py`, which rebuilds the agent from the checkpoint's own hyperparameters. What comes back: the networks and their targets, the optimizer moments, the observation-normalization statistics, each agent's own extra state (the exploration schedule's step counter, SAC's temperature, MPO's Lagrange duals — see `Agent._checkpoint_modules`), and the trainer's progress. `trainer.steps` is a **total**, so the resumed leg runs until the whole budget is spent and the logged x-axis continues the same curve rather than starting a second one at 0.
 
@@ -54,7 +56,7 @@ uv run python roxie/train.py --config-name dmc/bench_td3 trainer.save_buffer=tru
 ## Play
 
 ```bash
-uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/step_500000
+uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
 ```
 
 Playback drives a single world into the interactive MuJoCo viewer. It always forces CPU/MJX, even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override the saved run config, e.g. `env.config.early_termination=false` to watch a clip run to its end instead of resetting on tracking collapse.

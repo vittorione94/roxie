@@ -3,23 +3,27 @@ import functools
 import hydra
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.ddpg import DDPG
-from roxie.agents.utils import network_rngs, repack_samples
+from roxie.agents.utils import (
+    fused_grad_steps,
+    network_rngs,
+    repack_samples,
+    soft_update,
+)
 from roxie.losses.actor_losses import d4pg_actor_loss_fn
 from roxie.losses.critic_losses import d4pg_critic_loss_fn
 
 
-# Single D4PG gradient step. Not jitted on its own — called inside the jitted
-# `_grad_steps` below so N steps fuse into one compiled program. Identical to
-# DDPG's step except the losses go through the categorical critic, which needs
-# the fixed support `atoms`.
+# DDPG's step, except the losses go through the categorical critic and so need
+# the fixed support `atoms`. Not jitted on its own — called inside `_grad_steps`
+# below so N steps fuse into one compiled program.
 def _grad_step(
     state: TrainState,
     key: jax.random.PRNGKey,
+    *,
     gamma: float,
     tau: float,
     replay_sample_fn,
@@ -34,22 +38,21 @@ def _grad_step(
     atoms: jnp.ndarray,
     n_step: int = 1,
 ):
-    """One D4PG step. `obs_mean`/`obs_std` are hoisted in by `_grad_steps` (the
-    stats are loop-constant), as is `atoms`. `n_step` is the TD horizon (NOT the
-    scan length `n_steps` in _grad_steps)."""
+    """One D4PG step, mutating `state` in place. `obs_mean`/`obs_std` are hoisted
+    in by `_grad_steps` (the stats are loop-constant), as is `atoms`. `n_step` is
+    the TD horizon (NOT the scan length `n_steps` in _grad_steps)."""
     # `repack_samples` folds the n-step return, bootstrap coefficient, and
-    # bootstrap obs into the dict — exactly the ingredients the categorical
-    # projection needs to shift the support.
+    # bootstrap obs into the dict — what the categorical projection needs to
+    # shift the support.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalize once, here: both losses below read the same `observations`, and
-    # neither of them normalizes (see `Agent.normalize_samples`).
+    # Normalized once here: both losses below read the same `observations`, and
+    # neither of them normalizes.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    # Critic update: cross-entropy against the projected target categorical.
     critic_loss, critic_grads = nnx.value_and_grad(d4pg_critic_loss_fn)(
         state.critic,
         state.target_actor,
@@ -64,7 +67,6 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # Actor update: DPG through the categorical's expected value.
     actor_loss, actor_grads = nnx.value_and_grad(d4pg_actor_loss_fn)(
         state.actor,
         state.critic,
@@ -75,51 +77,21 @@ def _grad_step(
     )
     state.actor_optimizer.update(state.actor, actor_grads)
 
-    # Soft update of both target networks.
-    new_actor_tensors = nnx.state(state.actor, nnx.Param)
-    old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
-    new_target_actor_tensors = optax.incremental_update(
-        new_tensors=new_actor_tensors, old_tensors=old_actor_tensors, step_size=tau
-    )
+    soft_update(state.target_actor, state.actor, tau)
+    soft_update(state.target_critic, state.critic, tau)
 
-    new_critic_tensors = nnx.state(state.critic, nnx.Param)
-    old_critic_tensors = nnx.state(state.target_critic, nnx.Param)
-    new_target_critic_tensors = optax.incremental_update(
-        new_tensors=new_critic_tensors, old_tensors=old_critic_tensors, step_size=tau
-    )
-
-    nnx.update(state.target_actor, new_target_actor_tensors)
-    nnx.update(state.target_critic, new_target_critic_tensors)
-
-    return (
-        TrainState(
-            actor=state.actor,
-            critic=state.critic,
-            actor_optimizer=state.actor_optimizer,
-            target_actor=state.target_actor,
-            target_critic=state.target_critic,
-            critic_optimizer=state.critic_optimizer,
-            buffer_state=state.buffer_state,
-            obs_stats=state.obs_stats,
-        ),
-        actor_loss,
-        critic_loss,
-    )
+    return actor_loss, critic_loss
 
 
-# Fused N-step update. The body is compiled once and run `n_steps` times on-device
-# via `lax.scan` rather than unrolled, which would blow up compile time and HLO
-# size at large `n_steps`. Only the trainable graph state is
-# carried; `buffer_state`, the normalization params, and `atoms` are constant
-# across the loop and closed over.
+# `fused_grad_steps` compiles the body once and runs it `n_steps` times
+# on-device, so a burst costs one host dispatch rather than one per step.
 @functools.partial(
     nnx.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "n_step", "normalize",
     ),
-    # Donate the train state (arg 0): its large read-only replay buffer is threaded
-    # unchanged through the scan, so without donation XLA allocates a full second
-    # copy of it every update. The caller reassigns self.state from the result.
+    # The replay buffer rides unchanged through the scan; without donation XLA
+    # allocates a full second copy of it every update.
     donate_argnums=(0,),
 )
 def _grad_steps(
@@ -139,42 +111,31 @@ def _grad_steps(
     atoms: jnp.ndarray,
     n_step: int = 1,
 ):
-    # Hoist the (loop-constant) normalization params out of the scan body.
+    # Loop-constant, so hoisted out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
-    # Pre-split all per-step keys so they can be scanned over as `xs`.
-    keys = jax.random.split(key, n_steps)
+    state, (actor_losses, critic_losses) = fused_grad_steps(
+        state,
+        key,
+        n_steps,
+        functools.partial(
+            _grad_step,
+            gamma=gamma,
+            tau=tau,
+            replay_sample_fn=replay_sample_fn,
+            target_policy_noise=target_policy_noise,
+            target_noise_clip=target_noise_clip,
+            action_low=action_low,
+            action_high=action_high,
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            obs_clip=obs_clip,
+            normalize=normalize,
+            atoms=atoms,
+            n_step=n_step,
+        ),
+    )
 
-    # Split into a static graph definition + the trainable pytree state. Only the
-    # state is carried through the scan; the graphdef is closed over.
-    graphdef, scan_state = nnx.split(state)
-
-    def body(scan_state, step_key):
-        st = nnx.merge(graphdef, scan_state)
-        st, actor_loss, critic_loss = _grad_step(
-            st,
-            step_key,
-            gamma,
-            tau,
-            replay_sample_fn,
-            target_policy_noise,
-            target_noise_clip,
-            action_low,
-            action_high,
-            obs_mean,
-            obs_std,
-            obs_clip,
-            normalize,
-            atoms,
-            n_step,
-        )
-        _, scan_state = nnx.split(st)
-        return scan_state, (actor_loss, critic_loss)
-
-    scan_state, (actor_losses, critic_losses) = jax.lax.scan(body, scan_state, keys)
-    state = nnx.merge(graphdef, scan_state)
-
-    # Average over the update steps for less noisy logging.
     return state, jnp.mean(actor_losses), jnp.mean(critic_losses)
 
 
@@ -205,8 +166,7 @@ class D4PG(DDPG):
         num_atoms: int = 51,
         **kwargs,
     ):
-        # Set before super().__init__: _make_critic (called from DDPG.__init__)
-        # needs num_atoms.
+        # Set before super().__init__: `_make_critic` needs it.
         self.v_min = float(v_min)
         self.v_max = float(v_max)
         self.num_atoms = int(num_atoms)
@@ -246,14 +206,7 @@ class D4PG(DDPG):
         )
         return actor_loss, critic_loss
 
-    def update(self, steps, agent_rng):
-        gradient_steps, actor_loss, critic_loss = 0, 0, 0
-
-        if self.due_for_update(steps):
-            actor_loss, critic_loss = self.learn(agent_rng)
-            gradient_steps += self.learning_steps
-
-        return gradient_steps, actor_loss, critic_loss
+    # `update` is DDPG's unchanged; `learn` above is the only difference.
 
     def _export_hyperparams(self) -> dict:
         params = super()._export_hyperparams()

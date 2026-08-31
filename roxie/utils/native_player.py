@@ -10,7 +10,7 @@ the step orchestration. Everything env-specific — how to seed a fresh episode,
 how to turn state into an observation, how to map an action onto ctrl, how to
 score/terminate a step — is delegated to a small ``native_*`` protocol the env
 implements (see ``NativeSteppable``). Which env (and therefore which native
-implementation) is used is decided entirely by the Hydra ``env.builder`` config;
+implementation) is used is decided entirely by the Hydra ``env`` config block;
 nothing here knows about any particular task.
 
 ``reset(key)`` / ``step(state, action)`` mirror the jitted env's signatures and
@@ -95,8 +95,7 @@ class NativePlayer:
 
     def _state(self, obs, reward, done, metrics):
         # Shaped like the `mjx_env.State` the jitted FuncEnv path produces, so
-        # `play.py` reads `state.obs` / `state.data` / `state.done` without
-        # knowing which stepper produced it.
+        # `play.py` need not know which stepper produced it.
         return SimpleNamespace(
             obs=np.asarray(obs, dtype=np.float32),
             data=self._data,

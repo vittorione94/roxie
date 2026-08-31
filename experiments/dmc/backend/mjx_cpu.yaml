@@ -19,20 +19,16 @@
 release:
   cell: mjx_cpu
 
+agent:
+  device: cpu
+
 env:
-  builder: roxie.environment.loader.build_playground_env
+  _target_: roxie.environment.loader.build_playground_env
   env_name: ${release.task}
+  device: cpu
   impl: jax
   naconmax: null
   njmax: null
 
 runtime:
-  # The whole process — physics AND agent — on the CPU. train.py applies this
-  # via `jax.config.update("jax_platforms", ...)`, which is the only mechanism
-  # that works after `import jax`; recording it here rather than passing
-  # `device=cpu` on the CLI is what makes this cell reproducible from the
-  # resolved config alone.
-  jax_platform: cpu
-  # null = JAX's default, which on CPU is true f32. `tensorfloat32` is a GPU
-  # concept and buys nothing here.
   matmul_precision: null

@@ -1,4 +1,5 @@
 import abc
+import copy
 import functools
 import inspect
 from pathlib import Path
@@ -11,8 +12,9 @@ import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 
-# `roxie.models.actors` imports nothing from `roxie`, so this cannot cycle.
+from roxie.agents.utils import make_optimizer, serialize_bound
 from roxie.models.actors import distribution_entropy as _distribution_entropy
+from roxie.utils.checkpoint import CHECKPOINT_ITEM, checkpoint_steps
 
 
 class TrainState(nnx.Module, pytree=False):
@@ -65,16 +67,13 @@ class Agent(abc.ABC):
         noise_module: nnx.Module,
         evaluate: bool = False,
     ):
-        """
-        Pure action selection for any actor-critic agent.
-        - actor outputs actions in [-1, 1]
-        - add exploration noise in env units when not evaluating
-        """
+        """Pure action selection for a deterministic actor, which outputs
+        actions in [-1, 1]. Returns the action and the applied noise."""
         action = actor_model(observation)
 
         noisy_action = noise_module.add_noise(action, key, evaluate)
         noisy_action = jnp.clip(noisy_action, -1.0, 1.0)
-        return noisy_action, action - noisy_action  # the noise, for logging
+        return noisy_action, action - noisy_action
 
     @staticmethod
     @functools.partial(nnx.jit, static_argnames=("evaluate",))
@@ -84,15 +83,12 @@ class Agent(abc.ABC):
         evaluate: bool,
         key: jax.Array,
     ):
-        """
-        Pure action selection for any actor-critic agent.
-        - actor outputs actions in [-1, 1]
-        - add exploration noise in env units when not evaluating
-        """
+        """Pure action selection for a stochastic actor, which outputs a
+        distribution over actions in [-1, 1]."""
         distribution = actor_model(observation)
 
         if evaluate:
-            # The distribution mean, never a sample, so evaluation is deterministic.
+            # The mean, never a sample, so evaluation is deterministic.
             try:
                 action = distribution.mean()
             except TypeError:
@@ -118,7 +114,6 @@ class Agent(abc.ABC):
     @staticmethod
     @jax.jit
     def update_obs_stats(stats: ObsStats, batch_obs: jnp.ndarray) -> ObsStats:
-        # batch_obs: (B, *obs_shape)
         b = batch_obs.shape[0]
         batch_sum = jnp.sum(batch_obs, axis=0)
         batch_sumsq = jnp.sum(jnp.square(batch_obs), axis=0)
@@ -133,9 +128,8 @@ class Agent(abc.ABC):
         count = jnp.maximum(stats.count, 1.0)
         mean = stats.sum / count
         var = jnp.maximum(stats.sumsq / count - jnp.square(mean), 0.0)
-        # With 0 or 1 samples the variance is identically 0, so `sqrt(var + eps)` is
-        # tiny and dividing by it saturates every feature at the clip bound. Fall
-        # back to the identity scale until there is a meaningful spread.
+        # With 0 or 1 samples the variance is identically 0, so `sqrt(var + eps)`
+        # is tiny and dividing by it saturates every feature at the clip bound.
         std = jnp.where(stats.count > 1.0, jnp.sqrt(var + eps), 1.0)
         return mean, std
 
@@ -154,18 +148,12 @@ class Agent(abc.ABC):
     ) -> dict:
         """Normalize the observation entries of a repacked sample dict.
 
-        This is the contract every loss function relies on: losses are handed
-        observations that have ALREADY been normalized and therefore take no
-        `obs_mean` / `obs_std` / `obs_clip` arguments of their own (the
-        on-policy path does the same once per rollout in `PPO._prepare_rollout`).
-        Normalizing here also does it once per gradient step rather than once
-        per loss — the actor and critic losses read the same `observations`.
+        Losses are handed already-normalized observations and take no
+        `obs_mean`/`obs_std`/`obs_clip` arguments of their own.
 
-        `enabled` is the agent's `normalize_observations` flag and is static at
-        trace time. When it is False the samples pass through untouched, clip
-        included: `obs_clip` bounds *normalized* observations, and the unused
-        running stats degrade to mean 0 / std 1, so applying it anyway would
-        silently squash raw observations into +/- `clip`.
+        When `enabled` is False the samples pass through untouched, clip
+        included: `obs_clip` bounds *normalized* observations, so applying it
+        anyway would squash raw observations into +/- `clip`.
         """
         if not enabled:
             return samples
@@ -179,6 +167,66 @@ class Agent(abc.ABC):
             ),
         }
 
+    # --------------------------
+    # Construction (shared)
+    # --------------------------
+    def _init_train_state(
+        self,
+        actor: nnx.Module,
+        critic: nnx.Module,
+        buffer_state: Any,
+        *,
+        actor_learning_rate: float,
+        critic_learning_rate: float,
+        max_grad_norm: float,
+        actor_optimizer_config: dict = None,
+        critic_optimizer_config: dict = None,
+        target_actor: bool = True,
+        target_critic: bool = True,
+    ) -> None:
+        """Assemble the pieces every actor-critic agent puts together identically.
+
+        Sets `self.actor_learning_rate`, `self.critic_learning_rate`,
+        `self.max_grad_norm` and `self.state`.
+
+        The targets are deep copies of the live networks, so a run starts with
+        `target == online`. Passing `False` leaves the slot `None`, which is what
+        `restore` keys off to skip it without warning.
+
+        The optimizer family and its own hyperparameters come from the yaml
+        blocks; the learning rate and the global-norm clip stay top-level agent
+        args so they remain first-class swept/logged/checkpointed knobs.
+        """
+        self.actor_learning_rate = actor_learning_rate
+        self.critic_learning_rate = critic_learning_rate
+        self.max_grad_norm = max_grad_norm
+
+        self.state = TrainState(
+            actor=actor,
+            critic=critic,
+            target_actor=copy.deepcopy(actor) if target_actor else None,
+            target_critic=copy.deepcopy(critic) if target_critic else None,
+            actor_optimizer=make_optimizer(
+                actor,
+                actor_optimizer_config,
+                learning_rate=actor_learning_rate,
+                max_grad_norm=max_grad_norm,
+            ),
+            critic_optimizer=make_optimizer(
+                critic,
+                critic_optimizer_config,
+                learning_rate=critic_learning_rate,
+                max_grad_norm=max_grad_norm,
+            ),
+            buffer_state=buffer_state,
+            # The buffer is the authority on observation width: it was allocated
+            # from the prototype the transitions are written through, so stats
+            # built from it cannot disagree with `add`.
+            obs_stats=Agent.init_obs_stats(
+                buffer_state.experience.observation.shape[-1]
+            ),
+        )
+
     # Highest update boundary already served. Class-level default so every
     # off-policy agent inherits it without touching its __init__; the first
     # firing shadows it with an instance attribute.
@@ -188,19 +236,11 @@ class Agent(abc.ABC):
         """True at most once per `steps_between_updates` env steps past warmup.
 
         Do NOT write this as `(steps - steps_before_learning) % between == 0`.
-        The trainer advances `steps` in strides of `parallel_envs` from a
-        warmup-aligned start, so that test only ever fires if the OFFSET
-        `steps_before_learning` is itself a multiple of the stride. It silently
-        was not for the v1 release grid (30_000 % 256 == 48), the residue cycled
-        208, 464, ... 2000 without ever reaching 0, and all six off-policy arms
-        ran 5M env steps at exactly zero gradient steps.
-
-        Tracking the last boundary served instead makes the schedule depend only
-        on how many env steps have elapsed, not on whether the stride happens to
-        divide the offset. A stride wider than `steps_between_updates` still
-        collapses to one burst per trainer iteration (the schedule cannot run
-        faster than it is called) — that is the pre-existing "rounds up to one"
-        behaviour the bench configs warn about, and it is unchanged here.
+        The trainer advances `steps` in strides of `parallel_envs`, so that test
+        only fires when `steps_before_learning` is itself a multiple of the
+        stride; otherwise the residue cycles without reaching 0 and no gradient
+        step ever runs. Tracking the last boundary served makes the schedule
+        depend only on elapsed env steps.
 
         No backlog is queued: the boundary jumps to wherever `steps` now is, so
         a restored checkpoint resumes on schedule rather than firing a catch-up
@@ -231,24 +271,105 @@ class Agent(abc.ABC):
     # --------------------------
     @abc.abstractmethod
     def _export_hyperparams(self) -> Dict[str, Any]:
-        return {}
+        """The hyperparameter block written into every checkpoint.
+
+        Abstract because a non-learning baseline has none of the attributes read
+        below and overrides this outright; a learning agent should call
+        `super()` and extend the result.
+
+        `Agent.load` filters these against the constructor's signature, so the
+        names must keep matching the constructor keywords or a knob silently
+        stops round-tripping through playback.
+        """
+        return {
+            "seed": int(self.seed),
+            "gamma": float(self.gamma),
+            "actor_learning_rate": float(self.actor_learning_rate),
+            "critic_learning_rate": float(self.critic_learning_rate),
+            "max_grad_norm": float(self.max_grad_norm),
+            "learning_steps": int(self.learning_steps),
+            "normalize_observations": bool(self.normalize_observations),
+            "obs_norm_clip": float(self.obs_clip),
+            "obs_norm_eps": float(self.obs_eps),
+            # Per-actuator lists, not just the first actuator's bounds.
+            "action_low": serialize_bound(self.action_low),
+            "action_high": serialize_bound(self.action_high),
+        }
+
+    def _replay_hyperparams(self) -> Dict[str, Any]:
+        """The extra block every replay-driven agent carries.
+
+        None of it applies on-policy, hence the split from
+        `_export_hyperparams`. The env sizes are read off the buffer: the shape
+        it was allocated with is what a checkpoint has to be rebuilt against,
+        not whatever was passed to `__init__`.
+        """
+        return {
+            "tau": float(self.tau),
+            "env_obs_size": self.state.buffer_state.experience.observation.shape[2],
+            "env_action_size": self.state.buffer_state.experience.action.shape[2],
+            "steps_before_learning": int(self.steps_before_learning),
+            "steps_between_updates": int(self.steps_between_updates),
+            "memory_warmup": int(self.memory_warmup),
+            "memory_capacity": int(self.buffer_size),
+            "memory_batch_size": int(self.batch_size),
+        }
 
     def _checkpoint_modules(self) -> Dict[str, nnx.Module]:
-        """Agent-owned nnx modules that live OUTSIDE `self.state`.
+        """Agent-owned nnx modules that live outside `self.state`.
 
-        `self.state` is what `save`/`restore` serialize wholesale, but several
-        agents keep stateful modules next to it: DDPG's exploration noise (whose
-        step counter drives the decay schedule), SAC's temperature plus its
-        optimizer, MPO's Lagrange duals plus theirs. A resumed run that dropped
-        them would restart exploration at the initial noise scale and the duals
-        at their init values — a different algorithm from the one the checkpoint
-        stopped in the middle of.
+        `save`/`restore` serialize `self.state` wholesale, but several agents
+        keep stateful modules next to it: DDPG's exploration noise, SAC's
+        temperature, MPO's Lagrange duals, plus their optimizers. Dropping them
+        on resume would restart exploration and the duals at their init values.
 
-        Keys are attribute names on the agent, restored with `setattr`. Default
-        is empty: an agent whose whole learnable state is in `self.state` (PPO)
-        overrides nothing.
+        Keys are attribute names on the agent, restored with `setattr`.
         """
         return {}
+
+    def checkpoint_payload(
+        self,
+        *,
+        format_version: int = 1,
+        include_buffer: bool = False,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """The checkpoint's contents as host arrays; None for a stateless baseline.
+
+        Every leaf is `device_get`'d, which is what makes the manager's async
+        write safe: it reads host memory, so the trainer can resume the learner
+        — whose next update donates the device buffers this came from — without
+        waiting for the write to land.
+
+        `include_buffer` is off by default: the buffer dominates the state and
+        `device_get`'ing it every save can spike host RAM into an OOM mid-write.
+        """
+        if not hasattr(self, "state"):
+            return None
+
+        # `_export_hyperparams` reads the buffer's obs/action shapes, so it
+        # must be called *before* the detach below.
+        hyperparams = self._export_hyperparams()
+        saved_buffer = getattr(self.state, "buffer_state", None)
+        if not include_buffer:
+            self.state.buffer_state = None
+        try:
+            return {
+                "format_version": format_version,
+                # No graphdef: `restore` re-derives it from the live modules it
+                # is merging into.
+                "trainstate_state": jax.device_get(nnx.split(self.state)[1]),
+                # Split individually so restore merges them one at a time.
+                "extra_state": {
+                    name: jax.device_get(nnx.split(module)[1])
+                    for name, module in self._checkpoint_modules().items()
+                },
+                "hyperparams": hyperparams,
+                "last_update_boundary": int(self._last_update_boundary),
+                "metadata": (extra_metadata or {}),
+            }
+        finally:
+            self.state.buffer_state = saved_buffer
 
     def save(
         self,
@@ -258,68 +379,25 @@ class Agent(abc.ABC):
         include_buffer: bool = False,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Write the agent's state to `path`.
+        """Write one self-contained checkpoint to `path`.
 
-        `include_buffer` also writes the replay buffer. It defaults to False
-        because the buffer dominates the state, and `device_get`'ing it to host
-        on every save spikes host RAM (orbax holds its own serialization copies
-        on top) hard enough to risk an OOM mid-write on a large run. Off without
-        it, a resumed off-policy run has to refill the buffer through the
-        trainer's warmup; on, resume is exact but every checkpoint costs the
-        buffer's full size on disk. See `Trainer(save_buffer=...)`.
+        Training runs do not come through here: `Trainer` saves through a
+        `CheckpointManager`. This is the one-off path (tests, ad-hoc saves), and
+        it writes a single directory rather than a manager's step/item pair —
+        `_read_checkpoint` accepts both.
         """
-        try:
-            if not hasattr(self, "state"):
-                raise AttributeError("Agent must define `self.state` (an nnx.Module).")
-
-            path = Path(path).resolve()
-
-            # `_export_hyperparams` reads the buffer's obs/action shapes, so it
-            # must be called *before* the detach below.
-            hyperparams = self._export_hyperparams()
-            saved_buffer = getattr(self.state, "buffer_state", None)
-            if not include_buffer:
-                self.state.buffer_state = None
-            try:
-                graphdef, state_tree = nnx.split(self.state)
-
-                # Modules the agent keeps outside `self.state`, each split on its
-                # own so restore can merge them back one at a time against a live
-                # graphdef (see `_checkpoint_modules`).
-                extra_state = {
-                    name: jax.device_get(nnx.split(module)[1])
-                    for name, module in self._checkpoint_modules().items()
-                }
-
-                payload = {
-                    "format_version": format_version,
-                    "trainstate_graphdef": graphdef,  # serialized topology
-                    "trainstate_state": jax.device_get(state_tree),  # numeric pytree
-                    "extra_state": extra_state,
-                    "hyperparams": hyperparams,
-                    # Where the update schedule stands, so a resume neither
-                    # re-fires the boundary it already served nor queues a
-                    # catch-up storm (see `due_for_update`).
-                    "last_update_boundary": int(self._last_update_boundary),
-                    "metadata": (extra_metadata or {}),
-                }
-                checkpointer = ocp.StandardCheckpointer()
-
-                checkpointer.save(path, payload)
-                # save() returns before the background write finishes. Block here so
-                # the write completes while the checkpointer is still alive, rather
-                # than being torn down mid-write at interpreter exit.
-                checkpointer.wait_until_finished()
-            finally:
-                # Restore the live buffer so training continues uninterrupted.
-                self.state.buffer_state = saved_buffer
-
-            print(f"[Agent.save] Saved to {path}")
-        except Exception as e:
-            print(
-                f"[Agent.save] Warning: could not save to {path} ({e}) \
-                  Probably a basic agent without state."
-            )
+        payload = self.checkpoint_payload(
+            format_version=format_version,
+            include_buffer=include_buffer,
+            extra_metadata=extra_metadata,
+        )
+        if payload is None:
+            print(f"[Agent.save] {type(self).__name__} has no state; skipping {path}.")
+            return
+        path = Path(path).resolve()
+        with ocp.StandardCheckpointer() as checkpointer:
+            checkpointer.save(path, payload)
+        print(f"[Agent.save] Saved to {path}")
 
     @classmethod
     def load(
@@ -331,19 +409,15 @@ class Agent(abc.ABC):
     ):
         """Rebuild an agent from a checkpoint.
 
-        `config_blocks` are the yaml-side construction blocks — `actor_config`,
-        `critic_config`, `memory_config`, `noise_config`, the `*_optimizer_config`
-        blocks — forwarded verbatim from the run's agent config. They are taken
-        as keywords rather than a fixed positional list so an agent that grows a
-        new block (or drops one it never had, like SAC and `noise_config`) needs
-        no change here; `play.py` passes whichever blocks the config declares.
-        Everything else comes from the checkpoint's `hyperparams`.
+        `config_blocks` are the yaml-side construction blocks (`actor_config`,
+        `critic_config`, `memory_config`, `noise_config`, the
+        `*_optimizer_config` blocks), taken as keywords so an agent that grows or
+        drops one needs no change here. Everything else comes from the
+        checkpoint's `hyperparams`.
 
-        This is the *playback* entry point (`play.py`): the checkpoint is the
-        only source of truth, so it also dictates the hyperparameters. To resume
-        TRAINING, build the agent from its run config as usual and call
-        `restore` on it — there the yaml is authoritative, so a resume may
-        legitimately extend `trainer.steps` or retune a knob.
+        This is the playback entry point (`play.py`), where the checkpoint is the
+        only source of truth. To resume training, build the agent from its run
+        config and call `restore` instead — there the yaml is authoritative.
         """
         path = Path(path).resolve()
         loaded = _read_checkpoint(path)
@@ -352,10 +426,9 @@ class Agent(abc.ABC):
         hyper = loaded.get("hyperparams", {})
         print(hyper)
 
-        # Collect accepted __init__ params across the whole MRO. Subclasses like
-        # TD3 forward via ``*args, **kwargs``, so inspecting only ``cls.__init__``
-        # would miss the parent's hyperparams (action_low/high, gamma, tau, ...)
-        # and silently drop them from ``filtered_hyper``.
+        # Across the whole MRO: subclasses like TD3 forward via ``*args,
+        # **kwargs``, so inspecting only ``cls.__init__`` would drop the
+        # parent's hyperparams.
         valid_params = set()
         for klass in cls.__mro__:
             init = klass.__dict__.get("__init__")
@@ -369,12 +442,8 @@ class Agent(abc.ABC):
             for k, v in (hyper or {}).items()
             if k in valid_params and k not in explicit_keys
         }
-        # Action bounds were serialized to a plain list (one entry per actuator,
-        # so an env with differing ranges is not recorded as just the first
-        # one's). Rebuild the array the agent had at train time rather than
-        # handing the constructor a list of 0-d arrays: everything downstream —
-        # scale_to_env, the noise clip, the actor's output bounds — is written
-        # against an ndarray of shape (action_dim,).
+        # Serialized as a plain per-actuator list; everything downstream is
+        # written against an ndarray of shape (action_dim,).
         for key in ("action_low", "action_high"):
             if key in filtered_hyper:
                 filtered_hyper[key] = jnp.asarray(
@@ -400,24 +469,19 @@ class Agent(abc.ABC):
         restore_optimizers: bool = True,
         _payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Load a checkpoint's numeric state INTO this already-built agent.
+        """Load a checkpoint's numeric state into this already-built agent.
 
         This is what resuming training goes through: the agent is constructed
-        from the run's config (so the yaml stays the source of truth for every
-        hyperparameter, and a resume may legitimately raise `trainer.steps` or
-        retune a knob), and only the numbers come from disk — networks, targets,
-        optimizer slots, observation statistics, the modules listed by
-        `_checkpoint_modules`, and the replay buffer when the checkpoint carries
-        one.
+        from the run's config, so the yaml stays the source of truth for every
+        hyperparameter and only the numbers come from disk.
 
         `restore_optimizers=False` reloads the policy but starts the optimizers
-        cold; that is a fine-tune, not a resume, so it is not the default —
-        dropping Adam's moments mid-run makes the first updates after the resume
-        behave nothing like the ones before it.
+        cold — a fine-tune rather than a resume, since dropping Adam's moments
+        changes how the first updates after it behave.
 
         Returns the trainer-progress metadata the checkpoint was written with
         (`steps`, `epochs`, `episodes`, `gradient_steps`), plus
-        `buffer_restored`. Fields the checkpoint lacks are simply absent.
+        `buffer_restored`. Fields the checkpoint lacks are absent.
         """
         path = Path(path).resolve()
         loaded = _read_checkpoint(path) if _payload is None else _payload
@@ -426,9 +490,7 @@ class Agent(abc.ABC):
             ckpt_state = {}
 
         if not hasattr(self, "state"):
-            # A non-learning baseline (Constant, NormalRandom, ...): there is
-            # nothing numeric to load, but the run's progress metadata is still
-            # what the trainer resumes its step counter from.
+            # A non-learning baseline (Constant, NormalRandom, ...).
             print(f"[Agent.restore] No `state` on {type(self).__name__}; "
                   "restoring progress metadata only.")
             return dict(loaded.get("metadata") or {}, buffer_restored=False)
@@ -457,7 +519,6 @@ class Agent(abc.ABC):
                     if src_params is None:
                         print(f"Warning: no 'params' found for {name}; skipping.")
                     else:
-                        # Params only; NNX maps them into its own topology.
                         nnx.update(sub_live, {"params": src_params})
                 except Exception as ee:
                     print(
@@ -469,19 +530,14 @@ class Agent(abc.ABC):
             names += ["actor_optimizer", "critic_optimizer"]
         for name in names:
             # `target_actor` is None for SAC/PPO and absent from their
-            # checkpoints, so a missing entry is normal, not a warning-worthy
-            # loss of state.
+            # checkpoints, so a missing entry is normal there.
             if getattr(self.state, name, None) is not None:
                 _restore_module(self.state, name, ckpt_state)
 
-        # Modules the agent keeps outside `self.state` (SAC's temperature, MPO's
-        # duals, the exploration noise schedule). Skipped wholesale for a
-        # checkpoint written before `extra_state` existed.
         extra_ckpt = loaded.get("extra_state") or {}
         for name in self._checkpoint_modules():
-            # `restore_optimizers` covers every optimizer, including the ones
-            # kept outside `self.state` (SAC's temperature optimizer, MPO's dual
-            # optimizer), so a fine-tune starts all of them cold consistently.
+            # `restore_optimizers` covers the optimizers kept outside
+            # `self.state` too, so a fine-tune starts all of them cold.
             if restore_optimizers or not name.endswith("optimizer"):
                 _restore_module(self, name, extra_ckpt)
 
@@ -495,8 +551,7 @@ class Agent(abc.ABC):
                         sum=jnp.asarray(obs["sum"]),
                         sumsq=jnp.asarray(obs["sumsq"]),
                     )
-                else:
-                    # Already a struct-compatible tree.
+                else:  # already a struct-compatible tree
                     self.state.obs_stats = _to_jax(obs)
             except Exception as e:
                 print(f"Warning: could not restore obs_stats ({e}); using live stats.")
@@ -519,14 +574,12 @@ class Agent(abc.ABC):
     def _restore_buffer(self, ckpt_buffer) -> bool:
         """Rebuild the replay buffer from its checkpointed leaves.
 
-        The checkpoint stores the buffer as a plain nested dict, so it cannot be
-        assigned to `state.buffer_state` as-is — flashbax needs its own
-        `TrajectoryBufferState` dataclass back. The live (freshly initialized)
-        buffer is the template: every leaf is looked up by path and shape-checked
-        against it, which is also what catches a checkpoint saved with a
-        different `parallel_envs` or buffer capacity. Any mismatch keeps the
-        empty live buffer and returns False, so the trainer falls back to
-        refilling it through warmup rather than training on a malformed one.
+        The checkpoint stores the buffer as a plain nested dict, so flashbax
+        needs its `TrajectoryBufferState` dataclass rebuilt around it. The
+        freshly initialized live buffer is the template: every leaf is looked up
+        by path and shape-checked against it, catching a checkpoint saved with a
+        different `parallel_envs` or capacity. A mismatch keeps the empty buffer
+        and returns False, so the trainer refills it through warmup.
         """
         live = getattr(self.state, "buffer_state", None)
         if live is None:
@@ -555,23 +608,47 @@ class Agent(abc.ABC):
         return True
 
 
+def _host_restore_args(metadata):
+    """RestoreArgs pulling every leaf back as a numpy array.
+
+    Restoring to host memory rather than the device sharding baked into the
+    checkpoint is what lets a GPU-trained run load in a CPU-only process: the
+    saved arrays are pinned to cuda:0, host arrays are not, and the numpy->jax
+    conversion at use puts them on whatever device is active.
+    """
+    return jax.tree.map(
+        lambda _a: ocp.RestoreArgs(restore_type=np.ndarray),
+        ocp.checkpoint_utils.construct_restore_args(metadata),
+        is_leaf=lambda a: isinstance(a, ocp.RestoreArgs),
+    )
+
+
 def _read_checkpoint(path: Path) -> Dict[str, Any]:
     """Read a checkpoint payload off disk as host (numpy) arrays.
 
-    Restoring to host memory rather than onto the device sharding baked into the
-    checkpoint is what lets a GPU-trained run load in a CPU-only process: the
-    saved arrays are pinned to cuda:0, host arrays are placement-agnostic, and
-    the numpy->jax conversion at use puts them on whatever device is active.
+    A run's checkpoints come from `Trainer`'s CheckpointManager, which splits a
+    step into `<step>/<item>/` and files orbax's descriptor at the STEP level, so
+    they are read back through a manager — a bare checkpointer pointed at the
+    item directory reads fine but warns about the descriptor it cannot see.
+    `Agent.save` writes a self-contained checkpoint, read directly.
     """
+    step = checkpoint_steps(path)
+    if step is not None and (path / CHECKPOINT_ITEM).is_dir():
+        with ocp.CheckpointManager(
+            path.parent, item_handlers=ocp.PyTreeCheckpointHandler()
+        ) as manager:
+            return manager.restore(
+                step,
+                args=ocp.args.PyTreeRestore(
+                    restore_args=_host_restore_args(manager.item_metadata(step))
+                ),
+            )
+
     checkpointer = ocp.PyTreeCheckpointer()
-    restore_args = jax.tree.map(
-        lambda _a: ocp.RestoreArgs(restore_type=np.ndarray),
-        ocp.checkpoint_utils.construct_restore_args(
-            checkpointer.metadata(path).item_metadata
-        ),
-        is_leaf=lambda a: isinstance(a, ocp.RestoreArgs),
+    return checkpointer.restore(
+        path,
+        restore_args=_host_restore_args(checkpointer.metadata(path).item_metadata),
     )
-    return checkpointer.restore(path, restore_args=restore_args)
 
 
 def _to_jax(tree):
@@ -586,9 +663,9 @@ def _to_jax(tree):
 def _path_key(key):
     """The dict key a `tree_map_with_path` path entry corresponds to.
 
-    Buffer states nest dataclasses (attribute keys) inside dicts (dict keys);
-    orbax flattens both to plain nested dicts, so restoring needs the name
-    whichever kind of node it came from.
+    Buffer states nest dataclasses (attribute keys) inside dicts (dict keys) and
+    orbax flattens both to plain nested dicts, so restoring needs the name from
+    either kind of node.
     """
     for attr in ("key", "name", "idx"):
         if hasattr(key, attr):

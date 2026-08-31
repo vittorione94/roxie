@@ -11,6 +11,9 @@
 #   - target policy smoothing at the paper's 0.2 / 0.5
 _target_: roxie.agents.TD3
 
+# Where the agent runs; the `backend` group sets it per cell (see env.device).
+device: null
+
 gamma: 0.99
 tau: 0.005
 actor_learning_rate: 3e-4

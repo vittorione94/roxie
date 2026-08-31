@@ -40,7 +40,7 @@ export = _load_export_module()
 
 
 def _write_run(root: Path, rows, checkpoint_steps):
-    """A run dir with a log.csv and empty `step_<N>` checkpoint dirs.
+    """A run dir with a log.csv and empty `<N>` step checkpoint dirs.
 
     `rows` is a list of (steps, test/score). The checkpoints are directories
     only: nothing under test reads their contents.
@@ -52,7 +52,7 @@ def _write_run(root: Path, rows, checkpoint_steps):
         for epoch, (steps, score) in enumerate(rows, start=1):
             writer.writerow([epoch, steps, score])
     for steps in checkpoint_steps:
-        (root / "checkpoints" / f"step_{steps}").mkdir(parents=True)
+        (root / "checkpoints" / str(steps)).mkdir(parents=True)
     return root
 
 
@@ -69,7 +69,7 @@ def test_picks_the_best_checkpoint_not_the_last(tmp_path):
     )
     steps, path, row = export.pick_checkpoint(run, "test/score")
     assert steps == 200
-    assert path.name == "step_200"
+    assert path.name == "200"
     assert row["test/score"] == "90.0"
 
 

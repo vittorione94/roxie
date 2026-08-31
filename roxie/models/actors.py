@@ -38,8 +38,8 @@ class TanhNormal:
     """
 
     def __init__(self, loc: jnp.ndarray, scale: jnp.ndarray):
-        # Base (pre-squash) distribution. Its log_prob is already summed over the
-        # action dimension, so the tanh correction must be summed to match.
+        # The base log_prob is already summed over the action dimension, so the
+        # tanh correction must be summed to match.
         self._base = distrax.MultivariateNormalDiag(loc, scale)
 
     def _log_prob_from_pre(self, u: jnp.ndarray) -> jnp.ndarray:
@@ -193,9 +193,9 @@ class DeterministicActor(nnx.Module):
         if self.use_layer_norm:
             self.norm_layers = nnx.List(norm_layers)
 
-        # `output_init_scale` scales the VARIANCE of the default lecun_normal init,
-        # so 0.01 gives 10x smaller weights and pre-tanh logits starting near 0.1
-        # instead of 1 — squarely inside tanh's linear region.
+        # Scales the *variance* of the default lecun_normal init, so 0.01 gives
+        # 10x smaller weights and pre-tanh logits starting near 0.1 rather than
+        # 1 — squarely inside tanh's linear region.
         self.output_layer = nnx.Linear(
             current_features,
             action_dim,
@@ -247,8 +247,7 @@ class StochasticActor(nnx.Module):
         self.action_dim = action_dim
         self.std_min = std_min
         self.std_max = std_max
-        # Opt-in: bound actions in (-1, 1) via tanh (see TanhNormal). Defaults to
-        # False so SAC/MPO, which share this class, are untouched.
+        # Defaults to False so SAC/MPO, which share this class, are untouched.
         self.squash = squash
 
         hidden_layers = []
@@ -265,7 +264,6 @@ class StochasticActor(nnx.Module):
         if self.use_layer_norm:
             self.norm_layers = nnx.List(norm_layers)
 
-        # Output layers for mean and log_std
         self.output_layer = nnx.Linear(current_features, action_dim, rngs=rngs)
         self.log_std_layer = nnx.Linear(current_features, action_dim, rngs=rngs)
 
@@ -281,6 +279,6 @@ class StochasticActor(nnx.Module):
         mean = self.output_layer(x)
         # softplus keeps std positive; the clip keeps it numerically sane.
         std = nnx.softplus(self.log_std_layer(x)) + 1e-5
-        std = jnp.clip(std, a_min=self.std_min, a_max=self.std_max)
+        std = jnp.clip(std, self.std_min, self.std_max)
 
         return self.distribution(mean, std)

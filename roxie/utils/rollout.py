@@ -1,11 +1,10 @@
 """The backend-specific half of the training loop.
 
 `Trainer._run` is a single loop that serves both backends. Everything that
-genuinely differs between a vmapped JAX env (device-side physics, auto-reset by
-gather from a pre-built pool, env `params` threaded through the trainer because
-a traced env cannot own mutable state) and a C++ pool (native physics,
-auto-reset and any such state owned by the pool itself) lives behind the small
-surface below. The trainer has no idea which backend it is driving.
+differs between a vmapped JAX env (device-side physics, auto-reset by gather
+from a pre-built pool, env `params` threaded through the trainer because a
+traced env cannot own mutable state) and a C++ pool (native physics, auto-reset
+and any such state owned by the pool) lives behind the surface below.
 
     xp              array namespace for the trainer's per-step accumulation
     supports_async  whether an async learner can overlap acting and learning
@@ -17,19 +16,11 @@ surface below. The trainer has no idea which backend it is driving.
     evaluate()      the held-out eval rollout
 
 `step` returns `(state, prev_obs, timestep)`. `prev_obs` is the observation the
-action was selected from; `timestep` is the Gymnasium 5-tuple with PRE-auto-reset
-values — the true next observation for the replay buffer — while `state.obs` is
-what the NEXT action is selected from, which for a done env is a fresh start.
-On the JAX path those are two distinct arrays; a C++ pool resets internally and
-hands back only the post-reset observation, so there they are the same object.
-That difference predates this module and is preserved: the terminal transition's
-stored `next_obs` is the reset obs on the pool path, which is harmless because
-`terminated` zeroes the bootstrap for true terminations.
-
-The two classes stay two classes on purpose. One traces its whole step into XLA
-and scans its warmup into a single dispatch; the other steps C++ from a Python
-loop with the arrays already host-side. That is irreducible — what they now
-share is the env protocol, not the loop.
+action was selected from; `timestep` carries pre-auto-reset values — the true
+next observation for the replay buffer — while `state.obs` is what the next
+action is selected from, a fresh start for a done env. On the JAX path those are
+distinct arrays; a C++ pool hands back only the post-reset observation, so there
+they are the same object. Harmless, because `terminated` zeroes the bootstrap.
 """
 
 import dataclasses
@@ -48,8 +39,7 @@ from roxie.environment.vector import EnvPoolVectorEnv
 from roxie.models.actors import deterministic_action
 
 # Constant across epochs and runs so every eval rollout starts from the same
-# states. Distinct from any training seed, so eval starts are never a subset of
-# what the policy trained on.
+# states, and distinct from any training seed.
 _EVAL_SEED = 12345
 
 
@@ -76,8 +66,7 @@ class JaxRollout:
 
     xp = jnp
     # The env step is GPU-bound here, so a background learner thread would
-    # contend for the same device rather than overlap with it. Async learning
-    # only pays off when acting is on the CPU (see EnvPoolRollout).
+    # contend for the same device rather than overlap with it.
     supports_async = False
 
     def __init__(self, environment, test_environment, agent, num_envs, rngs,
@@ -95,11 +84,10 @@ class JaxRollout:
         self.pool_size = num_envs
         self._eval_fn = None
 
-        # `params` for an env that adapts its own (see FuncEnv.init_params);
-        # None for every other env. It travels as the FuncEnv `params` argument,
-        # which is TRACED — so refreshing it each epoch does not retrigger a
-        # compile of the reset. The three hooks are bound once, defaulted to
-        # no-ops, so nothing below branches on whether this env has them.
+        # `params` is None for every env that does not adapt its own. It travels
+        # as the traced FuncEnv `params` argument, so refreshing it each epoch
+        # does not retrigger a compile. The hooks default to no-ops so nothing
+        # below branches on their presence.
         func_env = environment.func_env
         self.params = getattr(func_env, "init_params", lambda: None)()
         self._observe_params = getattr(
@@ -117,13 +105,10 @@ class JaxRollout:
     # -- core ---------------------------------------------------------------
 
     def _step_and_observe(self, state, actions, rng, reset_pool, params):
-        """One env step plus the env's own `params` update, fused into one
-        dispatch.
+        """One env step plus the env's own `params` update, in one dispatch.
 
-        The update lives here rather than in the driver because this is the only
-        place that sees every env's info and termination flag on device at once.
-        It passes `terminated` — done MINUS truncation — so a non-failure cutoff
-        is never presented to the env as a failure.
+        Passes `terminated` rather than `done` so a non-failure cutoff is never
+        presented to the env as a failure.
         """
         state, timestep = self.environment.step(
             state, actions, rng, reset_pool, params,
@@ -144,9 +129,8 @@ class JaxRollout:
 
     def prepare(self):
         """Compile every program the loop will dispatch, then return a clean
-        reset state. Doing it upfront keeps the first training iterations from
-        being dominated by compiles that the throughput print would then blame
-        on the physics."""
+        reset state. Doing it upfront keeps first-iteration compiles out of the
+        throughput print."""
         agent = self.agent
 
         self.rng, reset_key, pool_key = jax.random.split(self.rng, 3)
@@ -159,12 +143,10 @@ class JaxRollout:
         timed(self._train_step, state, dummy_actions, self.rng, self.reset_pool,
               self.params, label="train step")
 
-        # Off-policy replay add precompile. Skipped for on-policy agents (PPO),
-        # whose buffer uses a different Transition layout and has no warmup.
+        # Skipped for on-policy agents (PPO), which have no warmup.
         if getattr(agent, "memory_warmup", 0) > 0:
-            # Build the dummy from the agent's OWN buffer prototype (leaves are
-            # (add_batch, time, ...)) so this stays correct across per-agent
-            # Transition layouts (e.g. DDPG/TD3 store `truncation`, SAC not).
+            # From the agent's own buffer prototype, since Transition layouts
+            # differ per agent.
             dummy_t = jax.tree.map(
                 lambda leaf: jnp.zeros((self.num_envs,) + leaf.shape[2:], leaf.dtype),
                 agent.state.buffer_state.experience,
@@ -180,9 +162,8 @@ class JaxRollout:
     def warmup(self, agent, iters, state):
         """Fill the replay buffer with `iters` scanned random-action steps.
 
-        Scanned rather than looped so the whole fill is one dispatch, then added
-        to the buffer in a single donated batch — a per-step Python loop here
-        costs minutes at the step counts warmup needs.
+        Scanned rather than looped so the whole fill is one dispatch — a per-step
+        Python loop costs minutes at the step counts warmup needs.
         """
         @jax.jit
         def warmup_rollout(state, rng, reset_pool, params):
@@ -191,10 +172,8 @@ class JaxRollout:
                 rng, act_key, step_key = jax.random.split(rng, 3)
                 actions = self._random_actions(act_key)
                 prev_obs = state.obs
-                # `observe_params` is deliberately NOT called here: these are
-                # random-action terminations, and an env adapting itself to them
-                # would be adapting to failures no policy caused. `params` still
-                # travels, since the env is entitled to read it in `transition`.
+                # No `observe_params` here: these are random-action
+                # terminations, not failures any policy caused.
                 state, timestep = self.environment.step(
                     state, actions, step_key, reset_pool, params,
                 )
@@ -203,9 +182,7 @@ class JaxRollout:
                     action=actions,
                     reward=timestep.reward,
                     terminal=timestep.terminated,
-                    # Only stored by agents whose prototype carries it
-                    # (DDPG/TD3 n-step); pruned below for the others.
-                    truncation=timestep.truncated,
+                    truncation=timestep.truncated,  # pruned below if unused
                 )
                 return (state, rng), (transition, timestep.obs)
             return jax.lax.scan(body, (state, rng), None, length=iters)
@@ -225,8 +202,7 @@ class JaxRollout:
         state.obs.block_until_ready()
         print(f"  {time.time() - t0:.1f}s", flush=True)
 
-        # Prune to the fields the agent's buffer actually stores (SAC's
-        # prototype has no `truncation`, DDPG/TD3's does) so the pytree
+        # Prune to the fields the agent's buffer actually stores, so the pytree
         # structures match at add time.
         proto = agent.state.buffer_state.experience
         transitions = Transition(**{
@@ -235,9 +211,8 @@ class JaxRollout:
             for f in dataclasses.fields(Transition)
         })
 
-        # Donate the buffer state: without it XLA keeps the input alive and
-        # allocates a full output copy — a transient 2x of the buffer's obs
-        # store that OOMs right here.
+        # Without donation XLA keeps the input alive and allocates a full output
+        # copy — a transient 2x of the buffer's obs store that OOMs right here.
         @functools.partial(jax.jit, donate_argnums=(0,))
         def batch_add(buffer_state, transitions):
             def add_one(bs, t):
@@ -256,9 +231,8 @@ class JaxRollout:
         jax.block_until_ready(jax.tree.leaves(agent.state.buffer_state))
         print(f"  {time.time() - t0:.1f}s", flush=True)
 
-        # The scanned fill bypasses `agent.add_transitions`, which is what
-        # normally folds observations into the stats — so do it here, over the
-        # same [prev, next] pair that path would have seen.
+        # The scanned fill bypasses `agent.add_transitions`, which normally folds
+        # observations into the stats.
         if agent.normalize_observations:
             all_obs = jnp.concatenate([
                 transitions.observation.reshape(-1, transitions.observation.shape[-1]),
@@ -302,15 +276,14 @@ class JaxRollout:
         """Build a single compiled eval rollout.
 
         The episode loop runs inside ``jax.lax.while_loop`` so the termination
-        check is evaluated on-device — no per-step host sync, full GPU pipelining.
-        A static ``max_steps`` cap bounds compute and guarantees termination.
-        Actor / obs-stats are traced args, so one compile is reused every epoch.
+        check is on-device. Actor / obs-stats are traced args, so one compile is
+        reused every epoch.
         """
         agent = self.agent
         normalize = agent.normalize_observations
         test_env = self.test_environment
-        # Deterministic: the env's own stochasticity rides in its state, so a
-        # fixed key here makes consecutive evals of the same policy identical.
+        # The env's own stochasticity rides in its state, so a fixed key here
+        # makes consecutive evals of the same policy identical.
         eval_key = jax.random.PRNGKey(0)
 
         @nnx.jit
@@ -326,10 +299,9 @@ class JaxRollout:
                 if normalize:
                     mean, std = Agent.obs_mean_std(obs_stats, agent.obs_eps)
                     obs = Agent.normalize_obs(obs, mean, std, agent.obs_clip)
-                # Deterministic eval: actor output scaled to env units, no noise
-                # module (its stateful update can't be mutated across the
-                # while_loop trace level). A stochastic actor (PPO) returns a
-                # distribution, so the mean is taken here — never a sample.
+                # No noise module: its stateful update can't be mutated across
+                # the while_loop trace level. `deterministic_action` takes the
+                # mean of a stochastic actor's distribution (PPO).
                 action = jnp.clip(deterministic_action(actor(obs)), -1.0, 1.0)
                 action = Agent.scale_to_env(action, agent.action_low, agent.action_high)
 
@@ -362,14 +334,13 @@ class JaxRollout:
         max_steps = int(self.test_environment.max_episode_steps or 1000)
 
         if self._eval_fn is None:
-            # Jitted, not eager: this runs once per epoch and an eager vmapped
-            # reset re-dispatches the whole physics op by op every time.
+            # Jitted, not eager: an eager vmapped reset re-dispatches the whole
+            # physics op by op, once per epoch.
             self._jit_test_reset = jax.jit(self.test_environment.reset)
             self._eval_fn = self._make_eval_fn(num_tests, max_steps)
 
-        # Fixed key, not a fresh draw: the eval env pins its own start state, so
-        # the key only decides WHICH clip. Holding it constant means a change in
-        # test/score is a change in the POLICY, not a different draw of clips.
+        # Fixed key, so a change in test/score is a change in the policy rather
+        # than a different draw of start states.
         state, _ = self._jit_test_reset(jax.random.PRNGKey(_EVAL_SEED))
         scores, lengths = self._eval_fn(
             agent.state.actor, agent.state.obs_stats, state,
@@ -379,12 +350,10 @@ class JaxRollout:
 
 
 class EnvPoolRollout:
-    """C++ pools: native physics, auto-reset and any adaptive state owned by
-    the pool itself.
+    """C++ pools: native physics, auto-reset and adaptive state owned by the pool.
 
-    No vmap/jit wrapping of the env step is needed — the pool batches natively —
-    so the whole rollout is a plain Python loop and the arrays are already
-    host-side. The agent still runs in JAX on whatever device is active.
+    The pool batches natively, so no vmap/jit wrapping is needed: the rollout is
+    a plain Python loop over host-side arrays. The agent still runs in JAX.
     """
 
     xp = np
@@ -417,8 +386,7 @@ class EnvPoolRollout:
         """Fill the replay buffer with `iters` random-action steps.
 
         A plain loop, unlike the JAX path's scan: the pool steps in C++ and
-        cannot be traced, so there is nothing to fuse. Episodes that finish here
-        are counted — they are real env steps, and the JAX path counts them too.
+        cannot be traced, so there is nothing to fuse.
         """
         episodes = 0
         t0 = time.time()
@@ -436,18 +404,14 @@ class EnvPoolRollout:
 
     def step(self, state, actions):
         prev_obs = state.obs
-        # The pool auto-resets in C++, so there is no separate pre-reset
-        # observation: `timestep.obs` and `state.obs` are the same array. See
-        # the module docstring.
+        # The pool auto-resets in C++, so `timestep.obs` and `state.obs` are the
+        # same array (see the module docstring).
         state, timestep = self.environment.step(state, actions)
         return state, prev_obs, timestep
 
     def epoch_refresh(self, state):
-        # There is no `params` to thread here: a pool owns whatever it
-        # regenerates per epoch (its own auto-reset pool, a start distribution
-        # it adapts) and does the lot inside this one call. Nothing is
-        # invalidated unless the pool says so — it keeps stepping its live envs
-        # across the refresh.
+        # No `params` to thread: a pool owns whatever it regenerates per epoch
+        # and does the lot inside this one call.
         refresh = getattr(self.environment, "epoch_refresh", None)
         return state, (bool(refresh()) if refresh is not None else False)
 
@@ -457,19 +421,16 @@ class EnvPoolRollout:
         test_env = self.test_environment
         max_steps = int(test_env.max_episode_steps or 1000)
 
-        # A pool's `reset()` advances its RNG, so consecutive evals would
-        # otherwise start from different states and a change in `test/score`
-        # could be a different draw rather than a better policy. `reseed`
-        # rebuilds the pool at a fixed seed (~3ms), matching the JAX path's
-        # fixed eval keys. Envs whose eval reset is already deterministic
-        # (an env that pins a single deterministic start) are unaffected either way.
+        # A pool's `reset()` advances its RNG, so consecutive evals would start
+        # from different states. `reseed` rebuilds the pool at a fixed seed
+        # (~3ms), matching the JAX path's fixed eval keys.
         reseed = getattr(test_env, "reseed", None)
         if reseed is not None:
             reseed(_EVAL_SEED)
 
         state, _ = test_env.reset()
-        # Size the eval buffers from the pool the reset actually returns, not
-        # from trainer.test_episodes: a mismatch would fail the broadcast below.
+        # From the reset, not trainer.test_episodes: a mismatch would fail the
+        # broadcast below.
         num_tests = int(state.obs.shape[0])
         scores = np.zeros(num_tests, dtype=np.float32)
         lengths = np.zeros(num_tests, dtype=np.int32)
@@ -495,7 +456,7 @@ class EnvPoolRollout:
 def build_rollout(environment, test_environment, agent, num_envs, rngs,
                   test_episodes):
     """Pick the rollout for this environment. The only place the backend is
-    named; everything downstream goes through the common surface."""
+    named."""
     cls = (EnvPoolRollout if isinstance(environment, EnvPoolVectorEnv)
            else JaxRollout)
     return cls(environment, test_environment, agent, num_envs, rngs, test_episodes)

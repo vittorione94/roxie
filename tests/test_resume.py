@@ -26,9 +26,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx, struct
-from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
+from roxie.agents.utils import build_agent
 from roxie.environment import functional
 from roxie.environment.vector import JaxVectorEnv, Timestep
 from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
@@ -104,7 +104,7 @@ def _build(name: str):
         kwargs["noise_config"] = OmegaConf.load(
             REPO / "roxie" / "configs" / "noise" / "gaussian.yaml"
         )
-    return instantiate(cfg, _recursive_=False, **kwargs)
+    return build_agent(cfg, **kwargs)
 
 
 # --------------------------------------------------------------------------
@@ -274,11 +274,11 @@ def _trained(name, seed_key, iterations=8):
 
 class TestFindCheckpoint:
     def test_parses_step_count_from_the_directory_name(self):
-        assert checkpoint_steps("/runs/x/checkpoints/step_500000") == 500_000
+        assert checkpoint_steps("/runs/x/checkpoints/500000") == 500_000
         assert checkpoint_steps("/runs/x/checkpoints") is None
 
     def test_accepts_run_dir_checkpoints_dir_and_step_dir(self, tmp_path):
-        step = tmp_path / "checkpoints" / "step_1000"
+        step = tmp_path / "checkpoints" / "1000"
         step.mkdir(parents=True)
         for candidate in (tmp_path, tmp_path / "checkpoints", step):
             assert find_checkpoint(candidate) == step.resolve()
@@ -286,9 +286,9 @@ class TestFindCheckpoint:
     def test_picks_the_highest_step_not_the_newest_file(self, tmp_path):
         checkpoints = tmp_path / "checkpoints"
         for steps in (500, 9_000, 1_000):
-            (checkpoints / f"step_{steps}").mkdir(parents=True)
+            (checkpoints / str(steps)).mkdir(parents=True)
         # 1_000 was created last; 9_000 is the one further into training.
-        assert find_checkpoint(tmp_path).name == "step_9000"
+        assert find_checkpoint(tmp_path).name == "9000"
 
     def test_a_wrong_path_fails_instead_of_starting_over(self, tmp_path):
         """Silently training from scratch is the one outcome a resume must never
@@ -310,7 +310,7 @@ def test_restore_recovers_every_checkpointed_module(name, tmp_path):
     """Networks, targets, optimizer slots, the buffer and each agent's own
     extra modules all come back."""
     agent = _trained(name, jax.random.PRNGKey(0))
-    path = tmp_path / "step_1024"
+    path = tmp_path / "1024"
     agent.save(path, include_buffer=True)
 
     fresh = _build(name)
@@ -334,7 +334,7 @@ def test_resume_matches_an_uninterrupted_run(name, tmp_path):
     key = jax.random.PRNGKey(1)
     uninterrupted = _trained(name, key)
 
-    path = tmp_path / "step_1024"
+    path = tmp_path / "1024"
     uninterrupted.save(path, include_buffer=True)
     resumed = _build(name)
     resumed.restore(path)
@@ -355,7 +355,7 @@ def test_optimizer_moments_are_restored_not_reinitialized(name, tmp_path):
     first steps after a cold start are effectively unscaled, so the policy jumps
     exactly where the checkpoint says it had converged."""
     agent = _trained(name, jax.random.PRNGKey(2))
-    path = tmp_path / "step_1024"
+    path = tmp_path / "1024"
     agent.save(path)
 
     restored = _build(name)
@@ -381,7 +381,7 @@ def test_buffer_is_opt_in_and_its_absence_is_reported(name, tmp_path):
     restore must say so — that flag is what makes the trainer refill it through
     warmup instead of sampling zeros."""
     agent = _trained(name, jax.random.PRNGKey(3))
-    path = tmp_path / "step_1024"
+    path = tmp_path / "1024"
     agent.save(path)
 
     restored = _build(name)
@@ -400,14 +400,13 @@ def test_a_buffer_from_a_different_env_count_is_refused(tmp_path):
     """Resuming with a changed `parallel_envs` must not splice a mis-shaped
     buffer into the agent; it falls back to refilling."""
     agent = _trained("td3", jax.random.PRNGKey(6))
-    path = tmp_path / "step_1024"
+    path = tmp_path / "1024"
     agent.save(path, include_buffer=True)
 
     cfg = _config("td3")
     cfg.memory_config.add_batch_size = NUM_ENVS * 2
-    wider = instantiate(
+    wider = build_agent(
         cfg,
-        _recursive_=False,
         env_obs_size=OBS,
         env_action_size=ACT,
         action_low=-jnp.ones(ACT),
@@ -435,7 +434,7 @@ def test_exploration_schedule_does_not_restart(tmp_path):
     count = int(agent.noise_module.step_count.value)
     assert count > 0
 
-    path = tmp_path / "step_1024"
+    path = tmp_path / "1024"
     agent.save(path)
     restored = _build("td3")
     assert int(restored.noise_module.step_count.value) == 0
@@ -455,7 +454,7 @@ def test_sac_temperature_and_mpo_duals_survive(tmp_path):
         (sac, lambda a: float(a.log_alpha_module.log_alpha.value)),
         (mpo, lambda a: float(np.ravel(np.asarray(a.dual_params.log_temperature.value))[0])),
     ):
-        path = tmp_path / f"step_{id(agent)}"
+        path = tmp_path / str(id(agent))
         agent.save(path)
         fresh = _build("sac" if agent is sac else "mpo")
         assert read(fresh) != pytest.approx(read(agent)), "value never moved"
@@ -472,7 +471,7 @@ def test_stateless_agent_restores_metadata_only(tmp_path):
         env_obs_size=OBS, env_action_size=ACT,
         action_low=-jnp.ones(ACT), action_high=jnp.ones(ACT),
     )
-    path = tmp_path / "step_64"
+    path = tmp_path / "64"
     # The base `save` declines (no `state`) rather than raising, so write a
     # checkpoint through an agent that has one and restore it into the baseline.
     _trained("td3", jax.random.PRNGKey(11)).save(path, extra_metadata={"steps": 64})
@@ -488,13 +487,14 @@ def test_stateless_agent_restores_metadata_only(tmp_path):
 
 
 class _RecordingAgent:
-    """Captures what the trainer asks `save` for."""
+    """Captures what the trainer asks the checkpoint payload for."""
 
     def __init__(self):
         self.calls = []
 
-    def save(self, path, *, include_buffer=False, extra_metadata=None):
-        self.calls.append((path, include_buffer, extra_metadata))
+    def checkpoint_payload(self, *, include_buffer=False, extra_metadata=None):
+        self.calls.append((include_buffer, extra_metadata))
+        return {"metadata": extra_metadata or {}}
 
 
 class TestTrainerResumeWiring:
@@ -538,13 +538,44 @@ class TestTrainerResumeWiring:
         trainer.steps = 4_096
         agent = _RecordingAgent()
         trainer._save(agent, epochs=3, episodes=42, gradient_steps=77)
+        trainer._checkpoint_manager.close()
 
-        (path, include_buffer, metadata), = agent.calls
-        assert Path(path).name == "step_4096"
+        (include_buffer, metadata), = agent.calls
         assert include_buffer is True
         assert metadata == {
             "steps": 4_096, "epochs": 3, "episodes": 42, "gradient_steps": 77,
         }
+        # The manager names the step directory after the env-step count, which
+        # is what `find_checkpoint` reads back.
+        assert (tmp_path / "checkpoints" / "4096").is_dir()
+
+    @pytest.mark.parametrize(
+        "replace_checkpoint, expected", [(True, ["300"]), (False, ["100", "200", "300"])]
+    )
+    def test_replace_checkpoint_is_the_retention_policy(
+        self, tmp_path, replace_checkpoint, expected
+    ):
+        """Superseded checkpoints are pruned by orbax's `max_to_keep`.
+
+        `replace_checkpoint: false` must keep every save — that is what makes
+        `find_checkpoint`'s "highest step wins" rule meaningful, and what a run
+        wanting a checkpoint series relies on.
+        """
+        trainer = Trainer(
+            output_dir=str(tmp_path), replace_checkpoint=replace_checkpoint
+        )
+        agent = _RecordingAgent()
+        for step in (100, 200, 300):
+            trainer.steps = step
+            trainer._save(agent, epochs=0, episodes=0, gradient_steps=0)
+        trainer._checkpoint_manager.close()
+
+        kept = sorted(
+            path.name
+            for path in (tmp_path / "checkpoints").iterdir()
+            if path.is_dir() and checkpoint_steps(path) is not None
+        )
+        assert kept == expected
 
 
 @pytest.fixture
@@ -582,7 +613,7 @@ def test_trainer_resumes_the_run_end_to_end(tmp_path, logging_to):
     run(tmp_path, first, agent)
 
     checkpoint = find_checkpoint(tmp_path)
-    assert checkpoint.name == f"step_{first}"
+    assert checkpoint.name == str(first)
 
     resumed_agent = _build("td3")
     metadata = resumed_agent.restore(checkpoint)
@@ -595,7 +626,7 @@ def test_trainer_resumes_the_run_end_to_end(tmp_path, logging_to):
     # exactly `second - first` env steps, and skipped the warmup refill.
     assert trainer.initial_steps == first
     assert trainer.steps == second
-    assert (Path(tmp_path) / "checkpoints" / f"step_{second}").is_dir()
+    assert (Path(tmp_path) / "checkpoints" / str(second)).is_dir()
 
 
 def test_trainer_refills_the_buffer_when_the_checkpoint_has_none(tmp_path, logging_to):
@@ -634,7 +665,7 @@ def test_transition_prototype_is_unchanged_by_a_round_trip(tmp_path):
     """The restored buffer must be flashbax's own state class, not the plain
     dict orbax hands back — a dict would fail at the next `add`."""
     agent = _trained("sac", jax.random.PRNGKey(12))
-    path = tmp_path / "step_1024"
+    path = tmp_path / "1024"
     agent.save(path, include_buffer=True)
 
     restored = _build("sac")

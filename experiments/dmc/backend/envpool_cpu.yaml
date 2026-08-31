@@ -21,24 +21,13 @@
 release:
   cell: envpool_cpu
 
+agent:
+  device: cpu
+
 env:
-  builder: roxie.environment.loader.build_envpool_env
+  _target_: roxie.environment.loader.build_envpool_env
   task_id: ${envpool_task:${release.task}}
-  # Read only for the load banner; EnvPoolVectorEnv reports the same string, so
-  # a mismatch here is loud rather than silent.
-  impl: envpool
-  # EnvPool's eval pool size must equal trainer.test_episodes (see the builder
-  # docstring); bind it so the two can't drift.
-  test_episodes: ${trainer.test_episodes}
+  device: cpu
 
 runtime:
-  # The whole process — physics AND agent — off the GPU. EnvPool's physics never
-  # touches the card, but the JAX agent would still claim (and preallocate most
-  # of) it; train.py already defaults `impl: envpool` to CPU, and stating it here
-  # is what makes the cell reproducible from the resolved config alone. An
-  # explicit `device=` on the CLI still wins.
-  jax_platform: cpu
-  # null = JAX's default, which on CPU is true f32. `tensorfloat32` is a GPU
-  # concept and buys nothing here, so this cell is the more numerically accurate
-  # of the two, not the less.
   matmul_precision: null

@@ -47,11 +47,9 @@ class NoiseModule(nnx.Module):
         current_scale = self.get_current_scale()
         noise = self.sample_noise(key, shape=actions.shape) * current_scale
 
-        # Advance the decay clock by the number of environment frames collected
-        # this call (the batch / env dimension), not by 1 per iteration. This
-        # measures the schedule in env steps -- the same unit as the trainer's
-        # `steps`/`memory_warmup` budgets -- so `decay_steps` is independent of
-        # how many parallel envs are used (same behaviour at 1 env or 4000).
+        # Advanced by env frames collected this call, not by 1 per iteration, so
+        # the schedule is measured in the same unit as the trainer's `steps` and
+        # `decay_steps` behaves the same at 1 parallel env or 4000.
         self.step_count.value += actions.shape[0] if actions.ndim > 1 else 1
 
         return actions + noise
@@ -99,20 +97,17 @@ class OrnsteinUhlenbeckNoise(NoiseModule):
     def sample_noise(
         self, key: jax.random.PRNGKey, shape: Optional[tuple] = None
     ) -> jnp.ndarray:
-        # OU process dx = theta * (mu - x) * dt + sqrt(2*theta) * dW, discretized as
-        # x_t = x_{t-1} + theta*dt*(mu - x_{t-1}) + sqrt(2*theta*dt)*noise.
-        #
-        # The sqrt(2*theta*dt) increment holds the process's STATIONARY std at ~1.0
-        # for any theta/dt, so `initial_noise_scale` (applied by add_noise) is the
-        # actual noise std. A bare sqrt(dt) increment would give
-        # std = sqrt(1/(2*theta)), coupling amplitude to the mean-reversion rate.
-        # Note this differs from roxie.agents.basic.OrnsteinUhlenbeck, the
-        # OU-as-policy agent, which keeps the unnormalized sqrt(dt) increment.
+        # OU process dx = theta * (mu - x) * dt + sqrt(2*theta) * dW, discretized
+        # as x_t = x_{t-1} + theta*dt*(mu - x_{t-1}) + sqrt(2*theta*dt)*noise.
+        # That increment holds the stationary std at ~1.0 for any theta/dt, so
+        # `initial_noise_scale` is the actual noise std. A bare sqrt(dt) one
+        # would give std = sqrt(1/(2*theta)), coupling amplitude to the
+        # mean-reversion rate — which the OU-as-policy agent in
+        # roxie.agents.basic deliberately keeps.
         current_noise = self.noise_state.value
 
         mean_reversion = self.theta * self.dt * (self.mu - current_noise)
 
-        # Gaussian sample clipped per step, then scaled to unit stationary variance.
         shape = shape or self.action_shape
         gaussian = jnp.clip(jax.random.normal(key, shape), -self.clip, self.clip)
         random_component = jnp.sqrt(2.0 * self.theta * self.dt) * gaussian
@@ -204,60 +199,6 @@ class ParameterNoise(nnx.Module):
         }
 
 
-class CompositeNoise(NoiseModule):
-    """Combine multiple noise sources."""
-
-    def __init__(
-        self, noise_modules: list[NoiseModule], weights: Optional[list[float]] = None
-    ):
-        # We'll use the first module's settings as defaults
-        first_module = noise_modules[0]
-        super().__init__(
-            first_module.action_shape,
-            first_module.initial_noise_scale,
-            first_module.decay_schedule,
-        )
-
-        self.noise_modules = noise_modules
-        self.weights = weights or [1.0] * len(noise_modules)
-
-        if len(self.weights) != len(noise_modules):
-            raise ValueError("Number of weights must match number of noise modules")
-
-    def sample_noise(
-        self, key: jax.random.PRNGKey, shape: Optional[tuple] = None
-    ) -> jnp.ndarray:
-        shape = shape or self.action_shape
-        keys = jax.random.split(key, len(self.noise_modules))
-        combined_noise = jnp.zeros(self.action_shape)
-
-        for i, (module, weight) in enumerate(zip(self.noise_modules, self.weights)):
-            noise = module.sample_noise(keys[i], shape=shape)
-            combined_noise += weight * noise
-
-        return combined_noise
-
-    def add_noise(
-        self, actions: jnp.ndarray, key: jax.random.PRNGKey, evaluation: bool = False
-    ) -> jnp.ndarray:
-        """Override to update all submodules."""
-        if evaluation:
-            return actions
-
-        # Advance every submodule's decay clock (and our own) by the number of
-        # environment frames in this call, so the schedule is measured in env
-        # steps and stays independent of the parallel env count.
-        inc = actions.shape[0] if actions.ndim > 1 else 1
-        for module in self.noise_modules:
-            module.step_count.value += inc
-        self.step_count.value += inc
-
-        current_scale = self.get_current_scale()
-        noise = self.sample_noise(key) * current_scale
-
-        return actions + noise
-
-
 class AdaptiveNoise(NoiseModule):
     """Adaptive noise that adjusts based on recent action variance."""
 
@@ -293,7 +234,6 @@ class AdaptiveNoise(NoiseModule):
     def compute_action_variance(self) -> float:
         """Compute variance of recent actions."""
         if not self.buffer_full.value:
-            # Not enough data yet
             return self.target_variance
 
         actions = self.action_buffer.value
@@ -308,7 +248,6 @@ class AdaptiveNoise(NoiseModule):
         else:
             self.adaptive_scale.value *= 1 - self.adaptation_rate
 
-        # Keep scale positive and bounded
         self.adaptive_scale.value = jnp.clip(self.adaptive_scale.value, 0.1, 10.0)
 
     def sample_noise(self, key: jax.random.PRNGKey) -> jnp.ndarray:
@@ -325,7 +264,6 @@ class AdaptiveNoise(NoiseModule):
 
         self.adapt_scale()
 
-        # Get current base scale from decay schedule
         base_scale = self.get_current_scale()
 
         effective_scale = base_scale * self.adaptive_scale.value

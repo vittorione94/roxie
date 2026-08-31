@@ -62,11 +62,19 @@ def test_cadence_rephases_after_warmup_jumps_steps():
 
 
 class _FakeAgent:
+    """Records what each checkpoint was asked for.
+
+    Returning no payload keeps these cadence tests off the filesystem — the
+    trainer skips the write, as it does for a baseline with nothing to save.
+    What actually reaches disk is covered in `test_resume.py`.
+    """
+
     def __init__(self):
         self.saves = []
 
-    def save(self, path, include_buffer=False, extra_metadata=None):
+    def checkpoint_payload(self, *, include_buffer=False, extra_metadata=None):
         self.saves.append(extra_metadata)
+        return None
 
 
 class _RecordingLearner:
@@ -288,6 +296,70 @@ def test_async_is_declined_for_an_agent_without_a_learn_burst():
     learner = build_learner(t, _StubRollout(True), _StubAgent(),
                             jax.random.PRNGKey(0), state=None)
     assert isinstance(learner, SyncLearner)
+
+
+# --- async pacing -----------------------------------------------------------
+#
+# The failure these guard against: `_drain_queue` looping until the queue is
+# momentarily empty. When acting is cheaper than buffering, the acting thread
+# refills faster than the learner drains, so the drain never returns and `learn`
+# is never reached — silently, at a fraction of the scheduled steps.
+
+
+class _PacingAgent(_AsyncCapableAgent):
+    """Enough surface for `AsyncLearner.__init__` and one buffered add."""
+
+    learning_steps = 20
+    steps_before_learning = 0
+    steps_between_updates = 2_048
+
+    def add_transitions(self, *args):
+        pass
+
+
+def _pacing_learner(chunk=8):
+    from roxie.utils.async_learner import AsyncLearner
+
+    # Constructed, never started: these drive `_drain_queue` on this thread, so
+    # no background thread and no device work is involved.
+    return AsyncLearner(_PacingAgent(), jax.random.PRNGKey(0), chunk=chunk)
+
+
+def _fill(learner, batches, num_envs=256):
+    for _ in range(batches):
+        learner._queue.put((None, None, np.zeros(num_envs), None, None, None))
+
+
+def test_bounded_drain_yields_to_learning_before_the_queue_empties():
+    """The regression guard: with far more data queued than one chunk owes, a
+    bounded drain must STOP so the caller reaches its `learn` call."""
+    learner = _pacing_learner(chunk=8)
+    _fill(learner, batches=500)
+    added = learner._drain_queue(bounded=True)
+    assert added < 500 * 256, "bounded drain consumed the whole queue"
+    # It stopped as soon as a chunk of gradient work was owed, and no earlier.
+    assert learner._target_grads(learner._added_steps) >= learner._chunk
+
+
+def test_unbounded_drain_still_empties_the_queue_for_pause():
+    """`pause()` quiesces the acting thread, so draining fully is safe there —
+    and necessary, or the buffered data is stranded across the pause."""
+    learner = _pacing_learner()
+    _fill(learner, batches=12)
+    assert learner._drain_queue() == 12 * 256
+    assert learner._queue.empty()
+
+
+def test_target_grad_steps_track_the_sync_replay_ratio():
+    """The async learner owes exactly what the sync schedule would have run:
+    one full burst at the warmup boundary, then `learning_steps` per
+    `steps_between_updates` env steps."""
+    learner = _pacing_learner()
+    learner.steps_before_learning = 30_720
+    assert learner._target_grads(30_719) == 0.0
+    assert learner._target_grads(30_720) == 20
+    # 100 update boundaries past warmup = 100 bursts on top of the first.
+    assert learner._target_grads(30_720 + 100 * 2_048) == pytest.approx(20 + 2_000)
 
 
 # --- rollout selection ------------------------------------------------------

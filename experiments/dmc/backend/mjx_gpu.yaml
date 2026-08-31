@@ -19,14 +19,16 @@
 release:
   cell: mjx_gpu
 
+agent:
+  device: gpu
+
 env:
-  builder: roxie.environment.loader.build_playground_env
+  _target_: roxie.environment.loader.build_playground_env
   env_name: ${release.task}
+  device: gpu
   impl: jax
-  # MJX ignores both budgets (they are Warp-only knobs).
   naconmax: null
   njmax: null
 
 runtime:
-  jax_platform: null
   matmul_precision: tensorfloat32

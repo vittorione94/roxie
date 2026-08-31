@@ -59,8 +59,7 @@ class FuncEnv(Generic[StateType, ObsType, ActType, ParamsType]):
     action_space: spaces.Space
 
     # Free-form, Gymnasium-style. Roxie reads ``metadata["impl"]`` for the
-    # startup backend banner, which is how the loud "which physics actually
-    # loaded" check survives the wrapper chain going away.
+    # startup backend banner.
     metadata: dict[str, Any] = {"jax": True}
 
     def initial(self, rng: Any, params: ParamsType | None = None) -> StateType:
@@ -133,13 +132,12 @@ class FuncEnv(Generic[StateType, ObsType, ActType, ParamsType]):
 
     # -- self-adapting ``params`` -------------------------------------------
     #
-    # Three optional hooks, all no-ops by default, that let an env change its
-    # own ``params`` while training runs without ever owning mutable state
-    # inside a trace. The driver just carries the value: it takes one from
-    # ``init_params``, passes it to every ``initial``/``transition``/... call,
-    # threads it through ``observe_params`` on each step (INSIDE the jitted
-    # step, so that stays one dispatch), and refreshes it once per epoch. Since
-    # ``params`` is a traced argument throughout, none of that recompiles.
+    # Three optional hooks, no-ops by default, that let an env change its own
+    # ``params`` mid-training without owning mutable state inside a trace. The
+    # driver only carries the value: from ``init_params``, into every
+    # ``initial``/``transition``, through ``observe_params`` on each step (inside
+    # the jitted step, so that stays one dispatch), and refreshed once per epoch.
+    # ``params`` is traced throughout, so none of it recompiles.
 
     def init_params(self) -> ParamsType | None:
         """The initial ``params``, or None for an env that needs none."""
@@ -158,11 +156,11 @@ class FuncEnv(Generic[StateType, ObsType, ActType, ParamsType]):
     def epoch_refresh(self, params: ParamsType | None) -> tuple[Any, bool]:
         """Once per epoch, on the host: return ``(params, invalidated)``.
 
-        Free to mutate the env — this is the one call that is not inside a
-        trace — but a mutation that leaves IN-PROGRESS episodes referring to
-        data that no longer exists must report ``invalidated=True``, which tells
-        the driver to reset the live envs and the trainer to drop their
-        part-scored episodes.
+        Free to mutate the env — this is the one call outside a trace — but a
+        mutation that leaves IN-PROGRESS episodes referring to data that no
+        longer exists must report ``invalidated=True``, which tells the driver
+        to reset the live envs and the trainer to drop their part-scored
+        episodes.
         """
         return params, False
 
@@ -195,9 +193,8 @@ def box(low, high, shape=None, dtype=np.float32) -> spaces.Box:
     high = np.asarray(high, dtype=dtype)
     if shape is None:
         shape = np.broadcast_shapes(low.shape, high.shape)
-    # Broadcast explicitly: gymnasium accepts a PYTHON scalar bound against an
-    # explicit shape but rejects a 0-d ndarray, and `np.asarray` above has
-    # already made every bound an ndarray.
+    # Broadcast explicitly: gymnasium accepts a Python scalar bound against an
+    # explicit shape but rejects the 0-d ndarray `np.asarray` produced above.
     return spaces.Box(
         low=np.broadcast_to(low, shape).copy(),
         high=np.broadcast_to(high, shape).copy(),

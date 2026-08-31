@@ -99,11 +99,9 @@ def wallclock_unit(runs):
     return 'seconds', 1.0
 
 
-# Metrics were renamed to a `train/` `test/` `sys/` scheme (see
-# `Trainer._store_epoch_metrics`). Runs logged before that carry the old bare
-# names, and this tool is routinely pointed at an outputs/ tree holding both, so
-# map the old spelling forward on load rather than silently drawing empty axes
-# for every pre-rename run.
+# Runs logged before the `train/` `test/` `sys/` rename carry bare metric names,
+# and this tool is routinely pointed at an outputs/ tree holding both. Mapping
+# the old spelling forward beats silently drawing empty axes for those runs.
 _LEGACY_COLUMNS = {
     "score": "train/score",
     "score/std": "train/score/std",
@@ -162,8 +160,8 @@ def load_runs(paths):
 # ------------------------------------------------------------- the grid -----
 
 # Line style per backend cell, so a task's panel shows GPU and CPU curves of the
-# same agent in the same colour and tells them apart by stroke. That is the
-# reading the figure exists for: the pair should overlap.
+# same agent in one colour and tells them apart by stroke — the pair should
+# overlap, which is the reading the figure exists for.
 CELL_STYLE = {
     "warp_gpu": ("-", 1.6),
     "mjx_gpu": ("-", 1.6),
@@ -208,9 +206,8 @@ def plot_grid(root: Path, output: str, metric: str = "test/score"):
     tasks = sorted(grid)
     agents = sorted({agent for cells in grid.values() for agent, _ in cells})
     prop = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
-    # Colour is the AGENT and nothing else, so the same arm is the same colour
-    # in all 25 panels — which is what makes the figure readable as one object
-    # rather than 25 unrelated plots.
+    # Colour is the agent and nothing else, so the same arm is the same colour
+    # in all 25 panels.
     color = {a: (prop[i % len(prop)] if prop else None) for i, a in enumerate(agents)}
 
     ncols = min(5, len(tasks))
@@ -229,11 +226,9 @@ def plot_grid(root: Path, output: str, metric: str = "test/score"):
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.tick_params(labelsize=8)
         # dm_control returns are bounded by construction, so pinning the axis
-        # makes the panels comparable at a glance instead of each auto-scaling
-        # to its own best arm.
+        # keeps the panels comparable instead of each auto-scaling to its best arm.
         ax.set_ylim(0, 1000)
-        # Axis labels only on the outside edge — 25 copies of "environment
-        # steps" is 25 copies of the same word.
+        # Axis labels only on the outside edge.
         if index % ncols == 0:
             ax.set_ylabel(metric, fontsize=9)
         if index >= len(tasks) - ncols:
@@ -253,8 +248,7 @@ def plot_grid(root: Path, output: str, metric: str = "test/score"):
                ncol=min(len(handles), 10), frameon=False, fontsize=9)
     fig.suptitle(f"{metric} vs environment steps — {len(tasks)} tasks, "
                  f"{len(agents)} agents", fontsize=14, fontweight="bold")
-    # Leave room at the bottom for the legend — it is a figure-level artist and
-    # tight_layout does not account for it.
+    # The legend is a figure-level artist, which tight_layout does not account for.
     bottom = 0.9 / fig.get_figheight()
     fig.tight_layout(rect=[0, bottom, 1, 1 - 0.4 / fig.get_figheight()])
 
@@ -335,8 +329,8 @@ def main():
             axs[2, 1].plot(df['steps'], df['train/gradient_steps'], label=f'{prefix}Gradient Steps',
                            color=color if multi else 'orange', alpha=0.8, linewidth=2)
 
-        # The wall-clock panels: what actually ranks runs that reach the same
-        # score at very different throughputs.
+        # What actually ranks runs that reach the same score at very different
+        # throughputs.
         if 'sys/time/total_s' not in df.columns:
             continue
         wall = df['sys/time/total_s'] / time_div

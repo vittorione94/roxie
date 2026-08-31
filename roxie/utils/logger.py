@@ -8,9 +8,8 @@ import termcolor
 
 current_logger = None
 
-# nvidia-smi GPU telemetry. Probed lazily and disabled after the first failure
-# (no GPU / no nvidia-smi / driver error) so a CPU run or a missing binary
-# doesn't pay a subprocess cost — or spam errors — every epoch.
+# Probed lazily and disabled after the first failure, so a CPU run or a missing
+# binary doesn't pay a subprocess cost every epoch.
 _gpu_stats_enabled = True
 _GPU_QUERY_FIELDS = (
     "utilization.gpu",
@@ -127,14 +126,12 @@ class ConsoleBackend(Backend):
 
     INDENT = "  "
 
-    # Shown ungrouped at the top, in this order. Everything else is expected to
-    # arrive already namespaced by its producer (see `Trainer`), so this backend
-    # no longer guesses which section a bare key belongs to.
+    # Shown ungrouped at the top, in this order. Everything else arrives already
+    # namespaced by its producer.
     TOP_KEYS = ("epoch", "steps")
 
-    # Display order of node paths. Any path not listed here sorts alphabetically
-    # after its listed siblings, so the layout degrades gracefully as new
-    # metrics appear.
+    # Any path not listed sorts alphabetically after its listed siblings, so the
+    # layout degrades gracefully as new metrics appear.
     ORDER = (
         "epoch",
         "steps",
@@ -161,9 +158,8 @@ class ConsoleBackend(Backend):
     def __init__(self, width=60):
         self.width = width
         self.known_keys = set()
-        # Rows to print, in order. Each is (label, base_key, std_key): a header
-        # row has base_key=None; a leaf row's value is data[base_key], rendered
-        # as ``mean +- std`` when std_key is set.
+        # (label, base_key, std_key): a header row has base_key=None; a leaf
+        # row renders as ``mean +- std`` when std_key is set.
         self.rows = []
 
     def _display_path(self, key):
@@ -205,9 +201,9 @@ class ConsoleBackend(Backend):
 
     @staticmethod
     def _fmt(val, pad=False):
-        # A metric can be deliberately absent for an epoch — `train/loss/*`
-        # before the first gradient burst, say. Render the gap rather than
-        # crashing on the type check below (or, worse, printing it as a 0).
+        # A metric can be deliberately absent for an epoch (`train/loss/*` before
+        # the first gradient burst), so render the gap rather than crashing
+        # below — or, worse, printing it as a 0.
         if val is None:
             return f"{'-':>8}" if pad else "-"
         if np.issubdtype(type(val), np.floating):
@@ -321,11 +317,9 @@ class WandbBackend(Backend):
                 "logging.wandb.enabled)."
             ) from e
         self._wandb = wandb
-        # Force an interactive re-authentication before the run starts: with
-        # several wandb accounts, cached netrc credentials would otherwise
-        # silently pick whichever was used last and send the run to the wrong
-        # account. Skipped when WANDB_API_KEY is set (CI) and in
-        # offline/disabled modes; set relogin=False to trust the cached login.
+        # With several wandb accounts, cached netrc credentials would otherwise
+        # silently send the run to whichever was used last. Skipped when
+        # WANDB_API_KEY is set (CI) and in offline/disabled modes.
         needs_auth = relogin and mode not in ("offline", "disabled") \
             and not os.environ.get("WANDB_API_KEY")
         if needs_auth:
@@ -335,10 +329,8 @@ class WandbBackend(Backend):
             entity=entity,
             name=name,
             group=group,
-            # `group` and `job_type` are the two axes a report groups runs by —
-            # the release benchmark sets them to the task and the backend cell,
-            # so roxie/report.py can rebuild its panel grids from the project
-            # alone. Both are plain run metadata; None just leaves them unset.
+            # `group` and `job_type` are the two axes roxie/report.py groups
+            # runs by; the release benchmark sets them to the task and the cell.
             job_type=job_type,
             tags=list(tags) if tags else None,
             mode=mode,
@@ -348,11 +340,9 @@ class WandbBackend(Backend):
         )
 
     def log(self, data, step):
-        # Drop absent metrics rather than sending nulls: wandb renders a missing
-        # key as a gap in the series, which is the honest picture for something
-        # that genuinely did not happen this epoch (no gradient burst yet, so no
-        # loss). Sending 0 instead is what let the v1 release grid publish 50
-        # epochs of `loss/actor = 0.0` that read as a real, converged loss.
+        # Dropped rather than sent as null: wandb renders a missing key as a gap
+        # in the series, the honest picture for something that did not happen.
+        # Sending 0 would read as a real, converged loss.
         self.run.log({k: v for k, v in data.items() if v is not None}, step=int(step))
 
     def close(self):
@@ -388,9 +378,9 @@ class Logger:
                     config_file.write(script)
                 log(f"Script file saved to {script_path}")
 
-        # The run config is deliberately NOT dumped here: Hydra already writes the
-        # fully composed, resolved config to ``<run>/.hydra/config.yaml``, which is
-        # what play.py reads. A second copy would only diverge from it.
+        # The run config is deliberately not dumped here: Hydra already writes
+        # the resolved config to ``<run>/.hydra/config.yaml``, which play.py
+        # reads, and a second copy would only diverge from it.
 
         self.stat_keys = set()
         self.epoch_dict = {}
@@ -427,11 +417,8 @@ class Logger:
         keys = list(self.epoch_dict.keys())
         for key in keys:
             values = self.epoch_dict[key]
-            # A metric can be stored as None to mean "did not happen this
-            # epoch" (see `Trainer._store_epoch_metrics`). Averaging Nones is a
-            # TypeError, and coercing them to 0 would reintroduce exactly the
-            # fake-zero the None is there to avoid, so drop them and only report
-            # a value when something real was stored.
+            # A metric stored as None means "did not happen this epoch".
+            # Coercing to 0 would reintroduce the fake-zero the None avoids.
             present = [v for v in values if v is not None]
             if not present:
                 self.epoch_dict[key] = None

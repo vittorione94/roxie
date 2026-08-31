@@ -6,7 +6,7 @@ Roxie can put the *physics* on the GPU or the CPU, and — independently — the
 
 ## The three physics backends
 
-| | `impl: jax` (MJX) | `impl: warp` (mujoco_warp) | `impl: envpool` (native MuJoCo) |
+| | `impl: jax` (MJX) | `impl: warp` (mujoco_warp) | EnvPool (native MuJoCo) |
 |---|---|---|---|
 | Device | GPU (or CPU) | GPU only | CPU only |
 | Vectorization | `jax.vmap` over a traced step | `jax.vmap` → Warp kernels | C++/Python thread pool, one `MjData` per env |
@@ -16,7 +16,9 @@ Roxie can put the *physics* on the GPU or the CPU, and — independently — the
 | Bounded by | VRAM | VRAM | system RAM + core count |
 | Built by | `roxie.environment.loader.build_playground_env` | `roxie.environment.loader.build_playground_env` (`impl: warp`) | `roxie.environment.loader.build_envpool_env` |
 
-Selection is a Hydra config group: [`experiments/dmc/backend/`](../experiments/dmc/backend/) holds `warp_gpu.yaml`, `envpool_cpu.yaml`, `mjx_gpu.yaml` and `mjx_cpu.yaml`, and a launchable picks one in its `defaults:`. Everything backend-mechanical (builder, `impl`, solver budgets, graph mode, where the learner runs) lives in that group; per-experiment tuning stays in the launchable. That is what makes the cells of the [release benchmark](../experiments/README.md) a genuine A/B: they differ in exactly one block.
+Selection is a Hydra config group: [`experiments/dmc/backend/`](../experiments/dmc/backend/) holds `warp_gpu.yaml`, `envpool_cpu.yaml`, `mjx_gpu.yaml` and `mjx_cpu.yaml`, and a launchable picks one in its `defaults:`. Everything backend-mechanical (the builder in `env._target_`, `impl`, solver budgets, graph mode, and the `agent.device`/`env.device` pair) lives in that group; per-experiment tuning stays in the launchable. That is what makes the cells of the [release benchmark](../experiments/README.md) a genuine A/B: they differ in exactly one block.
+
+`impl` is a key of the playground builder only — it picks which kernels step the *same* JAX env. EnvPool is not a third value of it but the other builder, named in `env._target_`, and its column carries no `impl:` key at all; `loader.uses_envpool` asks the builder wherever roxie needs to know (learner placement in `train.py`, "there is no viewer for a pool" in `play.py`).
 
 Note what the `envpool` column is and is not. It is **not** the same program on a different device — playground reimplements the dm_control tasks as JAX/MJX programs, while EnvPool wraps dm_control's own C++ physics. Two independent implementations of one task specification. The release benchmark runs all 25 dm_control tasks through both for exactly that reason; see [Keeping the backends honest](#keeping-the-backends-honest).
 
@@ -99,14 +101,39 @@ Roxie therefore defaults Warp to **`graph_mode: WARP_STAGED_EX`**: capture once 
 
 ## Where the agent runs (independent of where the physics runs)
 
-With CPU physics there are two viable configurations, and the choice is exposed as `runtime.jax_platform`:
+Each half declares its own hardware, in its own config block:
+
+```yaml
+agent:
+  device: gpu    # networks, optimizers, replay buffer
+env:
+  device: cpu    # physics
+```
+
+`cpu`, `gpu`, or null for "whatever JAX picks". Both are read by `train.py` before the first `jax.*` call (`loader.resolve_placement`) and both are then **checked against reality** by the startup banner, which prints where each half actually ended up:
+
+```
+  AGENT (networks, optimizers, replay):  GPU   [cuda]
+  ENV   (physics):                       CPU   [native MuJoCo, C++ thread pool]
+  OK - matches agent.device = 'gpu'
+  OK - matches env.device = 'cpu'
+```
+
+Only one of the two is a control. `agent.device` decides, because the agent is pure JAX and therefore *is* the JAX platform. `env.device` decides nothing by itself — what it gets depends on the builder, which is why declaring it is worth doing:
+
+| Builder | `env.device` | Notes |
+|---|---|---|
+| `build_envpool_env` | genuinely independent | Native MuJoCo on C++ threads, on the CPU whatever JAX does. This is the real hybrid. |
+| `build_playground_env` | follows `agent.device` | Traced into the same XLA program as the agent; declaring the other device gets a loud MISMATCH line, not a split. |
+
+With CPU physics there are then two viable configurations:
 
 | | Physics | Agent | Notes |
 |---|---|---|---|
-| `runtime.jax_platform: cpu` | CPU pool | CPU (JAX) | **Default for `backend: envpool`.** The card is genuinely free. |
-| `runtime.jax_platform: null` | CPU pool | GPU (JAX) | Faster, but puts ~1.4 GB back on the card and re-couples the run to it. |
+| `agent.device: cpu` | CPU pool | CPU (JAX) | **Default when `agent.device` is unset on an EnvPool run.** The card is genuinely free. |
+| `agent.device: gpu` | CPU pool | GPU (JAX) | Faster, but puts ~1.4 GB back on the card and re-couples the run to it. |
 
-The default matters more than it looks. The EnvPool pool's physics never touches the GPU, but the agent is plain JAX and would otherwise still claim the card — and preallocate most of it — so "running on CPU" would leave the GPU fully occupied, which is the opposite of the point. **The CPU backend is meant to free the card entirely**, so `backend/envpool_cpu.yaml` pins `jax_platform: cpu`.
+The default matters more than it looks. The EnvPool pool's physics never touches the GPU, but the agent is plain JAX and would otherwise still claim the card — and preallocate most of it — so "running on CPU" would leave the GPU fully occupied, which is the opposite of the point. **The CPU backend is meant to free the card entirely**, so `backend/envpool_cpu.yaml` pins both halves to `cpu`.
 
 Measured on a 12-core/24-thread 7900X with a bespoke CPU pool, PPO, `parallel_envs=1000`, obs 1069, nets `[1024, 512, 256]` — i.e. on a humanoid-scale task ([roxie-mocap](https://github.com/vittorione94/roxie-mocap)), which is where the learner is heavy enough for the split to matter:
 
@@ -116,7 +143,7 @@ Measured on a 12-core/24-thread 7900X with a bespoke CPU pool, PPO, `parallel_en
 | Fully GPU-free | ~13.6k sps |
 | Physics-only ceiling (no learner) | ~38–40k sps |
 
-Going GPU-free cost ~20% there, and that gap is entirely the dense actor/critic GEMMs — which is what the GPU is for. On the dm_control suite the nets are `[256, 256]` and the effect is much smaller, which is why the release grid's GPU-free cell is simply `jax_platform: cpu` and there is no hybrid cell in the default grid.
+Going GPU-free cost ~20% there, and that gap is entirely the dense actor/critic GEMMs — which is what the GPU is for. On the dm_control suite the nets are `[256, 256]` and the effect is much smaller, which is why the release grid's GPU-free cell is simply `agent.device: cpu` and there is no hybrid cell in the default grid.
 
 ## Async learner (CPU physics + GPU learner only)
 
@@ -155,7 +182,7 @@ The GPU/CPU settings have to be applied at different moments, and getting this w
 | Setting | Mechanism | Why |
 |---|---|---|
 | `JAX_PLATFORMS` (from `device=` on the CLI) | `os.environ`, **before `import jax`** | Parsed once at `import jax`. Setting the env var afterwards is ignored. |
-| `runtime.jax_platform` (from the composed config) | `jax.config.update("jax_platforms", ...)` | JAX is already imported by the time the config is composed, so this *must* go through `jax.config`. |
+| `agent.device` (from the composed config) | `jax.config.update("jax_platforms", ...)` | JAX is already imported by the time the config is composed, so this *must* go through `jax.config`. `gpu` forces nothing — it lets JAX pick the accelerator, so a missing card is a banner line rather than an import error. |
 | `XLA_PYTHON_CLIENT_MEM_FRACTION`, `XLA_PYTHON_CLIENT_ALLOCATOR` | `os.environ`, after import, before the first `jax.*` call | The PJRT C++ client reads these when it lazily initializes. |
 | `XLA_FLAGS=--xla_gpu_autotune_level=0` | `os.environ` | Required on Blackwell (RTX 5080): XLA's autotuning phase hangs indefinitely compiling MJX kernels. |
 | `runtime.matmul_precision` | `jax.config.update` | Global — reaches agent networks *and* MJX physics. |
@@ -192,7 +219,7 @@ What "same task" requires, and what to look at when a pair disagrees:
 
 - **Have a GPU, want maximum throughput on a task that fits in VRAM** → `backend: warp_gpu`, `parallel_envs` in the low thousands. Note the "low thousands": on small bodies at a few hundred envs the card is not saturated and the CPU pool is *faster* (measured on the dm_control suite at 256 envs — 13.7k sps on `envpool_cpu` against 6.6k on `warp_gpu`). The GPU wins on env count, not env size.
 - **Have a GPU but need a large off-policy replay buffer, or the contact arena won't fit** → CPU physics; the buffer moves to system RAM.
-- **Want the card free** (shared machine, another job, or the display is on the same GPU) → `backend: envpool_cpu` with its default `runtime.jax_platform: cpu`.
+- **Want the card free** (shared machine, another job, or the display is on the same GPU) → `backend: envpool_cpu`, which declares `agent.device: cpu` alongside `env.device: cpu`.
 - **No GPU at all** → `backend: envpool_cpu`, or `backend: mjx_cpu` to keep the very same JAX program and only move the device.
 - **Debugging, or you need bit-reproducibility** → CPU/MJX.
-- **Learner-dominated agent on CPU physics with a spare GPU** → `runtime.jax_platform: null` plus `trainer.async_learner: true`.
+- **Learner-dominated agent on CPU physics with a spare GPU** → `backend: envpool_cpu` with `agent.device: gpu` (leave `env.device: cpu`), plus `trainer.async_learner: true`.

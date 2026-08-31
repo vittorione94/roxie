@@ -10,6 +10,9 @@
 # (see sac_critic_loss_fn), the usual n-step approximation.
 _target_: roxie.agents.SAC
 
+# Where the agent runs; the `backend` group sets it per cell (see env.device).
+device: null
+
 gamma: 0.99
 tau: 0.005
 n_step: 5

@@ -1,5 +1,12 @@
 _target_: roxie.agents.SAC
 
+# Which hardware the agent — networks, optimizers, replay buffer — runs on.
+# `cpu`, `gpu`, or null for whatever JAX picks. Independent of `env.device`:
+# CPU physics with a GPU learner is a real configuration (docs/backends.md).
+# Applied by train.py before the first jax call, so it is a placement key rather
+# than a constructor argument, and the startup banner checks it against reality.
+device: null
+
 # Every SAC.__init__ keyword appears below. Values here are the constructor
 # defaults unless noted, so this file is the complete, editable surface of the
 # agent — nothing is reachable only from Python.

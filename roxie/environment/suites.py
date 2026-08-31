@@ -23,12 +23,10 @@ without the caller knowing about the two exceptions.
 
 from __future__ import annotations
 
-# The 25 dm_control-suite tasks mujoco_playground registers, in its own order
-# (`mujoco_playground.registry.dm_control_suite.ALL_ENVS`). Kept as a literal
-# rather than imported from the registry: this list defines the BENCHMARK, and a
-# playground release that adds a task should not silently widen a published
-# grid. `tests/test_benchmark_suite.py` fails when the two drift, which is the
-# prompt to update this deliberately.
+# The 25 dm_control-suite tasks mujoco_playground registers, in its own order.
+# A literal rather than an import from the registry: this list defines the
+# benchmark, and a playground release that adds a task should not silently widen
+# a published grid. `tests/test_benchmark_suite.py` fails when the two drift.
 DMC_TASKS = (
     "AcrobotSwingup",
     "AcrobotSwingupSparse",
@@ -58,9 +56,9 @@ DMC_TASKS = (
 )
 
 # envpool's id is the playground name plus "-v1" for 23 of the 25. The two
-# exceptions are naming, not task differences: playground's `BallInCup` is
-# dm_control's ball_in_cup/catch, and its `PointMass` is point_mass/easy — the
-# only variants either package ships for those domains.
+# exceptions are naming, not task differences: `BallInCup` is dm_control's
+# ball_in_cup/catch and `PointMass` is point_mass/easy — the only variants
+# either package ships for those domains.
 _ENVPOOL_EXCEPTIONS = {
     "BallInCup": "BallInCupCatch-v1",
     "PointMass": "PointMassEasy-v1",

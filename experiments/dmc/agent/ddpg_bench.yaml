@@ -42,6 +42,9 @@
 # SAME `pre_activation_coef`, so this set is a clean algorithm-only A/B.
 _target_: roxie.agents.DDPG
 
+# Where the agent runs; the `backend` group sets it per cell (see env.device).
+device: null
+
 gamma: 0.99
 tau: 0.005
 actor_learning_rate: 3e-4

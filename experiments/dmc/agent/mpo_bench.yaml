@@ -15,6 +15,9 @@
 #     in wall-clock. Judge it on score-vs-env-steps first, wall-clock second.
 _target_: roxie.agents.MPO
 
+# Where the agent runs; the `backend` group sets it per cell (see env.device).
+device: null
+
 gamma: 0.99
 tau: 0.005
 actor_learning_rate: 3e-4

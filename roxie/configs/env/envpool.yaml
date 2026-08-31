@@ -1,0 +1,52 @@
+_target_: roxie.environment.loader.build_envpool_env
+
+# EnvPool envs — native C++ physics stepped on a CPU thread pool, the GPU-free
+# path. The pools already auto-reset and time-limit internally and already return
+# gymnasium's 5-tuple, so there is no adapter: `EnvPoolVectorEnv` presents them
+# to the trainer directly.
+#
+# A launchable picks it up in its defaults list, then overrides what it needs:
+#
+#   defaults:
+#     - /agent: sac
+#     - /env: envpool
+#     - _self_
+#
+#   env:
+#     task_id: HalfCheetah-v4        # or ${envpool_task:CheetahRun}
+#
+# (See env/playground.yaml on the leading `/`, and on why the release benchmark
+# uses `experiments/dmc/backend/` instead of this group.)
+#
+# Two pools are built, one for training and one for evaluation, so eval rollouts
+# never corrupt training state. The eval pool is sized from
+# `trainer.test_episodes` by the trainer — do not add a `test_episodes` key here,
+# it is exactly the drift this used to have.
+#
+# ANY KEY NOT LISTED BELOW is forwarded to `envpool.make()` as a task kwarg
+# (`frame_skip`, `reward_clip`, ...), so a per-task envpool option needs no
+# change to roxie. The flip side is that a typo in one of the keys below is a
+# TypeError at launch rather than a silently ignored setting.
+
+# The envpool task id, e.g. `HalfCheetah-v4`. For a dm_control task named the
+# playground way, `${envpool_task:CheetahRun}` translates it (two of the 25
+# differ — roxie.environment.suites owns that mapping). `???` = must be set.
+task_id: ???
+
+# Which hardware the physics runs on. A pool steps native MuJoCo on C++ threads,
+# so `cpu` is the only answer here.
+device: cpu
+
+# Episode time limit, passed to `envpool.make()`. null =
+# loader.DEFAULT_MAX_EPISODE_STEPS.
+max_episode_steps: null
+
+# Seeds the pools: training gets `seed`, evaluation `seed + 1`, and the eval
+# pool is re-seeded from here before every eval so its start states are pinned.
+seed: 0
+
+# How many envs the pool steps at once. NOT a builder argument — the trainer
+# injects it as `num_envs` — but it lives here because it is a property of this
+# env's rollout, and every agent's replay buffer reads it back as
+# `${env.parallel_envs}`.
+parallel_envs: 32

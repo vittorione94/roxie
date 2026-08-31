@@ -1,18 +1,9 @@
 import os
 import sys
 
-# device=<cpu|gpu> overrides JAX platform selection. Must be parsed from
-# sys.argv before JAX is imported — JAX_PLATFORMS is read at import time.
-#
-# `device` is not a config key, so the arg is consumed (dropped from sys.argv)
-# rather than merely read: leaving it in argv makes Hydra reject the launch.
-# Both `device=` and `+device=` are accepted and hidden from Hydra.
-#
-# `resume=<path>` is consumed the same way and for the same reason: it is not a
-# config key either, so Hydra would reject it (and `+resume=` would only work
-# where the config is not struct-locked). Handling both here keeps the two
-# process-level switches — where to run, and what to continue from — spelled the
-# same way on the command line.
+# `device=` must be parsed before JAX is imported (JAX_PLATFORMS is read at
+# import time). Neither it nor `resume=` is a config key, so both are dropped
+# from sys.argv or Hydra rejects the launch.
 _device = None
 _resume = None
 for _arg in list(sys.argv[1:]):
@@ -34,27 +25,25 @@ from flax import nnx
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
-from hydra.utils import get_method
-
+from roxie.agents.utils import build_agent
 from roxie.environment import suites
 from roxie.environment.functional import space_size
 from roxie.environment.loader import (
-    DEFAULT_BUILDER,
+    build_env,
     log_loaded_backend,
+    resolve_placement,
 )
 from roxie.utils import hydra_searchpath, logger
 from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
 from roxie.utils.trainer import Trainer
 
-# Launchable experiment configs live in top-level experiments/, grouped by env.
-# Registering that dir lets `--config-name <env>/<name>` resolve there while
+# Lets `--config-name <env>/<name>` resolve against top-level experiments/ while
 # config groups stay in roxie/configs.
 hydra_searchpath.register()
-# ${envpool_task:<Task>} — the benchmark's playground-name -> envpool-id map,
-# used by the envpool backend group. Must be registered before Hydra composes.
+# Must happen before Hydra composes: ${envpool_task:<Task>} is used by configs.
 suites.register_resolvers()
-# examples/ is not part of the installed roxie package; put the repo root on the
-# path so example env builders are importable from anywhere.
+# examples/ is not part of the installed roxie package, but its env builders are
+# referenced by dotted path.
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 
@@ -62,53 +51,30 @@ sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 def main(cfg: DictConfig):
     print("Agent:", cfg.agent._target_)
 
-    # Backend env vars are decided from the COMPOSED config, not from sys.argv at
-    # module import: `env.impl: warp` set in an experiment yaml never appears in
-    # argv. Setting them here still works because JAX's CUDA client initializes
-    # lazily at the first jax.* call below.
+    # These env vars are still honoured after `import jax`: the CUDA client
+    # initializes lazily at the first jax.* call below.
     if cfg.env.get("impl", None) == "warp":
-        # Warp allocates GPU memory outside JAX's pool: cap JAX so Warp has
-        # headroom for its solver/collision scratch. Don't disable preallocation
-        # instead — that fragments and OOMs the large replay-buffer alloc.
+        # Warp allocates GPU memory outside JAX's pool, so leave it headroom.
+        # Disabling preallocation instead fragments and OOMs the replay buffer.
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
-        # CUDA's async pool instead of XLA's BFC allocator: BFC fragments under
-        # the alloc/free churn of a varying-size rollout and eventually fails a
-        # large contiguous request. Set XLA_PYTHON_CLIENT_ALLOCATOR=default to
-        # restore BFC.
+        # BFC fragments under the alloc/free churn of a varying-size rollout.
         os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
 
-    # Where the AGENT (networks, optimizers, replay buffer) runs, applied for
-    # every physics backend.
-    #
-    # `envpool` defaults to "cpu": its physics is native MuJoCo and never touches
-    # the GPU, but the agent is plain JAX and would otherwise still claim (and
-    # preallocate most of) the card. Set `runtime.jax_platform: null` to opt into
-    # the hybrid — CPU physics with a GPU learner is faster, since the dense
-    # actor/critic GEMMs dominate, at the cost of holding the card.
-    #
-    # Every other backend defaults to null = leave JAX's own choice. Setting it
-    # explicitly is how an experiment records e.g. "MJX on the CPU" in its yaml
-    # rather than relying on the caller to pass `device=cpu`, so a benchmark grid
-    # stays reproducible from the config alone. An explicit `device=` on the CLI
-    # still wins.
-    #
-    # NOTE: this must go through `jax.config`, NOT an env var. Unlike the
-    # XLA_PYTHON_CLIENT_* settings above (read lazily by the PJRT client),
-    # `JAX_PLATFORMS` is parsed once at `import jax` — already done above — so an
-    # os.environ write here is silently ignored.
-    platform = (cfg.get("runtime") or {}).get(
-        "jax_platform", "cpu" if cfg.env.get("impl", None) == "envpool" else None
-    )
+    # `agent.device` (networks, optimizers, replay) and `env.device` (physics)
+    # are separate knobs — CPU physics with a GPU learner is a real setup — so
+    # they are read, not reconciled; the banner below checks where each half
+    # actually landed. Must go through `jax.config`: JAX_PLATFORMS was already
+    # parsed at `import jax`.
+    runtime_cfg = cfg.get("runtime") or {}
+    agent_device, env_device, platform = resolve_placement(cfg)
     if platform and not _device:
         jax.config.update("jax_platforms", str(platform))
 
     # XLA GPU autotuning hangs on Blackwell GPUs; harmless on CPU.
     os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 
-    # Precision of every f32 matmul; null leaves JAX's own default. This is
-    # GLOBAL — it reaches the agent's networks and MJX physics alike — so change
-    # it for a whole sweep at once, never for a single arm.
-    matmul_precision = (cfg.get("runtime") or {}).get("matmul_precision", None)
+    # Global: reaches the agent's networks and MJX physics alike.
+    matmul_precision = runtime_cfg.get("matmul_precision", None)
     if matmul_precision:
         jax.config.update("jax_default_matmul_precision", matmul_precision)
         print(f"Matmul precision: {matmul_precision}")
@@ -118,32 +84,29 @@ def main(cfg: DictConfig):
     if _device:
         print(f"JAX platform override: device={_device}")
 
-    # ``env.builder`` is a dotted path to the callable that builds the env; the
-    # default builds a mujoco_playground env. The builder owns all env-specific
-    # setup (clip selection, Warp budget sizing, ...) and returns a normalized
-    # bundle, so this stays env-agnostic. ``impl`` selects the physics backend and
-    # is read here only for the load banner.
-    #
-    # ``num_envs``/``test_episodes`` are passed IN rather than read off
-    # ``cfg.env`` because they are trainer quantities that size the two drivers
-    # the builder returns: the same env definition is driven at
-    # ``env.parallel_envs`` worlds for training and at ``trainer.test_episodes``
-    # for evaluation. Deriving both from one place is what stops the eval batch
-    # from silently disagreeing with the eval loop's expectations.
+    # `env:` is a `_target_` block like `agent:`: the builder it names owns all
+    # env-specific setup (clip selection, Warp budget sizing, ...) and returns a
+    # normalized bundle, keeping this env-agnostic. The two sizes are injected so
+    # the drivers are sized from the same place as the loops that use them.
     impl = cfg.env.get("impl", None)
-    build_env = get_method(cfg.env.get("builder", DEFAULT_BUILDER))
     env, test_env, env_cfg = build_env(
         cfg.env, mode="train",
         num_envs=int(cfg.env.parallel_envs),
         test_episodes=int(cfg.trainer.test_episodes),
     )
-    log_loaded_backend(env, requested_impl=impl)
+    # `device=` deliberately overrides the config, so the declarations are not
+    # checked against it — it has already been printed above.
+    log_loaded_backend(
+        env,
+        requested_impl=impl,
+        agent_device=None if _device else agent_device,
+        env_device=None if _device else env_device,
+    )
     print("Environment configuration:", env_cfg)
 
     output_dir = HydraConfig.get().runtime.output_dir
 
-    # Console + CSV (in output_dir) are always on; wandb is opt-in via the
-    # `logging.wandb` config block so runs don't require the dependency.
+    # wandb is opt-in so runs don't require the dependency.
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     backends = logger.default_backends(output_dir)
     wandb_cfg = (cfg.get("logging") or {}).get("wandb") if "logging" in cfg else None
@@ -164,43 +127,29 @@ def main(cfg: DictConfig):
         )
     logger.initialize(path=output_dir, backends=backends)
 
-    # Shapes and action bounds come from the env's gymnasium spaces — one
-    # spelling for every backend, whether the bounds originate in
-    # `mj_model.actuator_ctrlrange` or in a pool's declared action space.
     obs_space, act_space = env.single_observation_space, env.single_action_space
     action_low = jnp.asarray(act_space.low, dtype=jnp.float32)
     action_high = jnp.asarray(act_space.high, dtype=jnp.float32)
 
-    # The agent config IS the constructor call: `_target_` names the class and
-    # every sibling key is one of its keywords, so a knob that exists in Python
-    # but not in the yaml fails loudly here instead of silently taking its
-    # default. Only the four env-derived arguments are injected.
-    #
-    # `_recursive_=False` keeps the nested `*_config` blocks as DictConfigs: the
-    # agent instantiates its own actor/critic/memory/optimizers, injecting shapes
-    # (in_features, action_dim, rngs, num_atoms) that are unknown out here.
+    # Only these four are injected — they are what only the env knows; the rest
+    # comes from the agent's yaml. `build_agent` keeps the nested `*_config`
+    # blocks unbuilt and drops `device`, applied above before the first jax call.
     agent_kwargs = dict(
         env_obs_size=space_size(obs_space),
         env_action_size=space_size(act_space),
         action_low=action_low,
         action_high=action_high,
     )
-    # `noise` is its own top-level config group (agents that explore from their
-    # own policy — SAC, MPO, PPO — carry no noise group and take no such arg).
+    # Agents that explore from their own policy (SAC, MPO, PPO) carry no noise
+    # group and take no such argument.
     if "noise" in cfg:
         agent_kwargs["noise_config"] = cfg.noise
 
-    agent = hydra.utils.instantiate(cfg.agent, _recursive_=False, **agent_kwargs)
+    agent = build_agent(cfg.agent, **agent_kwargs)
 
-    # Resume: the agent was just built from the CONFIG, and only its numbers come
-    # from the checkpoint — so the yaml stays authoritative and a resume may
-    # legitimately raise `trainer.steps` or retune a knob (unlike `play.py`,
-    # which rebuilds the agent from the checkpoint's own hyperparameters).
-    #
-    # `resume=` accepts a run dir, its `checkpoints/` dir, or one `step_<N>` dir;
-    # `resume.path` in a config does the same for a run that wants it recorded.
-    # The returned metadata is the trainer's progress: env steps, epochs,
-    # episodes, gradient steps, and whether a replay buffer came back with it.
+    # Only the agent's numbers come from the checkpoint — the yaml stays
+    # authoritative, so a resume may raise `trainer.steps` or retune a knob
+    # (unlike `play.py`, which rebuilds from the checkpoint's hyperparameters).
     resume_cfg = cfg.get("resume") or {}
     if isinstance(resume_cfg, str):  # `resume: <path>` rather than `resume.path`
         resume_cfg = {"path": resume_cfg}
@@ -209,8 +158,7 @@ def main(cfg: DictConfig):
     if resume_path:
         checkpoint = find_checkpoint(resume_path)
         resume_metadata = agent.restore(checkpoint)
-        # `Trainer.save` has recorded `steps` in the metadata since resume
-        # existed; older checkpoints only have it in the directory name.
+        # Older checkpoints only have the step count in the directory name.
         if not resume_metadata.get("steps"):
             resume_metadata["steps"] = checkpoint_steps(checkpoint) or 0
         print(
@@ -219,12 +167,9 @@ def main(cfg: DictConfig):
             flush=True,
         )
 
-    # Seeded from the config, but a resume offsets the env stream by the steps
-    # already taken: replaying the identical reset/exploration key sequence the
-    # first leg consumed would make the resumed segment revisit exactly the start
-    # states it has already trained on, which a run that never stopped would
-    # never do. `agent` is untouched — its stream feeds gradient-step keys, whose
-    # value comes from being reproducible.
+    # A resume offsets the env stream by the steps already taken, so it does not
+    # revisit the start states the first leg trained on. The agent stream stays
+    # fixed — its keys drive gradient steps, where reproducibility is the point.
     resumed_steps = int((resume_metadata or {}).get("steps") or 0)
     training_rngs = nnx.Rngs(envs=cfg.env.seed + resumed_steps, agent=3)
 
@@ -238,9 +183,8 @@ def main(cfg: DictConfig):
         replace_checkpoint=cfg.trainer.replace_checkpoint,
         async_learner=bool(cfg.trainer.get("async_learner", False)),
         learner_chunk=int(cfg.trainer.get("learner_chunk", 8)),
-        # Opt-in: checkpoints then carry the replay buffer, which makes a resumed
-        # off-policy run exact (no warmup refill) at the cost of the buffer's
-        # full size on disk per save.
+        # Exact off-policy resume (no warmup refill), at the cost of the
+        # buffer's full size on disk per save.
         save_buffer=bool(cfg.trainer.get("save_buffer", False)),
         resume=resume_metadata,
     )

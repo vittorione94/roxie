@@ -1,19 +1,19 @@
-import copy
 import functools
 import math
 
 import hydra
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import (
     Transition,
-    build_optimizer,
+    fused_grad_steps,
+    make_optimizer,
     network_rngs,
-    serialize_bound,
+    soft_update,
+    transition_prototype,
 )
 from roxie.losses.actor_losses import mpo_actor_loss_fn
 from roxie.losses.critic_losses import mpo_critic_loss_fn
@@ -68,14 +68,12 @@ def _mpo_step_fn(actor_model, observation, evaluate, key):
     return jnp.clip(action, -1.0, 1.0)
 
 
-# Single MPO gradient step. Not jitted on its own — called inside the jitted
-# `_mpo_grad_steps` below so N steps fuse into one compiled program. `obs_mean` /
-# `obs_std` are hoisted in by the caller (the stats are loop-constant).
+# Not jitted on its own — called inside `_mpo_grad_steps` below so N steps fuse
+# into one compiled program.
 def _mpo_grad_step(
-    state: TrainState,
-    dual_params: MPODualParams,
-    dual_optimizer: nnx.Optimizer,
+    nodes,
     key: jax.random.PRNGKey,
+    *,
     gamma: float,
     tau: float,
     replay_sample_fn,
@@ -90,6 +88,10 @@ def _mpo_grad_step(
     obs_clip: float,
     normalize: bool,
 ):
+    # The Lagrange duals and their optimizer travel with the train state so their
+    # ascent survives the fused burst.
+    state, dual_params, dual_optimizer = nodes
+
     key, sample_key, critic_key, actor_key = jax.random.split(key, 4)
 
     samples = replay_sample_fn(state.buffer_state, sample_key)
@@ -100,13 +102,12 @@ def _mpo_grad_step(
         "next_observations": samples.experience.second.observation,
         "terminals": samples.experience.first.terminal,
     }
-    # Normalize once, here: both losses below read the same `observations`, and
-    # neither of them normalizes (see `Agent.normalize_samples`).
+    # Normalized once here: both losses below read the same `observations`, and
+    # neither of them normalizes.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    # Critic update: policy evaluation under the target policy.
     critic_loss, critic_grads = nnx.value_and_grad(mpo_critic_loss_fn)(
         state.critic,
         state.target_actor,
@@ -120,8 +121,7 @@ def _mpo_grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # Actor + dual update (E-step + M-step), differentiated jointly w.r.t. the
-    # policy and the Lagrange duals.
+    # E-step + M-step, differentiated jointly w.r.t. the policy and the duals.
     (actor_loss, aux), (actor_grads, dual_grads) = nnx.value_and_grad(
         mpo_actor_loss_fn, argnums=(0, 1), has_aux=True
     )(
@@ -141,49 +141,24 @@ def _mpo_grad_step(
     state.actor_optimizer.update(state.actor, actor_grads)
     dual_optimizer.update(dual_params, dual_grads)
 
-    # Soft-update both target networks. The target actor is the "old" policy the
-    # E-step samples from, so it tracks the online policy slowly.
-    new_actor_tensors = nnx.state(state.actor, nnx.Param)
-    old_actor_tensors = nnx.state(state.target_actor, nnx.Param)
-    nnx.update(
-        state.target_actor,
-        optax.incremental_update(new_actor_tensors, old_actor_tensors, tau),
-    )
+    # The target actor is the "old" policy the E-step samples from, so it tracks
+    # the online policy slowly.
+    soft_update(state.target_actor, state.actor, tau)
+    soft_update(state.target_critic, state.critic, tau)
 
-    new_critic_tensors = nnx.state(state.critic, nnx.Param)
-    old_critic_tensors = nnx.state(state.target_critic, nnx.Param)
-    nnx.update(
-        state.target_critic,
-        optax.incremental_update(new_critic_tensors, old_critic_tensors, tau),
-    )
-
-    new_state = TrainState(
-        actor=state.actor,
-        critic=state.critic,
-        target_actor=state.target_actor,
-        target_critic=state.target_critic,
-        actor_optimizer=state.actor_optimizer,
-        critic_optimizer=state.critic_optimizer,
-        buffer_state=state.buffer_state,
-        obs_stats=state.obs_stats,
-    )
-    return new_state, actor_loss, critic_loss
+    return actor_loss, critic_loss
 
 
-# Fused N-step update. The body is compiled once and run `n_steps` times
-# on-device via `lax.scan`, so a burst costs one host dispatch rather than one per
-# gradient step. The Lagrange duals and their optimizer ride along in the carry
-# alongside
-# the train state; `buffer_state` and the normalization params are loop-constant.
+# `fused_grad_steps` compiles the body once and runs it `n_steps` times
+# on-device, so a burst costs one host dispatch rather than one per step.
 @functools.partial(
     nnx.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "num_action_samples", "n_steps",
         "normalize",
     ),
-    # Donate the train state (arg 0): its large read-only replay buffer is threaded
-    # unchanged through the scan, so without donation XLA allocates a full second
-    # copy of it every update. The caller reassigns self.state from the result.
+    # The replay buffer rides unchanged through the scan; without donation XLA
+    # allocates a full second copy of it every update.
     donate_argnums=(0,),
 )
 def _mpo_grad_steps(
@@ -205,46 +180,36 @@ def _mpo_grad_steps(
     obs_clip: float,
     normalize: bool,
 ):
-    # Hoist the (loop-constant) normalization params out of the scan body.
+    # Loop-constant, so hoisted out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
-    # Pre-split all per-step keys so they can be scanned over as `xs`.
-    keys = jax.random.split(key, n_steps)
+    # Carried as one tuple so the duals and their Adam slots keep updating across
+    # the fused steps.
+    (state, dual_params, dual_optimizer), (
+        actor_losses,
+        critic_losses,
+    ) = fused_grad_steps(
+        (state, dual_params, dual_optimizer),
+        key,
+        n_steps,
+        functools.partial(
+            _mpo_grad_step,
+            gamma=gamma,
+            tau=tau,
+            replay_sample_fn=replay_sample_fn,
+            num_action_samples=num_action_samples,
+            epsilon=epsilon,
+            epsilon_mean=epsilon_mean,
+            epsilon_stddev=epsilon_stddev,
+            action_low=action_low,
+            action_high=action_high,
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            obs_clip=obs_clip,
+            normalize=normalize,
+        ),
+    )
 
-    # Split into a static graph definition + the trainable pytree state. Only
-    # the state is carried through the scan; the graphdef is closed over. The
-    # three graph nodes are split as one tuple so the duals and their Adam slots
-    # stay in the carry and keep updating across the fused steps.
-    graphdef, scan_state = nnx.split((state, dual_params, dual_optimizer))
-
-    def body(scan_state, step_key):
-        st, duals, dopt = nnx.merge(graphdef, scan_state)
-        st, actor_loss, critic_loss = _mpo_grad_step(
-            st,
-            duals,
-            dopt,
-            step_key,
-            gamma,
-            tau,
-            replay_sample_fn,
-            num_action_samples,
-            epsilon,
-            epsilon_mean,
-            epsilon_stddev,
-            action_low,
-            action_high,
-            obs_mean,
-            obs_std,
-            obs_clip,
-            normalize,
-        )
-        _, scan_state = nnx.split((st, duals, dopt))
-        return scan_state, (actor_loss, critic_loss)
-
-    scan_state, (actor_losses, critic_losses) = jax.lax.scan(body, scan_state, keys)
-    state, dual_params, dual_optimizer = nnx.merge(graphdef, scan_state)
-
-    # Average over the burst for less noisy logging.
     return (
         state,
         dual_params,
@@ -309,7 +274,6 @@ class MPO(Agent):
     ):
         self.seed = int(seed)
 
-        # Gaussian policy (mean + diagonal std).
         actor = hydra.utils.instantiate(
             actor_config,
             in_features=env_obs_size,
@@ -317,83 +281,46 @@ class MPO(Agent):
             rngs=network_rngs(self.seed, offset=0),
         )
 
-        # Single Q critic (as in the original MPO paper).
         critic = hydra.utils.instantiate(
             critic_config,
             in_features=env_obs_size + env_action_size,
             rngs=network_rngs(self.seed, offset=2),
         )
 
-        # Replay buffer.
-        prototype = Transition(
-            observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
-            action=jnp.zeros(env_action_size, dtype=jnp.float32),
-            reward=jnp.zeros((), dtype=jnp.float32),
-            terminal=jnp.zeros((), dtype=jnp.bool_),
-        )
+        # No `truncation`: MPO's target is 1-step, so nothing here reads past the
+        # stored `terminal`.
         replay = hydra.utils.instantiate(memory_config)
         self.batch_size = memory_config.sample_batch_size
         self.buffer_size = memory_config.max_length
-        buffer_state = replay.init(prototype)
+        buffer_state = replay.init(
+            transition_prototype(env_obs_size, env_action_size, truncation=False)
+        )
 
-        # Target networks: the target actor is the old policy the E-step samples.
-        target_actor = copy.deepcopy(actor)
-        target_critic = copy.deepcopy(critic)
-
-        # Learnable Lagrange duals (temperature + decoupled KL multipliers).
         self.dual_params = MPODualParams(
             action_dim=env_action_size,
             init_temperature=init_temperature,
             init_alpha_mean=init_alpha_mean,
             init_alpha_stddev=init_alpha_stddev,
         )
-
-        self.actor_learning_rate = actor_learning_rate
-        self.critic_learning_rate = critic_learning_rate
         self.dual_learning_rate = dual_learning_rate
-        self.max_grad_norm = max_grad_norm
 
-        actor_optimizer = nnx.Optimizer(
-            actor,
-            build_optimizer(
-                actor_optimizer_config,
-                learning_rate=self.actor_learning_rate,
-                max_grad_norm=self.max_grad_norm,
-            ),
-            wrt=nnx.Param,
-        )
-        critic_optimizer = nnx.Optimizer(
-            critic,
-            build_optimizer(
-                critic_optimizer_config,
-                learning_rate=self.critic_learning_rate,
-                max_grad_norm=self.max_grad_norm,
-            ),
-            wrt=nnx.Param,
-        )
-        # The Lagrange duals are a handful of scalars, deliberately unclipped:
-        # a global-norm clip over them would just rescale the dual ascent step
-        # and fight the KL bounds it is supposed to enforce.
-        self.dual_optimizer = nnx.Optimizer(
+        # Deliberately unclipped: a global-norm clip over a handful of scalars
+        # would rescale the dual ascent step and fight the KL bounds.
+        self.dual_optimizer = make_optimizer(
             self.dual_params,
-            build_optimizer(
-                dual_optimizer_config, learning_rate=self.dual_learning_rate
-            ),
-            wrt=nnx.Param,
+            dual_optimizer_config,
+            learning_rate=self.dual_learning_rate,
         )
 
-        obs_shape = buffer_state.experience.observation.shape[-1]
-        obs_stats = Agent.init_obs_stats(obs_shape)
-
-        self.state = TrainState(
-            actor=actor,
-            critic=critic,
-            target_actor=target_actor,
-            target_critic=target_critic,
-            actor_optimizer=actor_optimizer,
-            critic_optimizer=critic_optimizer,
-            buffer_state=buffer_state,
-            obs_stats=obs_stats,
+        self._init_train_state(
+            actor,
+            critic,
+            buffer_state,
+            actor_learning_rate=actor_learning_rate,
+            critic_learning_rate=critic_learning_rate,
+            max_grad_norm=max_grad_norm,
+            actor_optimizer_config=actor_optimizer_config,
+            critic_optimizer_config=critic_optimizer_config,
         )
 
         self.gamma = gamma
@@ -420,10 +347,9 @@ class MPO(Agent):
         print("Hyper Params:", self._export_hyperparams())
 
     def _checkpoint_modules(self) -> dict:
-        # The Lagrange duals and their optimizer live outside `self.state`. They
-        # are learned, and they are what enforce the KL trust region: resuming
-        # with them reset to `init_temperature` / `init_alpha_*` would re-open
-        # the trust region on an already-converged policy.
+        # These live outside `self.state` and are what enforce the KL trust
+        # region: resuming with them reset to `init_temperature`/`init_alpha_*`
+        # would re-open it on an already-converged policy.
         return {
             "dual_params": self.dual_params,
             "dual_optimizer": self.dual_optimizer,
@@ -448,8 +374,7 @@ class MPO(Agent):
             observation=prev_obs,
             action=self.last_action,
             reward=timestep.reward,
-            # True termination only (not time-limit truncation) so truncated
-            # transitions still bootstrap in the Bellman target.
+            # True termination only, so a truncated transition still bootstraps.
             terminal=timestep.terminated,
         )
         self.state.buffer_state = self.replay.add(self.state.buffer_state, experiences)
@@ -508,32 +433,18 @@ class MPO(Agent):
         return gradient_steps, actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
-        return {
-            "seed": int(self.seed),
-            "gamma": float(self.gamma),
-            "tau": float(self.tau),
-            "actor_learning_rate": float(self.actor_learning_rate),
-            "critic_learning_rate": float(self.critic_learning_rate),
-            "dual_learning_rate": float(self.dual_learning_rate),
-            "max_grad_norm": float(self.max_grad_norm),
-            "env_obs_size": self.state.buffer_state.experience.observation.shape[2],
-            "env_action_size": self.state.buffer_state.experience.action.shape[2],
-            "num_action_samples": int(self.num_action_samples),
-            "epsilon": float(self.epsilon),
-            "epsilon_mean": float(self.epsilon_mean),
-            "epsilon_stddev": float(self.epsilon_stddev),
-            "init_temperature": float(self.init_temperature),
-            "init_alpha_mean": float(self.init_alpha_mean),
-            "init_alpha_stddev": float(self.init_alpha_stddev),
-            "steps_before_learning": int(self.steps_before_learning),
-            "steps_between_updates": int(self.steps_between_updates),
-            "learning_steps": int(self.learning_steps),
-            "memory_warmup": int(self.memory_warmup),
-            "memory_capacity": int(self.buffer_size),
-            "memory_batch_size": int(self.batch_size),
-            "normalize_observations": bool(self.normalize_observations),
-            "obs_norm_clip": float(self.obs_clip),
-            "obs_norm_eps": float(self.obs_eps),
-            "action_low": serialize_bound(self.action_low),
-            "action_high": serialize_bound(self.action_high),
-        }
+        params = super()._export_hyperparams()
+        params.update(self._replay_hyperparams())
+        params.update(
+            {
+                "dual_learning_rate": float(self.dual_learning_rate),
+                "num_action_samples": int(self.num_action_samples),
+                "epsilon": float(self.epsilon),
+                "epsilon_mean": float(self.epsilon_mean),
+                "epsilon_stddev": float(self.epsilon_stddev),
+                "init_temperature": float(self.init_temperature),
+                "init_alpha_mean": float(self.init_alpha_mean),
+                "init_alpha_stddev": float(self.init_alpha_stddev),
+            }
+        )
+        return params

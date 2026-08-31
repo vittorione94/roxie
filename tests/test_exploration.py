@@ -1,12 +1,10 @@
 import jax
 import jax.numpy as jnp
-import pytest
 from flax import nnx
 
 from roxie.exploration.noisy import (
     GaussianNoise,
     OrnsteinUhlenbeckNoise,
-    CompositeNoise,
 )
 from roxie.exploration.schedulers import (
     ConstantSchedule,
@@ -153,27 +151,3 @@ class TestOrnsteinUhlenbeckNoise:
         assert hp["mu"] == 0.1
 
 
-class TestCompositeNoise:
-    def test_combines_noise_sources(self, rng_key):
-        action_shape = (4,)
-        g1 = GaussianNoise(action_shape=action_shape, initial_noise_scale=0.1)
-        g2 = GaussianNoise(action_shape=action_shape, initial_noise_scale=0.2)
-        composite = CompositeNoise(noise_modules=[g1, g2], weights=[0.5, 0.5])
-        sample = composite.sample_noise(rng_key)
-        assert sample.shape == action_shape
-
-    def test_weight_validation(self):
-        action_shape = (4,)
-        g1 = GaussianNoise(action_shape=action_shape)
-        g2 = GaussianNoise(action_shape=action_shape)
-        with pytest.raises(ValueError):
-            CompositeNoise(noise_modules=[g1, g2], weights=[1.0])
-
-    def test_add_noise_eval(self, rng_key):
-        action_shape = (4,)
-        g1 = GaussianNoise(action_shape=action_shape)
-        g2 = GaussianNoise(action_shape=action_shape)
-        composite = CompositeNoise(noise_modules=[g1, g2])
-        actions = jnp.ones(action_shape)
-        result = composite.add_noise(actions, rng_key, evaluation=True)
-        assert jnp.allclose(result, actions)

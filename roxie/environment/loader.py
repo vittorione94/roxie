@@ -1,47 +1,47 @@
 """Loading envs: the MuJoCo adapters and the two built-in builders.
 
-A builder (``env.builder`` in the experiment yaml, a dotted path) turns a config
-block into an ``EnvBundle`` of ready-to-drive vector envs. Every builder in the
-repo returns the same thing, so ``train.py`` and ``play.py`` never branch on the
-env type.
+A builder turns the ``env:`` block into an ``EnvBundle`` of ready-to-drive vector
+envs. Every builder in the repo returns the same thing, so ``train.py`` and
+``play.py`` never branch on the env type.
 
-``FuncEnv``'s eight methods fall into two groups: the two that MAKE PHYSICS
-HAPPEN (``initial``, ``transition``) and the six that ANSWER QUESTIONS ABOUT A
-STATE (``observation``, ``reward``, ``terminal``, ``truncal``, ``state_info``,
-``transition_info``). Every MuJoCo env in this repo answers the six identically —
-read the field off ``mjx_env.State``, which already carries them — but produces
-that state in completely different ways. That split is the class split::
+**The env yaml IS the builder call**, exactly as the agent yaml is the
+constructor call: ``env._target_`` names the builder and every sibling key is one
+of its keyword arguments, so ``roxie/configs/env/`` is a Hydra config group like
+``agent/`` and ``noise/`` (``env=playground env.env_name=CheetahRun``). ``build_env``
+below is the one place that instantiates it; ``TRAINER_ENV_KEYS`` lists the keys
+that live in the block but belong to the trainer rather than the builder.
+
+``FuncEnv``'s eight methods split into the two that MAKE PHYSICS HAPPEN
+(``initial``, ``transition``) and the six that ANSWER QUESTIONS ABOUT A STATE
+(``observation``, ``reward``, ``terminal``, ``truncal``, ``state_info``,
+``transition_info``). Every MuJoCo env here answers the six identically — read
+the field off ``mjx_env.State`` — but produces that state differently. That split
+is the class split::
 
     FuncEnv                  the interface; knows nothing about MuJoCo
     └── MuJoCoFuncEnv        + "my state is an mjx_env.State" -> the 6 accessors
         └── PlaygroundFuncEnv    + initial/transition by WRAPPING a playground env
 
-The middle class carries no ``initial``/``transition`` deliberately, so a
-bespoke MuJoCo env — one living in another repo, like roxie-mocap's tracking
-task — inherits the six accessors instead of writing them again. That matters
-most for ``terminal`` versus ``truncal``, the rule where a mistake is silent and
-expensive: call an env's own non-failure cutoff a termination and the critic
-zeroes its bootstrap there.
+The middle class deliberately carries no ``initial``/``transition``, so a bespoke
+MuJoCo env in another repo inherits the six accessors instead of rewriting them.
+That matters most for ``terminal`` versus ``truncal``, where a mistake is silent
+and expensive: call a non-failure cutoff a termination and the critic zeroes its
+bootstrap there. The accessors read fields back rather than recomputing them
+because Playground produces physics, observation, reward and termination in one
+``step``; recomputing any of them would pay for the physics twice.
 
-Why the accessors read fields back rather than computing them: Playground (like
-Brax, and like Waymax) computes physics, observation, reward and termination in a
-single ``step`` call, so recomputing any of them independently would mean paying
-for the physics twice. That is a thin, honest adaptation and not a workaround —
-``mjx_env.State`` already carries exactly the fields ``FuncEnv`` asks for.
-
-EnvPool needs no adapter at all. Its ``env_type="gymnasium"`` pools already
-return ``(obs, reward, terminated, truncated, info)`` and already auto-reset and
-time-limit internally, which is exactly what
-``roxie.environment.vector.EnvPoolVectorEnv`` presents — so ``build_envpool_env``
-below is a builder and nothing more. (It used to live in its own module together
-with two duck-typed stand-in classes whose only job was translating the
-gymnasium 5-tuple INTO roxie's bespoke state; the classes and the module are
-both gone.)
+EnvPool needs no adapter: its ``env_type="gymnasium"`` pools already return
+``(obs, reward, terminated, truncated, info)`` and auto-reset and time-limit
+internally, which is what ``roxie.environment.vector.EnvPoolVectorEnv`` presents,
+so ``build_envpool_env`` below is a builder and nothing more.
 """
 
 from typing import Any, NamedTuple
 
+import jax
 import jax.numpy as jnp
+from hydra.utils import get_method, instantiate
+from omegaconf import DictConfig, OmegaConf
 from mujoco_playground import registry
 
 from roxie.environment import functional
@@ -53,9 +53,8 @@ class MuJoCoFuncEnv(FuncEnv):
     """Half a ``FuncEnv``: everything that follows from "my state is an
     ``mjx_env.State``".
 
-    Deliberately does NOT implement ``initial``/``transition`` — a subclass
-    supplies those, either by wrapping an env (``PlaygroundFuncEnv``) or by being
-    one. See the module docstring for the hierarchy.
+    Deliberately no ``initial``/``transition`` — a subclass supplies those, by
+    wrapping an env (``PlaygroundFuncEnv``) or by being one.
     """
 
     def observation(self, state, rng, params=None):
@@ -65,15 +64,12 @@ class MuJoCoFuncEnv(FuncEnv):
         return next_state.reward
 
     def terminal(self, state, rng, params=None):
-        # MuJoCo envs report a float `done`; the driver wants a predicate. Envs
-        # that fold their own non-failure cutoff into `done` declare it in
-        # `truncal`, and the driver subtracts it — see `JaxVectorEnv.step`.
+        # MuJoCo envs report a float `done`; the driver wants a predicate.
         return state.done.astype(jnp.bool_)
 
     def truncal(self, state, rng, params=None):
-        # An env's own non-failure cutoff. `.get` runs at TRACE time
-        # on a plain Python dict, so an env without the key costs nothing and
-        # simply never truncates for its own reasons.
+        # An env's own non-failure cutoff. `.get` runs at trace time on a plain
+        # Python dict, so an env without the key costs nothing.
         return jnp.asarray(state.info.get("truncation", False), dtype=jnp.bool_)
 
     def transition_info(self, state, action, next_state, params=None):
@@ -84,17 +80,15 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
     """The other half, for a ``mujoco_playground`` env: wrap one and point
     ``initial``/``transition`` at its ``reset``/``step``.
 
-    The state IS ``mjx_env.State`` — unwrapped, no roxie-specific box around it.
-    That is what lets ``play.py`` drive the same object single-world, and what
-    removed the third state shape from the codebase.
+    The state IS ``mjx_env.State``, unwrapped, which is what lets ``play.py``
+    drive the same object single-world.
     """
 
     def __init__(self, env: Any, impl: str | None = None):
         self.env = env
         self.observation_space = functional.unbounded_box(env.observation_size)
-        # MuJoCo declares its action bounds on the model, so the space is exact
-        # rather than a convention. This is the only place that reads
-        # `actuator_ctrlrange`; the agents take their bounds from the space.
+        # The only place that reads `actuator_ctrlrange`; the agents take their
+        # bounds from the space.
         ctrl_range = env.mj_model.actuator_ctrlrange
         self.action_space = functional.box(ctrl_range[:, 0], ctrl_range[:, 1])
         self.metadata = {"jax": True, "impl": impl or _read_impl(env)}
@@ -109,11 +103,9 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
         """Forward anything else to the wrapped env.
 
         `play.py` and the viewer hooks want `mj_model`, `xml_path`, the native
-        stepper protocol and so on. Forwarding keeps this adapter from having to
-        enumerate them.
+        stepper protocol and so on; forwarding avoids enumerating them.
         """
-        # `__getattr__` only fires for names not found normally, but guard the
-        # dunder case so copy/pickle don't recurse through `self.env`.
+        # Guard the dunder case so copy/pickle don't recurse through `self.env`.
         if name.startswith("__") or "env" not in self.__dict__:
             raise AttributeError(name)
         return getattr(self.env, name)
@@ -141,25 +133,74 @@ def resolve_loaded_impl(env: Any) -> str:
     return meta.get("impl") or _read_impl(func_env)
 
 
-def log_loaded_backend(env: Any, requested_impl: str | None = None) -> None:
-    """Print a loud banner reporting the loaded physics backend."""
+def resolve_agent_device() -> tuple[str, str]:
+    """Where the agent's arrays live: ``("cpu"|"gpu", exact jax backend)``.
+
+    The agent is pure JAX, so this is simply JAX's chosen backend. Anything not
+    the CPU counts as "gpu" for the coarse comparison against the declared
+    ``runtime.agent_device``; the exact backend string ("cuda", "rocm",
+    "METAL", ...) rides alongside so the banner says which one answered.
+    """
+    backend = jax.default_backend()
+    return ("cpu" if backend == "cpu" else "gpu", backend)
+
+
+def resolve_env_device(env: Any) -> tuple[str, str]:
+    """Where the physics runs: ``("cpu"|"gpu", how)``.
+
+    Not the same question as the agent's device: an EnvPool pool steps native
+    MuJoCo on C++ threads whatever JAX is doing, while an MJX/Warp env rides the
+    agent's JAX device — there is one XLA program.
+    """
+    impl = resolve_loaded_impl(env)
+    if impl == "envpool":
+        return "cpu", "native MuJoCo, C++ thread pool"
+    device, backend = resolve_agent_device()
+    return device, f"{impl} kernels on the JAX device ({backend})"
+
+
+def log_loaded_backend(
+    env: Any,
+    requested_impl: str | None = None,
+    agent_device: str | None = None,
+    env_device: str | None = None,
+) -> None:
+    """Print a loud banner reporting what loaded, and on which hardware.
+
+    The two halves are placed independently — physics on CPU threads while the
+    learner sits on the card — so the banner states both.
+    ``agent_device``/``env_device`` are the ``runtime:`` declarations, checked
+    here rather than trusted: a cell declaring ``gpu`` still runs on a machine
+    with no card, and this is what says so.
+    """
     actual = resolve_loaded_impl(env)
-    mismatch = requested_impl is not None and actual != requested_impl
+    agent_actual, agent_detail = resolve_agent_device()
+    env_actual, env_detail = resolve_env_device(env)
 
     bar = "=" * 70
     lines = [
         "",
         bar,
         f"  PHYSICS BACKEND LOADED:  impl = {actual.upper()}",
+        f"  AGENT (networks, optimizers, replay):  {agent_actual.upper():<4}"
+        f"  [{agent_detail}]",
+        f"  ENV   (physics):                       {env_actual.upper():<4}"
+        f"  [{env_detail}]",
     ]
-    if requested_impl is not None:
-        if mismatch:
+    for name, declared, got in (
+        ("env.impl", requested_impl, actual),
+        ("agent.device", agent_device, agent_actual),
+        ("env.device", env_device, env_actual),
+    ):
+        if declared is None:
+            continue
+        if str(declared) != got:
             lines.append(
-                f"  !!! MISMATCH !!!  requested {requested_impl!r} "
-                f"but env loaded {actual!r}"
+                f"  !!! MISMATCH !!!  {name} declares {str(declared)!r} "
+                f"but the run is on {got!r}"
             )
         else:
-            lines.append(f"  OK - matches requested impl = {requested_impl!r}")
+            lines.append(f"  OK - matches {name} = {str(declared)!r}")
     lines += [bar, ""]
     print("\n".join(lines), flush=True)
 
@@ -207,56 +248,63 @@ class EnvBundle(NamedTuple):
 # experiment yaml names one.
 DEFAULT_MAX_EPISODE_STEPS = 1000
 
-# Every key roxie itself gives meaning to under ``env:``. It exists for
-# ``build_envpool_env``, which forwards anything it does not recognise straight
-# into ``envpool.make()`` as a task kwarg — a useful escape hatch, and a trap
-# once one experiment composes a shared block with a backend group: the release
-# grid's two cells sit under the same ``env:`` block, so a playground-only key
-# like ``env_name`` would otherwise reach the pool and fail the launch with an
-# unknown-argument error from inside EnvPool.
+# The keys that live under ``env:`` but are NOT builder arguments — roxie
+# consumes them itself, so ``build_env`` strips them before instantiating.
 #
-# Keys are listed whether or not the envpool path uses them, because the point
-# is "roxie owns this name", not "this builder reads it".
-ROXIE_ENV_KEYS = frozenset({
-    # generic / trainer-facing
-    "builder", "impl", "seed", "parallel_envs", "test_episodes",
-    "max_episode_steps", "viewer", "player",
-    # envpool
-    "task_id",
-    # mujoco_playground
-    "env_name", "naconmax", "njmax", "list_envs", "xml_path",
+# Both sizes still reach the builder as the ``num_envs``/``test_episodes`` the
+# caller injects, so dropping their yaml spellings leaves one source for each: a
+# yaml ``test_episodes`` would silently compete with ``trainer.test_episodes``,
+# the drift that once failed a broadcast mid-eval. ``seed`` is deliberately
+# absent — it is a genuine env quantity, forwarded like any other key.
+#
+# Everything NOT listed here is a builder keyword, which lets
+# ``build_envpool_env`` collect task kwargs in a ``**task_kwargs`` tail and makes
+# a stale key a loud ``TypeError`` rather than a silently ignored setting.
+TRAINER_ENV_KEYS = frozenset({
+    "builder",         # pre-`_target_` spelling; still honoured by build_env
+    "device",          # which hardware the physics runs on (see resolve_placement)
+    "parallel_envs",   # -> num_envs
+    "test_episodes",   # -> test_episodes, from trainer.test_episodes
+    "viewer",          # play.py's ghost-renderer hook
+    "player",          # play.py's stepper factory
 })
 
 
 def build_playground_env(
-    cfg_env: Any, mode: str = "train", num_envs: int = 1, test_episodes: int = 1,
+    env_name: str,
+    *,
+    mode: str = "train",
+    num_envs: int = 1,
+    test_episodes: int = 1,
+    seed: int = 0,
+    impl: str | None = "jax",
+    naconmax: int | None = None,
+    njmax: int | None = None,
+    max_episode_steps: int | None = None,
 ) -> EnvBundle:
     """Builder for mujoco_playground envs.
 
-    This is the default builder: experiments that don't set ``env.builder`` get
+    This is the default builder: experiments that don't set ``env._target_`` get
     a playground env loaded by ``env.env_name``. ``mode`` is part of the builder
     protocol (train.py passes "train", play.py "play") but playground envs load
     identically for both. Override semantics for ``naconmax``/``njmax`` match
     ``load_playground_env``: ``None`` leaves the env's upstream Warp budget.
 
-    ``num_envs``/``test_episodes`` size the two drivers. They come from the
-    trainer rather than from ``cfg_env`` because they are trainer quantities —
+    ``num_envs``/``test_episodes`` size the two drivers and come from the trainer:
     the same env definition is driven at 256 worlds for training and at
     ``trainer.test_episodes`` for evaluation.
+
+    ``seed`` is accepted and unused — an MJX env takes its reset keys from the
+    trainer's rng stream — but declared so the shared ``env.seed`` key can stay
+    in the block for every backend (the envpool pools do seed from it).
     """
     func_env, env_cfg = load_playground_env(
-        cfg_env.env_name,
-        impl=cfg_env.get("impl", "jax"),
-        naconmax=cfg_env.get("naconmax", None),
-        njmax=cfg_env.get("njmax", None),
+        env_name, impl=impl, naconmax=naconmax, njmax=njmax,
     )
-    # The step limit, most specific source first: an explicit experiment
-    # override, then the env's own declared episode length, then the fallback.
-    # The middle term is what `TerminationWrapper` used to ignore — it always
-    # took the 1000 default — so this only changes behaviour for a playground
-    # env whose `episode_length` is not 1000. WalkerWalk's is.
+    # Most specific source first: an explicit experiment override, then the
+    # env's own declared episode length, then the fallback.
     max_steps = int(
-        cfg_env.get("max_episode_steps", None)
+        max_episode_steps
         or env_cfg.get("episode_length", None)
         or DEFAULT_MAX_EPISODE_STEPS
     )
@@ -270,41 +318,42 @@ def build_playground_env(
 
 
 def build_envpool_env(
-    cfg_env: Any, mode: str = "train", num_envs: int = 1, test_episodes: int = 1,
+    task_id: str,
+    *,
+    mode: str = "train",
+    num_envs: int = 1,
+    test_episodes: int = 1,
+    seed: int = 0,
+    max_episode_steps: int | None = None,
+    **task_kwargs: Any,
 ) -> EnvBundle:
     """Builder for envpool environments (CPU training path).
 
     Selected from an experiment yaml with::
 
         env:
-          builder: roxie.environment.loader.build_envpool_env
+          _target_: roxie.environment.loader.build_envpool_env
           task_id: HalfCheetah-v4
           parallel_envs: 32
 
-    Reads from cfg_env:
+    Arguments:
       task_id (str):            envpool task identifier, e.g. "HalfCheetah-v4".
       max_episode_steps (int):  episode time-limit (default 1000).
-      seed (int):               RNG seed (default 0).
-      (any key not in ``ROXIE_ENV_KEYS`` is forwarded to ``envpool.make()`` as a
-      task kwarg — see that constant for why the list is explicit)
+      seed (int):               RNG seed.
+      **task_kwargs:            any other key under ``env:`` (minus
+                                ``TRAINER_ENV_KEYS``) is forwarded to
+                                ``envpool.make()`` as a task kwarg.
 
-    ``num_envs``/``test_episodes`` come from the trainer, not from cfg_env: they
-    size the two pools, and the eval pool MUST match ``trainer.test_episodes``.
-    Taking them as arguments is what stops the two from drifting — they used to
-    be separate config keys and a mismatch failed a broadcast mid-eval.
+    ``num_envs``/``test_episodes`` come from the trainer, not the yaml: they size
+    the two pools, and the eval pool MUST match ``trainer.test_episodes``.
 
-    Two independent pools are created — one for training, one for evaluation —
-    so eval rollouts never corrupt the training environment state.
+    Two independent pools are created so eval rollouts never corrupt the
+    training environment state.
     """
     import envpool  # lazy: envpool is an optional dependency
 
-    task_id: str = cfg_env.task_id
-    seed: int = int(cfg_env.get("seed", 0))
-    max_episode_steps: int = int(
-        cfg_env.get("max_episode_steps", None) or DEFAULT_MAX_EPISODE_STEPS
-    )
-
-    extra = {k: v for k, v in cfg_env.items() if k not in ROXIE_ENV_KEYS}
+    max_steps = int(max_episode_steps or DEFAULT_MAX_EPISODE_STEPS)
+    seed = int(seed)
 
     def make_pool(n: int, pool_seed: int):
         return envpool.make(
@@ -312,24 +361,135 @@ def build_envpool_env(
             env_type="gymnasium",
             num_envs=n,
             seed=pool_seed,
-            max_episode_steps=max_episode_steps,
-            **extra,
+            max_episode_steps=max_steps,
+            **task_kwargs,
         )
 
     train_env = EnvPoolVectorEnv(
         make_pool(num_envs, seed), num_envs=num_envs,
-        max_episode_steps=max_episode_steps,
+        max_episode_steps=max_steps,
     )
     # The eval pool carries a rebuild thunk so the rollout can pin its start
     # states to a fixed seed before every eval (see `EnvPoolVectorEnv.reseed`).
     test_env = EnvPoolVectorEnv(
         make_pool(test_episodes, seed + 1), num_envs=test_episodes,
-        max_episode_steps=max_episode_steps,
+        max_episode_steps=max_steps,
         rebuild=lambda s: make_pool(test_episodes, s),
     )
 
     return EnvBundle(env=train_env, test_env=test_env, env_cfg=None)
 
 
-# Dotted path of the default builder, used when ``env.builder`` is unset.
+# Dotted path of the default builder, used when ``env`` names no ``_target_``.
 DEFAULT_BUILDER = "roxie.environment.loader.build_playground_env"
+
+
+def builder_target(cfg_env: Any) -> str:
+    """The dotted path of the builder an ``env:`` block names."""
+    return (
+        cfg_env.get("_target_", None)
+        or cfg_env.get("builder", None)  # pre-`_target_` spelling
+        or DEFAULT_BUILDER
+    )
+
+
+def uses_envpool(cfg_env: Any) -> bool:
+    """Whether this env block builds EnvPool pools.
+
+    Asked by ``train.py`` (an EnvPool run has no reason to claim the GPU, so the
+    learner defaults onto the CPU with the physics) and by ``play.py`` (a pool
+    hands out no ``MjModel``, so there is nothing to open a viewer on).
+
+    It is the BUILDER that answers this, not an ``impl`` key: ``impl`` names the
+    physics implementation *within* a builder — MJX or Warp kernels for the same
+    playground env — and EnvPool is not one of those, it is the other builder.
+    """
+    try:
+        return get_method(builder_target(cfg_env)) is build_envpool_env
+    except Exception:
+        # A stale dotted path is not this function's error to raise: `build_env`
+        # is about to fail on it with the message that actually helps.
+        return False
+
+
+# ``agent.device`` and ``env.device`` rather than one process-wide key, because
+# the two are separate placements: CPU physics with a GPU learner is a
+# configuration this repo ships. Both are consumed by ``train.py`` before
+# anything is built (a JAX platform must be chosen before the first ``jax.*``
+# call) and both are checked against reality by the startup banner.
+DEVICES = ("cpu", "gpu")
+
+
+def resolve_placement(cfg: Any) -> tuple[str | None, str | None, str | None]:
+    """``(agent_device, env_device, jax platform to force)`` for a run.
+
+    This reads the two knobs rather than reconciling them; ``log_loaded_backend``
+    then checks each against where that half actually ended up.
+
+    * ``agent.device`` always decides: the agent is pure JAX, so it IS the JAX
+      platform.
+    * ``env.device`` decides nothing by itself. An **EnvPool** env steps native
+      MuJoCo on C++ threads and is on the CPU whatever JAX does — the real
+      hybrid, ``agent: gpu`` + ``env: cpu`` — while a **playground** env is
+      traced into the agent's XLA program and lands on the agent's device.
+      Declaring it is still what lets the banner say the run is not where the
+      experiment says it is.
+
+    An EnvPool run with no ``agent.device`` defaults to the CPU rather than
+    preallocating VRAM the physics cannot use. ``"gpu"`` and an absent
+    declaration both force nothing — forcing a platform name would turn a
+    missing card into an import error instead of a loud banner line.
+    """
+    agent_device = (cfg.get("agent") or {}).get("device", None)
+    env_device = (cfg.get("env") or {}).get("device", None)
+    for name, value in (("agent.device", agent_device), ("env.device", env_device)):
+        if value is not None and str(value) not in DEVICES:
+            raise ValueError(
+                f"{name}={value!r} is not one of {DEVICES} "
+                f"(null means 'whatever JAX picks')."
+            )
+
+    if agent_device is None and uses_envpool(cfg.env):
+        agent_device = "cpu"
+    platform = None if agent_device in (None, "gpu") else agent_device
+    return agent_device, env_device, platform
+
+
+def build_env(
+    cfg_env: Any,
+    *,
+    mode: str = "train",
+    num_envs: int = 1,
+    test_episodes: int = 1,
+) -> EnvBundle:
+    """Instantiate the ``env:`` block into an ``EnvBundle``.
+
+    The single entry point both ``train.py`` and ``play.py`` use, so the two
+    agree on what an env block means. It does three things and nothing else:
+
+    1. strips ``TRAINER_ENV_KEYS`` — the keys roxie consumes itself;
+    2. falls back to ``DEFAULT_BUILDER`` when the block names no ``_target_``
+       (and still honours the older ``builder:`` spelling, so a checkpoint saved
+       before the env group existed can still be replayed by ``play.py``);
+    3. hands the rest to ``hydra.utils.instantiate`` with the three trainer
+       quantities injected — those override any same-named key in the yaml.
+
+    Everything else about an env — which builder, which task, the physics
+    backend, a bespoke builder's nested blocks — is yaml, which is what lets a
+    task living in another repo be launched through ``roxie.train`` unchanged.
+    """
+    # Resolve against the composed config FIRST: every interpolation in the block
+    # is relative to the config root, and `instantiate` re-creates what it is
+    # handed as a fresh, parentless node. `throw_on_missing` turns an unset `???`
+    # into its own error rather than passing the literal to a builder.
+    if isinstance(cfg_env, DictConfig):
+        resolved = OmegaConf.to_container(
+            cfg_env, resolve=True, throw_on_missing=True,
+        )
+    else:
+        resolved = dict(cfg_env)
+    node = {k: v for k, v in resolved.items() if k not in TRAINER_ENV_KEYS}
+    node["_target_"] = builder_target(cfg_env)
+    return instantiate(
+        node, mode=mode, num_envs=num_envs, test_episodes=test_episodes,
+    )

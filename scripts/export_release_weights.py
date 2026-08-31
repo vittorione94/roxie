@@ -10,13 +10,13 @@ its own:
     weights/CheetahRun/td3.warp_gpu/
       .hydra/config.yaml        the run's resolved config (play.py reads this)
       .hydra/overrides.yaml     the CLI condition, for reproducibility
-      checkpoints/step_<N>/     the orbax checkpoint itself
+      checkpoints/<N>/          the orbax checkpoint itself
       metadata.json             what it scored, where it came from, which commit
 
 The layout is not cosmetic: play.py resolves its config as
 `<checkpoint>/../../.hydra/config.yaml`, so the bundle has to mirror a run dir's
 shape for the checkpoint path to stay openable. That is why the checkpoint keeps
-its `checkpoints/step_<N>/` nesting instead of being flattened.
+its `checkpoints/<N>/` nesting instead of being flattened.
 
     uv run python scripts/export_release_weights.py --dry-run
     uv run python scripts/export_release_weights.py
@@ -56,33 +56,31 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from roxie.environment.suites import DMC_TASKS  # noqa: E402
+from roxie.utils.checkpoint import (  # noqa: E402
+    CHECKPOINTS_DIRNAME,
+    checkpoint_steps,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_ROOT = REPO_ROOT / "outputs" / "release_v1"
 DEFAULT_DEST = REPO_ROOT / "weights"
 
-# The headline cell. The other cell of the grid runs the SAME algorithm on the
-# same task, so publishing it too would ship near-duplicate policies under
-# different names — and a policy trained against playground's observation layout
-# is not loadable against EnvPool's anyway, which is the sharper reason to pick
-# one and say which.
+# The headline cell. The other cell runs the same algorithm on the same task, so
+# publishing it too would ship near-duplicate policies under different names —
+# and a policy trained against playground's observation layout is not loadable
+# against EnvPool's anyway.
 DEFAULT_CELL = "warp_gpu"
 
 # Selection metric, plus the columns copied into metadata.json alongside it.
-# `test/score` is the dm_control episode return (0-1000 on every task in the
-# suite, which is what makes the published table readable across tasks).
-# `test/score_per_step` and `test/length` come along because on the tasks that
-# CAN terminate early the sum alone cannot distinguish "acts well" from
-# "survives long"; on the tasks that always run to the 1000-step cap they are
-# constant and simply say so.
+# `test/score` is the dm_control episode return, 0-1000 across the suite.
+# `test/score_per_step` and `test/length` come along because on tasks that can
+# terminate early the sum alone cannot separate "acts well" from "survives long".
 DEFAULT_METRIC = "test/score"
 REPORTED_COLUMNS = (
     "test/score", "test/score/std", "test/score_per_step",
     "test/length", "test/length/std", "test/distinct_starts",
     "train/score", "train/gradient_steps", "sys/sps", "sys/time/total_s",
 )
-
-CHECKPOINTS_DIRNAME = "checkpoints"
 
 
 # --------------------------------------------------------------- reading -----
@@ -118,13 +116,8 @@ def _as_float(row: dict, column: str) -> float | None:
         return None
 
 
-def checkpoint_steps(path: Path) -> int | None:
-    name = path.name
-    return int(name[5:]) if name.startswith("step_") and name[5:].isdigit() else None
-
-
 def find_checkpoints(run_dir: Path) -> dict[int, Path]:
-    """Every `step_<N>` checkpoint in a run, keyed by N."""
+    """Every `<N>` step checkpoint in a run, keyed by N."""
     root = run_dir / CHECKPOINTS_DIRNAME
     if not root.is_dir():
         return {}
@@ -158,8 +151,8 @@ def pick_checkpoint(run_dir: Path, metric: str) -> tuple[int, Path, dict] | None
         return None
 
     rows = read_log(run_dir)
-    # Tolerance: half an epoch, derived from the log itself rather than assumed,
-    # so this holds whatever cadence a run was launched with.
+    # Half an epoch, derived from the log rather than assumed, so this holds
+    # whatever cadence a run was launched with.
     tolerance = _epoch_tolerance(rows)
     scored: list[tuple[float, int, dict]] = []
     for row in rows:
@@ -174,8 +167,7 @@ def pick_checkpoint(run_dir: Path, metric: str) -> tuple[int, Path, dict] | None
 
     if not scored:
         return None
-    # Highest metric wins; a tie goes to the later checkpoint, which has strictly
-    # more training behind it.
+    # A tie goes to the later checkpoint, which has more training behind it.
     value, steps, row = max(scored, key=lambda item: (item[0], item[1]))
     return steps, checkpoints[steps], row
 
@@ -365,7 +357,7 @@ def write_index(dest_root: Path, exported: list[dict], *, cell: str,
         f"<Task>/<agent>.{cell}/",
         "  .hydra/config.yaml     resolved run config (play.py reads this)",
         "  .hydra/overrides.yaml  the CLI condition the run was launched with",
-        "  checkpoints/step_<N>/  the orbax checkpoint",
+        "  checkpoints/<N>/      the orbax checkpoint",
         "  metadata.json          score, provenance, source run, git commit",
         "```",
         "",
@@ -386,7 +378,7 @@ def _fmt(value: float | None, digits: int = 1) -> str:
 def _example_path(ranked: list[dict]) -> str:
     """A real path from this export, so the README's command is copy-pasteable."""
     if not ranked:
-        return "weights/<Task>/<agent>.<cell>/checkpoints/step_<N>"
+        return "weights/<Task>/<agent>.<cell>/checkpoints/<N>"
     return ranked[0]["play"].split()[-1]
 
 
@@ -485,10 +477,8 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    # Tasks the manifest actually has finished runs for on this cell, in suite
-    # order. Reading them off the ledger rather than off DMC_TASKS is what makes
-    # a partial grid exportable — 4 tasks done, 4 tasks published, no failures
-    # for the 21 that have not run yet.
+    # Read off the ledger rather than DMC_TASKS, which is what makes a partial
+    # grid exportable: 4 tasks done, 4 published, no failures for the rest.
     available = {
         row["task"] for row in rows
         if row.get("status") == "ok" and row.get("cell") == args.cell
@@ -521,10 +511,9 @@ def main() -> int:
 
     print(f"cell {args.cell} — {len(tasks)} task(s), selecting by {args.metric}\n")
     for task in tasks:
-        # Per TASK, not once for the whole export: a partially-run grid can have
-        # one task finished at 50M and another only piloted at 5M, and taking a
-        # single global budget would silently drop the piloted one rather than
-        # publishing the best it has.
+        # Per task, not once for the whole export: a partial grid can have one
+        # task finished at 50M and another piloted at 5M, and a single global
+        # budget would silently drop the piloted one.
         budget = None if args.any_budget else (
             args.steps if args.steps is not None
             else budget_for(rows, task, args.cell)
@@ -570,10 +559,9 @@ def main() -> int:
                 problem = verify(bundle)
                 print(f"         verify: {problem or 'ok'}")
                 if problem:
-                    # Left on disk to be looked at, but kept OUT of the index
-                    # and the archives: a bundle that did not read back is not
-                    # something to hand anyone, and an index entry is exactly
-                    # that handing.
+                    # Left on disk to be looked at, but out of the index and the
+                    # archives: a bundle that did not read back is not something
+                    # to hand anyone.
                     skipped.append(
                         (label, f"exported but failed verification: {problem}")
                     )
