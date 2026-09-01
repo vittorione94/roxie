@@ -15,7 +15,7 @@ DEFAULT_CELLS="${DEFAULT_CELLS:-warp_gpu envpool_cpu}"
 ALL_TASKS="${ALL_TASKS:-$(uv run python -c 'from roxie.environment.suites import DMC_TASKS; print(" ".join(DMC_TASKS))' 2>/dev/null)}"
 [[ -z "$ALL_TASKS" ]] && { echo "Failed to load tasks. Ensure uv sync is run." >&2; exit 1; }
 
-STEPS="${STEPS:-1000000000}"
+STEPS="${STEPS:-500000000}"
 SMOKE_STEPS=100000
 SMOKE_EPOCH=25000
 OUT_ROOT="outputs/release_v1"

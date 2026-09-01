@@ -18,7 +18,12 @@ from roxie.losses.actor_losses import (
     sac_alpha_loss_fn,
     td3_actor_loss_fn,
 )
-from roxie.losses.critic_losses import ddpg_critic_loss_fn, ppo_critic_loss_fn, sac_critic_loss_fn
+from roxie.losses.critic_losses import (
+    _smoothed_target_actions,
+    ddpg_critic_loss_fn,
+    ppo_critic_loss_fn,
+    sac_critic_loss_fn,
+)
 from roxie.models.actors import DeterministicActor, StochasticActor
 from roxie.models.critics import QCritic, VCritic, TwinCritic
 
@@ -471,3 +476,54 @@ class TestSACLosses:
         loss = sac_alpha_loss_fn(log_alpha, log_probs, target_entropy)
         assert loss.shape == ()
         assert jnp.isfinite(loss)
+
+
+class TestTargetSmoothingUnits:
+    """`target_policy_noise` / `target_noise_clip` live in the actor's [-1, 1]
+    output space — the units the TD3 paper defines them in, and the ones
+    `NoiseModule.add_noise` already explores in. Scaling them by the env action
+    span instead silently doubles both on any [-1, 1] env, which is what made
+    TD3's smoothing kernel 4x its own exploration noise.
+    """
+
+    N = 4096
+
+    def _bounds(self, span):
+        return jnp.full((ACT_DIM,), -span / 2), jnp.full((ACT_DIM,), span / 2)
+
+    def _applied_noise(self, actor, obs, low, high, sigma, clip, seed=1):
+        """The smoothing actually applied, expressed back in [-1, 1] units."""
+        smoothed, _ = _smoothed_target_actions(
+            actor, obs, jax.random.PRNGKey(seed), sigma, clip, low, high
+        )
+        # `scale_to_env` is affine and increasing, so it inverts exactly.
+        smoothed_unit = 2.0 * (smoothed - low) / (high - low) - 1.0
+        return smoothed_unit - actor(obs)
+
+    @pytest.mark.parametrize("span", [2.0, 20.0])
+    def test_sigma_is_span_independent(self, det_actor, span):
+        obs = jax.random.normal(jax.random.PRNGKey(0), (self.N, OBS_DIM))
+        low, high = self._bounds(span)
+        # Clip deliberately wide enough to be inert, so this measures sigma alone.
+        applied = self._applied_noise(det_actor, obs, low, high, 0.2, 10.0)
+        assert float(jnp.std(applied)) == pytest.approx(0.2, rel=0.05)
+
+    @pytest.mark.parametrize("span", [2.0, 20.0])
+    def test_clip_is_span_independent(self, det_actor, span):
+        obs = jax.random.normal(jax.random.PRNGKey(0), (self.N, OBS_DIM))
+        low, high = self._bounds(span)
+        # Sigma >> clip, so essentially every sample is pinned to the clip.
+        applied = self._applied_noise(det_actor, obs, low, high, 1.0, 0.1)
+        assert float(jnp.max(jnp.abs(applied))) <= 0.1 + 1e-4
+
+    def test_zero_noise_is_a_no_op(self, det_actor):
+        """DDPG and D4PG run this same helper with the noise off; it must return
+        the bare target action, not merely a small perturbation of it."""
+        obs = jax.random.normal(jax.random.PRNGKey(0), (BATCH, OBS_DIM))
+        low, high = self._bounds(2.0)
+        smoothed, clip_frac = _smoothed_target_actions(
+            det_actor, obs, jax.random.PRNGKey(1), 0.0, 0.0, low, high
+        )
+        expected = Agent.scale_to_env(det_actor(obs), low, high)
+        assert jnp.allclose(smoothed, expected, atol=1e-6)
+        assert float(clip_frac) == 0.0

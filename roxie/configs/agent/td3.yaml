@@ -11,7 +11,7 @@ gamma: 0.99
 tau: 0.005
 actor_learning_rate: 3e-4
 critic_learning_rate: 3e-4
-target_policy_noise: 0.2        # TD3 default target smoothing (env-unit fraction)
+target_policy_noise: 0.2        # TD3 paper's target smoothing, in the actor's [-1, 1] units
 target_noise_clip: 0.5
 policy_delay: 2                 # actor + target updates every 2 critic steps
 memory_warmup: 30_000

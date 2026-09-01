@@ -35,28 +35,36 @@ def _smoothed_target_actions(
     """Target actions at `next_obs`, in env scale, with TD3 policy smoothing.
 
     Shared by every off-policy critic loss that bootstraps through a
-    deterministic target actor. `target_policy_noise` and `target_noise_clip`
-    are both fractions of the action span. D4PG/TD4 keep this call for signature
-    parity even though the papers do not smooth; their configs set the noise to
-    0, making it a no-op.
+    deterministic target actor. D4PG/TD4 keep this call for signature parity
+    even though the papers do not smooth; their configs set the noise to 0,
+    making it a no-op.
+
+    UNITS: `target_policy_noise` and `target_noise_clip` are in the actor's own
+    [-1, 1] output space, which is where the TD3 paper's 0.2 / 0.5 are defined
+    and where `NoiseModule.add_noise` applies the exploration noise. The
+    smoothing is therefore added *before* `scale_to_env`, exactly as
+    `Agent.deterministic_step_fn` does it — so the two noise sources are
+    directly comparable and neither depends on the env's action span. Scaling
+    these by the span instead (as this did until the AcrobotSwingup TD3 vs DDPG
+    regression) doubles them on any [-1, 1] env, putting the smoothing kernel at
+    4x the exploration noise.
 
     Returns ``(next_actions, smooth_clip_frac)``, the latter being the share of
     smoothing samples the clip bit: near 0 means `target_noise_clip` is inert,
     near 1 that it has flattened the Gaussian into a two-point distribution.
     """
     next_actions = target_actor_model(next_obs)  # [-1, 1]
-    next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
 
-    act_span = action_high - action_low
-    noise = jax.random.normal(noise_key, next_actions.shape) * (
-        target_policy_noise * act_span
+    noise = jax.random.normal(noise_key, next_actions.shape) * target_policy_noise
+    clipped_noise = jnp.clip(noise, -target_noise_clip, target_noise_clip)
+    smooth_clip_frac = jnp.mean(
+        (jnp.abs(noise) > target_noise_clip).astype(jnp.float32)
     )
-    noise_clip = target_noise_clip * act_span
-    clipped_noise = jnp.clip(noise, -noise_clip, noise_clip)
-    smooth_clip_frac = jnp.mean((jnp.abs(noise) > noise_clip).astype(jnp.float32))
 
-    next_actions = jnp.clip(next_actions + clipped_noise, action_low, action_high)
-    return next_actions, smooth_clip_frac
+    # Clipped in [-1, 1] and scaled afterwards; `scale_to_env` is an increasing
+    # affine map, so this is the same set as clipping to [action_low, action_high].
+    next_actions = jnp.clip(next_actions + clipped_noise, -1.0, 1.0)
+    return Agent.scale_to_env(next_actions, action_low, action_high), smooth_clip_frac
 
 
 def ddpg_critic_loss_fn(

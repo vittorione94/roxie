@@ -11,7 +11,7 @@ gamma: 0.99
 tau: 0.005
 actor_learning_rate: 3e-4
 critic_learning_rate: 3e-4
-target_policy_noise: 0.2       # target smoothing noise
+target_policy_noise: 0.2       # target smoothing noise, in the actor's [-1, 1] units
 target_noise_clip: 0.5
 memory_warmup: 30_000            # start updates after 30k transitions (~75 loops @ 400 envs)
 steps_before_learning: 30_000    # same as warmup (can differ if desired)
