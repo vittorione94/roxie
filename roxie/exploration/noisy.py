@@ -47,9 +47,8 @@ class NoiseModule(nnx.Module):
         current_scale = self.get_current_scale()
         noise = self.sample_noise(key, shape=actions.shape) * current_scale
 
-        # Advanced by env frames collected this call, not by 1 per iteration, so
-        # the schedule is measured in the same unit as the trainer's `steps` and
-        # `decay_steps` behaves the same at 1 parallel env or 4000.
+        # Advanced by env frames, not by 1 per call, so `decay_steps` is in the
+        # same unit as the trainer's `steps` at any parallel_envs.
         self.step_count.value += actions.shape[0] if actions.ndim > 1 else 1
 
         return actions + noise
@@ -97,13 +96,10 @@ class OrnsteinUhlenbeckNoise(NoiseModule):
     def sample_noise(
         self, key: jax.random.PRNGKey, shape: Optional[tuple] = None
     ) -> jnp.ndarray:
-        # OU process dx = theta * (mu - x) * dt + sqrt(2*theta) * dW, discretized
-        # as x_t = x_{t-1} + theta*dt*(mu - x_{t-1}) + sqrt(2*theta*dt)*noise.
-        # That increment holds the stationary std at ~1.0 for any theta/dt, so
-        # `initial_noise_scale` is the actual noise std. A bare sqrt(dt) one
-        # would give std = sqrt(1/(2*theta)), coupling amplitude to the
-        # mean-reversion rate — which the OU-as-policy agent in
-        # roxie.agents.basic deliberately keeps.
+        # The sqrt(2*theta*dt) increment holds the stationary std at ~1.0 for
+        # any theta/dt, so `initial_noise_scale` is the actual noise std. A bare
+        # sqrt(dt) would couple amplitude to the mean-reversion rate — which the
+        # OU-as-policy agent in roxie.agents.basic deliberately keeps.
         current_noise = self.noise_state.value
 
         mean_reversion = self.theta * self.dt * (self.mu - current_noise)

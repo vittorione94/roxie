@@ -54,9 +54,8 @@ class AsyncLearner:
         self.steps_before_learning = int(agent.steps_before_learning)
         self.steps_between_updates = int(agent.steps_between_updates)
         # `chunk` is how many fused grad steps the learner submits at a time —
-        # small so the GPU stream keeps freeing up for the acting thread's
-        # forward pass. `_ratio` is the sync loop's grad-steps-per-env-step,
-        # reproduced on average below.
+        # small so the GPU stream keeps freeing up for the acting thread.
+        # `_ratio` is the sync loop's grad-steps-per-env-step.
         self._chunk = max(1, min(int(chunk), self.learning_steps))
         self._ratio = self.learning_steps / max(1, self.steps_between_updates)
 
@@ -64,18 +63,16 @@ class AsyncLearner:
         self._lock = threading.Lock()
 
         # Published behaviour snapshot (learner -> main), version-stamped so the
-        # acting thread only re-syncs its behaviour actor when it changes.
+        # acting thread only re-syncs when it changes.
         self._snapshot = None            # (actor_param_state, obs_stats)
         self._snapshot_version = 0
 
-        # `_added_steps` seeds from transitions already buffered synchronously
-        # (the warmup fill) so the first burst fires on the same total-step
-        # boundary the sync loop would use.
+        # Seeded from transitions already buffered synchronously (the warmup
+        # fill) so the first burst fires on the same boundary the sync loop uses.
         self._added_steps = int(initial_steps)
         self._grad_steps = 0
         self._losses: list = []          # (actor_loss, critic_loss) since drain
 
-        # Control flags.
         self._stop = threading.Event()
         self._pause_req = threading.Event()
         self._paused = threading.Event()   # learner acks it is idle/paused
@@ -86,14 +83,11 @@ class AsyncLearner:
             target=self._loop, name="async-learner", daemon=True
         )
 
-        # Behaviour-side state, owned by the acting thread. Held here rather than
-        # in the training loop so the snapshot-versioning protocol stays this
-        # class's business.
+        # Owned by the acting thread, held here so the snapshot-versioning
+        # protocol stays this class's business.
         self._behavior_actor = None
         self._behavior_stats = None
         self._behavior_version = -1
-
-    # -- construction -------------------------------------------------------
 
     @classmethod
     def started(cls, agent, agent_key, state, *, initial_steps=0, chunk=8):
@@ -110,7 +104,7 @@ class AsyncLearner:
 
         learner._behavior_actor = copy.deepcopy(agent.state.actor)
         learner._behavior_stats = agent.state.obs_stats
-        warm_action, _ = agent.select_action(
+        warm_action, _, _ = agent.select_action(
             learner._behavior_actor, learner._behavior_stats,
             state.obs, agent_key, evaluate=False,
         )
@@ -124,11 +118,8 @@ class AsyncLearner:
               "(CPU acting overlaps GPU gradient bursts).", flush=True)
         return learner
 
-    # -- main-thread API ----------------------------------------------------
-
     def start(self):
-        # Seed an initial behaviour snapshot so the acting thread can act from
-        # step 0 (pre-learning behaviour = the current, warmup-era actor).
+        # So the acting thread can act from step 0, off the warmup-era actor.
         self._publish_snapshot()
         self._thread.start()
 
@@ -140,17 +131,19 @@ class AsyncLearner:
             nnx.update(self._behavior_actor, snapshot[0])
             self._behavior_stats = snapshot[1]
             self._behavior_version = version
-        return self._agent.select_action(
+        # Extras (PPO's stored log-prob / value) are DROPPED, and the queue
+        # carries none: the async path is gated on a public `learn`, which only
+        # the extras-free off-policy agents expose.
+        action, noise, _extras = self._agent.select_action(
             self._behavior_actor, self._behavior_stats, obs, key, evaluate=False,
         )
+        return action, noise
 
-    def observe(self, prev_obs, timestep, actions, steps):
+    def buffer(self, prev_obs, timestep, actions):
         """Hand the transition to the learner thread. The action travels WITH it
         rather than being read off `agent.last_action`, which `select_action`
-        never sets. `steps` is unused: the learner paces itself off the
-        transitions it has buffered, not the acting thread's count.
+        never sets.
         """
-        del steps
         self.push(
             prev_obs,
             actions,
@@ -166,6 +159,12 @@ class AsyncLearner:
         self._queue.put(
             (prev_obs, action, reward, termination, truncation, next_obs)
         )
+
+    def update(self, steps):
+        """No-op: the learner thread paces its own bursts off the transitions it
+        has buffered, not off the acting thread's step count. Present so the
+        rollout can call the same surface on either learner."""
+        del steps
 
     def _latest_snapshot(self):
         """`(version, (actor_params, obs_stats))`; snapshot is None before start."""
@@ -203,8 +202,6 @@ class AsyncLearner:
             pass
         if self._thread.is_alive():
             self._thread.join(timeout=30)
-
-    # -- learner thread -----------------------------------------------------
 
     def _add_item(self, item) -> int:
         if item is None:  # stop / wake sentinel
@@ -259,9 +256,9 @@ class AsyncLearner:
         return added
 
     def _publish_snapshot(self):
-        # Independent on-device copies: a plain reference would alias buffers the
-        # next `learn()` donates, leaving the acting thread reading freed memory.
-        # The copy is issued before that donation on the same stream.
+        # Independent on-device copies: a plain reference would alias buffers
+        # the next `learn()` donates, leaving the acting thread reading freed
+        # memory. The copy is issued before that donation on the same stream.
         params = jax.tree.map(jnp.copy, nnx.state(self._agent.state.actor, nnx.Param))
         obs_stats = jax.tree.map(jnp.copy, self._agent.state.obs_stats)
         with self._lock:
@@ -282,8 +279,6 @@ class AsyncLearner:
                 added = self._added_steps
                 grads = self._grad_steps
 
-            # Submitting the deficit in `chunk`-sized pieces preserves the replay
-            # ratio on average while keeping each device submission short.
             target = self._target_grads(added)
 
             if grads >= target:
@@ -299,8 +294,7 @@ class AsyncLearner:
                         self._added_steps += n
                 continue
 
-            # Fixed-size, so `_grad_steps` compiles once (n_steps is static);
-            # the at-most-`chunk` overshoot is negligible for the replay ratio.
+            # Fixed-size, so `_grad_steps` compiles once (n_steps is static).
             self._key, burst_key = jax.random.split(self._key)
             actor_loss, critic_loss = self._agent.learn(
                 burst_key, n_steps=self._chunk

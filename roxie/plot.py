@@ -7,7 +7,8 @@ Two modes, because the benchmark asks two different questions:
                         discovered run overlaid.
 ``--grid --path <root>``  the release figure: one cell per ENV, every agent's
                         eval curve inside it. Reads an ``outputs/release_v1``
-                        tree laid out as ``<task>/<cell>/<agent>/<stamp>/log.csv``.
+                        tree laid out as ``<task>/<cell>/<agent>/<stamp>/log.csv``,
+                        and writes ONE FIGURE PER SUITE — see ``CELL_SUITE``.
 
 Both read ``log.csv``, which the CSV logger writes for every run whether or not
 wandb was enabled — so the figure never depends on a network round-trip.
@@ -99,9 +100,7 @@ def wallclock_unit(runs):
     return 'seconds', 1.0
 
 
-# Runs logged before the `train/` `test/` `sys/` rename carry bare metric names,
-# and this tool is routinely pointed at an outputs/ tree holding both. Mapping
-# the old spelling forward beats silently drawing empty axes for those runs.
+# Runs logged before the `train/` `test/` `sys/` rename carry bare metric names.
 _LEGACY_COLUMNS = {
     "score": "train/score",
     "score/std": "train/score/std",
@@ -157,17 +156,54 @@ def load_runs(paths):
     return runs
 
 
-# ------------------------------------------------------------- the grid -----
-
-# Line style per backend cell, so a task's panel shows GPU and CPU curves of the
-# same agent in one colour and tells them apart by stroke — the pair should
-# overlap, which is the reading the figure exists for.
+# Line style per backend cell: within a suite the GPU and CPU curves of one
+# agent should overlap, which is the reading the figure exists for.
 CELL_STYLE = {
     "warp_gpu": ("-", 1.6),
     "mjx_gpu": ("-", 1.6),
     "envpool_cpu": ("--", 1.3),
     "mjx_cpu": ("--", 1.3),
 }
+
+# Which task IMPLEMENTATION a cell steps — the axis the figure must not
+# collapse. The playground cells share one set of XMLs, so overlaying them IS a
+# parity check; EnvPool steps dm_control's own C++ physics off a different XML,
+# and the two disagree on integrator (9 of 25 tasks) and sim dt (8). So a
+# cross-suite score gap tangles physics with algorithm, and each suite gets its
+# own figure.
+CELL_SUITE = {
+    "warp_gpu": "playground",
+    "mjx_gpu": "playground",
+    "mjx_cpu": "playground",
+    "envpool_cpu": "dm_control",
+}
+
+# Named in each figure's subtitle.
+SUITE_PHYSICS = {
+    "playground": "mujoco_playground XMLs, MJX-tuned solver settings",
+    "dm_control": "dm_control XMLs, native MuJoCo",
+}
+
+
+def split_suites(grid):
+    """``[(suite, subgrid), ...]`` — the grid partitioned by task implementation.
+
+    A cell the map does not know keeps its own name as its suite, so an
+    unrecognised backend gets its own figure rather than being silently folded
+    into someone else's physics.
+    """
+    suites: dict[str, dict] = {}
+    for task, cells in grid.items():
+        for (agent, cell), df in cells.items():
+            suite = CELL_SUITE.get(cell, cell)
+            suites.setdefault(suite, {}).setdefault(task, {})[(agent, cell)] = df
+    return sorted(suites.items())
+
+
+def suite_output(output: str, suite: str) -> str:
+    """``release.pdf`` -> ``release-playground.pdf``."""
+    path = Path(output)
+    return str(path.with_name(f"{path.stem}-{suite}{path.suffix}"))
 
 
 def discover_grid(root: Path):
@@ -195,19 +231,17 @@ def discover_grid(root: Path):
     return grid
 
 
-def plot_grid(root: Path, output: str, metric: str = "test/score"):
-    """The release figure: one panel per env, every agent's curve inside it."""
-    grid = discover_grid(root)
-    if not grid:
-        print(f"Error: no runs found under '{root}' "
-              f"(expected <task>/<cell>/<agent>/<stamp>/{LOG_NAME}).")
-        return
+def plot_grid(grid, output: str, metric: str = "test/score", suite: str | None = None):
+    """The release figure for ONE suite: a panel per env, every agent inside it.
 
+    Takes an already-discovered (and suite-filtered) grid rather than a root, so
+    a 350-run tree is read from disk once and drawn once per suite.
+    """
     tasks = sorted(grid)
     agents = sorted({agent for cells in grid.values() for agent, _ in cells})
     prop = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
-    # Colour is the agent and nothing else, so the same arm is the same colour
-    # in all 25 panels.
+    # Colour is the agent and nothing else, so an arm keeps its colour across
+    # every panel.
     color = {a: (prop[i % len(prop)] if prop else None) for i, a in enumerate(agents)}
 
     ncols = min(5, len(tasks))
@@ -226,9 +260,8 @@ def plot_grid(root: Path, output: str, metric: str = "test/score"):
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.tick_params(labelsize=8)
         # dm_control returns are bounded by construction, so pinning the axis
-        # keeps the panels comparable instead of each auto-scaling to its best arm.
+        # keeps panels comparable instead of each auto-scaling to its best arm.
         ax.set_ylim(0, 1000)
-        # Axis labels only on the outside edge.
         if index % ncols == 0:
             ax.set_ylabel(metric, fontsize=9)
         if index >= len(tasks) - ncols:
@@ -236,7 +269,6 @@ def plot_grid(root: Path, output: str, metric: str = "test/score"):
     for ax in axs.flat[len(tasks):]:
         ax.axis("off")
 
-    # One legend for the whole figure: agents by colour, cells by stroke.
     from matplotlib.lines import Line2D
     handles = [Line2D([], [], color=color[a], label=a) for a in agents]
     handles += [
@@ -246,11 +278,23 @@ def plot_grid(root: Path, output: str, metric: str = "test/score"):
     ]
     fig.legend(handles=handles, loc="lower center",
                ncol=min(len(handles), 10), frameon=False, fontsize=9)
-    fig.suptitle(f"{metric} vs environment steps — {len(tasks)} tasks, "
-                 f"{len(agents)} agents", fontsize=14, fontweight="bold")
-    # The legend is a figure-level artist, which tight_layout does not account for.
-    bottom = 0.9 / fig.get_figheight()
-    fig.tight_layout(rect=[0, bottom, 1, 1 - 0.4 / fig.get_figheight()])
+    title = f"{metric} vs environment steps — {len(tasks)} tasks, {len(agents)} agents"
+    physics = None
+    if suite:
+        title = f"{suite} — {title}"
+        physics = SUITE_PHYSICS.get(suite)
+    # Header lines are offset a fixed number of INCHES from the top: the grid is
+    # 1 row for a pilot and 5 for the full release, and a fractional offset that
+    # looks right at one height collides with the panels at the other.
+    height = fig.get_figheight()
+    fig.suptitle(title, fontsize=14, fontweight="bold", va="top",
+                 y=1 - 0.15 / height)
+    if physics:
+        fig.text(0.5, 1 - 0.46 / height, physics, ha="center", va="top",
+                 fontsize=9, color="0.35")
+    # The legend is a figure-level artist, which tight_layout ignores.
+    bottom = 0.9 / height
+    fig.tight_layout(rect=[0, bottom, 1, 1 - 0.72 / height])
 
     try:
         fig.savefig(output, format="pdf", bbox_inches="tight")
@@ -266,7 +310,10 @@ def main():
                              "recursively for log.csv. All discovered runs are overlaid.")
     parser.add_argument("--grid", action="store_true",
                         help="Release figure: one panel per env, every agent inside it. "
-                             "Takes a single release tree (outputs/release_v1) as --path.")
+                             "Takes a single release tree (outputs/release_v1) as --path. "
+                             "Writes ONE FIGURE PER SUITE (playground / dm_control), "
+                             "suffixed onto --output, because the two do not share a "
+                             "physics model on every task.")
     parser.add_argument("--metric", default="test/score",
                         help="Metric plotted in --grid mode (default: test/score)")
     parser.add_argument("--output", type=str, default="learning_curves.pdf",
@@ -277,7 +324,17 @@ def main():
         if len(args.csv_path) != 1:
             print("Error: --grid takes exactly one --path (a release tree root).")
             return
-        plot_grid(Path(args.csv_path[0]), args.output, args.metric)
+        root = Path(args.csv_path[0])
+        grid = discover_grid(root)
+        if not grid:
+            print(f"Error: no runs found under '{root}' "
+                  f"(expected <task>/<cell>/<agent>/<stamp>/{LOG_NAME}).")
+            return
+        suites = split_suites(grid)
+        for suite, subgrid in suites:
+            # The suffix exists only to stop two suites overwriting each other.
+            out = suite_output(args.output, suite) if len(suites) > 1 else args.output
+            plot_grid(subgrid, out, args.metric, suite)
         return
 
     runs = load_runs(args.csv_path)
@@ -286,7 +343,6 @@ def main():
         return
 
     multi = len(runs) > 1
-    # Consistent color per run so all of a run's curves share a hue.
     prop_colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', [])
     colors = [prop_colors[i % len(prop_colors)] for i in range(len(runs))] if prop_colors else [None] * len(runs)
 
@@ -329,8 +385,7 @@ def main():
             axs[2, 1].plot(df['steps'], df['train/gradient_steps'], label=f'{prefix}Gradient Steps',
                            color=color if multi else 'orange', alpha=0.8, linewidth=2)
 
-        # What actually ranks runs that reach the same score at very different
-        # throughputs.
+        # What ranks runs reaching the same score at different throughputs.
         if 'sys/time/total_s' not in df.columns:
             continue
         wall = df['sys/time/total_s'] / time_div
@@ -345,7 +400,6 @@ def main():
             axs[3, 1].plot(wall, df['steps'], label=f'{prefix}Steps',
                            color=color if multi else 'brown', alpha=0.8, linewidth=2)
 
-    # Titles / labels / grid are per-axis and shared across runs.
     time_label = f'Wall-Clock Time ({time_name})'
     titles = [
         ('Score vs Steps', 'Environment Steps', 'Score'),
@@ -362,7 +416,6 @@ def main():
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.grid(True, linestyle='--', alpha=0.6)
-        # Only show a legend where something was actually plotted.
         if ax.get_legend_handles_labels()[0]:
             ax.legend()
 

@@ -77,9 +77,6 @@ def _pool(env, key, n=4, params=None):
     return state
 
 
-# ---------------------------------------------------------------- construction
-
-
 def test_reset_returns_state_and_timestep(vec_env, rng_key):
     state, ts = vec_env.reset(rng_key)
 
@@ -111,9 +108,6 @@ def test_params_stay_traced_and_reach_initial(vec_env, rng_key):
     assert np.allclose(at_two - at_zero, 2.0)
     # One compile for both values is the property under test.
     assert jitted._cache_size() == 1
-
-
-# ------------------------------------------------------------- the done split
 
 
 def test_failure_is_terminated_not_truncated(vec_env, rng_key):
@@ -172,9 +166,6 @@ def test_step_limit_does_not_mask_a_genuine_failure(vec_env, rng_key):
     assert np.all(np.asarray(ts.truncated))
 
 
-# ------------------------------------------------------------------ autoreset
-
-
 def test_timestep_obs_is_pre_reset_and_state_obs_is_post_reset(rng_key):
     """The distinction the replay buffer depends on.
 
@@ -222,9 +213,6 @@ def test_autoreset_zeroes_the_step_counter(rng_key):
     steps = np.asarray(state.steps)
     assert steps[0] == 1      # reset on the first step, then stepped once
     assert np.all(steps[1:] == 2)
-
-
-# ------------------------------------------------------------------ jittability
 
 
 def test_whole_step_is_jittable_and_scannable(rng_key):

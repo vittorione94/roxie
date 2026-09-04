@@ -8,10 +8,12 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import (
-    Transition,
+    BurstNode,
     build_replay,
     fused_grad_steps,
+    graph_jit,
     network_rngs,
+    reduce_diagnostics,
     repack_samples,
     soft_update,
     transition_prototype,
@@ -35,25 +37,26 @@ def _grad_step(
     obs_std: jnp.ndarray,
     obs_clip: float,
     normalize: bool,
+    pre_activation_coef: float,
     n_step: int = 1,
 ):
     """One gradient step, mutating `state` in place. Not jitted on its own — it
     runs inside `_grad_steps` below, which fuses N steps into one compiled
     program. `n_step` is the TD horizon, not the scan length.
     """
-    # `repack_samples` folds the Bellman target ingredients (n-step return,
-    # bootstrap coefficient, bootstrap obs) into the dict for both buffer
-    # layouts, so the critic loss never sees gamma/terminals.
+    # `repack_samples` folds the n-step return, bootstrap coefficient and
+    # bootstrap obs into the dict, so the critic loss never sees gamma/terminals.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalized once here: both losses below read the same `observations`, and
-    # neither of them normalizes.
+    # Normalized once here: both losses read the same `observations`.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    critic_loss, critic_grads = nnx.value_and_grad(ddpg_critic_loss_fn)(
+    (critic_loss, critic_aux), critic_grads = nnx.value_and_grad(
+        ddpg_critic_loss_fn, has_aux=True
+    )(
         state.critic,
         state.target_actor,
         state.target_critic,
@@ -66,31 +69,29 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    actor_loss, actor_grads = nnx.value_and_grad(ddpg_actor_loss_fn)(
+    (actor_loss, actor_aux), actor_grads = nnx.value_and_grad(
+        ddpg_actor_loss_fn, has_aux=True
+    )(
         state.actor,
         state.critic,
         re_packed_samples,
         action_low,
         action_high,
+        pre_activation_coef,
     )
     state.actor_optimizer.update(state.actor, actor_grads)
 
     soft_update(state.target_actor, state.actor, tau)
     soft_update(state.target_critic, state.critic, tau)
 
-    return actor_loss, critic_loss
+    return actor_loss, critic_loss, actor_aux, critic_aux
 
 
-# `fused_grad_steps` compiles the body once and runs it `n_steps` times
-# on-device, so a burst costs one host dispatch rather than one per step.
 @functools.partial(
-    nnx.jit,
+    graph_jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "n_step", "normalize",
     ),
-    # The replay buffer rides unchanged through the scan; without donation XLA
-    # allocates a full second copy of it every update.
-    donate_argnums=(0,),
 )
 def _grad_steps(
     state: TrainState,
@@ -106,12 +107,12 @@ def _grad_steps(
     obs_eps: float,
     obs_clip: float,
     normalize: bool,
+    pre_activation_coef: float,
     n_step: int = 1,
 ):
-    # Loop-constant, so hoisted out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
-    state, (actor_losses, critic_losses) = fused_grad_steps(
+    state, (actor_losses, critic_losses, actor_aux, critic_aux) = fused_grad_steps(
         state,
         key,
         n_steps,
@@ -128,15 +129,26 @@ def _grad_steps(
             obs_std=obs_std,
             obs_clip=obs_clip,
             normalize=normalize,
+            pre_activation_coef=pre_activation_coef,
             n_step=n_step,
         ),
     )
 
-    # Averaged over the fused steps for less noisy logging.
-    return state, jnp.mean(actor_losses), jnp.mean(critic_losses)
+    # Averaged over the fused steps for less noisy logging. No `policy_delay`
+    # here, so the actor and critic ran on every one of them and share a
+    # denominator.
+    diagnostics = {
+        **reduce_diagnostics(actor_aux, n_steps),
+        **reduce_diagnostics(critic_aux, n_steps),
+    }
+    return state, jnp.mean(actor_losses), jnp.mean(critic_losses), diagnostics
 
 
 class DDPG(Agent):
+    # Its own split: the ACTING burst mutates it (the decay counter advances
+    # per step inside the scan) but the gradient burst never touches it.
+    noise_module = BurstNode(0, handle="_noise_nodes", size=1)
+
     def __init__(
         self,
         env_obs_size: int,
@@ -169,8 +181,7 @@ class DDPG(Agent):
         obs_norm_eps: float = 1e-8,
     ):
 
-        # Set before `_make_critic` so overriding subclasses can derive their
-        # own seed offsets.
+        # Set before `_make_critic` so subclasses can derive seed offsets.
         self.seed = int(seed)
 
         actor = hydra.utils.instantiate(
@@ -220,9 +231,8 @@ class DDPG(Agent):
         self.normalize_observations = normalize_observations
         self.obs_clip = float(obs_norm_clip)
         self.obs_eps = float(obs_norm_eps)
-        # Weight on the actor's pre-tanh saturation penalty, consumed by TD3's
-        # actor loss; 0.0 = the textbook DPG objective. On the base so every
-        # deterministic-actor agent round-trips it identically.
+        # Consumed by TD3's actor loss; 0.0 = the textbook DPG objective. On
+        # the base so every deterministic-actor agent round-trips it.
         self.pre_activation_coef = float(pre_activation_coef)
 
         print(f"{type(self).__name__} agent initialized.")
@@ -230,8 +240,8 @@ class DDPG(Agent):
         print("Hyper Params:", self._export_hyperparams())
 
     def _checkpoint_modules(self) -> dict:
-        # The noise module carries the step counter its decay schedule reads, so
-        # without it a resumed run would explore at the initial scale again.
+        # Carries the step counter its decay schedule reads, so without it a
+        # resumed run would explore at the initial scale again.
         return {"noise_module": self.noise_module}
 
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
@@ -242,18 +252,6 @@ class DDPG(Agent):
             rngs=network_rngs(self.seed, offset=2),
         )
 
-    def replay_add(self, buffer_state, transitions):
-        """Add one env-step batch of transitions (leaves shaped (B, ...)).
-
-        The trajectory buffer (n_step > 1) expects an explicit time axis on every
-        leaf — (B, T=1, ...) for per-step adds — while the flat buffer takes the
-        batch as-is. Callers go through here so they need not know which is
-        active.
-        """
-        if self.n_step > 1:
-            transitions = jax.tree.map(lambda x: x[:, None], transitions)
-        return self.replay.add(buffer_state, transitions)
-
     def select_action(
         self,
         actor: nnx.Module,
@@ -261,22 +259,43 @@ class DDPG(Agent):
         observation: jnp.ndarray,
         key: jax.random.PRNGKey,
         evaluate: bool = False,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        noise_module: nnx.Module = None,
+        critic: nnx.Module = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, dict]:
         """Pure action selection from an explicit actor + obs stats.
 
         Factored out of ``step`` so the async learner's acting thread can select
         actions from a behaviour actor snapshot — decoupled from the learner's
         live ``self.state.actor`` — through the same normalization + noise path.
-        Returns ``(scaled_action, applied_noise)``.
+        Returns ``(scaled_action, applied_noise, extras)``; `extras` is the
+        per-step fields the buffer stores beyond the standard five, and is empty
+        here — only PPO has any.
+
+        ``noise_module`` is explicit for the same reason the actor is: the fused
+        acting burst carries the module through a ``lax.scan``, and its decay
+        counter has to advance on the carry rather than on ``self``.
+
+        ``critic`` is accepted and ignored: only an on-policy agent stores a
+        value estimate at acting time. It is part of the shared signature the
+        fused acting burst calls through.
         """
+        del critic
         if self.normalize_observations:
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
 
         action, noise = Agent.deterministic_step_fn(
-            actor, observation, key, self.noise_module, evaluate,
+            actor,
+            observation,
+            key,
+            self.noise_module if noise_module is None else noise_module,
+            evaluate,
         )
-        return Agent.scale_to_env(action, self.action_low, self.action_high), noise
+        return (
+            Agent.scale_to_env(action, self.action_low, self.action_high),
+            noise,
+            {},
+        )
 
     def step(
         self,
@@ -285,55 +304,12 @@ class DDPG(Agent):
         key: jax.random.PRNGKey = None,
     ) -> jnp.ndarray:
         """Selects an action by calling the pure, JIT-compiled step function."""
-        self.last_action, noise = self.select_action(
+        self.last_action, noise, self.last_extras = self.select_action(
             self.state.actor, self.state.obs_stats, observation, key, evaluate,
         )
-        # Post-clip noise, per env per joint. Kept on device; the trainer reduces
-        # it to a per-joint epoch mean.
         self.last_noise = noise
 
         return self.last_action
-
-    def add_transitions(
-        self, prev_obs, action, reward, termination, truncation, next_obs
-    ):
-        """Buffer one env-step batch given an explicit action.
-
-        Split out of ``add`` so the async learner (which owns ``self.state`` on
-        its own thread) can add transitions whose action travelled with them
-        through the hand-off queue, rather than reading ``self.last_action``,
-        which the acting thread overwrites every step.
-        """
-        # `terminal` is true termination only: marking a time-limit truncation
-        # terminal zeroes its bootstrap and collapses Q at the cutoff, for every
-        # env at once since they hit the limit in lockstep. `truncation` is
-        # stored separately so n-step windows stop there too — in the flat
-        # stream the item after any done is a reset state.
-        experiences = Transition(
-            observation=prev_obs,
-            action=action,
-            reward=reward,
-            terminal=termination,
-            truncation=truncation,
-        )
-
-        self.state.buffer_state = self.replay_add(self.state.buffer_state, experiences)
-
-        if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_obs, next_obs], axis=0)
-            self.state.obs_stats = Agent.update_obs_stats(
-                self.state.obs_stats, obs_batch
-            )
-
-    def add(self, prev_obs, timestep):
-        self.add_transitions(
-            prev_obs,
-            self.last_action,
-            timestep.reward,
-            timestep.terminated,
-            timestep.truncated,
-            timestep.obs,
-        )
 
     def learn(self, agent_rng, n_steps=None):
         """Run one unconditional burst of ``n_steps`` (default ``learning_steps``)
@@ -346,10 +322,11 @@ class DDPG(Agent):
         learner passes a small ``n_steps`` so the GPU stream frees up frequently
         for the acting thread's forward pass.
         """
-        self.state, actor_loss, critic_loss = _grad_steps(
-            self.state,
+        burst_steps = self.learning_steps if n_steps is None else int(n_steps)
+        actor_loss, critic_loss, diagnostics = _grad_steps(
+            self._burst_nodes,
             agent_rng,
-            self.learning_steps if n_steps is None else int(n_steps),
+            burst_steps,
             self.gamma,
             self.tau,
             self.replay.sample,
@@ -360,8 +337,10 @@ class DDPG(Agent):
             self.obs_eps,
             self.obs_clip,
             self.normalize_observations,
+            self.pre_activation_coef,
             n_step=self.n_step,
         )
+        self.record_diagnostics(diagnostics, burst_steps)
         return actor_loss, critic_loss
 
     def update(self, steps, agent_rng):

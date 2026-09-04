@@ -4,15 +4,11 @@
 # ddpg_bench.yaml is the reference file and lists the invariants held identical
 # across every arm.
 #
-# D4PG-specific: the critic predicts a distribution over `num_atoms` fixed atoms
-# spanning [v_min, v_max] instead of a scalar Q, so the support has to bracket
-# the achievable return or the projection clips and the critic learns a
-# saturated distribution. This is the one hyperparameter here that is genuinely
-# task-dependent — and the reason ONE support works for the whole suite is a
-# property of dm_control, not luck: every suite task's per-step reward is a
-# normalised tolerance in [0, 1], so at gamma 0.99 the discounted return is
-# bounded by ~100 on all 25. The support below leaves headroom on both sides.
-# A task outside dm_control needs this rechecked.
+# D4PG-specific: the critic predicts a distribution over `num_atoms` atoms
+# spanning [v_min, v_max], so the support has to bracket the achievable return
+# or the projection clips. One support works for all 25 tasks because every
+# dm_control reward is a tolerance in [0, 1], bounding the discounted return at
+# ~100 at gamma 0.99. A task outside dm_control needs this rechecked.
 _target_: roxie.agents.D4PG
 
 # Where the agent runs; the `backend` group sets it per cell (see env.device).
@@ -33,7 +29,7 @@ steps_before_learning: 30_720
 steps_between_updates: 2_048
 learning_steps: 20
 max_grad_norm: 1
-pre_activation_coef: 1e-1       # see ddpg_bench.yaml
+pre_activation_coef: 0.0        # see ddpg_bench.yaml
 normalize_observations: true
 obs_norm_clip: 5.0
 obs_norm_eps: 1e-08

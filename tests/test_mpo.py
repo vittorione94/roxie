@@ -9,6 +9,8 @@ burst exercising it — hence these tests rather than unit tests of the loss
 functions alone.
 """
 
+import copy
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -166,13 +168,71 @@ class TestFusedBurst:
 
     def test_no_public_learn_hook(self, agent):
         """`Trainer._run` routes any agent exposing a public `learn` through the
-        async learner, which also calls `select_action` / `add_transitions`. MPO
-        implements neither, so the burst entry point stays private — otherwise
-        `async_learner=True` would crash instead of falling back to sync."""
+        async learner. MPO satisfies the rest of that contract but has never
+        been validated against the sync curves on it, so the burst entry point
+        stays private — the private name is the whole opt-out."""
         assert not hasattr(agent, "learn"), (
-            "MPO exposes `learn` but not the rest of the async-learner contract"
+            "MPO exposes `learn`, which opts it into the async learner; that "
+            "path has not been validated against the sync curves"
         )
-        assert not hasattr(agent, "select_action")
+
+    def test_qualifies_for_the_fused_acting_path(self, agent):
+        """The pure `select_action` / `buffer_transitions` pair is what
+        `JaxRollout._fusable` tests for, and without it a whole
+        `steps_between_updates` window of acting is dispatched one env step at a
+        time. That cost MPO ~4x throughput on the v1 grid (26k sps against SAC's
+        114k at an identical update schedule), so it is pinned here."""
+        for name in ("select_action", "buffer_transitions"):
+            assert hasattr(agent, name), f"MPO lost `{name}`; acting un-fuses"
+
+    def test_select_action_reads_the_actor_it_is_handed(self, agent):
+        """`select_action` has to run against a `lax.scan` carry, so it must take
+        the actor and the obs stats as ARGUMENTS. Handing it a perturbed actor
+        and getting the same action back would mean it read `self.state`."""
+        obs = jnp.zeros((4, OBS_DIM), dtype=jnp.float32)
+        key = jax.random.PRNGKey(0)
+
+        # `deepcopy`, not `nnx.merge(*nnx.split(...))`: the latter shares the
+        # SAME Variable objects, so perturbing it would perturb the agent's own
+        # actor and the two calls below would agree for the wrong reason.
+        other = copy.deepcopy(agent.state.actor)
+        # Small: a large perturbation saturates BOTH actors at the clip bound
+        # and hides the dependence being tested.
+        nnx.update(
+            other,
+            jax.tree.map(lambda x: x + 0.01, nnx.state(other, nnx.Param)),
+        )
+
+        mine, _, _ = agent.select_action(
+            agent.state.actor, agent.state.obs_stats, obs, key, evaluate=True,
+        )
+        theirs, _, _ = agent.select_action(
+            other, agent.state.obs_stats, obs, key, evaluate=True,
+        )
+        assert not jnp.allclose(mine, theirs), (
+            "select_action ignored the actor it was handed"
+        )
+
+    def test_buffer_layout_survives_the_shared_add(self, agent):
+        """MPO is the one agent whose buffer omits `truncation`, and the shared
+        `add`/`buffer_transitions` path is handed one anyway. The base prunes
+        against this agent's own prototype; if that regressed, the add would not
+        typecheck and the stored tree would grow a field."""
+        assert agent.state.buffer_state.experience.truncation is None
+
+        # The flat buffer is allocated for `add_batch_size` rows per add, so
+        # this has to be NUM_ENVS wide.
+        obs = jnp.zeros((NUM_ENVS, OBS_DIM), dtype=jnp.float32)
+        agent.add_transitions(
+            obs,
+            jnp.zeros((NUM_ENVS, ACT_DIM), dtype=jnp.float32),
+            jnp.zeros((NUM_ENVS,), dtype=jnp.float32),
+            jnp.zeros((NUM_ENVS,), dtype=jnp.bool_),
+            # Truncation is offered by the shared caller and must be dropped.
+            jnp.ones((NUM_ENVS,), dtype=jnp.bool_),
+            obs,
+        )
+        assert agent.state.buffer_state.experience.truncation is None
 
     def test_update_gate_respects_schedule(self, agent):
         """One burst per `steps_between_updates` of ELAPSED env steps.

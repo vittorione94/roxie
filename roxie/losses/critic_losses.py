@@ -61,10 +61,46 @@ def _smoothed_target_actions(
         (jnp.abs(noise) > target_noise_clip).astype(jnp.float32)
     )
 
-    # Clipped in [-1, 1] and scaled afterwards; `scale_to_env` is an increasing
-    # affine map, so this is the same set as clipping to [action_low, action_high].
+    # `scale_to_env` is an increasing affine map, so clipping in [-1, 1] first
+    # gives the same set as clipping to [action_low, action_high].
     next_actions = jnp.clip(next_actions + clipped_noise, -1.0, 1.0)
     return Agent.scale_to_env(next_actions, action_low, action_high), smooth_clip_frac
+
+
+def categorical_mean(logits, atoms) -> jnp.ndarray:
+    """Expected value of a categorical critic's output over its fixed support."""
+    return jnp.sum(jax.nn.softmax(logits, axis=-1) * atoms, axis=-1)
+
+
+def value_aux(q_buffer, target_q, td_error, **extra) -> dict:
+    """The value-health diagnostics every critic loss reports.
+
+    Shared for the same reason `actor_aux` is: the failure mode is shared. A
+    `q_buffer` that climbs away from `q_target` is the overestimation spiral the
+    clipped double-Q exists to curb, and `td_abs` says whether the critic is
+    tracking its own target at all. Read off the loss's own forward pass, so the
+    instrumentation costs no extra compute.
+
+    `extra` carries what only some critics have: the twin heads' disagreement,
+    the target-smoothing clip rate, the target actions' rail fraction.
+    """
+    return {
+        "q_buffer": jnp.mean(q_buffer),
+        "q_target": jnp.mean(target_q),
+        "td_abs": jnp.mean(jnp.abs(td_error)),
+        **extra,
+    }
+
+
+def action_rail_frac(actions, action_low, action_high) -> jnp.ndarray:
+    """Share of `actions` (env scale) sitting on the action-space bounds.
+
+    High at the bootstrap state means the target actor has saturated too, so the
+    bootstrap is being evaluated exactly where the critic has the least data.
+    """
+    tol = 1e-3 * (action_high - action_low)
+    at_rail = (actions <= action_low + tol) | (actions >= action_high - tol)
+    return jnp.mean(at_rail.astype(jnp.float32))
 
 
 def ddpg_critic_loss_fn(
@@ -78,19 +114,24 @@ def ddpg_critic_loss_fn(
     action_low,
     action_high,
 ):
-    """Calculates the MSE loss for the critic."""
+    """MSE loss for the critic. Returns ``(loss, aux)``, as every loss here does.
+
+    Single-headed, so `aux` carries no `twin_gap` — the epoch reduction takes
+    whatever keys the agent reports, so a metric that has no meaning for an
+    agent is simply absent rather than logged as a zero.
+    """
     obs = samples["observations"]
     next_obs = samples["next_observations"]
 
-    next_actions, _ = _smoothed_target_actions(
+    next_actions, smooth_clip_frac = _smoothed_target_actions(
         target_actor_model, next_obs, noise_key,
         target_policy_noise, target_noise_clip, action_low, action_high,
     )
     next_q = jnp.squeeze(target_critic_model(next_obs, next_actions))
     current_q = jnp.squeeze(critic_model(obs, samples["actions"]))
 
-    # `rlax.td_learning` owns the stop_gradient on the target and is defined per
-    # scalar transition, hence the vmap over the batch.
+    # `rlax.td_learning` owns the stop_gradient on the target and is defined
+    # per scalar transition, hence the vmap over the batch.
     reward = jnp.squeeze(samples["rewards"])
     td_error = jax.vmap(rlax.td_learning)(
         current_q, reward, samples["bootstrap"], next_q
@@ -99,7 +140,17 @@ def ddpg_critic_loss_fn(
     # NOT `rlax.l2_loss`, which carries a 0.5 factor: this loss is the unhalved
     # MSE, and halving it would halve the critic's effective learning rate.
     critic_loss = jnp.mean(jnp.square(td_error))
-    return critic_loss
+
+    # Restates the target `td_learning` builds internally; XLA folds it into the
+    # same subexpression.
+    aux = value_aux(
+        current_q,
+        jax.lax.stop_gradient(reward + samples["bootstrap"] * next_q),
+        td_error,
+        target_smooth_clip_frac=smooth_clip_frac,
+        target_act_rail_frac=action_rail_frac(next_actions, action_low, action_high),
+    )
+    return critic_loss, aux
 
 
 def td3_critic_loss_fn(
@@ -118,9 +169,7 @@ def td3_critic_loss_fn(
     Identical to DDPG's target construction but takes the elementwise minimum
     of the two target critics to curb overestimation bias.
 
-    Returns ``(loss, aux)``; `aux` carries the value-health diagnostics the
-    agent logs under `td3/`, read off this forward pass so the instrumentation
-    costs nothing extra.
+    Returns ``(loss, aux)``, as every loss here does.
     """
     obs = samples["observations"]
     next_obs = samples["next_observations"]
@@ -143,27 +192,18 @@ def td3_critic_loss_fn(
     td_error2 = jax.vmap(rlax.td_learning)(q2, reward, samples["bootstrap"], next_q)
     critic_loss = jnp.mean(jnp.square(td_error1)) + jnp.mean(jnp.square(td_error2))
 
-    # Restates the target `td_learning` builds internally; XLA folds it into the
-    # same subexpression, so it costs nothing.
-    target_q = jax.lax.stop_gradient(reward + samples["bootstrap"] * next_q)
-
-    # A high rail fraction means the target actor has saturated too, so the
-    # bootstrap is evaluated at action-space corners where the critic has the
-    # least data — the classic overestimation setup.
-    rail_tol = 1e-3 * (action_high - action_low)
-    at_rail = (next_actions <= action_low + rail_tol) | (
-        next_actions >= action_high - rail_tol
+    # Restates the target `td_learning` builds internally; XLA folds it into
+    # the same subexpression.
+    aux = value_aux(
+        q1,
+        jax.lax.stop_gradient(reward + samples["bootstrap"] * next_q),
+        td_error1,
+        # Should stay small relative to |Q|; a widening gap means the min is
+        # doing heavy lifting.
+        twin_gap=jnp.mean(jnp.abs(q1 - q2)),
+        target_smooth_clip_frac=smooth_clip_frac,
+        target_act_rail_frac=action_rail_frac(next_actions, action_low, action_high),
     )
-    aux = {
-        "q_buffer": jnp.mean(q1),
-        "q_target": jnp.mean(target_q),
-        "td_abs": jnp.mean(jnp.abs(td_error1)),
-        # Should stay small relative to |Q|; a widening gap means the two heads
-        # are extrapolating differently and the min is doing heavy lifting.
-        "twin_gap": jnp.mean(jnp.abs(q1 - q2)),
-        "target_smooth_clip_frac": smooth_clip_frac,
-        "target_act_rail_frac": jnp.mean(at_rail.astype(jnp.float32)),
-    }
     return critic_loss, aux
 
 
@@ -187,11 +227,16 @@ def d4pg_critic_loss_fn(
     cross-entropy against the online critic. That whole chain is
     `rlax.categorical_td_learning`, which is defined for one transition, hence
     the vmap over the batch with `atoms` broadcast.
+
+    Returns ``(loss, aux)``, as every loss here does. The `aux` values are the
+    categoricals' EXPECTED values, which is what makes them comparable against
+    the scalar-critic agents' — the loss itself is a cross-entropy, so `td_abs`
+    here is a diagnostic of the same quantity but not a term in it.
     """
     obs = samples["observations"]
     next_obs = samples["next_observations"]
 
-    next_actions, _ = _smoothed_target_actions(
+    next_actions, smooth_clip_frac = _smoothed_target_actions(
         target_actor_model, next_obs, noise_key,
         target_policy_noise, target_noise_clip, action_low, action_high,
     )
@@ -203,7 +248,19 @@ def d4pg_critic_loss_fn(
     losses = jax.vmap(rlax.categorical_td_learning, in_axes=(None, 0, 0, 0, None, 0))(
         atoms, logits, reward, samples["bootstrap"], atoms, target_logits
     )
-    return jnp.mean(losses)
+
+    q_buffer = categorical_mean(logits, atoms)
+    target_q = jax.lax.stop_gradient(
+        reward + samples["bootstrap"] * categorical_mean(target_logits, atoms)
+    )
+    aux = value_aux(
+        q_buffer,
+        target_q,
+        q_buffer - target_q,
+        target_smooth_clip_frac=smooth_clip_frac,
+        target_act_rail_frac=action_rail_frac(next_actions, action_low, action_high),
+    )
+    return jnp.mean(losses), aux
 
 
 def td4_critic_loss_fn(
@@ -226,21 +283,23 @@ def td4_critic_loss_fn(
     sample: whichever head has the lower expected value contributes its whole
     categorical, keeping the target a valid distribution while preserving TD3's
     underestimation bias. Both online heads are then trained against it.
+
+    Returns ``(loss, aux)``, as every loss here does; see `d4pg_critic_loss_fn`
+    on what the expected values in it mean for a distributional critic.
     """
     obs = samples["observations"]
     next_obs = samples["next_observations"]
 
-    next_actions, _ = _smoothed_target_actions(
+    next_actions, smooth_clip_frac = _smoothed_target_actions(
         target_actor_model, next_obs, noise_key,
         target_policy_noise, target_noise_clip, action_low, action_high,
     )
 
-    # Selected on the logits rather than the probabilities so the result can go
-    # straight to `categorical_td_learning`, which softmaxes internally; the two
-    # agree because whole rows are selected and softmax is row-wise.
+    # Selected on the logits, not the probabilities, so the result can go
+    # straight to `categorical_td_learning`, which softmaxes internally.
     target_logits1, target_logits2 = target_twin_critic(next_obs, next_actions)
-    target_q1 = jnp.sum(jax.nn.softmax(target_logits1, axis=-1) * atoms, axis=-1)  # (B,)
-    target_q2 = jnp.sum(jax.nn.softmax(target_logits2, axis=-1) * atoms, axis=-1)
+    target_q1 = categorical_mean(target_logits1, atoms)  # (B,)
+    target_q2 = categorical_mean(target_logits2, atoms)
     take_first = (target_q1 <= target_q2)[:, None]
     target_logits = jnp.where(take_first, target_logits1, target_logits2)
 
@@ -255,7 +314,20 @@ def td4_critic_loss_fn(
     ) + jnp.mean(
         categorical_td(atoms, logits2, reward, samples["bootstrap"], atoms, target_logits)
     )
-    return critic_loss
+
+    q1 = categorical_mean(logits1, atoms)
+    target_q = jax.lax.stop_gradient(
+        reward + samples["bootstrap"] * jnp.minimum(target_q1, target_q2)
+    )
+    aux = value_aux(
+        q1,
+        target_q,
+        q1 - target_q,
+        twin_gap=jnp.mean(jnp.abs(q1 - categorical_mean(logits2, atoms))),
+        target_smooth_clip_frac=smooth_clip_frac,
+        target_act_rail_frac=action_rail_frac(next_actions, action_low, action_high),
+    )
+    return critic_loss, aux
 
 
 def ppo_critic_loss_fn(
@@ -300,8 +372,8 @@ def mpo_critic_loss_fn(
     obs = samples["observations"]
     next_obs = samples["next_observations"]
 
-    # [S, B, A]. Gaussian, no squashing — bounded by clipping, consistent with
-    # action selection.
+    # [S, B, A]. Gaussian, no squashing — bounded by clipping, as in action
+    # selection.
     next_dist = target_actor_model(next_obs)
     next_actions = next_dist.sample(seed=key, sample_shape=(num_action_samples,))
     next_actions = jnp.clip(next_actions, -1.0, 1.0)
@@ -316,10 +388,16 @@ def mpo_critic_loss_fn(
     target_q = reward + gamma * (1.0 - term) * next_q
     target_q = jax.lax.stop_gradient(target_q)
 
-    # Stored actions are already in env scale (see DDPG/SAC `add`).
-    current_q = critic_model(obs, samples["actions"])
-    critic_loss = jnp.mean((jnp.squeeze(current_q) - target_q) ** 2)
-    return critic_loss
+    # Stored actions are already in env scale.
+    current_q = jnp.squeeze(critic_model(obs, samples["actions"]))
+    critic_loss = jnp.mean((current_q - target_q) ** 2)
+    aux = value_aux(
+        current_q,
+        target_q,
+        current_q - target_q,
+        target_act_rail_frac=action_rail_frac(next_actions, action_low, action_high),
+    )
+    return critic_loss, aux
 
 
 def sac_critic_loss_fn(
@@ -342,6 +420,9 @@ def sac_critic_loss_fn(
     exactly the textbook soft target; at n > 1 the intermediate-step bonuses are
     dropped, the usual n-step SAC approximation — the stored actions came from an
     older policy, so their log-probs are not the current pi's anyway.
+
+    Returns ``(loss, aux)``, as every loss here does. `q_target` includes the
+    entropy bonus, i.e. it is the SOFT target the critic actually regresses on.
     """
     obs = samples["observations"]
     next_obs = samples["next_observations"]
@@ -368,4 +449,14 @@ def sac_critic_loss_fn(
     td_error1 = jax.vmap(rlax.td_learning)(q1, reward, samples["bootstrap"], target_q)
     td_error2 = jax.vmap(rlax.td_learning)(q2, reward, samples["bootstrap"], target_q)
     critic_loss = jnp.mean(rlax.l2_loss(td_error1)) + jnp.mean(rlax.l2_loss(td_error2))
-    return critic_loss
+
+    aux = value_aux(
+        q1,
+        jax.lax.stop_gradient(reward + samples["bootstrap"] * target_q),
+        td_error1,
+        twin_gap=jnp.mean(jnp.abs(q1 - q2)),
+        target_act_rail_frac=action_rail_frac(
+            next_actions_scaled, action_low, action_high
+        ),
+    )
+    return critic_loss, aux

@@ -3,17 +3,14 @@
 # The GPU cell of the release grid: mujoco_playground's dm_control-suite envs,
 # stepped by mujoco_warp on the card, with the learner on the card too.
 #
-# This is one half of the benchmark's central claim. The other half is
-# backend/envpool_cpu.yaml, which runs the SAME 25 dm_control tasks through a
-# completely independent implementation (native MuJoCo on CPU threads) at the
-# same budget. Their score curves should land in the same place; where they
-# differ is throughput.
+# One half of the benchmark's central claim; backend/envpool_cpu.yaml is the
+# other, running the same 25 tasks through an independent implementation at the
+# same budget. The score curves should land in the same place.
 #
 # Requires warp-lang <1.13; verify with `uv run python scripts/check_warp.py`.
 #
-# Carries only backend-mechanical settings. The task, parallel_envs, the agent
-# and the step budget are held identical across cells by bench/dmc.yaml — this
-# group is the ONLY thing that differs between them.
+# Carries only backend-mechanical settings: bench/dmc.yaml holds everything else
+# identical across cells, so this group is the ONLY thing that differs.
 
 release:
   cell: warp_gpu

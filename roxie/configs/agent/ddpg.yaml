@@ -1,10 +1,7 @@
 _target_: roxie.agents.DDPG
 
-# Which hardware the agent — networks, optimizers, replay buffer — runs on.
 # `cpu`, `gpu`, or null for whatever JAX picks. Independent of `env.device`:
 # CPU physics with a GPU learner is a real configuration (docs/backends.md).
-# Applied by train.py before the first jax call, so it is a placement key rather
-# than a constructor argument, and the startup banner checks it against reality.
 device: null
 
 gamma: 0.99
@@ -13,33 +10,24 @@ actor_learning_rate: 3e-4
 critic_learning_rate: 3e-4
 target_policy_noise: 0.2       # target smoothing noise, in the actor's [-1, 1] units
 target_noise_clip: 0.5
-memory_warmup: 30_000            # start updates after 30k transitions (~75 loops @ 400 envs)
-steps_before_learning: 30_000    # same as warmup (can differ if desired)
-steps_between_updates: 400      # update every 400 new transitions (~once per trainer loop)
-learning_steps: 100              # gradient steps per update trigger
+memory_warmup: 30_000
+steps_before_learning: 30_000
+steps_between_updates: 400
+learning_steps: 100
 max_grad_norm: 1
-# Constructor defaults, surfaced here so every knob is editable from yaml.
 n_step: 1   # TD horizon; >1 switches to a trajectory buffer + n-step returns
 pre_activation_coef: 0.0   # actor pre-tanh saturation penalty; 0 = off
-normalize_observations: true   # running mean/std on observations
-obs_norm_clip: 5.0   # clip normalized observations to +/- this
-obs_norm_eps: 1e-08   # variance floor for the normalizer
+normalize_observations: true
+obs_norm_clip: 5.0
+obs_norm_eps: 1e-08
 
 actor_config:
-  # The _target_ points to the Python class you want to instantiate.
-  # Make sure the path is correct for your project structure.
   _target_: roxie.models.actors.DeterministicActor
-
-  # --- Required __init__ arguments ---
-  features: [256, 256]  # Defines the hidden layers
-
-  # --- Optional __init__ arguments ---
+  features: [256, 256]
   use_layer_norm: true
   dropout_rate: 0.
 
-
 critic_config:
-  # Path to the Critic class
   _target_: roxie.models.critics.QCritic
   features: [256, 256]
   use_layer_norm: true
@@ -47,42 +35,22 @@ critic_config:
 
 memory_config:
   _target_: flashbax.buffers.make_flat_buffer
-  max_length: 500_000   # ~1.53 GB obs field @ obs=764 (look_ahead=5); 1M OOMs on 15 GB w/ Warp
+  max_length: 500_000
   min_length: 1_000
   sample_batch_size: 512
   add_sequences: False
   add_batch_size: ${env.parallel_envs}
 
-# Network parameter init. Feeds `nnx.Rngs`; the actor and each critic head take
-# distinct derived offsets so twin critics never start identical (a clipped
-# double-Q min over two identical heads buys nothing). Sweep this to separate a
-# real effect from init luck.
+# Feeds `nnx.Rngs`; the actor and each critic head take distinct derived offsets
+# so twin critics never start identical.
 seed: 0
 
-# Optimizers. `_target_` picks the optax family and carries its own
-# hyperparameters; the learning rate stays a top-level arg above so it remains
-# swept, logged and checkpointed, and `max_grad_norm` applies the global-norm
-# clip ahead of the transform (null/0 disables clipping entirely).
-#
-# For a schedule instead of a constant rate, give the block its own
-# `learning_rate:` sub-block — a block that declares one wins over the scalar
-# arg above:
-#
-#   actor_optimizer_config:
-#     _target_: optax.adamw
-#     weight_decay: 1e-4
-#     learning_rate:
-#       _target_: optax.cosine_decay_schedule
-#       init_value: 3e-4
-#       decay_steps: 1_000_000
-#
-# Swapping family from the CLI must also drop the kwargs the new family does
-# not take -- hydra MERGES dict overrides rather than replacing them, so the
-# b1/b2 below would survive into an optimizer that has no such argument:
-#
-#   agent.actor_optimizer_config._target_=optax.rmsprop \
-#     '~agent.actor_optimizer_config.b1' '~agent.actor_optimizer_config.b2' \
-#     +agent.actor_optimizer_config.decay=0.9
+# `_target_` picks the optax family; the learning rate stays a top-level arg
+# above so it remains swept, logged and checkpointed. For a schedule instead of
+# a constant rate, give the block its own `learning_rate:` sub-block — one that
+# declares it wins over the scalar arg. Swapping family from the CLI must also
+# drop the kwargs the new family does not take: hydra MERGES dict overrides
+# rather than replacing them.
 actor_optimizer_config:
   _target_: optax.adam
   b1: 0.9

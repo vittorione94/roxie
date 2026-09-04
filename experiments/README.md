@@ -219,7 +219,7 @@ through it so the two paths cannot drift apart.
 | Prefix | Contents |
 | --- | --- |
 | `epoch`, `steps` | the run axes, ungrouped. `steps` is also the wandb x-axis. |
-| `train/` | behaviour policy and learner: `score`, `length`, `episodes/`, `gradient_steps`, `loss/`, `reward/` (env components), `noise/`, and per-agent diagnostics (`train/td3/`, `train/ppo/`). |
+| `train/` | behaviour policy and learner: `score`, `length`, `episodes/`, `gradient_steps`, `loss/`, `reward/` (env components), `noise/`, and per-agent diagnostics under the agent's own name (`train/td3/`, `train/sac/`, `train/ppo/`, ... — every agent reports). |
 | `test/` | held-out eval: `score`, `length`, `distinct_starts`, `score_per_step`. Fixed reset keys, so a change here is a change in the policy. |
 | `sys/` | `sps`, `time/`, `mem/`, and `gpu/` — throughput and health, never a result. |
 

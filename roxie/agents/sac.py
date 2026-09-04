@@ -8,16 +8,22 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import (
-    Transition,
+    BurstNode,
     build_replay,
     fused_grad_steps,
+    graph_jit,
     make_optimizer,
     network_rngs,
+    reduce_diagnostics,
     repack_samples,
     soft_update,
     transition_prototype,
 )
-from roxie.losses.actor_losses import sac_actor_loss_fn, sac_alpha_loss_fn
+from roxie.losses.actor_losses import (
+    sac_actor_loss_fn,
+    sac_alpha_loss_fn,
+    skipped_actor_aux,
+)
 from roxie.losses.critic_losses import sac_critic_loss_fn
 from roxie.models.critics import TwinCritic
 
@@ -40,7 +46,7 @@ def _sac_step_fn(actor_model, observation, evaluate, key):
     try:
         mean = distribution.mean()
     except TypeError:
-        # Some distrax versions expose mean as a property
+        # Some distrax versions expose mean as a property.
         mean = distribution.mean
     mode = jnp.tanh(mean)
 
@@ -51,10 +57,9 @@ def _sac_step_fn(actor_model, observation, evaluate, key):
     return action, mode - action
 
 
-# Not jitted on its own — called inside `_grad_steps` below so N steps fuse into
-# one compiled program. `n_step` is the TD horizon, not the scan length.
-# `update_actor` is a *traced* boolean: under `lax.scan` the step index is not
-# static, so the delayed policy update has to be a runtime branch.
+# Not jitted on its own — called inside `_grad_steps` so N steps fuse into one
+# compiled program. `update_actor` is a *traced* boolean: under `lax.scan` the
+# step index is not static, so the delayed policy update is a runtime branch.
 def _grad_step(
     nodes,
     key: jax.random.PRNGKey,
@@ -73,16 +78,14 @@ def _grad_step(
     normalize: bool,
     n_step: int = 1,
 ):
-    # The temperature and its optimizer travel with the train state so their
-    # updates survive the fused burst.
     state, log_alpha_module, alpha_optimizer = nodes
 
-    # `repack_samples` folds the n-step return, bootstrap coefficient, and
+    # `repack_samples` folds the n-step return, bootstrap coefficient and
     # bootstrap obs into the dict, so the critic loss never sees gamma/terminals.
     key, sample_key, actor_key, critic_key = jax.random.split(key, 4)
     samples = replay_sample_fn(state.buffer_state, sample_key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalized once here: the critic and (delayed) actor losses read the same
+    # Normalized once here: the critic and actor losses read the same
     # `observations`, and neither normalizes.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
@@ -90,7 +93,9 @@ def _grad_step(
 
     alpha = jnp.exp(log_alpha_module.log_alpha.value)
 
-    critic_loss, critic_grads = nnx.value_and_grad(sac_critic_loss_fn)(
+    (critic_loss, critic_aux), critic_grads = nnx.value_and_grad(
+        sac_critic_loss_fn, has_aux=True
+    )(
         state.critic,
         state.actor,
         state.target_critic,
@@ -107,7 +112,7 @@ def _grad_step(
     # re-apply the same gradient.
     def _actor_update(operand):
         st, la, aopt = operand
-        (actor_loss, log_probs), actor_grads = nnx.value_and_grad(
+        (actor_loss, (log_probs, actor_aux)), actor_grads = nnx.value_and_grad(
             sac_actor_loss_fn, has_aux=True
         )(
             st.actor,
@@ -127,40 +132,37 @@ def _grad_step(
                 target_entropy,
             )
             aopt.update(la, alpha_grads)
-        return actor_loss
+        return actor_loss, actor_aux
 
     def _skip_actor_update(operand):
-        # `nnx.cond` requires both branches to return the same pytree. The zero
-        # is never averaged in: `_grad_steps` divides the actor-loss sum by the
-        # number of *update* steps.
-        return jnp.array(0.0, dtype=critic_loss.dtype)
+        # `nnx.cond` requires both branches to return the same pytree.
+        zero = jnp.array(0.0, dtype=critic_loss.dtype)
+        return zero, skipped_actor_aux(critic_loss.dtype, "alpha", "entropy")
 
     operand = (state, log_alpha_module, alpha_optimizer)
     if update_actor is None:  # policy_delay == 1: no branch in the program
-        actor_loss = _actor_update(operand)
+        actor_loss, actor_aux = _actor_update(operand)
     else:
-        actor_loss = nnx.cond(
+        actor_loss, actor_aux = nnx.cond(
             update_actor, _actor_update, _skip_actor_update, operand
         )
 
-    # Runs on every step regardless of `policy_delay`: the target tracks the
-    # critic, not the policy.
+    # Every step regardless of `policy_delay`: the target tracks the critic,
+    # not the policy.
     soft_update(state.target_critic, state.critic, tau)
 
-    return actor_loss, critic_loss
+    return actor_loss, critic_loss, actor_aux, critic_aux
 
 
-# `fused_grad_steps` compiles the body once and runs it `n_steps` times
-# on-device, so a burst costs one host dispatch rather than one per step.
 @functools.partial(
-    nnx.jit,
+    graph_jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps",
         "target_entropy", "auto_alpha", "policy_delay", "n_step", "normalize",
     ),
-    # The replay buffer rides unchanged through the scan; without donation XLA
-    # allocates a full second copy of it every update.
-    donate_argnums=(0,),
+    # The temperature and its optimizer are mutated alongside the train state,
+    # so all three ride in one split.
+    num_nodes=3,
 )
 def _grad_steps(
     state: TrainState,
@@ -181,21 +183,20 @@ def _grad_steps(
     policy_delay: int = 1,
     n_step: int = 1,
 ):
-    # Loop-constant, so hoisted out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
-    # `policy_delay` is static, so at 1 the mask is dropped altogether and
-    # `_grad_step` takes its unconditional path. `None` is an empty pytree node,
-    # so it rides along in `xs` without contributing a scanned leaf.
+    # `policy_delay` is static, so at 1 the mask is dropped and `_grad_step`
+    # takes its unconditional path. `None` is an empty pytree node, so it rides
+    # along in `xs` without contributing a scanned leaf.
     update_mask = (
         None if policy_delay <= 1 else (jnp.arange(n_steps) % policy_delay) == 0
     )
 
-    # Carried as one tuple so `log_alpha` and its Adam slots keep updating across
-    # the fused steps.
     (state, log_alpha_module, alpha_optimizer), (
         actor_losses,
         critic_losses,
+        actor_aux,
+        critic_aux,
     ) = fused_grad_steps(
         (state, log_alpha_module, alpha_optimizer),
         key,
@@ -219,19 +220,31 @@ def _grad_steps(
     )
 
     # Actor loss only on update steps → average over those; critic over all.
+    # The diagnostics split the same way: the skipped steps contributed zeros.
     n_actor_updates = (
         n_steps if update_mask is None else jnp.maximum(jnp.sum(update_mask), 1)
     )
+    diagnostics = {
+        **reduce_diagnostics(actor_aux, n_actor_updates),
+        **reduce_diagnostics(critic_aux, n_steps),
+    }
     return (
         state,
         log_alpha_module,
         alpha_optimizer,
         jnp.sum(actor_losses) / n_actor_updates,
         jnp.mean(critic_losses),
+        diagnostics,
     )
 
 
 class SAC(Agent):
+    _num_burst_nodes = 3
+    # Mutated by every gradient burst, so held in the same split as the train
+    # state.
+    log_alpha_module = BurstNode(1)
+    alpha_optimizer = BurstNode(2)
+
     def __init__(
         self,
         env_obs_size: int,
@@ -254,6 +267,7 @@ class SAC(Agent):
         init_log_alpha: float = 0.0,
         auto_alpha: bool = True,
         target_entropy: float = None,
+        target_entropy_scale: float = 1.0,
         steps_before_learning: int = 100,
         steps_between_updates: int = 10,
         learning_steps: int = 5,
@@ -297,8 +311,18 @@ class SAC(Agent):
 
         self.log_alpha_module = LogAlpha(init_log_alpha)
         self.auto_alpha = auto_alpha
+        # -dim(A) is the SAC paper's heuristic: one nat per actuator. Because the
+        # policy is tanh-squashed, that entropy floor doubles as a saturation
+        # CEILING — the -sum log(1 - a^2) Jacobian term diverges at the rails, so
+        # a policy cannot both rail and hold the target. With many actuators the
+        # constraint binds on the sum and dims trade (some rail, others stay
+        # diffuse); at dim(A) = 1 there is no slack, and the mean is pinned near
+        # tanh(1). Tasks that want bang-bang torque need a scale > 1.
+        self.target_entropy_scale = float(target_entropy_scale)
         self.target_entropy = (
-            target_entropy if target_entropy is not None else -float(env_action_size)
+            target_entropy
+            if target_entropy is not None
+            else -self.target_entropy_scale * float(env_action_size)
         )
         self.alpha_learning_rate = alpha_learning_rate
 
@@ -310,8 +334,8 @@ class SAC(Agent):
             learning_rate=self.alpha_learning_rate,
         )
 
-        # No target actor in SAC: the policy is re-sampled every step, so the
-        # target only ever needs to slow down the critic.
+        # No target actor: the policy is re-sampled every step, so the target
+        # only ever needs to slow down the critic.
         self._init_train_state(
             actor,
             twin_critic,
@@ -332,8 +356,6 @@ class SAC(Agent):
         self.steps_before_learning = steps_before_learning
         self.steps_between_updates = steps_between_updates
         self.learning_steps = learning_steps
-        # Actor (and temperature) updates run on 1 of every `policy_delay`
-        # gradient steps; the critic updates on all of them.
         self.policy_delay = int(policy_delay)
         self.memory_warmup = memory_warmup
         self.normalize_observations = normalize_observations
@@ -344,24 +366,12 @@ class SAC(Agent):
         print("Hyper Params:", self._export_hyperparams())
 
     def _checkpoint_modules(self) -> dict:
-        # These live outside `self.state`; dropping them on resume would re-run
-        # the temperature annealing against a trained policy.
+        # Outside `self.state`; dropping them on resume would re-run the
+        # temperature annealing against a trained policy.
         return {
             "log_alpha_module": self.log_alpha_module,
             "alpha_optimizer": self.alpha_optimizer,
         }
-
-    def replay_add(self, buffer_state, transitions):
-        """Add one env-step batch of transitions (leaves shaped (B, ...)).
-
-        The trajectory buffer (n_step > 1) expects an explicit time axis on every
-        leaf — (B, T=1, ...) for per-step adds — while the flat buffer takes the
-        batch as-is. Callers go through here so they need not know which is
-        active.
-        """
-        if self.n_step > 1:
-            transitions = jax.tree.map(lambda x: x[:, None], transitions)
-        return self.replay.add(buffer_state, transitions)
 
     def select_action(
         self,
@@ -370,20 +380,36 @@ class SAC(Agent):
         observation: jnp.ndarray,
         key: jax.random.PRNGKey,
         evaluate: bool = False,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        noise_module: nnx.Module = None,
+        critic: nnx.Module = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, dict]:
         """Pure action selection from an explicit actor + obs stats.
 
         Factored out of ``step`` so the async learner's acting thread can select
         actions from a behaviour actor snapshot — decoupled from the learner's
         live ``self.state.actor`` — through the same normalization path. Returns
-        ``(scaled_action, deviation_from_mode)``.
+        ``(scaled_action, deviation_from_mode, extras)``; `extras` is the
+        per-step fields the buffer stores beyond the standard five, and is empty
+        here — only PPO has any.
+
+``critic`` is accepted and ignored too: only an on-policy agent
+        stores a value estimate at acting time.
+
+        ``noise_module`` is accepted and ignored: SAC explores from its own
+        stochastic policy and carries no noise module. The argument is part of
+        the shared signature the fused acting burst calls through.
         """
+        del noise_module, critic
         if self.normalize_observations:
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
 
         action, noise = _sac_step_fn(actor, observation, evaluate, key)
-        return Agent.scale_to_env(action, self.action_low, self.action_high), noise
+        return (
+            Agent.scale_to_env(action, self.action_low, self.action_high),
+            noise,
+            {},
+        )
 
     def step(
         self,
@@ -391,52 +417,11 @@ class SAC(Agent):
         evaluate: bool = False,
         key: jax.random.PRNGKey = None,
     ) -> jnp.ndarray:
-        self.last_action, noise = self.select_action(
+        self.last_action, noise, self.last_extras = self.select_action(
             self.state.actor, self.state.obs_stats, observation, key, evaluate,
         )
-        # Kept on device; the trainer reduces it to a per-joint epoch mean.
         self.last_noise = noise
         return self.last_action
-
-    def add_transitions(
-        self, prev_obs, action, reward, termination, truncation, next_obs
-    ):
-        """Buffer one env-step batch given an explicit action.
-
-        Split out of ``add`` so the async learner (which owns ``self.state`` on
-        its own thread) can add transitions whose action travelled with them
-        through the hand-off queue, rather than reading ``self.last_action``,
-        which the acting thread overwrites every step.
-        """
-        # `terminal` is true termination only: a time-limit truncation must still
-        # bootstrap the next-state value. `truncation` is stored separately so
-        # n-step windows stop there too — in the flat stream the item after any
-        # done is the next episode's reset state.
-        experiences = Transition(
-            observation=prev_obs,
-            action=action,
-            reward=reward,
-            terminal=termination,
-            truncation=truncation,
-        )
-
-        self.state.buffer_state = self.replay_add(self.state.buffer_state, experiences)
-
-        if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_obs, next_obs], axis=0)
-            self.state.obs_stats = Agent.update_obs_stats(
-                self.state.obs_stats, obs_batch
-            )
-
-    def add(self, prev_obs, timestep):
-        self.add_transitions(
-            prev_obs,
-            self.last_action,
-            timestep.reward,
-            timestep.terminated,
-            timestep.truncated,
-            timestep.obs,
-        )
 
     def learn(self, agent_rng, n_steps=None):
         """Run one unconditional burst of ``n_steps`` (default ``learning_steps``)
@@ -447,18 +432,11 @@ class SAC(Agent):
         from its own thread — the sole owner of ``self.state`` there, so the
         buffer-donating ``_grad_steps`` stays valid unchanged.
         """
-        (
-            self.state,
-            self.log_alpha_module,
-            self.alpha_optimizer,
-            actor_loss,
-            critic_loss,
-        ) = _grad_steps(
-            self.state,
-            self.log_alpha_module,
-            self.alpha_optimizer,
+        burst_steps = self.learning_steps if n_steps is None else int(n_steps)
+        actor_loss, critic_loss, diagnostics = _grad_steps(
+            self._burst_nodes,
             agent_rng,
-            self.learning_steps if n_steps is None else int(n_steps),
+            burst_steps,
             self.gamma,
             self.tau,
             self.replay.sample,
@@ -472,6 +450,7 @@ class SAC(Agent):
             self.policy_delay,
             n_step=self.n_step,
         )
+        self.record_diagnostics(diagnostics, burst_steps)
         return actor_loss, critic_loss
 
     def update(self, steps, agent_rng):
@@ -491,11 +470,15 @@ class SAC(Agent):
                 "n_step": int(self.n_step),
                 "policy_delay": int(self.policy_delay),
                 "alpha_learning_rate": float(self.alpha_learning_rate),
-                # The live temperature, not the constructor's: a checkpoint has
-                # to resume where the annealing got to, not where it started.
+                # The live temperature, not the constructor's: a resume has to
+                # pick up where the annealing got to.
                 "init_log_alpha": float(self.log_alpha_module.log_alpha.value),
                 "auto_alpha": bool(self.auto_alpha),
+                # Both: `target_entropy` is what the dual actually chased, and a
+                # resume passes it explicitly so the scale is inert on playback —
+                # but it still has to survive the round trip to describe the run.
                 "target_entropy": float(self.target_entropy),
+                "target_entropy_scale": float(self.target_entropy_scale),
             }
         )
         return params

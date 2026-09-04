@@ -8,8 +8,8 @@ import termcolor
 
 current_logger = None
 
-# Probed lazily and disabled after the first failure, so a CPU run or a missing
-# binary doesn't pay a subprocess cost every epoch.
+# Disabled after the first failure, so a CPU run or a missing binary doesn't
+# pay a subprocess cost every epoch.
 _gpu_stats_enabled = True
 _GPU_QUERY_FIELDS = (
     "utilization.gpu",
@@ -126,12 +126,9 @@ class ConsoleBackend(Backend):
 
     INDENT = "  "
 
-    # Shown ungrouped at the top, in this order. Everything else arrives already
-    # namespaced by its producer.
     TOP_KEYS = ("epoch", "steps")
 
-    # Any path not listed sorts alphabetically after its listed siblings, so the
-    # layout degrades gracefully as new metrics appear.
+    # Any path not listed sorts alphabetically after its listed siblings.
     ORDER = (
         "epoch",
         "steps",
@@ -201,9 +198,8 @@ class ConsoleBackend(Backend):
 
     @staticmethod
     def _fmt(val, pad=False):
-        # A metric can be deliberately absent for an epoch (`train/loss/*` before
-        # the first gradient burst), so render the gap rather than crashing
-        # below — or, worse, printing it as a 0.
+        # A metric can be deliberately absent for an epoch (`train/loss/*`
+        # before the first gradient burst); render the gap, not a 0.
         if val is None:
             return f"{'-':>8}" if pad else "-"
         if np.issubdtype(type(val), np.floating):
@@ -318,8 +314,7 @@ class WandbBackend(Backend):
             ) from e
         self._wandb = wandb
         # With several wandb accounts, cached netrc credentials would otherwise
-        # silently send the run to whichever was used last. Skipped when
-        # WANDB_API_KEY is set (CI) and in offline/disabled modes.
+        # silently send the run to whichever was used last.
         needs_auth = relogin and mode not in ("offline", "disabled") \
             and not os.environ.get("WANDB_API_KEY")
         if needs_auth:
@@ -329,8 +324,8 @@ class WandbBackend(Backend):
             entity=entity,
             name=name,
             group=group,
-            # `group` and `job_type` are the two axes roxie/report.py groups
-            # runs by; the release benchmark sets them to the task and the cell.
+            # The two axes roxie/report.py groups runs by; the release
+            # benchmark sets them to the task and the cell.
             job_type=job_type,
             tags=list(tags) if tags else None,
             mode=mode,
@@ -340,9 +335,8 @@ class WandbBackend(Backend):
         )
 
     def log(self, data, step):
-        # Dropped rather than sent as null: wandb renders a missing key as a gap
-        # in the series, the honest picture for something that did not happen.
-        # Sending 0 would read as a real, converged loss.
+        # Dropped rather than sent as null: wandb renders a missing key as a
+        # gap, where a 0 would read as a real, converged loss.
         self.run.log({k: v for k, v in data.items() if v is not None}, step=int(step))
 
     def close(self):
@@ -377,10 +371,6 @@ class Logger:
                 with open(script_path, "w") as config_file:
                     config_file.write(script)
                 log(f"Script file saved to {script_path}")
-
-        # The run config is deliberately not dumped here: Hydra already writes
-        # the resolved config to ``<run>/.hydra/config.yaml``, which play.py
-        # reads, and a second copy would only diverge from it.
 
         self.stat_keys = set()
         self.epoch_dict = {}
@@ -417,8 +407,8 @@ class Logger:
         keys = list(self.epoch_dict.keys())
         for key in keys:
             values = self.epoch_dict[key]
-            # A metric stored as None means "did not happen this epoch".
-            # Coercing to 0 would reintroduce the fake-zero the None avoids.
+            # None means "did not happen this epoch"; coercing to 0 would
+            # reintroduce the fake zero it avoids.
             present = [v for v in values if v is not None]
             if not present:
                 self.epoch_dict[key] = None

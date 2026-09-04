@@ -71,8 +71,7 @@ class VecState:
 
     env_state: Any
     obs: jax.Array
-    # Per-env elapsed control steps, for the driver's own time limit. ``None``
-    # for pools, which count internally.
+    # ``None`` for pools, which count internally.
     steps: Any = None
 
 
@@ -125,8 +124,6 @@ class JaxVectorEnv:
             func_env.transition_info, in_axes=(0, 0, 0, None)
         )
 
-    # -- construction --------------------------------------------------------
-
     def reset(self, key, params=None, num_envs: int | None = None):
         """Fresh episodes for ``num_envs`` worlds (default: this env's count).
 
@@ -146,8 +143,6 @@ class JaxVectorEnv:
             obs=obs, reward=zeros, terminated=false, truncated=false,
             info=self._v_state_info(env_state, params),
         )
-
-    # -- the step ------------------------------------------------------------
 
     def step(
         self, state: VecState, action, key, reset_pool: VecState | None = None,
@@ -173,11 +168,11 @@ class JaxVectorEnv:
             prev_env_state, action, next_env_state, params,
         )
 
-        # `terminal` is failure, `truncal` the env's own non-failure cutoff (a
-        # reference clip running out), and the step limit is the driver's. An
-        # env-internal truncation clears termination, or a value-based agent
-        # zeroes its bootstrap at the cutoff and Q collapses there; the step
-        # limit does not, since a fall on the last step is still a fall.
+        # `terminal` is failure, `truncal` the env's own non-failure cutoff,
+        # and the step limit is the driver's. An env-internal truncation clears
+        # termination, or a value-based agent zeroes its bootstrap at the cutoff
+        # and Q collapses there; the step limit does not, since a fall on the
+        # last step is still a fall.
         terminal = self._v_terminal(next_env_state, keys, params)
         truncal = self._v_truncal(next_env_state, keys, params)
         steps = state.steps + 1
@@ -212,9 +207,9 @@ class JaxVectorEnv:
         idx = jax.random.randint(key, (self.num_envs,), 0, pool_size)
 
         def _leaf(pool_leaf, s):
-            # Leaves with no per-env leading dim (warp's world-flattened contact
-            # arena) would be gathered out of bounds. The physics recomputes them
-            # every step, so the stepped value stands.
+            # Leaves with no per-env leading dim (warp's world-flattened
+            # contact arena) would be gathered out of bounds. The physics
+            # recomputes them every step, so the stepped value stands.
             if not (isinstance(s, jnp.ndarray) and s.shape[:1] == done.shape):
                 return s
             return jnp.where(
@@ -278,13 +273,11 @@ class EnvPoolVectorEnv:
     anyway.
     """
 
-    # Read by the startup banner in place of a physics ``impl``: a pool has no
-    # MJX backend, it is the backend.
     metadata = {"jax": False, "impl": "envpool"}
 
     # The pool's counterpart to ``FuncEnv.epoch_refresh``, forwarded verbatim so
-    # it reaches the rollout. There is no ``params`` to thread, because a C++
-    # pool steps in plain Python and can just own the mutable state.
+    # it reaches the rollout. No ``params`` to thread: a C++ pool steps in plain
+    # Python and can just own the mutable state.
     _POOL_HOOKS = ("epoch_refresh",)
 
     def __init__(
@@ -298,7 +291,6 @@ class EnvPoolVectorEnv:
         self._num_envs = num_envs
         self._bind_pool(pool)
 
-        # Both pool flavours expose the single-env spaces.
         self.single_observation_space = _as_box(
             pool.observation_space, unbounded=True,
         )

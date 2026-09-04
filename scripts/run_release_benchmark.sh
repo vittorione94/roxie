@@ -15,7 +15,14 @@ DEFAULT_CELLS="${DEFAULT_CELLS:-warp_gpu envpool_cpu}"
 ALL_TASKS="${ALL_TASKS:-$(uv run python -c 'from roxie.environment.suites import DMC_TASKS; print(" ".join(DMC_TASKS))' 2>/dev/null)}"
 [[ -z "$ALL_TASKS" ]] && { echo "Failed to load tasks. Ensure uv sync is run." >&2; exit 1; }
 
-STEPS="${STEPS:-500000000}"
+# The budget lives in experiments/dmc/bench/dmc.yaml and NOWHERE ELSE: the
+# exploration anneal is sized as a fraction of it. Read it, do not restate it;
+# `--steps` still overrides for a pilot.
+STEPS="${STEPS:-$(uv run python -c 'import roxie.utils.hydra_searchpath as h; h.register()
+from hydra import compose, initialize_config_dir
+with initialize_config_dir(config_dir=str(h.REPO_ROOT / "roxie" / "configs"), version_base=None):
+    print(int(compose(config_name="dmc/bench_ddpg", overrides=["release.task=WalkerWalk"]).trainer.steps))' 2>/dev/null)}"
+[[ -z "$STEPS" ]] && { echo "Failed to read trainer.steps from the bench config." >&2; exit 1; }
 SMOKE_STEPS=100000
 SMOKE_EPOCH=25000
 OUT_ROOT="outputs/release_v1"
@@ -64,9 +71,13 @@ sps_prior() {
     esac
 }
 
+# Field-exact lookup: `grep "\t"` is a literal 't' in a POSIX BRE, which
+# silently made every run look unseen and recomputed the whole grid.
 already_done() {
     [[ $FORCE -eq 1 ]] && return 1
-    [[ -f "$MANIFEST" ]] && grep -q "^ok\t$1\t$2\t$3\t$4\t" "$MANIFEST"
+    [[ -f "$MANIFEST" ]] || return 1
+    awk -F'\t' -v t="$1" -v c="$2" -v a="$3" -v s="$4" \
+        '$1=="ok" && $2==t && $3==c && $4==a && $5==s {found=1; exit} END {exit !found}' "$MANIFEST"
 }
 
 get_cells() {
@@ -105,13 +116,21 @@ MANIFEST_HDR=$'status\ttask\tcell\tagent\tsteps\tseconds\tsps\trun_dir'
 [[ -f "$MANIFEST" ]] || echo "$MANIFEST_HDR" > "$MANIFEST"
 
 steps=$([[ $SMOKE -eq 1 ]] && echo $SMOKE_STEPS || echo $STEPS)
-QUEUE=(); total_est=0
+QUEUE=(); total_est=0; selected=0; skip_count=0
 
+# Drop what the manifest already has here, not in the run loop, so the count
+# and the estimate below describe the work that is actually left.
 for task in $ALL_TASKS; do
     [[ -n "$TASK_FILTER" ]] && ! in_list "$task" $TASK_FILTER && continue
     for agent in $ALL_AGENTS; do
         [[ -n "$AGENT_FILTER" ]] && ! in_list "$agent" $AGENT_FILTER && continue
         for cell in $(get_cells); do
+            ((selected++))
+            if already_done "$task" "$cell" "$agent" "$steps"; then
+                echo "-- skipping $task/$cell/$agent (already in manifest)"
+                ((skip_count++))
+                continue
+            fi
             QUEUE+=("$task|$agent|$cell|$steps")
             sps=$(sps_prior "$cell")
             (( sps > 0 )) && total_est=$(( total_est + steps / sps ))
@@ -119,24 +138,19 @@ for task in $ALL_TASKS; do
     done
 done
 
-[[ ${#QUEUE[@]} -eq 0 ]] && { err "No runs selected by filters."; exit 2; }
+(( selected == 0 )) && { err "No runs selected by filters."; exit 2; }
+[[ ${#QUEUE[@]} -eq 0 ]] && { say "\nAll $skip_count selected runs are already in the manifest. Nothing to do."; exit 0; }
 
-say "\nroxie benchmark: ${#QUEUE[@]} runs | Est compute: $(hms $total_est)\nPreflight checks..."
+say "\nroxie benchmark: ${#QUEUE[@]} runs to go, $skip_count already done | Est compute: $(hms $total_est)\nPreflight checks..."
 preflight || [[ $DRY_RUN -eq 1 ]] || exit 1
 [[ $DRY_RUN -eq 1 ]] && { say "Dry run complete."; exit 0; }
 
 # --- Execution ---
-ok_count=0; fail_count=0; skip_count=0; INTERRUPTED=0
+ok_count=0; fail_count=0; INTERRUPTED=0
 trap 'INTERRUPTED=1' INT TERM
 
 for item in "${QUEUE[@]}"; do
     IFS='|' read -r task agent cell run_steps <<< "$item"
-    if already_done "$task" "$cell" "$agent" "$run_steps"; then
-        echo "-- skipping $task/$cell/$agent (already in manifest)"
-        ((skip_count++))
-        continue
-    fi
-
     stamp=$(date +%Y-%m-%d_%H-%M-%S)
     run_dir="$OUT_ROOT/$task/$cell/$agent/$stamp"
     log="$LOG_DIR/$task.$cell.$agent.log"

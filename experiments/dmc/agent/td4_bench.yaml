@@ -2,9 +2,8 @@
 # TD3's delayed actor updates — i.e. d4pg_bench + the two TD3 ingredients.
 #
 # ddpg_bench.yaml is the reference file and lists the invariants held identical
-# across every arm. The categorical support matches d4pg_bench exactly so the
-# two distributional arms differ only in critic count and policy delay, which
-# is the comparison this arm exists to make.
+# across every arm. The categorical support matches d4pg_bench exactly, so the
+# two distributional arms differ only in critic count and policy delay.
 _target_: roxie.agents.TD4
 
 # Where the agent runs; the `backend` group sets it per cell (see env.device).
@@ -28,7 +27,7 @@ steps_before_learning: 30_720
 steps_between_updates: 2_048
 learning_steps: 20
 max_grad_norm: 1
-pre_activation_coef: 1e-1       # see ddpg_bench.yaml
+pre_activation_coef: 0.0        # see ddpg_bench.yaml
 normalize_observations: true
 obs_norm_clip: 5.0
 obs_norm_eps: 1e-08

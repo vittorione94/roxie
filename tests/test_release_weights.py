@@ -36,9 +36,6 @@ def _load_export_module():
 export = _load_export_module()
 
 
-# --- fixtures: a fake run tree ----------------------------------------------
-
-
 def _write_run(root: Path, rows, checkpoint_steps):
     """A run dir with a log.csv and empty `<N>` step checkpoint dirs.
 
@@ -54,9 +51,6 @@ def _write_run(root: Path, rows, checkpoint_steps):
     for steps in checkpoint_steps:
         (root / "checkpoints" / str(steps)).mkdir(parents=True)
     return root
-
-
-# --- checkpoint selection ---------------------------------------------------
 
 
 def test_picks_the_best_checkpoint_not_the_last(tmp_path):
@@ -116,9 +110,6 @@ def test_run_without_a_logged_score_is_not_publishable(tmp_path):
     ever evaluated, so there is no basis on which to publish one."""
     run = _write_run(tmp_path / "run", rows=[], checkpoint_steps=[100])
     assert export.pick_checkpoint(run, "test/score") is None
-
-
-# --- run selection ----------------------------------------------------------
 
 
 MANIFEST_ROWS = [
@@ -204,9 +195,6 @@ def test_the_newest_run_of_an_agent_wins(tmp_path):
     runs = export.latest_ok_runs(export.read_manifest(path), "CheetahRun",
                                  "warp_gpu", steps=None)
     assert runs["td3"]["run_dir"] == "outputs/second"
-
-
-# --- budget-linked config invariants ----------------------------------------
 
 
 BENCH = OmegaConf.load(REPO / "experiments" / "dmc" / "bench" / "dmc.yaml")

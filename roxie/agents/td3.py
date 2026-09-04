@@ -9,29 +9,15 @@ from roxie.agents.agent import Agent, TrainState
 from roxie.agents.ddpg import DDPG
 from roxie.agents.utils import (
     fused_grad_steps,
+    graph_jit,
     network_rngs,
+    reduce_diagnostics,
     repack_samples,
     soft_update,
 )
-from roxie.losses.actor_losses import td3_actor_loss_fn
+from roxie.losses.actor_losses import skipped_actor_aux, td3_actor_loss_fn
 from roxie.losses.critic_losses import td3_critic_loss_fn
 from roxie.models.critics import TwinCritic
-
-# Listed here rather than inferred because `nnx.cond`'s skipped branch has to
-# synthesize a structurally identical dict when the actor update does not run.
-ACTOR_DIAGNOSTIC_KEYS = (
-    "pre_act_abs",
-    "pre_act_max",
-    "pre_act_penalty",
-    "sat_frac",
-    "tanh_grad",
-    "actor_q",
-)
-
-# Reduced with max rather than mean across the fused burst: an epoch mean of a
-# per-batch maximum would wash out exactly the outlier it is there to expose.
-MAX_REDUCED_KEYS = frozenset({"pre_act_max"})
-
 
 def _grad_step(
     state: TrainState,
@@ -57,13 +43,13 @@ def _grad_step(
     and target updates run under `nnx.cond` so the delayed-policy-update trick
     survives the `lax.scan`, where the step index is no longer static. `n_step`
     is the TD horizon, not the scan length."""
-    # `repack_samples` folds the n-step return, bootstrap coefficient, and
+    # `repack_samples` folds the n-step return, bootstrap coefficient and
     # bootstrap obs into the dict, so the critic loss never sees gamma/terminals.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalized once here: the critic and (delayed) actor losses read the same
-    # `observations`, and neither normalizes.
+    # Normalized once here: the critic and actor losses read the same
+    # `observations`.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
@@ -103,9 +89,7 @@ def _grad_step(
 
     def _skip_actor_update(state):
         zero = jnp.array(0.0, dtype=critic_loss.dtype)
-        # The zeros are never averaged in: `_grad_steps` divides the actor sums
-        # by the number of *update* steps.
-        return zero, {k: zero for k in ACTOR_DIAGNOSTIC_KEYS}
+        return zero, skipped_actor_aux(critic_loss.dtype, "pre_act_penalty")
 
     actor_loss, actor_aux = nnx.cond(
         update_actor, _actor_update, _skip_actor_update, state
@@ -114,17 +98,12 @@ def _grad_step(
     return actor_loss, critic_loss, actor_aux, critic_aux
 
 
-# `fused_grad_steps` compiles the body once and runs it `n_steps` times
-# on-device, so a burst costs one host dispatch rather than one per step.
 @functools.partial(
-    nnx.jit,
+    graph_jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "policy_delay", "n_step",
         "normalize",
     ),
-    # The replay buffer rides unchanged through the scan; without donation XLA
-    # allocates a full second copy of it every update.
-    donate_argnums=(0,),
 )
 def _grad_steps(
     state: TrainState,
@@ -144,10 +123,8 @@ def _grad_steps(
     pre_activation_coef: float,
     n_step: int = 1,
 ):
-    # Loop-constant, so hoisted out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
-    # The delayed-update schedule, scanned over alongside the keys.
     update_mask = (jnp.arange(n_steps) % policy_delay) == 0
 
     state, (actor_losses, critic_losses, actor_aux, critic_aux) = fused_grad_steps(
@@ -174,19 +151,12 @@ def _grad_steps(
     )
 
     # Actor loss only on update steps → average over those; critic over all steps.
+    # The diagnostics split the same way: the skipped steps contributed zeros.
     n_actor_updates = jnp.maximum(jnp.sum(update_mask), 1)
     actor_loss = jnp.sum(actor_losses) / n_actor_updates
-
-    def _reduce(per_step, key, denom):
-        if key in MAX_REDUCED_KEYS:
-            return jnp.max(per_step)
-        return jnp.sum(per_step) / denom
-
-    # Reduced on-device so the host sees one scalar per metric per burst rather
-    # than an (n_steps,) array.
     diagnostics = {
-        **{k: _reduce(v, k, n_actor_updates) for k, v in actor_aux.items()},
-        **{k: _reduce(v, k, n_steps) for k, v in critic_aux.items()},
+        **reduce_diagnostics(actor_aux, n_actor_updates),
+        **reduce_diagnostics(critic_aux, n_steps),
     }
     return state, actor_loss, jnp.mean(critic_losses), diagnostics
 
@@ -203,11 +173,6 @@ class TD3(DDPG):
     def __init__(self, *args, policy_delay: int = 2, **kwargs):
         self.policy_delay = int(policy_delay)
         super().__init__(*args, **kwargs)
-        # Kept as device arrays and only reduced to floats at drain time, so no
-        # burst pays a host sync on the loop's critical path.
-        self._diag_bursts: list[dict] = []
-        self._diag_grad_steps = 0
-        self._diag_env_steps = 0
 
     def _make_critic(self, critic_config, env_obs_size, env_action_size):
         """Two Q heads behind a TwinCritic. The heads get distinct seed offsets
@@ -229,8 +194,8 @@ class TD3(DDPG):
         """One unconditional burst, threading `policy_delay` into the fused grad
         step. See DDPG.learn for the sync/async sharing rationale."""
         burst_steps = self.learning_steps if n_steps is None else int(n_steps)
-        self.state, actor_loss, critic_loss, diagnostics = _grad_steps(
-            self.state,
+        actor_loss, critic_loss, diagnostics = _grad_steps(
+            self._burst_nodes,
             agent_rng,
             burst_steps,
             self.gamma,
@@ -247,67 +212,8 @@ class TD3(DDPG):
             self.pre_activation_coef,
             n_step=self.n_step,
         )
-        # Appended from whichever thread owns the learner; list.append is atomic
-        # under the GIL.
-        self._diag_bursts.append(diagnostics)
-        self._diag_grad_steps += burst_steps
+        self.record_diagnostics(diagnostics, burst_steps)
         return actor_loss, critic_loss
-
-    def update(self, steps, agent_rng):
-        gradient_steps, actor_loss, critic_loss = 0, 0, 0
-
-        if self.due_for_update(steps):
-            actor_loss, critic_loss = self.learn(agent_rng)
-            gradient_steps += self.learning_steps
-
-        self._diag_env_steps = steps
-        return gradient_steps, actor_loss, critic_loss
-
-    def pop_diagnostics(self) -> dict:
-        """Return this epoch's TD3 health metrics and reset the accumulators.
-
-        Optional agent hook (see `Trainer`), tracking the two things that break
-        TD3: the actor's tanh saturation and the critic's value inflation.
-
-        `td3/tanh_grad` is the mean d(tanh u)/du that every actor gradient is
-        multiplied by; as it falls toward 0 the policy freezes into a bang-bang
-        controller. `td3/pre_act_penalty` times `pre_activation_coef` is
-        comparable against `td3/actor_q` — orders of magnitude below it means the
-        saturation hinge is inert.
-
-        `td3/q_buffer` vs `td3/q_target` and `td3/twin_gap` track value
-        inflation; `td3/target_act_rail_frac` says how much of the bootstrap is
-        evaluated at action-space corners, and `td3/target_smooth_clip_frac`
-        whether `target_noise_clip` is inert (~0) or has collapsed the smoothing
-        Gaussian into two spikes (~1).
-
-        Returns ``{}`` when no gradient burst ran this epoch.
-        """
-        if not self._diag_bursts:
-            return {}
-        bursts, self._diag_bursts = self._diag_bursts, []
-
-        out = {}
-        for key in bursts[0]:
-            values = jnp.stack([jnp.asarray(b[key]) for b in bursts])
-            reduced = jnp.max(values) if key in MAX_REDUCED_KEYS else jnp.mean(values)
-            out[f"td3/{key}"] = float(reduced)
-
-        # Run-to-date rather than per-epoch, so these read as a level. Sync path
-        # only: the async learner drives `learn` directly and never calls
-        # `update`, so there is no env-step count to divide by.
-        if self._diag_env_steps > 0:
-            # Realized replay ratio, which `steps_between_updates` and
-            # `learning_steps` jointly control.
-            out["td3/updates_per_env_step"] = (
-                self._diag_grad_steps / self._diag_env_steps
-            )
-            # Below 1.0 the sampler draws from a narrower window than configured,
-            # changing the effective off-policyness of every batch.
-            out["td3/buffer_frac"] = min(
-                1.0, self._diag_env_steps / float(self.buffer_size)
-            )
-        return out
 
     def _export_hyperparams(self) -> dict:
         params = super()._export_hyperparams()

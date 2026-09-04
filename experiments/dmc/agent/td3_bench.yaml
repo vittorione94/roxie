@@ -18,11 +18,10 @@ gamma: 0.99
 tau: 0.005
 actor_learning_rate: 3e-4
 critic_learning_rate: 3e-4
-# The TD3 paper's values. Smoothing is the mechanism that stops the critic
-# growing sharp action-space peaks for the actor to chase; a kernel much
-# narrower than the critic's own action resolution turns it off in all but
-# name, whose signature is critic loss climbing monotonically while the score
-# crawls. Watch `td3/twin_gap` and `td3/target_smooth_clip_frac`.
+# The paper's values. Smoothing stops the critic growing sharp action-space
+# peaks for the actor to chase; a kernel much narrower than the critic's own
+# action resolution turns it off in all but name, whose signature is critic loss
+# climbing while the score crawls. Watch `td3/target_smooth_clip_frac`.
 target_policy_noise: 0.2
 target_noise_clip: 0.5
 policy_delay: 2
@@ -32,10 +31,10 @@ steps_between_updates: 2_048
 learning_steps: 20
 n_step: 5
 max_grad_norm: 1
-# See ddpg_bench.yaml. Watch `td3/tanh_grad` (healthy ~0.6, collapse < 0.05)
-# and `td3/sat_frac` rather than the score to tell whether this is doing its
-# job — the score moves too late to be a diagnostic.
-pre_activation_coef: 1e-1
+# OFF — see ddpg_bench.yaml. Watch `td3/tanh_grad` (healthy ~0.6, collapse
+# < 0.05) and `td3/sat_frac` rather than the score to tell whether it is needed
+# again; the score moves too late to be a diagnostic.
+pre_activation_coef: 0.0
 normalize_observations: true
 obs_norm_clip: 5.0
 obs_norm_eps: 1e-08
@@ -48,9 +47,9 @@ actor_config:
   output_init_scale: 0.01
 
 critic_config:
-  # Instantiated twice behind a TwinCritic — per-network width is what is
-  # equalized across the benchmark, not total parameter count, because twin vs
-  # single critic IS the algorithm.
+  # Instantiated twice behind a TwinCritic. Per-network width is what is
+  # equalized across the benchmark, not total parameter count: twin vs single
+  # critic IS the algorithm.
   _target_: roxie.models.critics.QCritic
   features: [256, 256]
   use_layer_norm: true

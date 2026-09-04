@@ -1,5 +1,5 @@
 import os
-# Playback drives a single world, so GPU throughput buys nothing, and CPU/MJX
+# Playback is single-world, so GPU throughput buys nothing, and CPU/MJX
 # playback is exactly reproducible — warp's atomic contact reductions make even
 # identical rollouts diverge. JAX_PLATFORMS is read at jax import.
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -30,9 +30,7 @@ from roxie.environment.loader import (
 )
 from roxie.utils import hydra_searchpath
 
-# What may stay in an `env:` block once rewritten onto the playground builder
-# below: that builder's own keywords, plus the keys roxie reads itself. Derived
-# from the signature so it cannot drift out of sync with the builder.
+# Derived from the signature so it cannot drift out of sync with the builder.
 _PLAYGROUND_ENV_KEYS = (
     set(inspect.signature(build_playground_env).parameters)
     | set(TRAINER_ENV_KEYS)
@@ -54,19 +52,18 @@ def main(checkpoint_path, overrides):
     cfg_path = os.path.join(checkpoint_path, "../../.hydra/config.yaml")
     cfg = OmegaConf.load(cfg_path)
 
-    # Trailing ``dotted.key=value`` args override the saved run config: this is a
-    # Click CLI, so it stands in for Hydra's own CLI overrides.
+    # This is a Click CLI, so this stands in for Hydra's own CLI overrides.
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
 
     # Warp targets CUDA and JAX is forced onto CPU above. Checkpoints are
-    # agent-side and replay identically either way, so warp runs play on MJX.
+    # agent-side and replay identically either way.
     if cfg.env.get("impl", None) == "warp":
         cfg.env.impl = "jax"
 
     # EnvPool cannot be played back: the pool hands out no `MjModel` to open a
-    # viewer on. Its checkpoints replay on the playground twin of the same
-    # dm_control task, which shares the observation layout and action bounds.
+    # viewer on. Its checkpoints replay on the playground twin of the same task,
+    # which shares the observation layout and action bounds.
     if uses_envpool(cfg.env):
         task = suites.playground_task(cfg.env.task_id)
         print(
@@ -75,8 +72,7 @@ def main(checkpoint_path, overrides):
             flush=True,
         )
         # Edited in place, not replaced: the saved agent config interpolates
-        # `${env.parallel_envs}`. Swapping the builder means swapping `_target_`
-        # and dropping every pool key — a leftover one is a TypeError.
+        # `${env.parallel_envs}`. A leftover pool key is a TypeError.
         cfg.env["_target_"] = DEFAULT_BUILDER
         cfg.env.env_name = task
         cfg.env.impl = "jax"
@@ -93,18 +89,16 @@ def main(checkpoint_path, overrides):
 
     key = jax.random.PRNGKey(seed=0)
 
-    # ``mode="play"`` lets the builder apply playback-specific tweaks, such as
-    # shrinking a GPU clip pool.
     env, _, env_cfg = build_env(cfg.env, mode="play", num_envs=1, test_episodes=1)
 
     log_loaded_backend(env, requested_impl=cfg.env.get("impl", "jax"))
 
-    # Playback is single-world, so it drives the `FuncEnv` directly rather than
-    # the batched driver the trainer uses.
+    # Single-world, so it drives the `FuncEnv` directly rather than the batched
+    # driver the trainer uses.
     func_env = env.func_env
 
-    # Every construction block the saved config declares is forwarded, plus the
-    # separate `noise` group; the rest comes from the checkpoint.
+    # Every construction block the saved config declares, plus the separate
+    # `noise` group; the rest comes from the checkpoint.
     agent_args = {
         key: value
         for key, value in cfg.agent.items()
@@ -120,8 +114,8 @@ def main(checkpoint_path, overrides):
         **agent_args,
     )
 
-    # Optional per-env viewer override, used to render a reference "ghost"
-    # alongside the policy.
+    # Optional per-env override, used to render a reference "ghost" alongside
+    # the policy.
     viewer_path = cfg.env.get("viewer", None)
     ghost = get_method(viewer_path)(func_env) if viewer_path else None
     model = ghost.model if ghost is not None else func_env.mj_model
@@ -141,16 +135,16 @@ def main(checkpoint_path, overrides):
     )
 
     # MJX is GPU-first and very slow for a single world on CPU, so a native
-    # MuJoCo stepper wins when the env provides one. The default factory returns
-    # None without the ``native_*`` protocol, falling back to jitted MJX below.
+    # MuJoCo stepper wins when the env provides one; the default factory returns
+    # None without the ``native_*`` protocol.
     player_path = cfg.env.get("player", "roxie.utils.native_player.make_native_player")
     player = get_method(player_path)(func_env) if player_path else None
     if player is not None:
         print("Playback stepper: native MuJoCo (CPU)", flush=True)
         jit_reset, jit_step = player.reset, player.step
     else:
-        # `transition` takes an rng that every MuJoCo env here ignores (its own
-        # stream rides in the state), so a fixed key keeps playback reproducible.
+        # `transition` takes an rng every MuJoCo env here ignores (its own
+        # stream rides in the state), so a fixed key is reproducible.
         _step = jax.jit(func_env.transition)
         jit_reset = jax.jit(func_env.initial)
 

@@ -43,9 +43,7 @@ AGENTS = ["ddpg", "td3", "d4pg", "td4", "sac", "mpo", "ppo"]
 OBS, ACT, NUM_ENVS = 6, 3, 8
 
 
-# --------------------------------------------------------------------------
 # Agents, shrunk to test size
-# --------------------------------------------------------------------------
 
 
 def _config(name: str):
@@ -107,9 +105,7 @@ def _build(name: str):
     return build_agent(cfg, **kwargs)
 
 
-# --------------------------------------------------------------------------
 # A minimal env, driven through the same `step` / `add` calls as the trainer
-# --------------------------------------------------------------------------
 
 
 @struct.dataclass
@@ -194,9 +190,7 @@ def _drive(agent, iterations, key, num_envs=NUM_ENVS):
     return obs
 
 
-# --------------------------------------------------------------------------
 # State comparison
-# --------------------------------------------------------------------------
 
 
 def _as_array(leaf):
@@ -267,9 +261,7 @@ def _trained(name, seed_key, iterations=8):
     return agent
 
 
-# --------------------------------------------------------------------------
 # Locating a checkpoint
-# --------------------------------------------------------------------------
 
 
 class TestFindCheckpoint:
@@ -300,9 +292,7 @@ class TestFindCheckpoint:
             find_checkpoint(tmp_path)
 
 
-# --------------------------------------------------------------------------
 # Per-agent round trip
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("name", AGENTS)
@@ -481,9 +471,7 @@ def test_stateless_agent_restores_metadata_only(tmp_path):
     assert metadata["buffer_restored"] is False
 
 
-# --------------------------------------------------------------------------
 # Trainer wiring
-# --------------------------------------------------------------------------
 
 
 class _RecordingAgent:

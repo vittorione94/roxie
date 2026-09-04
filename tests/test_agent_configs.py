@@ -22,9 +22,8 @@ from omegaconf import OmegaConf
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Supplied positionally by train.py from the env, plus `noise_config`, which
-# comes from the separate top-level `noise` config group rather than from the
-# agent's own yaml.
+# Supplied by train.py from the env, plus `noise_config`, which comes from the
+# separate top-level `noise` config group.
 INJECTED = {
     "self",
     "env_obs_size",
@@ -34,12 +33,9 @@ INJECTED = {
     "noise_config",
 }
 
-# The one key in an agent yaml that is not a constructor argument: `device` says
-# which hardware the agent runs on, which has to be applied before the first
-# `jax.*` call — long before the agent is built — so train.py consumes and drops
-# it. It is the agent block's counterpart to `loader.TRAINER_ENV_KEYS`, and it is
-# required rather than merely tolerated: an experiment states where both of its
-# halves run (`env.device` is the other), and a config that omits it hides that.
+# The one key in an agent yaml that is not a constructor argument. Required
+# rather than merely tolerated: an experiment states where both of its halves
+# run (`env.device` is the other), and a config that omits it hides that.
 PLACEMENT_KEYS = {"device"}
 
 CONFIG_FILES = sorted(
@@ -113,8 +109,8 @@ def test_required_constructor_args_are_set(path):
             assert arg in cfg, f"{path}: {arg} is required and has no default"
 
 
-# Launchable experiment configs: the ones with a `defaults:` list naming an
-# agent group (`--config-name <env>/<name>`), not the groups they pull in.
+# The ones with a `defaults:` list naming an agent group, not the groups they
+# pull in.
 LAUNCHABLES = [
     p
     for p in sorted(REPO.glob("experiments/*/*.yaml"))
@@ -193,8 +189,7 @@ def test_nested_blocks_are_instantiable(path):
             continue
         target = block.get("_target_")
         assert target, f"{path}: `{key}` has no `_target_`"
-        # `optax.adam` and `flashbax...make_flat_buffer` are functions, so
-        # resolve as a generic callable rather than with get_class.
+        # These targets are functions, so they need get_method, not get_class.
         from hydra.utils import get_method
 
         get_method(target)

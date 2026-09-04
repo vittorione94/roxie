@@ -10,22 +10,30 @@ from flax import nnx
 from roxie.utils import logger
 from roxie.utils.checkpoint import CHECKPOINTS_DIRNAME
 from roxie.utils.learner import build_learner
-from roxie.utils.rollout import build_rollout, timed
+from roxie.utils.rollout import CHUNK_SUMS, build_rollout, timed
 
 
 def _new_epoch_acc():
     """Per-epoch accumulators, reset at every epoch boundary.
 
-    `ret`/`len` collect only episodes that actually terminated; their `_sq`
-    companions recover the per-episode std at the boundary via
-    sqrt(E[x^2] - E[x]^2), avoiding a host-side list and a per-step sync.
-    `noise` needs its own counter: it is added on policy steps only.
+    The `CHUNK_SUMS` half is what `rollout.collect` returns per chunk and this
+    only sums up; `steps` counts the env steps those sums cover, which is what
+    the per-step means divide by. The loss lists stay host-side: they are one
+    entry per gradient burst, not per step.
     """
     return dict(
-        ret=0.0, ret_sq=0.0, len=0.0, len_sq=0.0, count=0.0,
-        metrics={}, metric_iters=0, noise=0.0, noise_iters=0,
-        actor_losses=[], critic_losses=[],
+        {key: 0.0 for key in CHUNK_SUMS},
+        metrics={}, steps=0, actor_losses=[], critic_losses=[],
     )
+
+
+def _merge_chunk(acc, sums, steps):
+    """Fold one collected chunk into the epoch accumulator."""
+    for key in CHUNK_SUMS:
+        acc[key] = acc[key] + sums[key]
+    for key, value in sums["metrics"].items():
+        acc["metrics"][key] = acc["metrics"].get(key, 0.0) + value
+    acc["steps"] += steps
 
 
 class Trainer:
@@ -110,10 +118,6 @@ class Trainer:
             int(self.steps), args=ocp.args.StandardSave(payload)
         )
 
-    # ------------------------------------------------------------------
-    # Counters, cadences and accumulators
-    # ------------------------------------------------------------------
-
     def _resync_cadence(self):
         """Re-phase the epoch and save cadences against the current `self.steps`.
         Called whenever `steps` jumps rather than increments (resume, warmup fill)."""
@@ -144,38 +148,32 @@ class Trainer:
         return agent_key
 
     @staticmethod
-    def _accumulate_episodes(acc, scores, lengths, done, xp):
-        """Fold this step's completed episodes into the epoch accumulators and
-        return how many finished.
+    def _collect_steps(agent, num_envs):
+        """Env steps per `rollout.collect` call — the loop's unit of work.
 
-        `xp` is `jnp` on the JAX rollout, where a host reduction would sync the
-        pipeline every step, and `np` on EnvPool, where arrays are host-side.
+        ONE `steps_between_updates` window, so the chunk ends exactly where the
+        gradient burst fires and the actor is constant for its whole duration.
+        That is what makes the fused acting burst a throughput change and not an
+        algorithm change: the per-step loop also left the actor untouched
+        between bursts, so the two produce the same schedule.
+
+        An agent that does not declare the cadence (PPO, which updates when its
+        rollout buffer fills, and the baselines) gets 1 — today's per-step loop,
+        unchanged.
         """
-        done_f = done.astype(xp.float32)
-        done_sum = xp.sum(done_f)
-        ep_ret, ep_len = scores * done_f, lengths.astype(xp.float32) * done_f
-        acc["ret"] += xp.sum(ep_ret)
-        acc["ret_sq"] += xp.sum(ep_ret ** 2)
-        acc["len"] += xp.sum(ep_len)
-        acc["len_sq"] += xp.sum(ep_len ** 2)
-        acc["count"] += done_sum
-        return done_sum
+        between = int(getattr(agent, "steps_between_updates", 0) or 0)
+        return max(1, between // int(num_envs))
 
     @staticmethod
     def _bench(bench_steps, bench_t0, obs):
-        """One throughput print, after the first 20 iterations. Blocks on the
+        """One throughput print, after the first few chunks. Blocks on the
         loop's output first, so this times real work rather than dispatch."""
         jax.block_until_ready(obs)
         elapsed = time.time() - bench_t0
         print(
-            f"\n  Speed: {bench_steps / elapsed:.0f} steps/s "
-            f"({elapsed / 20 * 1000:.1f}ms/iter)",
+            f"\n  Speed: {bench_steps / elapsed:.0f} steps/s",
             flush=True,
         )
-
-    # ------------------------------------------------------------------
-    # The training loop
-    # ------------------------------------------------------------------
 
     def run(self, NUM_ENVS, rngs):
         """Build the backend rollout and the learning strategy, then train."""
@@ -193,15 +191,15 @@ class Trainer:
     def _run(self, rollout, NUM_ENVS, rngs):
         start_time = last_epoch_time = time.time()
         agent = self.agent
-        xp = rollout.xp
+        # Read by `_store_epoch_metrics`, which turns the rollout's per-step
+        # sums back into per-step means.
+        self.num_envs = int(NUM_ENVS)
         agent_key = rngs.agent()
 
         state = rollout.prepare()
         agent_key, compile_key = jax.random.split(agent_key)
         timed(functools.partial(agent.step, evaluate=False, key=compile_key),
               state.obs, label="agent step")
-
-        # --- Warmup: fill the replay buffer with random actions ---
 
         memory_warmup = getattr(agent, "memory_warmup", 0)
         warmup_iters = self._warmup_iters(memory_warmup, NUM_ENVS)
@@ -219,59 +217,39 @@ class Trainer:
             print(f"  Done: {self.steps:,} steps, {int(episodes)} episodes",
                   flush=True)
 
-        # The buffer now holds warmup data.
         agent_key = self._precompile_update(agent, agent_key)
 
         learner = build_learner(self, rollout, agent, agent_key, state)
 
-        # --- Training loop ---
-
         print("Training...", flush=True)
-        # In-flight per-env counters; `acc` collects only completed episodes.
-        scores = xp.zeros(NUM_ENVS)
-        lengths = xp.zeros(NUM_ENVS, dtype=xp.int32)
+        # One update window per iteration, so every cadence measured in env
+        # steps is quantized to this chunk. The CSV records the actual `steps`.
+        collect_steps = self._collect_steps(agent, NUM_ENVS)
+        chunk_env_steps = collect_steps * NUM_ENVS
         acc = _new_epoch_acc()
         bench_t0, bench_steps = time.time(), 0
-        action_rng = rngs.envs()
 
         while True:
-            action_rng, action_key = jax.random.split(action_rng)
-            actions, last_noise = learner.act(state.obs, action_key)
-            # Only deterministic agents (DDPG/TD3) expose noise.
-            if last_noise is not None:
-                acc["noise"] += xp.mean(xp.abs(last_noise))
-                acc["noise_iters"] += 1
+            state, sums = rollout.collect(state, collect_steps, learner)
+            self.steps += chunk_env_steps
+            epoch_steps += chunk_env_steps
+            steps_since_save += chunk_env_steps
+            bench_steps += chunk_env_steps
+            _merge_chunk(acc, sums, chunk_env_steps)
+            # Left as a device scalar on the JAX path and reduced to an int
+            # only at the epoch boundary; `int()` here would sync every chunk.
+            episodes = episodes + sums["count"]
 
-            state, prev_obs, timestep = rollout.step(state, actions)
-            learner.observe(prev_obs, timestep, actions, self.steps)
-
+            learner.update(self.steps)
             grad_steps, new_losses = learner.drain()
             tot_gradient_steps = self.initial_gradient_steps + grad_steps
             for actor_loss, critic_loss in new_losses:
                 acc["actor_losses"].append(actor_loss)
                 acc["critic_losses"].append(critic_loss)
 
-            reward = xp.asarray(timestep.reward)
-            done = xp.asarray(timestep.terminated) | xp.asarray(timestep.truncated)
-            scores = scores + reward
-            lengths = lengths + 1
-            # The mean is deferred to the epoch boundary to avoid one dispatch
-            # per metric per step.
-            for k, v in timestep.info.get("metrics", {}).items():
-                acc["metrics"][k] = acc["metrics"].get(k, 0.0) + v
-            acc["metric_iters"] += 1
-
-            self.steps += NUM_ENVS
-            epoch_steps += NUM_ENVS
-            steps_since_save += NUM_ENVS
-            bench_steps += NUM_ENVS
-
-            episodes = episodes + self._accumulate_episodes(
-                acc, scores, lengths, done, xp,
-            )
-
-            if bench_steps == NUM_ENVS * 20:
+            if bench_steps >= NUM_ENVS * 20 and bench_t0 is not None:
                 self._bench(bench_steps, bench_t0, state.obs)
+                bench_t0 = None
 
             if self.show_progress:
                 logger.show_progress(self.steps, self.epoch_steps, self.max_steps)
@@ -279,7 +257,7 @@ class Trainer:
             if epoch_steps >= self.epoch_steps:
                 epoch_steps = 0
                 epochs, acc = self._end_of_epoch(
-                    agent, acc, scores, lengths, rollout, learner,
+                    agent, acc, rollout, learner,
                     epochs=epochs, episodes=episodes,
                     gradient_steps=tot_gradient_steps,
                     start_time=start_time, last_epoch_time=last_epoch_time,
@@ -288,14 +266,10 @@ class Trainer:
                 # changes itself, and this epoch's numbers describe it as it was.
                 state, invalidated = rollout.epoch_refresh(state)
                 if invalidated:
-                    # The backend reset the live envs, so the part-scored
-                    # episodes in flight are meaningless.
-                    scores = xp.zeros(NUM_ENVS)
-                    lengths = xp.zeros(NUM_ENVS, dtype=xp.int32)
+                    # The live envs were reset, so the part-scored episodes in
+                    # flight are meaningless.
+                    rollout.reset_tally()
                 last_epoch_time = time.time()
-
-            scores = xp.where(done, 0, scores)
-            lengths = xp.where(done, 0, lengths)
 
             steps_since_save, stop_training = self._checkpoint_if_due(
                 agent, learner, epochs=epochs, episodes=episodes,
@@ -307,7 +281,7 @@ class Trainer:
 
         learner.stop()
 
-    def _end_of_epoch(self, agent, acc, scores, lengths, rollout, learner, *,
+    def _end_of_epoch(self, agent, acc, rollout, learner, *,
                       epochs, episodes, gradient_steps, start_time,
                       last_epoch_time):
         """The epoch boundary: reset exploration noise, run the held-out eval,
@@ -329,7 +303,7 @@ class Trainer:
 
         epochs += 1
         self._store_epoch_metrics(
-            agent, self._epoch_stats(acc, scores, lengths), acc,
+            agent, self._epoch_stats(acc, rollout.scores, rollout.lengths), acc,
             epochs=epochs, episodes=episodes,
             sps=self.steps / (time.time() - start_time),
             gradient_steps=gradient_steps,
@@ -353,21 +327,18 @@ class Trainer:
             steps_since_save = self.steps % self.save_steps
         return steps_since_save, stop_training
 
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _epoch_stats(acc, scores, lengths):
         """(n, mean/std of return, mean/std of length) over episodes that
         completed this epoch, falling back to the in-flight per-env counters when
         none did (episodes longer than an epoch) so the line is never blank."""
         n = int(acc["count"])
+        scores, lengths = np.asarray(scores), np.asarray(lengths)
         if n == 0:
             return (n, float(np.mean(scores)), float(np.std(scores)),
                     float(np.mean(lengths)), float(np.std(lengths)))
-        # Dividing by the accumulator rather than `n` keeps the arithmetic in its
-        # own dtype (f32 on the jax path) instead of widening.
+        # Dividing by the accumulator rather than `n` keeps the arithmetic in
+        # its own dtype (f32 on the jax path) instead of widening.
         mean_ret = float(acc["ret"] / acc["count"])
         mean_len = float(acc["len"] / acc["count"])
 
@@ -387,7 +358,8 @@ class Trainer:
         ``epoch``/``steps`` are the run axes, ``train/*`` the behaviour policy
         and learner, ``test/*`` the held-out eval, ``sys/*`` throughput and
         host/device health. Anything a producer already prefixes for itself
-        (``reward/``, ``noise/``, ``td3/``, ``ppo/``) nests under ``train/``.
+        (``reward/``, ``noise/``, and each agent's own name from
+        ``pop_diagnostics``) nests under ``train/``.
         """
         ep_n, score, score_std, length, length_std = stats
         start_time, last_epoch_time = times
@@ -402,23 +374,23 @@ class Trainer:
         logger.store("train/episodes/epoch", ep_n)
         logger.store("train/episodes/total", int(episodes))
         logger.store("train/gradient_steps", gradient_steps)
-        # None, not 0.0, when the epoch ran no gradient bursts: a logged zero is
-        # indistinguishable from a converged loss. Backends render None as a gap.
+        # None, not 0.0, when the epoch ran no gradient bursts: a logged zero
+        # is indistinguishable from a converged loss, and renders as a gap.
         for name in ("actor", "critic"):
             values = acc[f"{name}_losses"]
             logger.store(f"train/loss/{name}",
                          float(np.mean(values)) if values else None)
 
-        # Epoch-mean of each env metric, e.g. `train/reward/upright`. np.mean
-        # reduces per-env vectors (jax) and scalars (envpool) alike.
-        extra = {k: float(np.mean(v) / acc["metric_iters"])
-                 for k, v in acc["metrics"].items()} if acc["metric_iters"] else {}
-        # Post-clip noise, in normalized [-1, 1] action units; compare against
-        # the noise module's scheduled scale to see how much clipping eats.
-        if acc["noise_iters"]:
-            extra["noise/per_joint_abs"] = float(acc["noise"] / acc["noise_iters"])
-        diagnostics = getattr(agent, "pop_diagnostics", None)
-        extra.update(diagnostics() if diagnostics is not None else {})
+        # The rollout already reduced each step to a scalar, so this divides by
+        # the number of steps those scalars came from.
+        iters = acc["steps"] / self.num_envs
+        extra = {k: float(v / iters) for k, v in acc["metrics"].items()} if iters else {}
+        # Post-clip, in normalized [-1, 1] action units; compare against the
+        # noise module's scheduled scale to see how much clipping eats.
+        if iters:
+            extra["noise/per_joint_abs"] = float(acc["noise"] / iters)
+        # Every agent answers this; the ones with nothing to report answer {}.
+        extra.update(agent.pop_diagnostics(self.steps))
         for k, v in extra.items():
             logger.store(f"train/{k}", float(v))
 
@@ -426,8 +398,8 @@ class Trainer:
         logger.store("sys/sps", sps)
         logger.store("sys/time/total_s", now - start_time)
         logger.store("sys/time/epoch_s", now - last_epoch_time)
-        # Device telemetry is whole-card: a run not on the GPU would attribute
-        # another process's memory and utilisation to itself.
+        # Whole-card telemetry: a run not on the GPU would attribute another
+        # process's memory and utilisation to itself.
         if any(d.platform == "gpu" for d in jax.devices()):
             for k, v in logger.gpu_stats().items():
                 logger.store(k, v)
@@ -449,10 +421,10 @@ class Trainer:
         logger.store("test/length", float(np.mean(lengths)))
         logger.store("test/length/std", float(np.std(lengths)))
         # Episode return is a sum, so with spread start phases it is bounded by
-        # how much clip was left at reset; the per-step rate divides that out.
+        # how much episode was left at reset; the per-step rate divides that out.
         logger.store("test/score_per_step",
                      float(np.mean(scores / np.maximum(lengths, 1))))
-        # `test/length/std` cannot stand in for this: 0.00 there means either a
+        # `test/length/std` cannot stand in: 0.00 there means either a
         # degenerate eval or a policy saturating the episode cap.
         logger.store("test/distinct_starts",
                      float(len(np.unique(start_obs, axis=0))))

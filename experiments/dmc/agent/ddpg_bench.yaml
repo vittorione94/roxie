@@ -2,10 +2,9 @@
 # the whole set: the other six agents repeat these values and only deviate where
 # the ALGORITHM demands it.
 #
-# ONE SETTING FOR 25 TASKS. Nothing below is tuned per task, and that is the
-# point: the grid ranks algorithms at matched hyperparameters, so a task where
-# an arm needs a different lr or a wider net is one where it scores badly and
-# says so. Per-task tuning would turn the figure into a tuning result.
+# ONE SETTING FOR 25 TASKS. Nothing below is tuned per task: the grid ranks
+# algorithms at matched hyperparameters, so a task where an arm needs a
+# different lr or a wider net is one where it scores badly and says so.
 #
 # BENCHMARK INVARIANTS — identical in every `*_bench.yaml` here:
 #   networks      actor + critic MLP [256, 256], layer norm on
@@ -14,32 +13,17 @@
 #   replay        flat buffer 500k, min 10k, batch 512
 #   warmup        memory_warmup 30_720 = steps_before_learning 30_720
 #   schedule      steps_between_updates 2_048 env steps x learning_steps 20
-#                 grad steps at batch 512  =>  replay ratio 5.0, and ~488k
-#                 gradient steps over the 50M-step budget. 2_048 is 8 trainer
-#                 iterations at parallel_envs 256; keep it a multiple of the env
-#                 count or the update boundary silently rounds up to one.
-#
-#                 BOTH numbers are multiples of parallel_envs 256, and 30_720
-#                 (= 120 x 256) is why the warmup figure is not a round 30k. The
-#                 trainer advances `steps` in strides of parallel_envs, so an
-#                 unaligned OFFSET used to disarm the schedule outright: at
-#                 30_000 the v1 release grid ran all six off-policy arms for 5M
-#                 env steps at ZERO gradient steps. `Agent.due_for_update` no
-#                 longer depends on that alignment, so this is now only about
-#                 warmup landing on an iteration boundary rather than 48 steps
-#                 past one — but keep the multiples anyway, they are free.
+#                 grad steps at batch 512  =>  replay ratio 5.0. Both are
+#                 multiples of parallel_envs 256, which is why the warmup is
+#                 30_720 (= 120 x 256) and not a round 30k: the trainer advances
+#                 `steps` in strides of parallel_envs.
 #   returns       n_step 5 wherever the agent takes it (MPO/PPO do not)
 #   init          seed 0
 #   obs           running normalization on, clip 5.0
 #
-# What is allowed to differ, because it IS the algorithm: critic count and type
-# (single Q / twin Q / categorical), policy delay, target-policy smoothing,
-# exploration source, and — for PPO — the entire on-policy replacement of the
-# buffer. Those deltas are called out at the top of each file.
-#
-# Unlike experiments/mocap/agent/*_sweep.yaml (which is mid-migration and has a
-# TD3 arm carrying knobs the others lack), every deterministic arm here runs the
-# SAME `pre_activation_coef`, so this set is a clean algorithm-only A/B.
+# What is allowed to differ, because it IS the algorithm: critic count and type,
+# policy delay, target-policy smoothing, exploration source, and — for PPO — the
+# entire on-policy replacement of the buffer. Each file calls out its own delta.
 _target_: roxie.agents.DDPG
 
 # Where the agent runs; the `backend` group sets it per cell (see env.device).
@@ -60,13 +44,15 @@ learning_steps: 20
 n_step: 5
 max_grad_norm: 1
 # Penalty on the actor's pre-tanh logits: relu(|u| - 1)^2 summed over action
-# dims, averaged over the batch. Without it the DPG objective drives the logits
-# outward until tanh saturates and the actor gradient underflows to zero — a
-# bang-bang controller that cannot be updated. Diagnosed on the mocap sweep
-# (mean |u| = 9.1, 63% of dims past |a| > 0.999); the tell is deterministic eval
-# scoring BELOW the noisy behaviour policy. Every deterministic arm in this
-# benchmark carries the same coefficient.
-pre_activation_coef: 1e-1
+# dims. Without it the DPG objective can drive the logits outward until tanh
+# saturates and the actor gradient underflows to zero — a bang-bang controller
+# that cannot be updated. OFF here: dm_control shows none of that failure mode
+# (`td3/sat_frac` 0.002, `td3/tanh_grad` 0.6 across a full 500M-step run), and
+# the penalty cost TD3 half its score. Turn it back on only with those two
+# diagnostics saying so, and then for every deterministic arm at once — which is
+# now checkable per arm, since each reports its own `<agent>/sat_frac` and
+# `<agent>/tanh_grad` rather than TD3's standing in for all four.
+pre_activation_coef: 0.0
 normalize_observations: true
 obs_norm_clip: 5.0
 obs_norm_eps: 1e-08
@@ -97,7 +83,6 @@ memory_config:
   add_sequences: False
   add_batch_size: ${env.parallel_envs}
 
-# Feeds `nnx.Rngs`; actor and each critic head take distinct derived offsets.
 # Held at 0 across the benchmark — a single seed is a demonstration, not a
 # significance claim, which is why the figure quotes back-half mean +- std over
 # epochs rather than a peak.

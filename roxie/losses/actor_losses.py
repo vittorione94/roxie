@@ -14,15 +14,27 @@ from roxie.agents.agent import Agent
 from roxie.models.actors import distribution_entropy
 
 # Pre-tanh magnitude past which the saturation penalty starts charging.
-# tanh(1) = 0.76, so the policy keeps the useful range of the action space for
-# free and is pushed back only once it heads for the rails. A two-sided u^2
-# penalty would instead bias every action toward zero.
+# tanh(1) = 0.76, so the policy keeps the useful range for free and is pushed
+# back only once it heads for the rails.
 PRE_ACTIVATION_THRESHOLD = 1.0
 
+# Bound on PPO's log importance ratio before it is exponentiated.
+# `exp` overflows float32 at 88.7, and the overflow is not merely a large
+# number: `jnp.minimum` hands the unclipped branch a zero cotangent whenever the
+# clipped one is selected, so the backward pass computes `0 * inf = NaN` while
+# the forward loss still reads a perfectly healthy -(1 + clip_eps) * advantage.
+# One such transition in one minibatch is terminal, because `clip_by_global_norm`
+# rescales by 1 / global_norm and a NaN norm poisons every parameter in the tree.
+# 20 is ~2 orders of magnitude outside any ratio the clip leaves meaningful
+# (e^20 = 4.9e8 against a clip range of [0.8, 1.2]), so it binds only where the
+# surrogate has already stopped saying anything useful, and the `target_kl`
+# early stop -- which now sees a finite `approx_kl` -- is what actually abandons
+# the rollout.
+_MAX_LOG_RATIO = 20.0
+
 # rlax's MPO ops default `projection_operator` to a `jnp.clip(a_min=...)`
-# partial, but JAX dropped the `a_min`/`a_max` aliases, so `rlax.mpo_loss`
-# raises a TypeError as soon as it projects the duals. This is rlax's own
-# `_EPSILON`, so the numerics are unchanged.
+# partial, but JAX dropped the `a_min`/`a_max` aliases. rlax's own `_EPSILON`,
+# so the numerics are unchanged.
 _DUAL_EPSILON = 1e-10
 
 
@@ -51,20 +63,81 @@ def pre_activation_penalty(pre_activation: jnp.ndarray) -> jnp.ndarray:
     return jnp.mean(jnp.sum(jnp.square(excess), axis=-1))
 
 
+# The keys `actor_aux` always produces. Listed rather than inferred because
+# `nnx.cond`'s skipped branch — a delayed policy update — has to synthesize a
+# structurally identical dict without running the loss that would fill it.
+ACTOR_DIAGNOSTIC_KEYS = (
+    "pre_act_abs",
+    "pre_act_max",
+    "sat_frac",
+    "tanh_grad",
+    "actor_q",
+)
+
+
+def skipped_actor_aux(dtype, *extra_keys) -> dict:
+    """A zero-filled `actor_aux` for a step whose policy update did not run.
+
+    `extra_keys` mirror the `extra` the agent's loss passes to `actor_aux`.
+    Never averaged in: the burst divides the actor sums by the number of
+    *update* steps, so the zeros land outside the denominator.
+    """
+    zero = jnp.array(0.0, dtype=dtype)
+    return {key: zero for key in (*ACTOR_DIAGNOSTIC_KEYS, *extra_keys)}
+
+
+def actor_aux(actions, pre_activation, actor_q, **extra) -> dict:
+    """The saturation diagnostics every squashing actor reports.
+
+    Shared by all of them — deterministic (DDPG, D4PG, TD3, TD4) and stochastic
+    (SAC) — because the failure mode is shared: the policy gradient pushes the
+    pre-tanh logits outward without bound until `d(tanh u)/du` underflows and the
+    policy freezes as a bang-bang controller. Every term is read off the loss's
+    own forward pass, so the instrumentation costs no extra compute.
+
+    `actions` are the squashed outputs in [-1, 1] — NOT the env-scaled ones, on
+    which the thresholds below would mean nothing — and `pre_activation` the
+    logits behind them. `extra` carries whatever else the caller has in hand
+    (the pre-tanh penalty; SAC's temperature and entropy).
+    """
+    abs_u = jnp.abs(pre_activation)
+    return {
+        "pre_act_abs": jnp.mean(abs_u),
+        "pre_act_max": jnp.max(abs_u),
+        "sat_frac": jnp.mean((jnp.abs(actions) > 0.99).astype(jnp.float32)),
+        # d(tanh u)/du: the factor the policy gradient is scaled by before it
+        # reaches the weights, so the leading indicator of saturation collapse.
+        "tanh_grad": jnp.mean(1.0 - jnp.square(actions)),
+        "actor_q": actor_q,
+        **extra,
+    }
+
+
 def ddpg_actor_loss_fn(
     actor_model,
     critic_model,
     samples,
     action_low,
     action_high,
+    pre_activation_coef,
 ):
-    """Calculates the loss for the actor (aims to maximize Q-value)."""
+    """Deterministic policy gradient, plus the one-sided pre-tanh penalty.
+
+    `pre_activation_coef` of 0.0 recovers the textbook DDPG actor loss. It is a
+    parameter here — as it is on every deterministic arm — because the benchmark
+    holds it identical across them and calls the set an algorithm-only A/B; a
+    knob only TD3 consumed made that claim false, and silently so.
+
+    Returns ``(loss, aux)``, the uniform contract across this module.
+    """
     obs = samples["observations"]
-    actions = actor_model(obs)  # [-1, 1]
-    actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
-    q_values = critic_model(obs, actions)
-    actor_loss = -jnp.mean(q_values)
-    return actor_loss
+    actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
+    scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
+    q_values = critic_model(obs, scaled_actions)
+    actor_q = jnp.mean(q_values)
+    penalty = pre_activation_penalty(pre_activation)
+    aux = actor_aux(actions, pre_activation, actor_q, pre_act_penalty=penalty)
+    return -actor_q + pre_activation_coef * penalty, aux
 
 
 def d4pg_actor_loss_fn(
@@ -74,15 +147,22 @@ def d4pg_actor_loss_fn(
     action_low,
     action_high,
     atoms,
+    pre_activation_coef,
 ):
-    """DPG through the distributional critic: maximize the categorical's mean."""
+    """DPG through the distributional critic: maximize the categorical's mean.
+
+    Carries the pre-tanh penalty for the same reason `ddpg_actor_loss_fn` does,
+    and reports the same `aux`.
+    """
     obs = samples["observations"]
-    actions = actor_model(obs)  # [-1, 1]
-    actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
-    logits = critic_model(obs, actions)  # (B, num_atoms)
+    actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
+    scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
+    logits = critic_model(obs, scaled_actions)  # (B, num_atoms)
     q_values = jnp.sum(jax.nn.softmax(logits, axis=-1) * atoms, axis=-1)
-    actor_loss = -jnp.mean(q_values)
-    return actor_loss
+    actor_q = jnp.mean(q_values)
+    penalty = pre_activation_penalty(pre_activation)
+    aux = actor_aux(actions, pre_activation, actor_q, pre_act_penalty=penalty)
+    return -actor_q + pre_activation_coef * penalty, aux
 
 
 def td3_actor_loss_fn(
@@ -101,8 +181,7 @@ def td3_actor_loss_fn(
     bang-bang controller. `pre_activation_coef` of 0.0 recovers the textbook TD3
     actor loss.
 
-    Returns ``(loss, aux)``; `aux` carries the saturation diagnostics the agent
-    logs under `td3/`, read off this forward pass rather than a second one.
+    Returns ``(loss, aux)``, the uniform contract across this module.
     """
     obs = samples["observations"]
     actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
@@ -110,19 +189,7 @@ def td3_actor_loss_fn(
     q1, _ = twin_critic(obs, scaled_actions)
     actor_q = jnp.mean(q1)
     penalty = pre_activation_penalty(pre_activation)
-
-    abs_u = jnp.abs(pre_activation)
-    # d(tanh u)/du: the factor the DPG gradient is multiplied by before it
-    # reaches the weights, and so the leading indicator of saturation collapse.
-    tanh_grad = 1.0 - jnp.square(actions)
-    aux = {
-        "pre_act_abs": jnp.mean(abs_u),
-        "pre_act_max": jnp.max(abs_u),
-        "pre_act_penalty": penalty,
-        "sat_frac": jnp.mean((jnp.abs(actions) > 0.99).astype(jnp.float32)),
-        "tanh_grad": jnp.mean(tanh_grad),
-        "actor_q": actor_q,
-    }
+    aux = actor_aux(actions, pre_activation, actor_q, pre_act_penalty=penalty)
     return -actor_q + pre_activation_coef * penalty, aux
 
 
@@ -133,19 +200,26 @@ def td4_actor_loss_fn(
     action_low,
     action_high,
     atoms,
+    pre_activation_coef,
 ):
     """DPG through the first distributional head's expected value (TD4).
 
     The TD3 convention: the actor follows critic 1 only, so the pessimistic
-    min stays confined to the critic's bootstrap target.
+    min stays confined to the critic's bootstrap target. Carries the pre-tanh
+    penalty for the same reason `ddpg_actor_loss_fn` does, and reports the same
+    `aux` — which is the whole point of TD4 having them: it inherits from D4PG,
+    so before this it was the one delayed-policy agent flying blind on the
+    saturation TD3's diagnostics exist to catch.
     """
     obs = samples["observations"]
-    actions = actor_model(obs)  # [-1, 1]
-    actions = Agent.scale_to_env(actions, action_low, action_high)  # [low, high]
-    logits1, _ = twin_critic(obs, actions)  # (B, num_atoms)
+    actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
+    scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
+    logits1, _ = twin_critic(obs, scaled_actions)  # (B, num_atoms)
     q_values = jnp.sum(jax.nn.softmax(logits1, axis=-1) * atoms, axis=-1)
-    actor_loss = -jnp.mean(q_values)
-    return actor_loss
+    actor_q = jnp.mean(q_values)
+    penalty = pre_activation_penalty(pre_activation)
+    aux = actor_aux(actions, pre_activation, actor_q, pre_act_penalty=penalty)
+    return -actor_q + pre_activation_coef * penalty, aux
 
 
 def ppo_loss_fn(
@@ -169,13 +243,26 @@ def ppo_loss_fn(
     distribution = actor_model(observations)
     logp_new = distribution.log_prob(actions_buf)       # (N, T)
 
-    # Analytic for a plain Normal; for a squashed policy it is a single-sample
-    # estimate, which is what `key` is for.
+    # Analytic for a plain Normal; a single-sample estimate for a squashed
+    # policy, which is what `key` is for.
     entropy_t = distribution_entropy(distribution, key)[:, :-1]
 
     # The last entry is the next-frame bootstrap, dropped so the ratio lines up
     # with the advantages: (NUM_ENVS, BATCH_SIZE - 1).
-    ratio = jnp.exp(logp_new[:, :-1] - old_log_probs[:, :-1])
+    #
+    # Clamped BEFORE the exponential, never after: `exp` of an unbounded
+    # log-ratio overflows to `inf`, and an `inf` ratio makes this loss's own
+    # gradient NaN even though its value stays finite (see `_MAX_LOG_RATIO`).
+    # The squashed policy reaches that regime easily -- `TanhNormal.log_prob`
+    # recovers `u` through a clipped arctanh, so a saturated sample's `u` is
+    # pinned at the rail while the mean walks away from it, and the resulting
+    # z-score is divided by a `std` free to shrink to `std_min`.
+    log_ratio = jnp.clip(
+        logp_new[:, :-1] - old_log_probs[:, :-1],
+        -_MAX_LOG_RATIO,
+        _MAX_LOG_RATIO,
+    )
+    ratio = jnp.exp(log_ratio)
 
     if ratio.shape != advantages.shape:
         raise ValueError(f"ratio and advantages shapes must match; got {ratio.shape} vs {advantages.shape}")
@@ -183,19 +270,19 @@ def ppo_loss_fn(
     if ratio.ndim < 1:
         raise ValueError("ratio must have at least 1 dimension (time axis)")
 
-    # Written out elementwise so the result keeps the inputs' shape (per-timestep
-    # losses) rather than being reduced to a scalar.
     clipped_ratio = jnp.clip(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
     surrogate1 = ratio * advantages
     surrogate2 = clipped_ratio * advantages
     surrogate = jnp.minimum(surrogate1, surrogate2)
     pg_loss = -surrogate
 
-    # `approx_kl` is Schulman's low-variance estimator of KL(pi_old || pi_new):
-    # >= 0, and 0 iff the ratio is 1 everywhere. Samples outside the clip range
-    # take the constant branch of the min() above, whose policy gradient is zero
-    # — near clip_frac 1 the entropy term alone drives the update.
-    approx_kl = jnp.mean((ratio - 1.0) - jnp.log(ratio))
+    # Schulman's low-variance estimator of KL(pi_old || pi_new): >= 0, and 0 iff
+    # the ratio is 1 everywhere. Taken against `log_ratio` rather than
+    # `jnp.log(ratio)` -- exact, one op cheaper, and finite by construction. The
+    # difference is not cosmetic: an unbounded `ratio` made this NaN, and
+    # `approx_kl > target_kl` is False for NaN, so the trust region silently
+    # switched itself off at exactly the moment it was needed.
+    approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
     clip_frac = jnp.mean((jnp.abs(ratio - 1.0) > clip_epsilon).astype(jnp.float32))
 
     per_step_loss = pg_loss - entropy_coef * entropy_t
@@ -211,6 +298,14 @@ def sac_actor_loss_fn(
     action_low,
     action_high,
 ):
+    """Reparameterized policy gradient through the pessimistic Q, minus the
+    entropy bonus.
+
+    Returns ``(loss, (log_probs, aux))``: the log-probs feed the temperature
+    loss, `aux` the agent's diagnostics. `entropy` is the single-sample estimate
+    the loss already paid for; against `target_entropy` it says whether the
+    temperature is holding the constraint, and `alpha` says at what price.
+    """
     obs = samples["observations"]
     distribution = actor_model(obs)
     u = distribution.sample(seed=key)
@@ -222,7 +317,12 @@ def sac_actor_loss_fn(
     q1, q2 = twin_critic(obs, actions_scaled)
     min_q = jnp.minimum(jnp.squeeze(q1), jnp.squeeze(q2))
     actor_loss = jnp.mean(alpha * log_probs - min_q)
-    return actor_loss, log_probs
+    aux = actor_aux(
+        actions, u, jnp.mean(min_q),
+        alpha=alpha,
+        entropy=-jnp.mean(log_probs),
+    )
+    return actor_loss, (log_probs, aux)
 
 
 def mpo_actor_loss_fn(

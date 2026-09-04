@@ -3,17 +3,14 @@
 # Extra cell, NOT in the default grid: GPU physics (MJX) + GPU learner.
 #
 # Same task, same card, different physics implementation: MJX traces the step
-# into the XLA program itself rather than dispatching Warp kernels. Against the
-# warp_gpu cell this isolates the cost of the physics backend alone — the
-# learner, the agent and the env count are untouched. Two cells x 25 tasks x 7
-# agents is already 350 runs, so the grid runs warp_gpu + envpool_cpu (GPU vs
-# CPU, the claim that needs the whole suite behind it) and this stays one flag
-# away for the backend comparison, which a handful of tasks answers:
+# into the XLA program itself rather than dispatching Warp kernels, so against
+# warp_gpu this isolates the physics backend alone. Kept out of the default grid
+# (350 runs already) but one flag away:
 #
 #   scripts/run_release_benchmark.sh --cells mjx_gpu --tasks CheetahRun,WalkerWalk
 #
-# Note that MJX sizes contact arrays STATICALLY to all potential geom pairs,
-# where Warp uses a budgeted global arena — see
+# MJX sizes contact arrays STATICALLY to all potential geom pairs, where Warp
+# uses a budgeted global arena — see
 # docs/backends.md#contact-budgets-three-backends-three-models.
 
 release:

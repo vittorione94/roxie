@@ -4,19 +4,13 @@
 # native MuJoCo inside EnvPool's C++ thread pool, with the learner on CPU too —
 # so this cell is **fully GPU-free**, start to finish.
 #
-# It is not the same code running somewhere else. Playground reimplements the
-# dm_control tasks as JAX/MJX programs; EnvPool wraps dm_control's own C++
-# physics. Two independent implementations of one task specification, at a
-# matched step budget, with the same 0-1000 return scale — which is what makes
+# Not the same code running somewhere else: playground reimplements the tasks as
+# JAX/MJX programs, EnvPool wraps dm_control's own C++ physics. Two independent
+# implementations of one specification at a matched budget, which is what makes
 # the per-task GPU-vs-CPU score panel a parity check rather than a curiosity.
-# Where the two disagree on score, that is a finding about one of the
-# implementations; where they disagree on wall-clock, that is the cells doing
-# their job.
 #
-# The task-name translation (playground `BallInCup` -> envpool
-# `BallInCupCatch-v1`, and one more) lives in roxie.environment.suites and is
-# reached through the `${envpool_task:...}` resolver, so an interactive
-# `release.task=BallInCup` picks the right pool without the caller knowing.
+# The task-name translation lives in roxie.environment.suites, reached through
+# the `${envpool_task:...}` resolver.
 
 release:
   cell: envpool_cpu

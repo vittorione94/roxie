@@ -68,8 +68,8 @@ class MuJoCoFuncEnv(FuncEnv):
         return state.done.astype(jnp.bool_)
 
     def truncal(self, state, rng, params=None):
-        # An env's own non-failure cutoff. `.get` runs at trace time on a plain
-        # Python dict, so an env without the key costs nothing.
+        # `.get` runs at trace time on a plain Python dict, so an env without
+        # the key costs nothing.
         return jnp.asarray(state.info.get("truncation", False), dtype=jnp.bool_)
 
     def transition_info(self, state, action, next_state, params=None):
@@ -87,8 +87,6 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
     def __init__(self, env: Any, impl: str | None = None):
         self.env = env
         self.observation_space = functional.unbounded_box(env.observation_size)
-        # The only place that reads `actuator_ctrlrange`; the agents take their
-        # bounds from the space.
         ctrl_range = env.mj_model.actuator_ctrlrange
         self.action_space = functional.box(ctrl_range[:, 0], ctrl_range[:, 1])
         self.metadata = {"jax": True, "impl": impl or _read_impl(env)}
@@ -248,18 +246,9 @@ class EnvBundle(NamedTuple):
 # experiment yaml names one.
 DEFAULT_MAX_EPISODE_STEPS = 1000
 
-# The keys that live under ``env:`` but are NOT builder arguments — roxie
-# consumes them itself, so ``build_env`` strips them before instantiating.
-#
-# Both sizes still reach the builder as the ``num_envs``/``test_episodes`` the
-# caller injects, so dropping their yaml spellings leaves one source for each: a
-# yaml ``test_episodes`` would silently compete with ``trainer.test_episodes``,
-# the drift that once failed a broadcast mid-eval. ``seed`` is deliberately
-# absent — it is a genuine env quantity, forwarded like any other key.
-#
-# Everything NOT listed here is a builder keyword, which lets
-# ``build_envpool_env`` collect task kwargs in a ``**task_kwargs`` tail and makes
-# a stale key a loud ``TypeError`` rather than a silently ignored setting.
+# Keys that live under ``env:`` but are NOT builder arguments — roxie consumes
+# them itself, so ``build_env`` strips them before instantiating. Everything not
+# listed is forwarded, which makes a stale key a loud ``TypeError``.
 TRAINER_ENV_KEYS = frozenset({
     "builder",         # pre-`_target_` spelling; still honoured by build_env
     "device",          # which hardware the physics runs on (see resolve_placement)
@@ -301,8 +290,6 @@ def build_playground_env(
     func_env, env_cfg = load_playground_env(
         env_name, impl=impl, naconmax=naconmax, njmax=njmax,
     )
-    # Most specific source first: an explicit experiment override, then the
-    # env's own declared episode length, then the fallback.
     max_steps = int(
         max_episode_steps
         or env_cfg.get("episode_length", None)
@@ -380,7 +367,6 @@ def build_envpool_env(
     return EnvBundle(env=train_env, test_env=test_env, env_cfg=None)
 
 
-# Dotted path of the default builder, used when ``env`` names no ``_target_``.
 DEFAULT_BUILDER = "roxie.environment.loader.build_playground_env"
 
 
@@ -412,11 +398,6 @@ def uses_envpool(cfg_env: Any) -> bool:
         return False
 
 
-# ``agent.device`` and ``env.device`` rather than one process-wide key, because
-# the two are separate placements: CPU physics with a GPU learner is a
-# configuration this repo ships. Both are consumed by ``train.py`` before
-# anything is built (a JAX platform must be chosen before the first ``jax.*``
-# call) and both are checked against reality by the startup banner.
 DEVICES = ("cpu", "gpu")
 
 
@@ -478,10 +459,9 @@ def build_env(
     backend, a bespoke builder's nested blocks — is yaml, which is what lets a
     task living in another repo be launched through ``roxie.train`` unchanged.
     """
-    # Resolve against the composed config FIRST: every interpolation in the block
-    # is relative to the config root, and `instantiate` re-creates what it is
-    # handed as a fresh, parentless node. `throw_on_missing` turns an unset `???`
-    # into its own error rather than passing the literal to a builder.
+    # Resolve against the composed config FIRST: every interpolation in the
+    # block is relative to the config root, and `instantiate` re-creates what it
+    # is handed as a fresh, parentless node.
     if isinstance(cfg_env, DictConfig):
         resolved = OmegaConf.to_container(
             cfg_env, resolve=True, throw_on_missing=True,

@@ -6,16 +6,10 @@
 #   uv run python roxie/train.py --config-name dmc/bench_td4 release.task=CheetahRun
 #   uv run python roxie/train.py --config-name dmc/bench_td4 dmc/backend@backend=envpool_cpu
 #
-# The agent block, the noise block (where there is one) and the whole bench/dmc
-# block are shared VERBATIM with every other bench_*.yaml; agent/td4_bench
-# holds the only algorithmic difference. Nothing is overridden below on purpose
-# — put ad-hoc tweaks on the CLI so this file keeps recording the benchmark
-# condition.
-#
-# TWO things the grid varies over this launchable, neither of them a file:
-# `release.task` (one of the 25 in roxie.environment.suites.DMC_TASKS) and the
-# `backend` group (warp_gpu / envpool_cpu). scripts/run_release_benchmark.sh
-# walks the cross product.
+# Everything except agent/td4_bench is shared VERBATIM with every other
+# bench_*.yaml, and nothing is overridden below on purpose — put ad-hoc tweaks
+# on the CLI so this file keeps recording the benchmark condition. The grid
+# varies `release.task` and the `backend` group over it, neither of them a file.
 defaults:
   - agent: td4_bench
   - noise: bench_gaussian

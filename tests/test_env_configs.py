@@ -26,17 +26,13 @@ from roxie.environment.loader import TRAINER_ENV_KEYS
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Injected by `build_env` from the trainer, never from the yaml: `mode` says
-# training or playback, and the two sizes come from `env.parallel_envs` /
-# `trainer.test_episodes` so the drivers and the loops that drive them are sized
-# from one place.
+# Injected by `build_env` from the trainer, never from the yaml.
 INJECTED = {"mode", "num_envs", "test_episodes"}
 
 GROUP_FILES = sorted((REPO / "roxie" / "configs" / "env").glob("*.yaml"))
 
-# Every experiment config that says anything about the builder. The rest of an
-# experiment's `env:` block (`seed`, `parallel_envs`) is checked through the
-# group files, since a partial block cannot be resolved on its own.
+# The rest of an experiment's `env:` block is checked through the group files,
+# since a partial block cannot be resolved on its own.
 EXPERIMENT_FILES = sorted(
     p
     for p in REPO.glob("experiments/**/*.yaml")
@@ -129,11 +125,8 @@ def test_experiment_env_block_has_no_unknown_keys(path):
     )
 
 
-# --- build_env itself -------------------------------------------------------
-#
-# Instantiating a real env means loading MuJoCo physics, so the contract of
-# `build_env` — what reaches the builder and what does not — is pinned against a
-# builder that only records its arguments.
+# Instantiating a real env means loading MuJoCo physics, so `build_env`'s
+# contract is pinned against a builder that only records its arguments.
 
 
 def record_builder(**kwargs):
@@ -208,12 +201,8 @@ def test_legacy_builder_key_is_still_honoured():
     assert "builder" not in kwargs
 
 
-# --- which builder is this? -------------------------------------------------
-#
-# `train.py` keeps an EnvPool run's learner on the CPU with its physics, and
-# `play.py` refuses to open a viewer on a pool. Both ask the builder: EnvPool is
-# not a value of `impl` — that picks MJX or Warp kernels *within* the playground
-# builder — and a config key restating the builder could disagree with it.
+# EnvPool is not a value of `impl` — that picks MJX or Warp kernels *within*
+# the playground builder — so both callers ask the builder instead.
 
 
 def test_uses_envpool_reads_the_builder_not_an_impl_key():
@@ -243,9 +232,6 @@ def test_envpool_release_cell_is_recognised():
     cfg = OmegaConf.load(REPO / "experiments" / "dmc" / "backend" / "envpool_cpu.yaml")
     assert uses_envpool(cfg.env)
     assert (cfg.agent.device, cfg.env.device) == ("cpu", "cpu")
-
-
-# --- where the two halves run -----------------------------------------------
 
 
 BACKEND_CELLS = sorted((REPO / "experiments" / "dmc" / "backend").glob("*.yaml"))

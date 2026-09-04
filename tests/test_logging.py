@@ -67,9 +67,8 @@ class TestNamespaceScheme:
 
         from roxie.utils.trainer import Trainer
 
-        # These two are now the ONLY places the trainer calls store(): the eval
-        # rollout moved to `roxie.utils.rollout` and hands back plain arrays, so
-        # every key name is still decided here.
+        # The only two places the trainer calls store(), so every key name is
+        # decided here.
         literals = []
         for fn in (Trainer._store_epoch_metrics, Trainer._store_test_metrics):
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))

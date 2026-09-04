@@ -11,25 +11,10 @@
 #   uv run python roxie/train.py --config-name dmc/bench_td3 release.task=CheetahRun
 #   uv run python roxie/train.py --config-name dmc/bench_td3 release.task=CheetahRun \
 #       dmc/backend@backend=envpool_cpu
-#
-# THE TASK IS AN OVERRIDE, NOT A FILE. 25 tasks x 7 agents x 2 cells is 350
-# runs, and generating 350 yamls to say "same thing, different env_name" would
-# be 350 files to keep in sync. `release.task` names one of the 25 in
-# `roxie.environment.suites.DMC_TASKS`, and the backend group turns it into
-# either a playground registry name or an envpool task id — those differ for two
-# of the 25, which is exactly why the mapping lives in Python with a test on it
-# rather than being spelled out here.
-#
-# Budget note: `trainer.steps` is the SAME for every agent, every task and every
-# cell, which is the point — score-vs-env-steps ranks the algorithms and the
-# wall-clock panel then shows honestly what each backend cost to get there.
-# Override it for a pilot with `trainer.steps=...` on the CLI; do not edit it
-# per-cell or per-task.
 
-# Identity of this run within the release grid. `task` is the env (and the wandb
-# PROJECT — see below), `cell` comes from the backend group, `agent` from the
-# launchable. All three feed the hydra output dir and the wandb run identity, so
-# a 350-run grid lands in a predictable tree.
+# `task` is the env (and the wandb project), `cell` comes from the backend
+# group, `agent` from the launchable. All three feed the hydra output dir and
+# the wandb run identity.
 release:
   grid: release-v1
   # Default so a bare `--config-name dmc/bench_td3` still runs something; the
@@ -40,85 +25,58 @@ release:
 
 env:
   seed: 0
-  # Held equal across both cells. This is a data-collection AND a replay-ratio
-  # quantity (the trainer advances `steps` by parallel_envs per iteration and
-  # `agent.steps_between_updates` is expressed in env steps), so moving it for
-  # one cell would change the algorithm's update schedule, not just its
-  # throughput.
+  # Held equal across both cells: this is a replay-ratio quantity as well as a
+  # data-collection one, so moving it for one cell would change the update
+  # schedule, not just the throughput.
   parallel_envs: 256
-  # null = take each task's own declared episode length (1000 for every
-  # dm_control task, on both implementations). Named here rather than pinned to
-  # 1000 so the two backends can only ever agree by construction.
+  # null = take each task's own declared episode length, so the two backends can
+  # only ever agree by construction.
   max_episode_steps: null
-  # `_target_` (the builder), and the env-naming key it reads (`env_name` for
-  # playground, `task_id` for envpool), come from the `backend` group — that IS
-  # the variable under test, so it must not be pinned in this file.
+  # `_target_` and the env-naming key it reads (`env_name` for playground,
+  # `task_id` for envpool) come from the `backend` group — that IS the variable
+  # under test, so it must not be pinned here.
 
 trainer:
-  # 50M env steps per run. The suite spans tasks that saturate by 1M
-  # (CartpoleBalance, ReacherEasy) and tasks no arm here is expected to solve
-  # (HumanoidRun); one budget for all of them means the easy tasks show a long
-  # flat top — which is a result, not waste — and the hard ones get a fair
-  # chance. Same budget for every agent, task and cell.
-  #
   # ANYTHING MEASURED IN ENV STEPS IS TIED TO THIS NUMBER and has to move with
-  # it. Today that is `noise/bench_gaussian.yaml`'s `decay_steps` (held at 40%
-  # of the budget) plus the two cadences below. `memory_warmup` and the replay
-  # capacity deliberately do NOT scale: they are matched hyperparameters, so a
-  # longer budget means more turnover through the same buffer, which is the
-  # intended reading. tests/test_release_weights.py pins both relationships.
-  steps: 1_000_000_000
-  # 100 points on the learning curve. Also the eval cadence: every epoch pauses
+  # it: today `noise/bench_gaussian.yaml`'s `decay_steps` (40% of the budget)
+  # plus the two cadences below. `memory_warmup` and the replay capacity
+  # deliberately do NOT scale — they are matched hyperparameters.
+  # tests/test_release_weights.py pins both relationships, and
+  # scripts/run_release_benchmark.sh reads the budget from here.
+  steps: 500_000_000
+  # 100 points on the learning curve, and the eval cadence: every epoch pauses
   # the learner and runs `test_episodes` deterministic rollouts.
   epoch_steps: 500_000
-  # 10 checkpoints per run — enough for the weights export to pick a best from,
-  # and with `replace_checkpoint: false` they all stay.
+  # 10 checkpoints per run for the weights export to pick a best from.
   save_steps: 5_000_000
-  # dm_control resets are stochastic, so this is a sample size and the release
-  # figure quotes back-half mean +- std over it.
+  # dm_control resets are stochastic, so this is a sample size.
   test_episodes: 10
   show_progress: true
   replace_checkpoint: false
-  # Checkpoint the replay buffer too. Off: a checkpoint stays small and cheap to
-  # write, and a run resumed with `resume=` refills the buffer through its
-  # warmup before learning again. On, a resume is exact — at the cost of the
-  # buffer's full size on disk per save, which is gigabytes here.
+  # On, a resume is exact, at the cost of the buffer's full size on disk per
+  # save — gigabytes here.
   save_buffer: false
 
-# No `runtime:` block here on purpose, and no `agent.device`/`env.device` either.
-# Which hardware each half of the run uses, and `matmul_precision` with it
-# (global: it reaches the agent's networks AND MJX physics), are properties of
-# the DEVICE, so they belong to the backend group — that group IS the hardware
-# choice, and this file is what is held identical across it.
+# No `runtime:` block and no `agent.device`/`env.device` on purpose: hardware
+# placement and `matmul_precision` belong to the backend group, and this file is
+# what is held identical across it.
 
 logging:
-  # Console + CSV (log.csv in the run's output dir) are always on — the CSV is
-  # what roxie/plot.py reads for the offline grid figure. wandb is on for the
-  # release grid so roxie/report.py can assemble the report from it.
+  # Console + CSV are always on; roxie/plot.py reads the CSV for the offline
+  # grid figure and roxie/report.py assembles the report from wandb.
   wandb:
     enabled: true
-    # ONE PROJECT PER ENV. A project is the unit wandb gives its own workspace,
-    # run table, and cross-run charts to, so making it the env means the runs
-    # inside it are exactly the ones that are directly comparable: same task,
-    # same budget, 7 agents x 2 cells. The previous scheme — one project for the
-    # whole grid, with the env carried as a tag — put runs with incomparable
-    # score scales on the same axes by default and needed a filter to say
-    # anything at all.
+    # ONE PROJECT PER ENV, so the runs inside a project are exactly the ones
+    # directly comparable: same task, same budget, 7 agents x 2 cells.
     project: roxie-${release.task}
     entity: null
-    # Within the project a run is identified by what varies inside it: which
-    # agent, on which backend cell.
     name: ${release.agent}.${release.cell}
-    # Which grid this run belongs to. This is what a later re-run or a one-off
-    # can be told apart by, and what roxie/report.py selects on — it replaces
-    # the tag list, which said the same thing four times over.
+    # What roxie/report.py selects on, and what tells a re-run apart.
     group: ${release.grid}
     job_type: ${release.cell}
     mode: online
-    # MUST stay false for the release grid: `true` re-prompts interactively for
-    # the API key on every run, which deadlocks an unattended sweep. Set
-    # WANDB_API_KEY (scripts/run_release_benchmark.sh checks for a login) if the
-    # cached netrc credential is not the account you want.
+    # MUST stay false for the grid: `true` re-prompts interactively for the API
+    # key on every run, which deadlocks an unattended sweep.
     relogin: false
 
 hydra:

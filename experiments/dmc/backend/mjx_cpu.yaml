@@ -2,19 +2,15 @@
 
 # Extra cell, NOT in the default grid: CPU physics (MJX on CPU) + CPU learner.
 #
-# The grid's GPU-free cell is envpool_cpu, because on the dm_control suite the
-# native pool is both faster and a genuinely independent implementation. This
-# cell answers a narrower question: what does moving *the very same JAX program*
-# off the card cost? It is the same env class, same builder, same wrapper and
-# the same trainer loop (`_run_jax`) as the two GPU cells, so against warp_gpu /
-# mjx_gpu the ONLY difference is the device.
+# The grid's GPU-free cell is envpool_cpu. This one answers a narrower
+# question: what does moving *the very same JAX program* off the card cost?
+# Against warp_gpu / mjx_gpu the ONLY difference is the device.
 #
 #   scripts/run_release_benchmark.sh --cells mjx_cpu --tasks CheetahRun
 #
-# Expect it to be slow: MJX on CPU vmaps the traced step across 256 envs with no
-# kernel-fusion advantage. It is here to show the curve lands in the same place,
-# not to compete on wall-clock — and if you shorten the budget for it, shorten
-# it for every cell of the task, or score-vs-steps is no longer matched.
+# Expect it to be slow. It is here to show the curve lands in the same place,
+# not to compete on wall-clock — and shortening the budget for it means
+# shortening it for every cell of the task, or score-vs-steps is unmatched.
 
 release:
   cell: mjx_cpu

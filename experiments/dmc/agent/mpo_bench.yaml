@@ -4,15 +4,12 @@
 # ddpg_bench.yaml is the reference file and lists the invariants held identical
 # across every arm.
 #
-# TWO CAVEATS that belong in the figure's caption, not just here:
-#  1. mpo.py takes no `n_step` argument, so this arm runs 1-STEP returns while
-#     every other off-policy arm runs n_step 5. That is an implementation gap,
-#     not a chosen handicap.
-#  2. COST: every gradient step evaluates the critic on `num_action_samples`
-#     (20) actions per state — ~10k critic forwards per step at batch 512, some
-#     20x the other arms. `learning_steps` is held at the common value anyway so
-#     the replay ratio stays comparable, which means this arm buys its fairness
-#     in wall-clock. Judge it on score-vs-env-steps first, wall-clock second.
+# TWO CAVEATS for the figure's caption:
+#  1. mpo.py takes no `n_step`, so this arm runs 1-STEP returns while every
+#     other off-policy arm runs n_step 5. An implementation gap, not a choice.
+#  2. Every gradient step evaluates the critic on `num_action_samples` actions
+#     per state — some 20x the other arms. `learning_steps` is held at the
+#     common value anyway, so this arm buys its fairness in wall-clock.
 _target_: roxie.agents.MPO
 
 # Where the agent runs; the `backend` group sets it per cell (see env.device).

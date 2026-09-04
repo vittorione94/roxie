@@ -45,7 +45,7 @@ DEFAULT_PROJECT_PREFIX = "roxie-"
 # `group` on every run of the v1 grid (release.grid in experiments/dmc/bench).
 DEFAULT_GRID = "release-v1"
 
-# Backend cells in display order, keyed by job_type, with a one-liner each.
+# Backend cells in display order, keyed by job_type.
 CELL_INFO = {
     "warp_gpu": "GPU physics (mujoco_warp) + GPU learner",
     "envpool_cpu": "CPU physics (native MuJoCo pool) + CPU learner — fully GPU-free",
@@ -107,8 +107,8 @@ def discover(entity, prefix, grid_name, tasks=None):
         except Exception:
             continue
         for run in runs:
-            # Set from release.cell, so a run missing it was not launched by the
-            # grid.
+            # Set from release.cell, so a run missing it was not launched by
+            # the grid.
             cell = run.job_type
             if not cell:
                 continue
@@ -189,8 +189,7 @@ def build(wr, grid, entity, prefix, grid_name, report_project, title, descriptio
                 f"Project: {prefix}{task}."
             ),
             # One runset per cell rather than per task: the two are different
-            # implementations, so they get their own colour groups instead of
-            # being averaged into one line per agent.
+            # implementations, so they get their own colour groups.
             wr.PanelGrid(
                 runsets=[
                     _runset(wr, entity, task, prefix, grid_name, cell, cell=cell)
@@ -202,7 +201,7 @@ def build(wr, grid, entity, prefix, grid_name, report_project, title, descriptio
 
     return wr.Report(
         project=report_project,
-        # "" means "my default entity"; the pydantic model rejects None here.
+        # "" means "my default entity"; the pydantic model rejects None.
         entity=entity or "",
         title=title,
         description=description,

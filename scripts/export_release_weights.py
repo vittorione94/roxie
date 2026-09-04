@@ -65,25 +65,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_ROOT = REPO_ROOT / "outputs" / "release_v1"
 DEFAULT_DEST = REPO_ROOT / "weights"
 
-# The headline cell. The other cell runs the same algorithm on the same task, so
-# publishing it too would ship near-duplicate policies under different names —
-# and a policy trained against playground's observation layout is not loadable
-# against EnvPool's anyway.
+# The headline cell. A policy trained against playground's observation layout
+# is not loadable against EnvPool's anyway.
 DEFAULT_CELL = "warp_gpu"
 
 # Selection metric, plus the columns copied into metadata.json alongside it.
-# `test/score` is the dm_control episode return, 0-1000 across the suite.
-# `test/score_per_step` and `test/length` come along because on tasks that can
-# terminate early the sum alone cannot separate "acts well" from "survives long".
+# `score_per_step` and `length` come along because on tasks that can terminate
+# early the sum alone cannot separate "acts well" from "survives long".
 DEFAULT_METRIC = "test/score"
 REPORTED_COLUMNS = (
     "test/score", "test/score/std", "test/score_per_step",
     "test/length", "test/length/std", "test/distinct_starts",
     "train/score", "train/gradient_steps", "sys/sps", "sys/time/total_s",
 )
-
-
-# --------------------------------------------------------------- reading -----
 
 
 def read_manifest(manifest: Path) -> list[dict]:
@@ -129,9 +123,6 @@ def find_checkpoints(run_dir: Path) -> dict[int, Path]:
     return found
 
 
-# ------------------------------------------------------------- selecting -----
-
-
 def pick_checkpoint(run_dir: Path, metric: str) -> tuple[int, Path, dict] | None:
     """The best-scoring checkpoint of a run: `(steps, path, epoch_row)`.
 
@@ -151,8 +142,8 @@ def pick_checkpoint(run_dir: Path, metric: str) -> tuple[int, Path, dict] | None
         return None
 
     rows = read_log(run_dir)
-    # Half an epoch, derived from the log rather than assumed, so this holds
-    # whatever cadence a run was launched with.
+    # Derived from the log rather than assumed, so this holds whatever cadence
+    # a run was launched with.
     tolerance = _epoch_tolerance(rows)
     scored: list[tuple[float, int, dict]] = []
     for row in rows:
@@ -220,9 +211,6 @@ def latest_ok_runs(manifest_rows: list[dict], task: str, cell: str,
             continue
         chosen[row["agent"]] = row
     return chosen
-
-
-# -------------------------------------------------------------- writing ------
 
 
 def git_commit() -> str | None:
@@ -399,9 +387,6 @@ def make_archives(dest_root: Path, exported: list[dict]) -> None:
     (archive_dir / "SHA256SUMS").write_text("\n".join(digests) + "\n")
 
 
-# ------------------------------------------------------------- verifying -----
-
-
 def verify(bundle: Path) -> str | None:
     """Read the exported checkpoint back. Returns an error string, or None.
 
@@ -434,9 +419,6 @@ def verify(bundle: Path) -> str | None:
     if not (bundle / ".hydra" / "config.yaml").is_file():
         return "no .hydra/config.yaml — play.py could not rebuild the agent"
     return None
-
-
-# ------------------------------------------------------------------ main -----
 
 
 def main() -> int:
@@ -478,7 +460,7 @@ def main() -> int:
         return 1
 
     # Read off the ledger rather than DMC_TASKS, which is what makes a partial
-    # grid exportable: 4 tasks done, 4 published, no failures for the rest.
+    # grid exportable.
     available = {
         row["task"] for row in rows
         if row.get("status") == "ok" and row.get("cell") == args.cell

@@ -20,16 +20,18 @@ import pytest
 from flax import nnx
 
 from roxie.utils.learner import SyncLearner, build_learner
-from roxie.utils.rollout import EnvPoolRollout, JaxRollout
+from roxie.utils.rollout import (
+    EnvPoolRollout,
+    JaxRollout,
+    accumulate_episodes,
+    new_chunk_sums,
+)
 from roxie.utils.trainer import Trainer, _new_epoch_acc
 
 
 def _trainer(**kwargs):
     """A Trainer with no env and no agent — enough for the bookkeeping helpers."""
     return Trainer(output_dir="/nonexistent", **kwargs)
-
-
-# --- counters ---------------------------------------------------------------
 
 
 def test_fresh_run_starts_every_counter_at_zero():
@@ -56,9 +58,6 @@ def test_cadence_rephases_after_warmup_jumps_steps():
     t._init_counters()
     t.steps = 1700                      # warmup fill, not an increment
     assert t._resync_cadence() == (700, 200)
-
-
-# --- save cadence -----------------------------------------------------------
 
 
 class _FakeAgent:
@@ -136,13 +135,10 @@ def test_no_quiesce_when_nothing_is_due():
     assert learner.events == []
 
 
-# --- episode accumulation ---------------------------------------------------
-
-
 def _accumulate(xp, scores, lengths, done):
     """Run one step of accumulation in the given array namespace."""
-    acc = _new_epoch_acc()
-    n = Trainer._accumulate_episodes(
+    acc = new_chunk_sums(xp)
+    n = accumulate_episodes(
         acc, xp.asarray(scores), xp.asarray(lengths, dtype=xp.int32),
         xp.asarray(done), xp,
     )
@@ -214,7 +210,28 @@ def test_losses_are_absent_not_zero_when_an_epoch_ran_no_bursts():
     assert acc["actor_losses"] == [] and acc["critic_losses"] == []
 
 
-# --- learner selection ------------------------------------------------------
+class _CadencedAgent:
+    def __init__(self, steps_between_updates):
+        self.steps_between_updates = steps_between_updates
+
+
+def test_a_chunk_is_exactly_one_update_window():
+    """What makes the fused acting burst a throughput change and not an
+    algorithm change: the actor cannot move inside a chunk, because the chunk
+    ends where the gradient burst fires."""
+    assert Trainer._collect_steps(_CadencedAgent(2_048), 256) == 8
+    assert Trainer._collect_steps(_CadencedAgent(2_048), 1) == 2_048
+
+
+def test_an_agent_without_a_declared_cadence_stays_per_step():
+    """PPO updates when its rollout buffer fills and declares no window; the
+    baselines declare nothing at all. Both keep the old one-step loop."""
+    assert Trainer._collect_steps(object(), 256) == 1
+    assert Trainer._collect_steps(_CadencedAgent(0), 256) == 1
+
+
+def test_a_window_narrower_than_one_iteration_still_collects_a_step():
+    assert Trainer._collect_steps(_CadencedAgent(64), 256) == 1
 
 
 class _StubAgent:
@@ -243,6 +260,10 @@ class _AsyncCapableAgent(_StubAgent):
         return 0.0, 0.0
 
 
+class _StubTimestep:
+    obs = None
+
+
 class _StubRollout:
     def __init__(self, supports_async):
         self.supports_async = supports_async
@@ -251,7 +272,7 @@ class _StubRollout:
 def test_sync_learner_accumulates_gradient_steps_and_clears_losses():
     learner = SyncLearner(_StubAgent(per_update=3), jax.random.PRNGKey(0))
     for _ in range(2):
-        learner.observe(None, None, actions=None, steps=0)
+        learner.update(steps=0)
     grads, losses = learner.drain()
     assert grads == 6 and losses == [(1.0, 2.0), (1.0, 2.0)]
     # Drained losses are not re-reported; the cumulative count persists.
@@ -260,7 +281,17 @@ def test_sync_learner_accumulates_gradient_steps_and_clears_losses():
 
 def test_sync_learner_records_no_loss_when_no_burst_fired():
     learner = SyncLearner(_StubAgent(per_update=0), jax.random.PRNGKey(0))
-    learner.observe(None, None, actions=None, steps=0)
+    learner.update(steps=0)
+    assert learner.drain() == (0, [])
+
+
+def test_sync_learner_buffers_without_grad_stepping():
+    """The two are called at different granularities — once per env step and
+    once per update window — so buffering must not drag a burst with it."""
+    agent = _StubAgent(per_update=3)
+    learner = SyncLearner(agent, jax.random.PRNGKey(0))
+    learner.buffer(None, _StubTimestep(), actions=None)
+    assert agent.added == 1
     assert learner.drain() == (0, [])
 
 
@@ -298,8 +329,6 @@ def test_async_is_declined_for_an_agent_without_a_learn_burst():
     assert isinstance(learner, SyncLearner)
 
 
-# --- async pacing -----------------------------------------------------------
-#
 # The failure these guard against: `_drain_queue` looping until the queue is
 # momentarily empty. When acting is cheaper than buffering, the acting thread
 # refills faster than the learner drains, so the drain never returns and `learn`
@@ -362,13 +391,10 @@ def test_target_grad_steps_track_the_sync_replay_ratio():
     assert learner._target_grads(30_720 + 100 * 2_048) == pytest.approx(20 + 2_000)
 
 
-# --- rollout selection ------------------------------------------------------
-
-
 def test_the_two_rollouts_declare_matching_surfaces():
     """One loop drives both, so anything it calls must exist on each."""
-    surface = ("xp", "supports_async", "prepare", "warmup", "step",
-               "epoch_refresh", "evaluate")
+    surface = ("xp", "supports_async", "prepare", "warmup", "step", "collect",
+               "reset_tally", "epoch_refresh", "evaluate")
     for name in surface:
         assert hasattr(JaxRollout, name), f"JaxRollout is missing {name}"
         assert hasattr(EnvPoolRollout, name), f"EnvPoolRollout is missing {name}"

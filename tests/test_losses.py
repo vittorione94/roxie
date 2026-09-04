@@ -11,6 +11,7 @@ import roxie.agents  # noqa: F401
 from roxie.agents.agent import Agent
 from roxie.agents.sac import LogAlpha
 from roxie.losses.actor_losses import (
+    ACTOR_DIAGNOSTIC_KEYS,
     ddpg_actor_loss_fn,
     ppo_loss_fn,
     pre_activation_penalty,
@@ -143,22 +144,25 @@ class TestSampleNormalization:
 
 class TestDDPGActorLoss:
     def test_returns_scalar(self, det_actor, det_critic, ddpg_samples, action_bounds):
-        loss = ddpg_actor_loss_fn(
+        loss, aux = ddpg_actor_loss_fn(
             det_actor,
             det_critic,
             ddpg_samples,
             action_bounds["action_low"],
             action_bounds["action_high"],
+            0.0,
         )
         assert loss.shape == ()
+        assert set(aux) == {*ACTOR_DIAGNOSTIC_KEYS, "pre_act_penalty"}
 
     def test_finite(self, det_actor, det_critic, ddpg_samples, action_bounds):
-        loss = ddpg_actor_loss_fn(
+        loss, _aux = ddpg_actor_loss_fn(
             det_actor,
             det_critic,
             ddpg_samples,
             action_bounds["action_low"],
             action_bounds["action_high"],
+            0.0,
         )
         assert jnp.isfinite(loss)
 
@@ -335,7 +339,7 @@ class TestDDPGCriticLoss:
         target_actor = copy.deepcopy(det_actor)
         target_critic = copy.deepcopy(det_critic)
         key = jax.random.PRNGKey(0)
-        loss = ddpg_critic_loss_fn(
+        loss, _aux = ddpg_critic_loss_fn(
             det_critic,
             target_actor,
             target_critic,
@@ -352,7 +356,7 @@ class TestDDPGCriticLoss:
         target_actor = copy.deepcopy(det_actor)
         target_critic = copy.deepcopy(det_critic)
         key = jax.random.PRNGKey(0)
-        loss = ddpg_critic_loss_fn(
+        loss, _aux = ddpg_critic_loss_fn(
             det_critic,
             target_actor,
             target_critic,
@@ -416,6 +420,43 @@ class TestPPOLoss:
         assert float(approx_kl) == pytest.approx(0.0, abs=1e-6)
         assert float(clip_frac) == pytest.approx(0.0, abs=1e-6)
 
+    @pytest.mark.parametrize("stale_log_probs", [-1e4, -1e6, 1e4, 1e6])
+    def test_a_diverged_ratio_cannot_produce_a_nan_gradient(
+        self, stoch_actor, ppo_data, stale_log_probs
+    ):
+        """The AcrobotSwingup/warp_gpu release run died here.
+
+        `old_log_probs` far from `logp_new` is not hypothetical for a squashed
+        policy: `TanhNormal.log_prob` pins a saturated sample's `u` at the
+        arctanh rail and divides the z-score by a `std` free to fall to
+        `std_min`, so log-probs of order 1e4+ are ordinary and their DIFFERENCES
+        pass `exp`'s float32 overflow at 88 easily.
+
+        The forward loss is no witness -- the clip caps it at a healthy-looking
+        `(1 + clip_eps) * advantage` -- so this asserts on the GRADIENT, which
+        is where `jnp.minimum`'s zero cotangent used to meet an `inf` ratio and
+        produce `0 * inf = NaN`. One NaN element is terminal downstream:
+        `clip_by_global_norm` rescales by 1 / global_norm and spreads it over
+        every parameter in the tree, with no path back.
+        """
+        obs, actions, log_probs, _values, advantages = ppo_data
+        diverged = jnp.full_like(log_probs, stale_log_probs)
+
+        (loss, (approx_kl, clip_frac)), grads = nnx.value_and_grad(
+            lambda m: self._ppo_actor_loss(m, obs, actions, diverged, advantages),
+            has_aux=True,
+        )(stoch_actor)
+
+        assert jnp.isfinite(loss)
+        for leaf in jax.tree.leaves(grads):
+            assert jnp.isfinite(leaf).all()
+
+        # And the trust region must still be able to see the divergence:
+        # `NaN > target_kl` is False, which is how the early stop switched
+        # itself off for the last 487M steps of that run.
+        assert jnp.isfinite(approx_kl) and approx_kl > 1.0
+        assert float(clip_frac) == pytest.approx(1.0)
+
     def test_critic_loss_scalar(self, stoch_critic, ppo_data):
         obs, actions, log_probs, values, advantages = ppo_data
         returns = values[:, :-1] + advantages
@@ -439,7 +480,7 @@ class TestSACLosses:
     def test_actor_loss(self, stoch_actor, twin_critic, ddpg_samples, action_bounds):
         key = jax.random.PRNGKey(0)
         alpha = 0.2
-        loss, log_probs = sac_actor_loss_fn(
+        loss, (log_probs, _aux) = sac_actor_loss_fn(
             stoch_actor,
             twin_critic,
             alpha,
@@ -455,7 +496,7 @@ class TestSACLosses:
     def test_critic_loss(self, stoch_actor, twin_critic, ddpg_samples, action_bounds):
         target_twin = copy.deepcopy(twin_critic)
         key = jax.random.PRNGKey(0)
-        loss = sac_critic_loss_fn(
+        loss, _aux = sac_critic_loss_fn(
             twin_critic,
             stoch_actor,
             target_twin,

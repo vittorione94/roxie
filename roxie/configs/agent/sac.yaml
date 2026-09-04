@@ -1,15 +1,9 @@
 _target_: roxie.agents.SAC
 
-# Which hardware the agent — networks, optimizers, replay buffer — runs on.
 # `cpu`, `gpu`, or null for whatever JAX picks. Independent of `env.device`:
 # CPU physics with a GPU learner is a real configuration (docs/backends.md).
-# Applied by train.py before the first jax call, so it is a placement key rather
-# than a constructor argument, and the startup banner checks it against reality.
 device: null
 
-# Every SAC.__init__ keyword appears below. Values here are the constructor
-# defaults unless noted, so this file is the complete, editable surface of the
-# agent — nothing is reachable only from Python.
 gamma: 0.99
 tau: 0.005
 actor_learning_rate: 3e-4
@@ -20,6 +14,11 @@ alpha_learning_rate: 3e-4
 init_log_alpha: 0.0
 auto_alpha: true
 target_entropy: null
+# Multiplies the -dim(A) default (ignored when `target_entropy` is set). The
+# tanh squash makes the entropy floor a saturation ceiling, so 1.0 caps the
+# policy near tanh(1) per actuator — too timid for tasks that need bang-bang
+# torque, and there is no per-dim slack to trade at dim(A) = 1.
+target_entropy_scale: 1.0
 memory_warmup: 30_000
 steps_before_learning: 30_000
 steps_between_updates: 400
@@ -28,9 +27,8 @@ learning_steps: 20
 # trajectory buffer and uses masked n-step returns.
 n_step: 1
 # Actor + temperature update on 1 of every `policy_delay` gradient steps; the
-# critic updates on all of them. 1 = textbook SAC (and compiles without a
-# branch at all). >1 trades policy freshness for critic updates per second —
-# the actor block is ~39% of a gradient step, so 2 buys ~1.25x, 4 ~1.45x.
+# critic updates on all of them. 1 = textbook SAC, and compiles without a
+# branch. >1 trades policy freshness for critic updates per second.
 policy_delay: 1
 max_grad_norm: 1
 normalize_observations: true
@@ -58,36 +56,16 @@ memory_config:
   add_sequences: False
   add_batch_size: ${env.parallel_envs}
 
-# Network parameter init. Feeds `nnx.Rngs`; the actor and each critic head take
-# distinct derived offsets so twin critics never start identical (a clipped
-# double-Q min over two identical heads buys nothing). Sweep this to separate a
-# real effect from init luck.
+# Feeds `nnx.Rngs`; the actor and each critic head take distinct derived offsets
+# so twin critics never start identical.
 seed: 0
 
-# Optimizers. `_target_` picks the optax family and carries its own
-# hyperparameters; the learning rate stays a top-level arg above so it remains
-# swept, logged and checkpointed, and `max_grad_norm` applies the global-norm
-# clip ahead of the transform (null/0 disables clipping entirely).
-#
-# For a schedule instead of a constant rate, give the block its own
-# `learning_rate:` sub-block — a block that declares one wins over the scalar
-# arg above:
-#
-#   actor_optimizer_config:
-#     _target_: optax.adamw
-#     weight_decay: 1e-4
-#     learning_rate:
-#       _target_: optax.cosine_decay_schedule
-#       init_value: 3e-4
-#       decay_steps: 1_000_000
-#
-# Swapping family from the CLI must also drop the kwargs the new family does
-# not take -- hydra MERGES dict overrides rather than replacing them, so the
-# b1/b2 below would survive into an optimizer that has no such argument:
-#
-#   agent.actor_optimizer_config._target_=optax.rmsprop \
-#     '~agent.actor_optimizer_config.b1' '~agent.actor_optimizer_config.b2' \
-#     +agent.actor_optimizer_config.decay=0.9
+# `_target_` picks the optax family; the learning rate stays a top-level arg
+# above so it remains swept, logged and checkpointed. For a schedule instead of
+# a constant rate, give the block its own `learning_rate:` sub-block — one that
+# declares it wins over the scalar arg. Swapping family from the CLI must also
+# drop the kwargs the new family does not take: hydra MERGES dict overrides
+# rather than replacing them.
 actor_optimizer_config:
   _target_: optax.adam
   b1: 0.9

@@ -4,6 +4,10 @@ The diagnostics are produced inside `nnx.cond` (delayed policy update) nested in
 `lax.scan` (fused burst), which is exactly where a shape/pytree mismatch fails
 silently at trace time rather than at review time — hence a real burst here
 rather than a unit test of the loss functions alone.
+
+What every agent's diagnostics must satisfy lives in `test_diagnostics.py`;
+what is here is TD3's own reading of them — the saturation and value-inflation
+metrics its tuning actually turns on.
 """
 
 import jax
@@ -138,14 +142,16 @@ class TestTD3Diagnostics:
         assert diag["td3/sat_frac"] < 0.1
 
     def test_replay_ratio_reported_only_once_env_steps_are_known(self, agent):
-        """`updates_per_env_step` needs the trainer's step count, which only the
-        sync path supplies — the async learner calls `learn` directly."""
+        """`updates_per_env_step` needs the trainer's step count, which reaches
+        the agent as the `pop_diagnostics` argument — so it is reported on the
+        async path too, where the learner calls `learn` and `update` never runs.
+        """
         _fill_buffer(agent)
         agent.learn(jax.random.PRNGKey(0))
         assert "td3/updates_per_env_step" not in agent.pop_diagnostics()
 
-        agent.update(steps=1000, agent_rng=jax.random.PRNGKey(1))
-        diag = agent.pop_diagnostics()
+        agent.learn(jax.random.PRNGKey(1))
+        diag = agent.pop_diagnostics(env_steps=1000)
         assert diag["td3/updates_per_env_step"] > 0.0
         assert 0.0 <= diag["td3/buffer_frac"] <= 1.0
 

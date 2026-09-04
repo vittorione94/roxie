@@ -1,9 +1,8 @@
 _target_: roxie.environment.loader.build_playground_env
 
 # mujoco_playground envs — the default env family, and the one the release
-# benchmark's GPU cells run. Physics is JAX all the way down (MJX kernels, or
-# Warp kernels dispatched from the same traced step), so the whole rollout stays
-# on device and the trainer scans over it.
+# benchmark's GPU cells run. Physics is JAX all the way down, so the whole
+# rollout stays on device and the trainer scans over it.
 #
 # A launchable picks it up in its defaults list, then overrides what it needs:
 #
@@ -23,23 +22,19 @@ _target_: roxie.environment.loader.build_playground_env
 # release benchmark deliberately does NOT use this group — its env block comes
 # from `experiments/dmc/backend/`, which is the variable under test there.)
 #
-# Like an agent config, this file IS the builder call: `_target_` names the
-# builder and every key below is one of its keyword arguments, so a knob that
-# exists in `build_playground_env` but is missing here would be invisible in the
-# run's config and unsweepable. `tests/test_env_configs.py` pins both directions.
+# Like an agent config, this file IS the builder call: every key below is one of
+# `build_playground_env`'s keyword arguments, so a knob missing here would be
+# invisible in the run's config and unsweepable.
+# `tests/test_env_configs.py` pins both directions.
 
-# The mujoco_playground registry name (`WalkerWalk`, `CheetahRun`, ... — see
-# roxie.environment.suites.DMC_TASKS for the 25 the benchmark uses). `???` = no
-# default: a launchable or the CLI must name one, and forgetting fails at
-# compose time rather than loading something arbitrary.
+# The mujoco_playground registry name — see roxie.environment.suites.DMC_TASKS
+# for the 25 the benchmark uses.
 env_name: ???
 
-# Which hardware the physics runs on: `cpu`, `gpu`, or null for whatever JAX
-# picks.
 # A playground env is traced into the same XLA program as the agent, so this
 # lands wherever `agent.device` puts the process; declaring `gpu` here with an
-# agent on the CPU gets a loud MISMATCH line, not a split. EnvPool is the builder
-# that can genuinely hold the env on the CPU while the learner uses the card.
+# agent on the CPU gets a loud MISMATCH line, not a split. EnvPool is the
+# builder that can genuinely split the two.
 device: null
 
 # Physics backend: `jax` (MJX) or `warp` (mujoco_warp kernels) — which kernels
@@ -47,26 +42,23 @@ device: null
 # docs/backends.md; play.py coerces `warp` to `jax` for playback.
 impl: jax
 
-# Warp's contact/constraint budgets. null keeps mujoco_playground's own
-# upstream-tuned per-env values, which is right for anything dm_control-sized;
-# MJX ignores both. Watch for "broadphase/narrowphase/nefc overflow" warnings on
-# heavier bodies.
+# Warp's contact/constraint budgets; MJX ignores both. null keeps
+# mujoco_playground's own upstream-tuned per-env values. Watch for
+# "broadphase/narrowphase/nefc overflow" warnings on heavier bodies.
 naconmax: null
 njmax: null
 
-# Episode time limit. null = the env's own declared `episode_length` (1000 for
-# every dm_control task), falling back to loader.DEFAULT_MAX_EPISODE_STEPS.
+# null = the env's own declared `episode_length`, falling back to
+# loader.DEFAULT_MAX_EPISODE_STEPS.
 max_episode_steps: null
 
 # Accepted and unused by this builder: an MJX env takes its reset keys from the
-# trainer's rng stream (`nnx.Rngs(envs=env.seed + resumed_steps)`), not from the
-# env definition. Kept in the block because it seeds that stream, and because
-# the envpool builder does seed its pools from the same key.
+# trainer's rng stream. Kept in the block because it seeds that stream, and
+# because the envpool builder does seed its pools from the same key.
 seed: 0
 
-# How many worlds the training driver steps at once. NOT a builder argument —
-# the trainer injects it as `num_envs` — but it lives here because it is a
-# property of this env's rollout, and every agent's replay buffer reads it back
-# as `${env.parallel_envs}`. It is a replay-ratio quantity as well as a
-# throughput one: the trainer advances `steps` by this much per iteration.
+# NOT a builder argument — the trainer injects it as `num_envs` — but it lives
+# here because every agent's replay buffer reads it back as
+# `${env.parallel_envs}`. A replay-ratio quantity as well as a throughput one:
+# the trainer advances `steps` by this much per iteration.
 parallel_envs: 256

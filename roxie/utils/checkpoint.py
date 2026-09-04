@@ -22,12 +22,10 @@ from pathlib import Path
 
 CHECKPOINTS_DIRNAME = "checkpoints"
 
-# The orbax item name the trainer saves under. A CheckpointManager step
-# directory holds one subdirectory per item; the trainer writes a single
-# unnamed item, which orbax files under "default".
+# A CheckpointManager step directory holds one subdirectory per item; the
+# trainer writes a single unnamed item, which orbax files under "default".
 CHECKPOINT_ITEM = "default"
 
-# `<env steps>` — the step directory names a CheckpointManager writes.
 _STEP_RE = re.compile(r"^(\d+)$")
 
 

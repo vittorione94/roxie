@@ -42,8 +42,8 @@ from roxie.utils.trainer import Trainer
 hydra_searchpath.register()
 # Must happen before Hydra composes: ${envpool_task:<Task>} is used by configs.
 suites.register_resolvers()
-# examples/ is not part of the installed roxie package, but its env builders are
-# referenced by dotted path.
+# examples/ is not installed with roxie, but its env builders are referenced by
+# dotted path.
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 
@@ -51,20 +51,19 @@ sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 def main(cfg: DictConfig):
     print("Agent:", cfg.agent._target_)
 
-    # These env vars are still honoured after `import jax`: the CUDA client
-    # initializes lazily at the first jax.* call below.
+    # Still honoured after `import jax`: the CUDA client initializes lazily at
+    # the first jax.* call below.
     if cfg.env.get("impl", None) == "warp":
         # Warp allocates GPU memory outside JAX's pool, so leave it headroom.
         # Disabling preallocation instead fragments and OOMs the replay buffer.
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
-        # BFC fragments under the alloc/free churn of a varying-size rollout.
-        os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
+        # Do NOT set XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async here: with the env
+        # step inside a `lax.scan` the async allocator fails to free pointers it
+        # does not own and the process eventually SIGSEGVs.
 
-    # `agent.device` (networks, optimizers, replay) and `env.device` (physics)
-    # are separate knobs — CPU physics with a GPU learner is a real setup — so
-    # they are read, not reconciled; the banner below checks where each half
-    # actually landed. Must go through `jax.config`: JAX_PLATFORMS was already
-    # parsed at `import jax`.
+    # `agent.device` and `env.device` are separate knobs — CPU physics with a
+    # GPU learner is a real setup — so they are read, not reconciled. Must go
+    # through `jax.config`: JAX_PLATFORMS was already parsed at `import jax`.
     runtime_cfg = cfg.get("runtime") or {}
     agent_device, env_device, platform = resolve_placement(cfg)
     if platform and not _device:
@@ -85,9 +84,7 @@ def main(cfg: DictConfig):
         print(f"JAX platform override: device={_device}")
 
     # `env:` is a `_target_` block like `agent:`: the builder it names owns all
-    # env-specific setup (clip selection, Warp budget sizing, ...) and returns a
-    # normalized bundle, keeping this env-agnostic. The two sizes are injected so
-    # the drivers are sized from the same place as the loops that use them.
+    # env-specific setup and returns a normalized bundle.
     impl = cfg.env.get("impl", None)
     env, test_env, env_cfg = build_env(
         cfg.env, mode="train",
@@ -95,7 +92,7 @@ def main(cfg: DictConfig):
         test_episodes=int(cfg.trainer.test_episodes),
     )
     # `device=` deliberately overrides the config, so the declarations are not
-    # checked against it — it has already been printed above.
+    # checked against it.
     log_loaded_backend(
         env,
         requested_impl=impl,
@@ -131,25 +128,21 @@ def main(cfg: DictConfig):
     action_low = jnp.asarray(act_space.low, dtype=jnp.float32)
     action_high = jnp.asarray(act_space.high, dtype=jnp.float32)
 
-    # Only these four are injected — they are what only the env knows; the rest
-    # comes from the agent's yaml. `build_agent` keeps the nested `*_config`
-    # blocks unbuilt and drops `device`, applied above before the first jax call.
+    # Only what the env alone knows; the rest comes from the agent's yaml.
     agent_kwargs = dict(
         env_obs_size=space_size(obs_space),
         env_action_size=space_size(act_space),
         action_low=action_low,
         action_high=action_high,
     )
-    # Agents that explore from their own policy (SAC, MPO, PPO) carry no noise
-    # group and take no such argument.
+    # Agents that explore from their own policy carry no noise group.
     if "noise" in cfg:
         agent_kwargs["noise_config"] = cfg.noise
 
     agent = build_agent(cfg.agent, **agent_kwargs)
 
     # Only the agent's numbers come from the checkpoint — the yaml stays
-    # authoritative, so a resume may raise `trainer.steps` or retune a knob
-    # (unlike `play.py`, which rebuilds from the checkpoint's hyperparameters).
+    # authoritative, so a resume may raise `trainer.steps` or retune a knob.
     resume_cfg = cfg.get("resume") or {}
     if isinstance(resume_cfg, str):  # `resume: <path>` rather than `resume.path`
         resume_cfg = {"path": resume_cfg}
@@ -167,9 +160,8 @@ def main(cfg: DictConfig):
             flush=True,
         )
 
-    # A resume offsets the env stream by the steps already taken, so it does not
-    # revisit the start states the first leg trained on. The agent stream stays
-    # fixed — its keys drive gradient steps, where reproducibility is the point.
+    # A resume offsets the env stream by the steps already taken so it does not
+    # revisit the first leg's start states. The agent stream stays fixed.
     resumed_steps = int((resume_metadata or {}).get("steps") or 0)
     training_rngs = nnx.Rngs(envs=cfg.env.seed + resumed_steps, agent=3)
 

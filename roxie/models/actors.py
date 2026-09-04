@@ -6,8 +6,8 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-# Largest magnitude fed to arctanh. tanh saturates in float32 well before 1.0, so
-# the inverse must be clipped or it returns inf; +-(1 - 1e-6) maps to +-7.25.
+# Largest magnitude fed to arctanh: tanh saturates in float32 well before 1.0,
+# so the inverse must be clipped or it returns inf.
 _TANH_CLIP = 1.0 - 1e-6
 
 
@@ -194,8 +194,7 @@ class DeterministicActor(nnx.Module):
             self.norm_layers = nnx.List(norm_layers)
 
         # Scales the *variance* of the default lecun_normal init, so 0.01 gives
-        # 10x smaller weights and pre-tanh logits starting near 0.1 rather than
-        # 1 — squarely inside tanh's linear region.
+        # 10x smaller weights and pre-tanh logits inside tanh's linear region.
         self.output_layer = nnx.Linear(
             current_features,
             action_dim,
@@ -227,7 +226,6 @@ class DeterministicActor(nnx.Module):
         return self.forward(x)[0]
 
 
-# --- Actor for SAC/PPO ---
 class StochasticActor(nnx.Module):
     def __init__(
         self,
@@ -247,7 +245,7 @@ class StochasticActor(nnx.Module):
         self.action_dim = action_dim
         self.std_min = std_min
         self.std_max = std_max
-        # Defaults to False so SAC/MPO, which share this class, are untouched.
+        # False so SAC/MPO, which share this class, are untouched.
         self.squash = squash
 
         hidden_layers = []

@@ -13,9 +13,16 @@ background thread. Two implementations:
 Shared surface:
 
     act(obs, key)                     -> (actions, last_noise)
-    observe(prev_obs, timestep, actions, steps)
+    buffer(prev_obs, timestep, actions)
+    update(steps)                     run the gated gradient burst, if due
     drain()                           -> (gradient_steps_since_start, [(a, c)])
     pause() / resume()                quiesce for eval and checkpointing
+
+`buffer` and `update` are separate because the rollout calls them at different
+granularities: buffering happens once per env step, the gradient burst once per
+`steps_between_updates` window. The fused JAX rollout buffers on-device inside
+its scan and never calls `buffer` at all — it calls `update` once per chunk,
+which is the same cadence the per-step loop produced.
 
 ``drain`` reports gradient steps *since this run started*, not including any
 restored from a resume — the trainer adds that back, so a resumed run's
@@ -41,31 +48,27 @@ class SyncLearner:
 
     def act(self, obs, key):
         actions = self._agent.step(obs, evaluate=False, key=key)
-        # Only deterministic agents (DDPG/TD3) expose `last_noise`.
         return actions, getattr(self._agent, "last_noise", None)
 
-    def observe(self, prev_obs, timestep, actions, steps):
-        # `actions` is already on `agent.last_action`, which is what `add` reads;
-        # taken here only to share the async learner's signature, where the
-        # action travels through a queue.
+    def buffer(self, prev_obs, timestep, actions):
+        # Already on `agent.last_action`, which is what `add` reads; taken only
+        # to share the async learner's signature, where it travels by queue.
         del actions
         agent = self._agent
         agent.add(prev_obs, timestep)
 
-        # Tracks the current policy's state distribution rather than freezing
-        # after warmup. On top of the update `add` performs, which looks
-        # redundant, but dropping it reweights the statistics and breaks
-        # comparability with every run logged so far.
+        # On top of the update `add` already performs. Redundant-looking, but
+        # dropping it reweights the statistics away from every run logged so far.
         if getattr(agent, "normalize_observations", False):
             agent.state.obs_stats = Agent.update_obs_stats(
                 agent.state.obs_stats, timestep.obs,
             )
 
-        # The agent gates its own updates. The trainer must not read buffer
-        # device state here: a Python branch on a device array forces a blocking
-        # host sync every iteration and serializes the GPU pipeline.
+    def update(self, steps):
+        # The agent gates its own updates: a Python branch on a device array
+        # here would sync the host every iteration.
         self._key, update_key = jax.random.split(self._key)
-        gradient_steps, actor_loss, critic_loss = agent.update(
+        gradient_steps, actor_loss, critic_loss = self._agent.update(
             steps=steps, agent_rng=update_key,
         )
         if gradient_steps > 0:

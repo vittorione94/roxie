@@ -1,3 +1,5 @@
+import functools
+import inspect
 from typing import Optional
 
 import flashbax
@@ -11,12 +13,9 @@ from flax import nnx
 from omegaconf import OmegaConf
 
 
-# The keys an agent yaml carries that are NOT constructor arguments. Just one:
-# `device` has to be applied before the first `jax.*` call — long before an
-# agent exists — so `train.py` reads it (`loader.resolve_placement`) and
-# `build_agent` drops it. The agent block's counterpart to
-# `loader.TRAINER_ENV_KEYS`, and what keeps "the agent yaml IS the constructor
-# call" exact.
+# `device` has to be applied before the first `jax.*` call, long before an
+# agent exists, so `train.py` reads it and `build_agent` drops it. The agent
+# block's counterpart to `loader.TRAINER_ENV_KEYS`.
 AGENT_PLACEMENT_KEYS = frozenset({"device"})
 
 
@@ -72,8 +71,8 @@ def build_optimizer(config, *, learning_rate: float, max_grad_norm: float = None
         tx = hydra.utils.instantiate(config, **overrides)
 
     if max_grad_norm:
-        # Clip first, then adapt, so the optimizer's moment estimates see the
-        # already-clipped gradient.
+        # Clip first, then adapt, so the moment estimates see the clipped
+        # gradient.
         tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), tx)
     return tx
 
@@ -119,6 +118,191 @@ def soft_update(target: nnx.Module, source: nnx.Module, tau: float) -> None:
     )
 
 
+class SplitNodes:
+    """The nnx graph nodes a fused burst mutates, held in split form.
+
+    `nnx.jit` re-walks the module graph in Python on EVERY call — measured on
+    this repo's train states: 2.2 ms for DDPG's (98 leaves), 3.5 ms for TD3's
+    (142). The training loop makes two such calls per update window (the acting
+    burst in `JaxRollout` and the agent's own `_grad_steps`) against a ~16 ms
+    window, so on AcrobotSwingup/warp_gpu that walk was 28% of DDPG's loop and
+    36% of TD3's — pure host time, with the GPU at ~50% util. Handing a plain
+    `jax.jit` the graphdef as a STATIC argument and the state as a pytree costs
+    one pytree traversal instead: 0.4 / 0.6 ms.
+
+    The end-to-end gain is larger than that subtraction, because the host was
+    not merely adding time — it was starving the device. Same box, same config:
+    DDPG 130k -> 245k sps, TD3 97k -> 199k, GPU util 53% -> 99% / 88%, power
+    101 W -> 136 W. The curves are BIT-FOR-BIT identical across the first seven
+    epochs of a matched-seed run: this moves no computation, no ordering and no
+    RNG stream, only where the graph is walked.
+
+    `nnx.cached_partial` is the flax-native answer to this and does not work
+    here: it requires every attribute of a cached node to be an `nnx.Variable`,
+    and `TrainState` holds `buffer_state` and `obs_stats` as raw arrays
+    (`AttributeError: 'ArrayImpl' object has no attribute 'get_raw_value'`,
+    flax 0.12.9 — the `# TODO(cgarciae): support Array attribute updates` in
+    `graphlib._cached_partial`).
+
+    NOT thread-safe, and does not need to be: `AsyncLearner` makes its learner
+    thread the sole owner of `agent.state` (the acting thread reads a published
+    snapshot, and `pause()` quiesces the learner before eval or checkpointing
+    touches it), so no two threads ever reach this handle at once.
+
+    THE LIVE NODES STAY THE AUTHORITY once host code has materialized them.
+    `checkpoint_payload` detaches and reattaches `buffer_state`, `restore`
+    merges into the live modules, eval reads the actor — all in place — so
+    `split()` re-derives after any `.live` access rather than trusting a cached
+    pytree. That is one `nnx.split` per epoch boundary instead of two per
+    window, which is the whole point.
+    """
+
+    __slots__ = ("_graphdef", "_pytree", "_live", "_fresh")
+
+    def __init__(self, nodes: tuple):
+        self._live = tuple(nodes)
+        self._graphdef = None
+        self._pytree = None
+        # Is `_pytree` current? False whenever `_live` may have been mutated
+        # behind our back.
+        self._fresh = False
+
+    def split(self):
+        """`(graphdef, pytree)` for a jitted burst, re-derived if `.live` was
+        handed out since the last one."""
+        if not self._fresh:
+            self._graphdef, self._pytree = nnx.split(self._live)
+            self._fresh = True
+        return self._graphdef, self._pytree
+
+    def replace(self, pytree) -> None:
+        """Adopt the pytree a burst returned.
+
+        The previous live nodes are dropped: a burst donates its input, so any
+        reference held across one is a deleted buffer. That is the same contract
+        `nnx.jit` had — it also returned fresh objects the caller had to rebind.
+        """
+        self._pytree = pytree
+        self._fresh = True
+        self._live = None
+
+    @property
+    def live(self) -> tuple:
+        """The live nodes, merged back if a burst has replaced the pytree.
+
+        Marks the split stale: the caller is free to mutate what it gets.
+        """
+        if self._live is None:
+            self._live = nnx.merge(self._graphdef, self._pytree)
+        self._fresh = False
+        return self._live
+
+    def set(self, index: int, value) -> None:
+        """Rebind one node — construction and checkpoint restore only."""
+        live = list(self.live)
+        live[index] = value
+        self._live = tuple(live)
+
+
+class BurstNode:
+    """Attribute view onto one node of a `SplitNodes` the agent owns.
+
+    Lets `self.state` (and SAC's temperature, MPO's duals, DDPG's exploration
+    noise) read and write like the plain attributes they replaced, while the hot
+    loop exchanges pytrees with the device and never materializes them.
+
+    Two handles exist because the two bursts mutate different sets: the gradient
+    burst takes `_burst_nodes` (train state + any side modules), the acting
+    burst takes `_burst_nodes` plus `_noise_nodes`. Keeping the noise module out
+    of the gradient burst's split is what spares four agents a `noise_module`
+    parameter they would only pass through.
+    """
+
+    def __init__(self, index: int, handle: str = "_burst_nodes",
+                 size: Optional[int] = None):
+        self.index = index
+        self.handle = handle
+        self.size = size
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        nodes = getattr(obj, self.handle, None)
+        node = None if nodes is None else nodes.live[self.index]
+        if node is None:
+            # Keeps `hasattr(agent, "state")` False for the stateless baselines
+            # in `roxie.agents.basic`, which `checkpoint_payload` branches on.
+            raise AttributeError(self.name)
+        return node
+
+    def __set__(self, obj, value):
+        nodes = getattr(obj, self.handle, None)
+        if nodes is None:
+            size = obj._num_burst_nodes if self.size is None else self.size
+            nodes = SplitNodes((None,) * size)
+            setattr(obj, self.handle, nodes)
+        nodes.set(self.index, value)
+
+
+def graph_jit(fn=None, *, static_argnames=(), num_nodes: int = 1, donate: bool = True):
+    """`nnx.jit` for a burst whose leading arguments and returns are graph nodes,
+    with the module-graph walk hoisted out of the call.
+
+    The wrapped function is written exactly as it was under `nnx.jit` — it takes
+    live nodes and returns them first — but the caller passes the agent's
+    `SplitNodes` in their place, and the graphdef rides as a static argument.
+    The nodes' pytree is donated, as it was before: the replay buffer threads
+    unchanged through the scan, so without donation XLA allocates a second copy
+    of it per burst.
+
+    `SplitNodes` is updated in place, so a call site drops the node from both
+    sides of its assignment:
+
+        self.state, actor_loss, critic_loss = _grad_steps(self.state, key, ...)
+        actor_loss, critic_loss = _grad_steps(self._burst_nodes, key, ...)
+    """
+    if fn is None:
+        return functools.partial(
+            graph_jit, static_argnames=static_argnames, num_nodes=num_nodes,
+            donate=donate,
+        )
+
+    # `jax.jit` infers argnums from argnames ONLY when one of the two is
+    # omitted; giving both (as the graphdef forces) disables inference, so the
+    # positions are mapped here or a positional `gamma` arrives as a tracer.
+    # `fn`'s node arguments collapse into `(graphdef, pytree)`, hence the shift.
+    params = list(inspect.signature(fn).parameters)
+    static_argnums = (0,) + tuple(
+        params.index(name) - num_nodes + 2 for name in static_argnames
+    )
+
+    @functools.partial(
+        jax.jit,
+        static_argnums=static_argnums,
+        static_argnames=tuple(static_argnames),
+        donate_argnums=(1,) if donate else (),
+    )
+    def _inner(graphdef, pytree, *args, **kwargs):
+        # Trace time only — which is the difference between this and the
+        # `nnx.jit` boundary.
+        nodes = nnx.merge(graphdef, pytree)
+        outputs = fn(*nodes, *args, **kwargs)
+        _, new_pytree = nnx.split(tuple(outputs[:num_nodes]))
+        return (new_pytree, *outputs[num_nodes:])
+
+    @functools.wraps(fn)
+    def wrapper(nodes: SplitNodes, *args, **kwargs):
+        graphdef, pytree = nodes.split()
+        new_pytree, *rest = _inner(graphdef, pytree, *args, **kwargs)
+        nodes.replace(new_pytree)
+        return tuple(rest)
+
+    return wrapper
+
+
 def fused_grad_steps(nodes, key: jax.Array, n_steps: int, step_fn, extras=()):
     """Run `step_fn` `n_steps` times on-device as ONE compiled program.
 
@@ -158,14 +342,48 @@ def fused_grad_steps(nodes, key: jax.Array, n_steps: int, step_fn, extras=()):
     def body(carry, step_inputs):
         live = nnx.merge(graphdef, carry)
         outputs = step_fn(live, *step_inputs)
-        # `optimizer.update` and `soft_update` wrote through to these modules,
-        # so splitting them again gives the post-step state.
+        # The updates wrote through to these modules, so re-splitting gives the
+        # post-step state.
         _, carry = nnx.split(live)
         return carry, outputs
 
     keys = jax.random.split(key, n_steps)
     carry, outputs = jax.lax.scan(body, carry, (keys, *extras))
     return nnx.merge(graphdef, carry), outputs
+
+
+# Diagnostic keys reduced with `max` rather than a mean — over the steps of one
+# fused burst (`reduce_diagnostics`) and over the bursts of one epoch
+# (`Agent.pop_diagnostics`) alike. Listed once here rather than per agent
+# because the rule belongs to the metric, not to whoever emits it: every
+# deterministic arm publishes `pre_act_max`, and a mean of a per-batch maximum
+# in any of them would wash out the outlier the metric exists to expose.
+DIAGNOSTIC_MAX_KEYS = frozenset({"pre_act_max"})
+# Counts rather than levels: totalled across an epoch instead of averaged. Only
+# the epoch reduction sees these — a burst records its own count already summed.
+DIAGNOSTIC_SUM_KEYS = frozenset({"kl_early_stops"})
+
+
+def reduce_diagnostics(per_step: dict, denom) -> dict:
+    """Collapse one burst's stacked per-step diagnostics to a scalar per key.
+
+    `per_step` is what `fused_grad_steps` stacked on the leading step axis;
+    `denom` is what the mean divides by — `n_steps` for critic-side keys, the
+    number of *actor update* steps for actor-side ones, which under a
+    `policy_delay` is the smaller of the two and is why the two sides are
+    reduced by separate calls.
+
+    Reduced on-device so the host sees one scalar per metric per burst, never a
+    per-step array.
+    """
+    return {
+        key: (
+            jnp.max(value)
+            if key in DIAGNOSTIC_MAX_KEYS
+            else jnp.sum(value) / denom
+        )
+        for key, value in per_step.items()
+    }
 
 
 def network_rngs(seed: int, offset: int = 0) -> nnx.Rngs:
@@ -318,8 +536,7 @@ def repack_samples(samples, gamma: float, n_step: int) -> dict:
     }
 
 
-# Action bounds -> JSON-friendly scalars/lists for the checkpointed hyperparameter
-# block. Per-actuator bounds stay a full list, so an env whose actuators have
+# Per-actuator bounds stay a full list, so an env whose actuators have
 # different ranges is not recorded as just the first one's.
 def serialize_bound(x):
     x = jax.device_get(x)
@@ -328,9 +545,8 @@ def serialize_bound(x):
             return float(x)
         return np.asarray(x, dtype=np.float32).tolist()
     # A list arrives when the agent was built from a checkpoint: `Agent.load`
-    # feeds the serialized bounds back into the constructor, which re-serializes
-    # them. Without this branch that round trip dies in `float([...])` —
-    # training is fine, every `play.py` crashes.
+    # feeds the serialized bounds back through the constructor. Without this
+    # branch that round trip dies in `float([...])`.
     if isinstance(x, (list, tuple)):
         return [serialize_bound(v) for v in x]
     if hasattr(x, "item"):

@@ -130,13 +130,8 @@ class FuncEnv(Generic[StateType, ObsType, ActType, ParamsType]):
         """
         return {}
 
-    # -- self-adapting ``params`` -------------------------------------------
-    #
     # Three optional hooks, no-ops by default, that let an env change its own
-    # ``params`` mid-training without owning mutable state inside a trace. The
-    # driver only carries the value: from ``init_params``, into every
-    # ``initial``/``transition``, through ``observe_params`` on each step (inside
-    # the jitted step, so that stays one dispatch), and refreshed once per epoch.
+    # ``params`` mid-training without owning mutable state inside a trace.
     # ``params`` is traced throughout, so none of it recompiles.
 
     def init_params(self) -> ParamsType | None:

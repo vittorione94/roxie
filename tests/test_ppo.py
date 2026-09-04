@@ -1,10 +1,15 @@
+import copy
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from flax import nnx
 from omegaconf import OmegaConf
 
 import roxie.agents  # noqa: F401  (avoid circular import)
-from roxie.agents.ppo import PPO
+from roxie.agents.ppo import PPO, _grad_step, _grad_steps, _prepare_rollout
+from roxie.agents.utils import SplitNodes
 from roxie.environment.vector import Timestep
 
 NUM_ENVS = 4
@@ -73,8 +78,10 @@ def _collect_and_update(agent, drift=2.0, unfreeze_norm=False):
         obs = timestep.obs
 
     if unfreeze_norm:
-        # Throw away the acting snapshot so the update re-derives mean/std from the
-        # (heavily drifted) running stats — the failure mode the freeze prevents.
+        # Throw away BOTH caches so the update re-derives mean/std from the
+        # drifted running stats — the failure mode the freeze prevents.
+        # `_obs_norm` alone would re-derive the same numbers.
+        agent._obs_stats_snapshot = None
         agent._obs_norm = None
 
     key, update_key = jax.random.split(key)
@@ -122,3 +129,155 @@ class TestPPOObsNormFreeze:
         diag = _collect_and_update(agent)
         assert float(agent.state.obs_stats.count) == 0.0
         assert diag["ppo/approx_kl"] == pytest.approx(0.0, abs=1e-5)
+
+
+# The fused update burst must be the Python loop, only faster.
+
+
+def _prepared_rollout(agent, key):
+    """Drive one rollout into the queue, then dequeue the tensors that both
+    update paths get fed. Going through the real `_prepare_rollout` rather than
+    synthesizing arrays is what keeps the time axes (T for the policy tensors,
+    T-1 for the GAE ones) honest."""
+    key, k0 = jax.random.split(key)
+    obs = _timestep(k0, 1.0).obs
+    for _ in range(ROLLOUT):
+        key, act_key, step_key = jax.random.split(key, 3)
+        agent.step(obs, evaluate=False, key=act_key)
+        timestep = _timestep(step_key, 1.0)
+        agent.add(obs, timestep)
+        obs = timestep.obs
+
+    obs_mean, obs_std = agent._frozen_obs_norm()
+    # Both bursts take the agent's split rather than a live state; `SplitNodes`
+    # is mutated in place, so the new state is read back off the handle.
+    nodes = SplitNodes((agent.state,))
+    tensors = _prepare_rollout(
+        nodes,
+        gamma=agent.gamma,
+        gae_lambda=agent.gae_lambda,
+        replay_get_fn=agent.replay.sample,
+        obs_clip=agent.obs_clip,
+        normalize=agent.normalize_observations,
+        obs_mean=obs_mean,
+        obs_std=obs_std,
+    )
+    agent.state = nodes.live[0]
+    return tuple(tensors)
+
+
+def _looped_update(state, key, agent, tensors):
+    """The Python loop `_grad_steps` replaced, kept here as the reference.
+
+    Deliberately a transcription of the original — nested loops, a host `float`
+    on `approx_kl`, and a `break` that abandons the rest of the rollout — so the
+    scanned version is measured against what it is meant to reproduce rather
+    than against itself.
+    """
+    mb = agent.minibatch_size
+    steps = stops = 0
+    sums = dict(actor=0.0, critic=0.0, kl=0.0, clip=0.0)
+    stop_epochs = False
+    for _ in range(agent.learning_steps):
+        key, perm_key = jax.random.split(key)
+        perm = jax.random.permutation(perm_key, agent.batch_size)
+        shuffled = tuple(leaf[perm] for leaf in tensors)
+
+        for m in range(agent.num_minibatches):
+            key, step_key = jax.random.split(key)
+            sl = slice(m * mb, (m + 1) * mb)
+            actor_loss, critic_loss, approx_kl, clip_frac = _grad_step(
+                state, step_key, *[leaf[sl] for leaf in shuffled],
+                clip_eps=agent.clip_eps,
+                entropy_coef=agent.entropy_coef,
+                action_low=agent.action_low,
+                action_high=agent.action_high,
+            )
+            steps += 1
+            sums["actor"] += float(actor_loss)
+            sums["critic"] += float(critic_loss)
+            sums["kl"] += float(approx_kl)
+            sums["clip"] += float(clip_frac)
+
+            if agent.target_kl is not None and float(approx_kl) > agent.target_kl:
+                stops += 1
+                stop_epochs = True
+                break
+        if stop_epochs:
+            break
+    return steps, stops, sums
+
+
+def _params(module):
+    return jax.tree.leaves(nnx.state(module, nnx.Param))
+
+
+class TestFusedUpdateMatchesTheLoop:
+    """`_grad_steps` moved the `target_kl` early stop from a host `break` into a
+    sticky flag in the scan carry. That is only a throughput change if it lands
+    exactly where the loop landed, so these run one rollout through both."""
+
+    # `None` exercises the no-stop path; the tiny bound trips MID-rollout, on
+    # the second of six steps (`approx_kl` is identically 0 on the first). A
+    # bound that tripped immediately, or never, would not cover the sticky flag.
+    @pytest.mark.parametrize("target_kl", [None, 1e-9])
+    def test_fused_update_matches_the_per_minibatch_loop(self, target_kl):
+        agent = _make_agent(
+            learning_steps=3, num_minibatches=2, target_kl=target_kl,
+        )
+        tensors = _prepared_rollout(agent, jax.random.PRNGKey(0))
+
+        burst_key = jax.random.PRNGKey(7)
+        fused_nodes = SplitNodes((copy.deepcopy(agent.state),))
+        looped_state = copy.deepcopy(agent.state)
+
+        (
+            _key, steps, actor_sum, critic_sum,
+            kl_sum, clip_sum, stops, _last_kl, _last_clip,
+        ) = _grad_steps(
+            fused_nodes, burst_key, *tensors,
+            agent.learning_steps, agent.num_minibatches, agent.minibatch_size,
+            agent.clip_eps, agent.entropy_coef, agent.target_kl,
+            agent.action_low, agent.action_high,
+        )
+        ref_steps, ref_stops, ref_sums = _looped_update(
+            looped_state, burst_key, agent, tensors,
+        )
+
+        assert int(steps) == ref_steps, "different number of passes ran"
+        assert int(stops) == ref_stops
+        for name, got in (("actor", actor_sum), ("critic", critic_sum),
+                          ("kl", kl_sum), ("clip", clip_sum)):
+            np.testing.assert_allclose(
+                float(got), ref_sums[name], rtol=1e-5, atol=1e-5,
+                err_msg=f"{name} sum diverged between the two paths",
+            )
+
+        # The parameters are the real assertion: the diagnostics could agree
+        # while the updates landed differently.
+        new_state = fused_nodes.live[0]
+        for network in ("actor", "critic"):
+            for fused, looped in zip(_params(getattr(new_state, network)),
+                                     _params(getattr(looped_state, network))):
+                np.testing.assert_allclose(
+                    fused, looped, rtol=1e-5, atol=1e-5,
+                    err_msg=f"{network} params diverged",
+                )
+
+    def test_the_tiny_bound_really_stops_mid_rollout(self):
+        """Guards the parametrization above: if the bound never tripped, the
+        `target_kl` case would just be re-testing the no-stop path."""
+        agent = _make_agent(
+            learning_steps=3, num_minibatches=2, target_kl=1e-9,
+        )
+        tensors = _prepared_rollout(agent, jax.random.PRNGKey(0))
+        _, steps, *_rest = _grad_steps(
+            SplitNodes((copy.deepcopy(agent.state),)),
+            jax.random.PRNGKey(7), *tensors,
+            agent.learning_steps, agent.num_minibatches, agent.minibatch_size,
+            agent.clip_eps, agent.entropy_coef, agent.target_kl,
+            agent.action_low, agent.action_high,
+        )
+        assert 0 < int(steps) < agent.learning_steps * agent.num_minibatches, (
+            f"{int(steps)} passes ran: the bound did not stop mid-rollout"
+        )

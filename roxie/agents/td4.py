@@ -9,18 +9,20 @@ from roxie.agents.agent import Agent, TrainState
 from roxie.agents.d4pg import D4PG
 from roxie.agents.utils import (
     fused_grad_steps,
+    graph_jit,
     network_rngs,
+    reduce_diagnostics,
     repack_samples,
     soft_update,
 )
-from roxie.losses.actor_losses import td4_actor_loss_fn
+from roxie.losses.actor_losses import skipped_actor_aux, td4_actor_loss_fn
 from roxie.losses.critic_losses import td4_critic_loss_fn
 from roxie.models.critics import TwinCritic
 
 
 # D4PG's step (categorical critic on the fixed support `atoms`) with TD3's twin
 # critic and delayed policy update bolted on. Not jitted on its own — called
-# inside `_grad_steps` below so N steps fuse into one compiled program.
+# inside `_grad_steps` so N steps fuse into one compiled program.
 def _grad_step(
     state: TrainState,
     key: jax.random.PRNGKey,
@@ -38,6 +40,7 @@ def _grad_step(
     obs_clip: float,
     normalize: bool,
     atoms: jnp.ndarray,
+    pre_activation_coef: float,
     n_step: int = 1,
 ):
     """One TD4 step. `obs_mean`/`obs_std` and `atoms` are hoisted in by
@@ -45,19 +48,20 @@ def _grad_step(
     actor and target updates run under `nnx.cond` so the delayed-policy-update
     trick survives the `lax.scan` (where the step index is no longer static).
     `n_step` is the TD horizon (NOT the scan length `n_steps`)."""
-    # `repack_samples` folds the n-step return, bootstrap coefficient, and
-    # bootstrap obs into the dict — what the categorical projection needs to
-    # shift the support.
+    # `repack_samples` folds the n-step return, bootstrap coefficient and
+    # bootstrap obs into the dict — what shifts the categorical support.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalized once here: the critic and (delayed) actor losses read the same
-    # `observations`, and neither normalizes.
+    # Normalized once here: the critic and actor losses read the same
+    # `observations`.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
 
-    critic_loss, critic_grads = nnx.value_and_grad(td4_critic_loss_fn)(
+    (critic_loss, critic_aux), critic_grads = nnx.value_and_grad(
+        td4_critic_loss_fn, has_aux=True
+    )(
         state.critic,
         state.target_actor,
         state.target_critic,
@@ -71,43 +75,44 @@ def _grad_step(
     )
     state.critic_optimizer.update(state.critic, critic_grads)
 
-    # Under `lax.scan` the step index is traced, so the delayed update has to be
-    # a runtime branch rather than a Python `if`.
+    # Under `lax.scan` the step index is traced, so the delayed update has to
+    # be a runtime branch rather than a Python `if`.
     def _actor_update(state):
-        actor_loss, actor_grads = nnx.value_and_grad(td4_actor_loss_fn)(
+        (actor_loss, actor_aux), actor_grads = nnx.value_and_grad(
+            td4_actor_loss_fn, has_aux=True
+        )(
             state.actor,
             state.critic,
             re_packed_samples,
             action_low,
             action_high,
             atoms,
+            pre_activation_coef,
         )
         state.actor_optimizer.update(state.actor, actor_grads)
 
         # Both targets move with the policy, not with the critic.
         soft_update(state.target_actor, state.actor, tau)
         soft_update(state.target_critic, state.critic, tau)
-        return actor_loss
+        return actor_loss, actor_aux
 
     def _skip_actor_update(state):
-        return jnp.array(0.0, dtype=critic_loss.dtype)
+        zero = jnp.array(0.0, dtype=critic_loss.dtype)
+        return zero, skipped_actor_aux(critic_loss.dtype, "pre_act_penalty")
 
-    actor_loss = nnx.cond(update_actor, _actor_update, _skip_actor_update, state)
+    actor_loss, actor_aux = nnx.cond(
+        update_actor, _actor_update, _skip_actor_update, state
+    )
 
-    return actor_loss, critic_loss
+    return actor_loss, critic_loss, actor_aux, critic_aux
 
 
-# `fused_grad_steps` compiles the body once and runs it `n_steps` times
-# on-device, so a burst costs one host dispatch rather than one per step.
 @functools.partial(
-    nnx.jit,
+    graph_jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "policy_delay", "n_step",
         "normalize",
     ),
-    # The replay buffer rides unchanged through the scan; without donation XLA
-    # allocates a full second copy of it every update.
-    donate_argnums=(0,),
 )
 def _grad_steps(
     state: TrainState,
@@ -123,17 +128,16 @@ def _grad_steps(
     obs_eps: float,
     obs_clip: float,
     normalize: bool,
+    pre_activation_coef: float,
     atoms: jnp.ndarray,
     policy_delay: int,
     n_step: int = 1,
 ):
-    # Loop-constant, so hoisted out of the scan body.
     obs_mean, obs_std = Agent.obs_mean_std(state.obs_stats, obs_eps)
 
-    # The delayed-update schedule, scanned over alongside the keys.
     update_mask = (jnp.arange(n_steps) % policy_delay) == 0
 
-    state, (actor_losses, critic_losses) = fused_grad_steps(
+    state, (actor_losses, critic_losses, actor_aux, critic_aux) = fused_grad_steps(
         state,
         key,
         n_steps,
@@ -151,14 +155,21 @@ def _grad_steps(
             obs_clip=obs_clip,
             normalize=normalize,
             atoms=atoms,
+            pre_activation_coef=pre_activation_coef,
             n_step=n_step,
         ),
         extras=(update_mask,),
     )
 
     # Actor loss only on update steps → average over those; critic over all steps.
-    actor_loss = jnp.sum(actor_losses) / jnp.maximum(jnp.sum(update_mask), 1)
-    return state, actor_loss, jnp.mean(critic_losses)
+    # The diagnostics split the same way: the skipped steps contributed zeros.
+    n_actor_updates = jnp.maximum(jnp.sum(update_mask), 1)
+    actor_loss = jnp.sum(actor_losses) / n_actor_updates
+    diagnostics = {
+        **reduce_diagnostics(actor_aux, n_actor_updates),
+        **reduce_diagnostics(critic_aux, n_steps),
+    }
+    return state, actor_loss, jnp.mean(critic_losses), diagnostics
 
 
 class TD4(D4PG):
@@ -208,10 +219,11 @@ class TD4(D4PG):
         """One unconditional burst (TD4 variant: threads both the categorical
         `atoms` support and `policy_delay` into the fused grad step). See
         DDPG.learn for the sync/async sharing rationale."""
-        self.state, actor_loss, critic_loss = _grad_steps(
-            self.state,
+        burst_steps = self.learning_steps if n_steps is None else int(n_steps)
+        actor_loss, critic_loss, diagnostics = _grad_steps(
+            self._burst_nodes,
             agent_rng,
-            self.learning_steps if n_steps is None else int(n_steps),
+            burst_steps,
             self.gamma,
             self.tau,
             self.replay.sample,
@@ -222,10 +234,12 @@ class TD4(D4PG):
             self.obs_eps,
             self.obs_clip,
             self.normalize_observations,
+            self.pre_activation_coef,
             self.atoms,
             self.policy_delay,
             n_step=self.n_step,
         )
+        self.record_diagnostics(diagnostics, burst_steps)
         return actor_loss, critic_loss
 
     def _export_hyperparams(self) -> dict:
