@@ -38,11 +38,13 @@ actor_config:
   _target_: roxie.models.actors.StochasticActor
   features: [256, 256]
   use_layer_norm: true
-  std_min: 1e-4
+  # NOT 1e-4. PPO is the one agent whose loss divides by this: the per-step
+  # log-ratio goes as (u - mu)/sigma, so a floor of 1e-4 lets a single Adam
+  # step at lr 3e-4 produce approx_kl ~ 4, tripping target_kl 0.03 on the
+  # first minibatch of every rollout. At 1e-2 one step costs ~4.6e-4, so the
+  # trust region spends its budget over ~65 steps as intended.
+  std_min: 1e-2
   std_max: 5.0
-  # Bound actions in (-1, 1) via tanh. Without it nothing keeps the policy mean
-  # inside actuator_ctrlrange.
-  squash: true
 
 critic_config:
   _target_: roxie.models.critics.VCritic

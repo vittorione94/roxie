@@ -20,7 +20,7 @@ from roxie.agents.utils import (
     make_optimizer,
     serialize_bound,
 )
-from roxie.models.actors import distribution_entropy as _distribution_entropy
+from roxie.models.actors import deterministic_action
 from roxie.utils.checkpoint import CHECKPOINT_ITEM, checkpoint_steps
 
 
@@ -122,26 +122,50 @@ class Agent(abc.ABC):
         observation: jnp.ndarray,
         evaluate: bool,
         key: jax.Array,
+        critic_model: nnx.Module = None,
     ):
-        """Pure action selection for a stochastic actor, which outputs a
-        distribution over actions in [-1, 1]."""
+        """Action selection for every stochastic-policy agent, in ONE dispatch.
+
+        Returns ``(action, deviation_from_mode, pre_activation, log_probs,
+        value)``. `action` is pre-scaling, in [-1, 1] — every stochastic actor
+        here emits a `TanhNormal`, so that range is the distribution's own
+        support and nothing has to bound it on the way out.
+        `deviation_from_mode` is what the trainer reduces to the
+        `noise/per_joint_abs` panel: these agents explore from their own policy,
+        so the analogue of DDPG's injected noise is how far the sample landed
+        from the mode. It is returned unconditionally (zero under `evaluate`)
+        because the fused acting burst accumulates it inside a `lax.scan`, where
+        a `None` would change the carry's structure.
+
+        `critic_model` is given only by an on-policy agent, which needs the
+        behaviour quantities at acting time: the value estimate, the pre-tanh
+        draw, and the log-prob its ratio is recomputed against. Folding them in
+        here keeps acting a single dispatch. Off-policy callers pass no critic
+        and get None for all three, so neither the density nor the value ever
+        enters their acting graph.
+
+        The density is scored from the pre-tanh `u`, never re-derived from the
+        action: `TanhNormal.log_prob` has to invert the squash through a clipped
+        arctanh, which loses `u` entirely once it passes ~7.25 in float32.
+        """
         distribution = actor_model(observation)
-
+        mode = deterministic_action(distribution)
+        # The mode's own pre-activation is the base mean; a sample's is the `u`
+        # it was drawn from.
         if evaluate:
-            # The mean, never a sample, so evaluation is deterministic.
-            try:
-                action = distribution.mean()
-            except TypeError:
-                # Some distrax versions expose mean as a property.
-                action = distribution.mean
+            action, pre_activation = mode, distribution.loc
+        else:
+            action, pre_activation = distribution.sample_from_pre(seed=key)
 
-            log_probs = distribution.log_prob(action)
-            entropy = _distribution_entropy(distribution, key)
-            return action, log_probs, entropy
-
-        action, log_probs = distribution.sample_and_log_prob(seed=key)
-        entropy = _distribution_entropy(distribution, key)
-        return action, log_probs, entropy
+        if critic_model is None:
+            return action, mode - action, None, None, None
+        return (
+            action,
+            mode - action,
+            pre_activation,
+            distribution.log_prob_from_pre(pre_activation),
+            critic_model(observation),
+        )
 
     @staticmethod
     def init_obs_stats(obs_shape) -> ObsStats:
@@ -406,21 +430,33 @@ class Agent(abc.ABC):
     def due_for_update(self, steps: int) -> bool:
         """True at most once per `steps_between_updates` env steps past warmup.
 
-        Do NOT write this as `(steps - steps_before_learning) % between == 0`.
-        The trainer advances `steps` in strides of `parallel_envs`, so that test
-        only fires when `steps_before_learning` is itself a multiple of the
-        stride; otherwise the residue cycles without reaching 0 and no gradient
-        step ever runs. Tracking the last boundary served makes the schedule
-        depend only on elapsed env steps.
+        `memory_warmup` is the gate, and the only one: learning starts once the
+        prefill is in the buffer. Sampling before that is not merely premature —
+        flashbax allocates with `jnp.empty_like`, so a batch drawn below the
+        buffer's `min_length` is uninitialized memory rather than an error.
+
+        There used to be a second knob, `steps_before_learning`, and every
+        config set it equal to `memory_warmup`. It could not do anything else:
+        the trainer runs the warmup to completion before the loop's first call,
+        so any value at or below the warmup gave a bit-identical schedule, and
+        any value above it meant acting with an untrained policy while refusing
+        to learn from the result.
+
+        Do NOT write this as `(steps - memory_warmup) % between == 0`. The
+        trainer advances `steps` in strides of `parallel_envs`, so that test
+        only fires when the offset is itself a multiple of the stride;
+        otherwise the residue cycles without reaching 0 and no gradient step
+        ever runs. Tracking the last boundary served makes the schedule depend
+        only on elapsed env steps.
 
         No backlog is queued: the boundary jumps to wherever `steps` now is, so
         a restored checkpoint resumes on schedule rather than firing a catch-up
         storm.
         """
-        if steps < self.steps_before_learning:
+        if steps < self.memory_warmup:
             return False
-        elapsed = steps - self.steps_before_learning
-        boundary = self.steps_before_learning + (
+        elapsed = steps - self.memory_warmup
+        boundary = self.memory_warmup + (
             (elapsed // self.steps_between_updates) * self.steps_between_updates
         )
         if boundary <= self._last_update_boundary:
@@ -569,7 +605,6 @@ class Agent(abc.ABC):
             "tau": float(self.tau),
             "env_obs_size": self.state.buffer_state.experience.observation.shape[2],
             "env_action_size": self.state.buffer_state.experience.action.shape[2],
-            "steps_before_learning": int(self.steps_before_learning),
             "steps_between_updates": int(self.steps_between_updates),
             "memory_warmup": int(self.memory_warmup),
             "memory_capacity": int(self.buffer_size),

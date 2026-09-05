@@ -339,7 +339,7 @@ class _PacingAgent(_AsyncCapableAgent):
     """Enough surface for `AsyncLearner.__init__` and one buffered add."""
 
     learning_steps = 20
-    steps_before_learning = 0
+    memory_warmup = 0
     steps_between_updates = 2_048
 
     def add_transitions(self, *args):
@@ -384,7 +384,7 @@ def test_target_grad_steps_track_the_sync_replay_ratio():
     one full burst at the warmup boundary, then `learning_steps` per
     `steps_between_updates` env steps."""
     learner = _pacing_learner()
-    learner.steps_before_learning = 30_720
+    learner.memory_warmup = 30_720
     assert learner._target_grads(30_719) == 0.0
     assert learner._target_grads(30_720) == 20
     # 100 update boundaries past warmup = 100 bursts on top of the first.

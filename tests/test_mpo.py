@@ -241,12 +241,12 @@ class TestFusedBurst:
         exactly a boundary. That is the behaviour that broke the v1 release grid:
         the trainer advances `steps` in strides of `parallel_envs` and only ever
         lands exactly on a boundary when the stride divides the offset, so an
-        unaligned `steps_before_learning` disarmed learning completely. The gate
+        unaligned warmup offset disarmed learning completely. The gate
         now serves a boundary on the first call at or past it — see
         tests/test_update_schedule.py.
         """
         _fill_buffer(agent)
-        agent.steps_before_learning = 100
+        agent.memory_warmup = 100
         agent.steps_between_updates = 10
 
         # Before warmup: nothing, regardless of where the stride lands.

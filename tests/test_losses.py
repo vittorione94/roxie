@@ -377,20 +377,20 @@ class TestPPOLoss:
         num_envs, seq_len = 4, 10
         obs = jax.random.normal(key, (num_envs, seq_len, OBS_DIM))
         dist = stoch_actor(obs)
-        actions = dist.sample(seed=key)
-        log_probs = dist.log_prob(actions)
+        # As the agent stores them: the pre-tanh draw and the density scored
+        # from it, never the squashed action re-inverted.
+        _actions, pre_actions = dist.sample_from_pre(seed=key)
+        log_probs = dist.log_prob_from_pre(pre_actions)
         values = stoch_critic(obs).squeeze(-1)
         advantages = jax.random.normal(key, (num_envs, seq_len - 1))
-        return obs, actions, log_probs, values, advantages
+        return obs, pre_actions, log_probs, values, advantages
 
-    def _ppo_actor_loss(self, actor, obs, actions, log_probs, advantages, **kw):
+    def _ppo_actor_loss(self, actor, obs, pre_actions, log_probs, advantages, **kw):
         return ppo_loss_fn(
             actor,
             obs,
-            actions,
+            pre_actions,
             log_probs,
-            jnp.full(ACT_DIM, -1.0),
-            jnp.full(ACT_DIM, 1.0),
             advantages,
             clip_epsilon=kw.get("clip_epsilon", 0.2),
             entropy_coef=kw.get("entropy_coef", 0.01),
@@ -398,9 +398,9 @@ class TestPPOLoss:
         )
 
     def test_actor_loss_scalar(self, stoch_actor, ppo_data):
-        obs, actions, log_probs, values, advantages = ppo_data
+        obs, pre_actions, log_probs, values, advantages = ppo_data
         loss, (approx_kl, clip_frac) = self._ppo_actor_loss(
-            stoch_actor, obs, actions, log_probs, advantages
+            stoch_actor, obs, pre_actions, log_probs, advantages
         )
         assert loss.shape == ()
         assert jnp.isfinite(loss)
@@ -413,9 +413,9 @@ class TestPPOLoss:
         the policy already moved (or the observations were normalized
         differently) between acting and learning.
         """
-        obs, actions, log_probs, values, advantages = ppo_data
+        obs, pre_actions, log_probs, values, advantages = ppo_data
         _, (approx_kl, clip_frac) = self._ppo_actor_loss(
-            stoch_actor, obs, actions, log_probs, advantages
+            stoch_actor, obs, pre_actions, log_probs, advantages
         )
         assert float(approx_kl) == pytest.approx(0.0, abs=1e-6)
         assert float(clip_frac) == pytest.approx(0.0, abs=1e-6)
@@ -427,10 +427,11 @@ class TestPPOLoss:
         """The AcrobotSwingup/warp_gpu release run died here.
 
         `old_log_probs` far from `logp_new` is not hypothetical for a squashed
-        policy: `TanhNormal.log_prob` pins a saturated sample's `u` at the
-        arctanh rail and divides the z-score by a `std` free to fall to
-        `std_min`, so log-probs of order 1e4+ are ordinary and their DIFFERENCES
-        pass `exp`'s float32 overflow at 88 easily.
+        policy: the z-score is divided by a `std` free to fall to `std_min`, so
+        log-probs of order 1e4+ are ordinary and their DIFFERENCES pass `exp`'s
+        float32 overflow at 88 easily. Scoring from the stored pre-tanh draw
+        (`TestRatioSurvivesSaturation`) is what stops the loss REACHING that
+        regime; this stays as the backstop for when it gets there anyway.
 
         The forward loss is no witness -- the clip caps it at a healthy-looking
         `(1 + clip_eps) * advantage` -- so this asserts on the GRADIENT, which
@@ -439,11 +440,11 @@ class TestPPOLoss:
         `clip_by_global_norm` rescales by 1 / global_norm and spreads it over
         every parameter in the tree, with no path back.
         """
-        obs, actions, log_probs, _values, advantages = ppo_data
+        obs, pre_actions, log_probs, _values, advantages = ppo_data
         diverged = jnp.full_like(log_probs, stale_log_probs)
 
         (loss, (approx_kl, clip_frac)), grads = nnx.value_and_grad(
-            lambda m: self._ppo_actor_loss(m, obs, actions, diverged, advantages),
+            lambda m: self._ppo_actor_loss(m, obs, pre_actions, diverged, advantages),
             has_aux=True,
         )(stoch_actor)
 
@@ -458,7 +459,7 @@ class TestPPOLoss:
         assert float(clip_frac) == pytest.approx(1.0)
 
     def test_critic_loss_scalar(self, stoch_critic, ppo_data):
-        obs, actions, log_probs, values, advantages = ppo_data
+        obs, pre_actions, log_probs, values, advantages = ppo_data
         returns = values[:, :-1] + advantages
         loss = ppo_critic_loss_fn(stoch_critic, obs, returns)
         assert loss.shape == ()
@@ -568,3 +569,118 @@ class TestTargetSmoothingUnits:
         expected = Agent.scale_to_env(det_actor(obs), low, high)
         assert jnp.allclose(smoothed, expected, atol=1e-6)
         assert float(clip_frac) == 0.0
+
+
+class TestRatioSurvivesSaturation:
+    """The AcrobotSwingup/AcrobotSwingupSparse release runs died here.
+
+    `tanh` is not invertible in float32: it rounds to exactly 1.0 for |u| >= 8,
+    so `TanhNormal.log_prob` -- which recovers `u` with an arctanh clipped at
+    1 - 1e-6 -- maps every saturated draw onto the same rail, u ~ 7.2477.
+    Nothing bounds the pre-tanh mean, so once it walks past that rail the stored
+    density is evaluated at a FIXED point in the far tail and its sensitivity to
+    the parameters is set by how far the mean has drifted, not by how far the
+    policy actually moved.
+
+    In the release runs that put `approx_kl` at ~1e8 (the ratio pinned at
+    exp(_MAX_LOG_RATIO)) from 6.6M steps onward: `target_kl` then tripped on the
+    first minibatch of every single rollout, and PPO ran the remaining 493M
+    steps at 1 gradient step per rollout against a configured 64.
+
+    The fix is to score both sides from the stored pre-tanh draw. These tests
+    pin the property that makes it work -- the ratio tracks the policy, not the
+    saturation.
+    """
+
+    # Past the arctanh rail, where the old path lost `u` entirely.
+    SATURATED_MEAN = 20.0
+    # One Adam step at the benchmark's actor_learning_rate.
+    STEP = 3e-4
+
+    @pytest.fixture
+    def saturated(self, stoch_actor):
+        """An actor forced to emit a pre-tanh mean well past the rail."""
+        actor = copy.deepcopy(stoch_actor)
+        actor.output_layer.kernel[...] = jnp.zeros_like(actor.output_layer.kernel[...])
+        actor.output_layer.bias[...] = jnp.full_like(
+            actor.output_layer.bias[...], self.SATURATED_MEAN
+        )
+        return actor
+
+    def _rollout(self, actor, key):
+        obs = jax.random.normal(key, (4, 10, OBS_DIM))
+        dist = actor(obs)
+        _, pre_actions = dist.sample_from_pre(seed=key)
+        return obs, pre_actions, dist.log_prob_from_pre(pre_actions)
+
+    def _kl(self, actor, obs, pre_actions, old_log_probs):
+        _, (approx_kl, _) = ppo_loss_fn(
+            actor, obs, pre_actions, old_log_probs,
+            jax.random.normal(jax.random.PRNGKey(1), (4, 9)),
+            clip_epsilon=0.2, entropy_coef=0.01, key=jax.random.PRNGKey(0),
+        )
+        return float(approx_kl)
+
+    def test_the_fixture_really_saturates(self, saturated):
+        """Guards every assertion below against passing vacuously: if the mean
+        stayed inside the rail there would be no pathology to regress on."""
+        obs = jax.random.normal(jax.random.PRNGKey(0), (4, 10, OBS_DIM))
+        dist = saturated(obs)
+        _, pre_actions = dist.sample_from_pre(seed=jax.random.PRNGKey(0))
+        assert float(jnp.min(jnp.abs(pre_actions))) > 8.0
+        # ... and that the squash really has destroyed `u` at that magnitude.
+        assert float(jnp.max(jnp.abs(jnp.tanh(pre_actions)))) == 1.0
+
+    def test_first_pass_ratio_is_one_when_saturated(self, saturated):
+        obs, pre_actions, log_probs = self._rollout(
+            saturated, jax.random.PRNGKey(0)
+        )
+        assert self._kl(saturated, obs, pre_actions, log_probs) == pytest.approx(
+            0.0, abs=1e-6
+        )
+
+    def test_kl_tracks_the_policy_step_not_the_saturation(self, saturated):
+        """The regression proper.
+
+        A single optimizer-sized step on the mean must cost a KL the trust
+        region can budget with. Scored through the arctanh instead, the same
+        step moved the density by ~5e4 nats, `approx_kl` came out at
+        exp(_MAX_LOG_RATIO) ~ 4.85e8, and `target_kl` tripped immediately.
+        """
+        obs, pre_actions, log_probs = self._rollout(
+            saturated, jax.random.PRNGKey(0)
+        )
+        stepped = copy.deepcopy(saturated)
+        stepped.output_layer.bias[...] = saturated.output_layer.bias[...] + self.STEP
+
+        kl = self._kl(stepped, obs, pre_actions, log_probs)
+        assert 0.0 < kl < 1e-3, f"one {self.STEP} step cost approx_kl {kl}"
+
+    def test_kl_is_independent_of_how_far_past_the_rail_the_mean_sits(
+        self, stoch_actor
+    ):
+        """The same step must cost the same KL at any saturation level.
+
+        This is the property the arctanh path could not have: there the cost
+        grew with (mean - 7.2477), so a policy that kept drifting kept raising
+        its own KL without moving any further per step.
+        """
+        kls = []
+        for mean in (1.0, 8.0, 40.0):
+            actor = copy.deepcopy(stoch_actor)
+            actor.output_layer.kernel[...] = jnp.zeros_like(
+                actor.output_layer.kernel[...]
+            )
+            actor.output_layer.bias[...] = jnp.full_like(
+                actor.output_layer.bias[...], mean
+            )
+            obs, pre_actions, log_probs = self._rollout(
+                actor, jax.random.PRNGKey(0)
+            )
+            stepped = copy.deepcopy(actor)
+            stepped.output_layer.bias[...] = (
+                actor.output_layer.bias[...] + self.STEP
+            )
+            kls.append(self._kl(stepped, obs, pre_actions, log_probs))
+
+        assert max(kls) == pytest.approx(min(kls), rel=0.1), kls

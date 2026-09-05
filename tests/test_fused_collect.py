@@ -31,7 +31,6 @@ NUM_ENVS = 4
 # Off-policy: a warmed buffer, and an update window exactly one chunk long.
 _OFF_POLICY_OVERRIDES = (
     "agent.memory_warmup=512",
-    "agent.steps_before_learning=512",
     f"agent.steps_between_updates={CHUNK * NUM_ENVS}",
     "agent.memory_config.max_length=256",
     "agent.memory_config.min_length=8",

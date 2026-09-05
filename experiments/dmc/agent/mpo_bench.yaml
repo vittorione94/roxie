@@ -1,5 +1,6 @@
-# MPO arm of the dm_control release benchmark: Gaussian policy, single Q critic,
-# EM-style update with KL-constrained E/M steps and learned Lagrange duals.
+# MPO arm of the dm_control release benchmark: tanh-squashed Gaussian policy,
+# single Q critic, EM-style update with KL-constrained E/M steps and learned
+# Lagrange duals.
 #
 # ddpg_bench.yaml is the reference file and lists the invariants held identical
 # across every arm.
@@ -28,7 +29,6 @@ init_temperature: 1.0
 init_alpha_mean: 1.0
 init_alpha_stddev: 1.0
 memory_warmup: 30_720
-steps_before_learning: 30_720
 steps_between_updates: 2_048
 learning_steps: 20
 max_grad_norm: 1

@@ -20,7 +20,7 @@ arrays; it never aliases the buffer.
 Semantics vs. the synchronous loop:
   * Replay ratio is preserved: the learner runs one ``learning_steps`` burst
     each time the number of *buffered* transitions crosses a
-    ``steps_between_updates`` boundary past ``steps_before_learning``, the same
+    ``steps_between_updates`` boundary past ``memory_warmup``, the same
     cadence sync ``update`` uses. Behind, it runs bursts back-to-back; ahead, it
     waits for data — so the ratio matches sync on average and never runs ahead
     of collected data.
@@ -51,7 +51,7 @@ class AsyncLearner:
         self._agent = agent
         self._key = agent_key
         self.learning_steps = int(agent.learning_steps)
-        self.steps_before_learning = int(agent.steps_before_learning)
+        self.memory_warmup = int(agent.memory_warmup)
         self.steps_between_updates = int(agent.steps_between_updates)
         # `chunk` is how many fused grad steps the learner submits at a time —
         # small so the GPU stream keeps freeing up for the acting thread.
@@ -214,13 +214,11 @@ class AsyncLearner:
 
     def _target_grads(self, added: int) -> float:
         """Cumulative grad steps the replay ratio owes for `added` buffered env
-        steps: one full `learning_steps` burst at the `steps_before_learning`
-        boundary (as the sync loop does), then `ratio` more per env step."""
-        if added < self.steps_before_learning:
+        steps: one full `learning_steps` burst at the `memory_warmup` boundary
+        (as the sync loop does), then `ratio` more per env step."""
+        if added < self.memory_warmup:
             return 0.0
-        return self.learning_steps + self._ratio * (
-            added - self.steps_before_learning
-        )
+        return self.learning_steps + self._ratio * (added - self.memory_warmup)
 
     def _drain_queue(self, bounded: bool = False) -> int:
         """Add queued transition batches to the buffer (the learner is the sole

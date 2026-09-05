@@ -134,12 +134,13 @@ class Trainer:
     def _precompile_update(self, agent, agent_key):
         """Compile the gradient step once the buffer holds warmup data. Returns
         the advanced key. No-op for agents without the update contract."""
-        if not (hasattr(agent, "update") and hasattr(agent, "steps_before_learning")):
+        if not (hasattr(agent, "update") and hasattr(agent, "memory_warmup")):
             return agent_key
         print("Compiling gradient step...", flush=True)
         t0 = time.time()
         agent_key, warm_key = jax.random.split(agent_key)
-        agent.update(steps=agent.steps_before_learning, agent_rng=warm_key)
+        # Exactly the gate value, so `due_for_update` serves one boundary here.
+        agent.update(steps=agent.memory_warmup, agent_rng=warm_key)
         jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
         # Hand back the boundary this call consumed, so the loop runs the full
         # schedule and the realized replay ratio matches the config.

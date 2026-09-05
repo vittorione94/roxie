@@ -11,7 +11,6 @@ critic_learning_rate: 3e-4
 target_policy_noise: 0.2       # target smoothing noise, in the actor's [-1, 1] units
 target_noise_clip: 0.5
 memory_warmup: 30_000
-steps_before_learning: 30_000
 steps_between_updates: 400
 learning_steps: 100
 max_grad_norm: 1

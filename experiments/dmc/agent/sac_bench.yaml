@@ -27,9 +27,14 @@ target_entropy: null            # null -> -target_entropy_scale * dim(A)
 # torque and is fatal on the ones that need bang-bang (AcrobotSwingup: SAC flat
 # at ~50 for 100M+ steps while the deterministic arms drift out to pre_act_abs
 # 4.0 and reach ~500). 3.0 permits E|a| ~ 0.97 while still costing entropy.
+#
+# Measured, 1-D tanh-squashed Gaussian, best E|a| the entropy floor allows:
+#   scale 1.0 -> 0.856   scale 3.0 -> 0.980   scale 5.0 -> 0.997
+# The 2026-09-05 AcrobotSwingupSparse run sat exactly on the scale-1.0
+# optimum (entropy -1.000, pre_act_abs 1.0-1.8) and scored 3.7 against DDPG's
+# 378, never finding reward at all (q_buffer ~ 0.02).
 target_entropy_scale: 3.0
 memory_warmup: 30_720
-steps_before_learning: 30_720
 steps_between_updates: 2_048
 learning_steps: 20
 # 1 = textbook SAC. Raising it is an algorithm change (REDQ/DroQ-style), not a

@@ -1,7 +1,7 @@
 """The update schedule must not depend on stride/offset alignment.
 
 Regression test for the v1 release grid, where all six off-policy arms of the walker suite
-ran 5M env steps at exactly zero gradient steps. `steps_before_learning` was
+ran 5M env steps at exactly zero gradient steps. The warmup offset was
 30_000 and the trainer advances `steps` in strides of `parallel_envs` = 256;
 30_000 % 256 == 48, so `(steps - 30_000) % 2_048` cycled 208, 464, ... 2_000 and
 never once reached 0. Nothing crashed, nothing logged a warning, and every run
@@ -18,10 +18,10 @@ from roxie.agents.agent import Agent
 
 
 class _Schedule(Agent):
-    """Bare carrier for the three attributes `due_for_update` reads."""
+    """Bare carrier for the two attributes `due_for_update` reads."""
 
     def __init__(self, before, between):
-        self.steps_before_learning = before
+        self.memory_warmup = before
         self.steps_between_updates = between
 
     def _export_hyperparams(self):
@@ -44,7 +44,7 @@ class TestUnalignedOffset:
         """The exact numbers that produced the zero-gradient-step release grid."""
         fired = _fire_count(before=30_000, between=2_048, stride=256, total=5_000_000)
         assert fired > 0, (
-            "steps_before_learning=30_000 with parallel_envs=256 fired no updates "
+            "memory_warmup=30_000 with parallel_envs=256 fired no updates "
             "— this is the v1 release-grid bug, the schedule is disarmed again"
         )
         # ~(5M - 30k) / 2048 boundaries, allow one either side for edge effects.
@@ -107,8 +107,7 @@ class TestBenchConfigsAligned:
         checked = 0
         for path in glob.glob("experiments/dmc/agent/*_bench.yaml"):
             text = open(path).read()
-            for key in ("memory_warmup", "steps_before_learning",
-                        "steps_between_updates"):
+            for key in ("memory_warmup", "steps_between_updates"):
                 m = re.search(rf"^{key}: ([\d_]+)", text, re.M)
                 if m is None:
                     continue  # PPO carries none of these
@@ -118,4 +117,4 @@ class TestBenchConfigsAligned:
                     f"parallel_envs={parallel_envs}"
                 )
                 checked += 1
-        assert checked >= 18, f"only checked {checked} keys — did the configs move?"
+        assert checked >= 12, f"only checked {checked} keys — did the configs move?"

@@ -20,7 +20,6 @@ target_entropy: null
 # torque, and there is no per-dim slack to trade at dim(A) = 1.
 target_entropy_scale: 1.0
 memory_warmup: 30_000
-steps_before_learning: 30_000
 steps_between_updates: 400
 learning_steps: 20
 # TD horizon for the Bellman target. >1 swaps the flat replay buffer for a

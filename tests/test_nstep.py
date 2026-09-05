@@ -187,7 +187,6 @@ class TestTrajectoryBufferEndToEnd:
                 "initial_noise_scale": 0.1, "theta": 2.0, "dt": 0.025,
                 "clip": 2.0, "mu": 0.0,
             }),
-            steps_before_learning=0,
             steps_between_updates=1,
             learning_steps=2,
             memory_warmup=0,

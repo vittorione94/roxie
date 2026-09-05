@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import rlax
 
 from roxie.agents.agent import Agent
-from roxie.models.actors import distribution_entropy
 
 # Pre-tanh magnitude past which the saturation penalty starts charging.
 # tanh(1) = 0.76, so the policy keeps the useful range for free and is pushed
@@ -225,10 +224,8 @@ def td4_actor_loss_fn(
 def ppo_loss_fn(
     actor_model,
     observations,
-    actions_buf,
+    pre_actions,
     old_log_probs,
-    action_low,
-    action_high,
     advantages,
     clip_epsilon,
     entropy_coef,
@@ -238,14 +235,21 @@ def ppo_loss_fn(
 
     `observations` are already normalized, under the frozen behaviour-policy
     statistics — that freeze is what keeps the ratio exactly 1 on the first pass.
+
+    `pre_actions` are the PRE-TANH draws the behaviour policy stored, and the
+    ratio is recomputed from those rather than from the stored actions. Scoring
+    an action instead would send `TanhNormal.log_prob` through a clipped
+    arctanh, which cannot recover a `u` past ~7.25 in float32: every saturated
+    draw would collapse onto that rail while the policy mean walked past it,
+    and the ratio would diverge on arithmetic rather than on policy drift.
     """
 
     distribution = actor_model(observations)
-    logp_new = distribution.log_prob(actions_buf)       # (N, T)
+    logp_new = distribution.log_prob_from_pre(pre_actions)   # (N, T)
 
-    # Analytic for a plain Normal; a single-sample estimate for a squashed
-    # policy, which is what `key` is for.
-    entropy_t = distribution_entropy(distribution, key)[:, :-1]
+    # A single-sample estimate: the squashed entropy has no closed form, which
+    # is what `key` is for.
+    entropy_t = distribution.entropy(seed=key)[:, :-1]
 
     # The last entry is the next-frame bootstrap, dropped so the ratio lines up
     # with the advantages: (NUM_ENVS, BATCH_SIZE - 1).
@@ -253,10 +257,11 @@ def ppo_loss_fn(
     # Clamped BEFORE the exponential, never after: `exp` of an unbounded
     # log-ratio overflows to `inf`, and an `inf` ratio makes this loss's own
     # gradient NaN even though its value stays finite (see `_MAX_LOG_RATIO`).
-    # The squashed policy reaches that regime easily -- `TanhNormal.log_prob`
-    # recovers `u` through a clipped arctanh, so a saturated sample's `u` is
-    # pinned at the rail while the mean walks away from it, and the resulting
-    # z-score is divided by a `std` free to shrink to `std_min`.
+    # A backstop, not a mechanism: scoring from `pre_actions` keeps the ratio
+    # bounded by the policy's actual drift, so this should never bind. It used
+    # to bind on EVERY step -- the arctanh path pinned saturated draws at the
+    # rail, `approx_kl` came out at exp(_MAX_LOG_RATIO), and the `target_kl`
+    # early stop then abandoned all but the first minibatch of every rollout.
     log_ratio = jnp.clip(
         logp_new[:, :-1] - old_log_probs[:, :-1],
         -_MAX_LOG_RATIO,
@@ -308,11 +313,8 @@ def sac_actor_loss_fn(
     """
     obs = samples["observations"]
     distribution = actor_model(obs)
-    u = distribution.sample(seed=key)
-    actions = jnp.tanh(u)
-    log_probs = distribution.log_prob(u) - jnp.sum(
-        jnp.log(1.0 - actions ** 2 + 1e-6), axis=-1
-    )
+    actions, u = distribution.sample_from_pre(seed=key)
+    log_probs = distribution.log_prob_from_pre(u)
     actions_scaled = Agent.scale_to_env(actions, action_low, action_high)
     q1, q2 = twin_critic(obs, actions_scaled)
     min_q = jnp.minimum(jnp.squeeze(q1), jnp.squeeze(q2))
@@ -356,25 +358,31 @@ def mpo_actor_loss_fn(
     """
     obs = samples["observations"]
 
-    # N actions per state from the target (old) policy: [S, B, A].
+    # N actions per state from the target (old) policy: [S, B, A]. Already in
+    # (-1, 1) — the policy is a `TanhNormal`, so nothing is clipped on top.
+    # `pre_actions` is kept because the M-step below scores these draws under
+    # the ONLINE policy: see `TanhNormal.log_prob_from_pre` for why recovering
+    # `u` through arctanh instead would bias that fit.
     target_dist = target_actor_model(obs)
-    actions = target_dist.sample(seed=key, sample_shape=(num_action_samples,))
+    actions, pre_actions = target_dist.sample_from_pre(
+        seed=key, sample_shape=(num_action_samples,)
+    )
 
     # No gradient flows into the policy through Q; it only shapes the E-step
     # weights and the temperature.
-    actions_scaled = Agent.scale_to_env(
-        jnp.clip(actions, -1.0, 1.0), action_low, action_high
-    )
+    actions_scaled = Agent.scale_to_env(actions, action_low, action_high)
     obs_tiled = jnp.broadcast_to(obs, (num_action_samples,) + obs.shape)
     q_values = critic_model(obs_tiled, actions_scaled)  # [S, B, 1]
     q_values = jax.lax.stop_gradient(jnp.squeeze(q_values, axis=-1))  # [S, B]
 
     # M-step likelihood of the sampled actions under the *online* policy.
     online_dist = actor_model(obs)
-    log_probs = online_dist.log_prob(actions)  # [S, B]
+    log_probs = online_dist.log_prob_from_pre(pre_actions)  # [S, B]
 
     # `kl_mean` varies the mean while holding the target std fixed; `kl_stddev`
-    # varies the std while holding the target mean fixed.
+    # varies the std while holding the target mean fixed. Both are the plain
+    # Gaussian KLs of the PRE-squash distributions, which is exact rather than
+    # an approximation: tanh is a bijection, so it leaves a KL unchanged.
     mu_t = jax.lax.stop_gradient(target_dist.loc)
     sig_t = jax.lax.stop_gradient(target_dist.scale_diag)
     mu_o = online_dist.loc
@@ -419,14 +427,23 @@ def mpo_actor_loss_fn(
         sample_axis=0,
     )
 
-    aux = {
-        "policy_loss": jnp.mean(outputs.policy_loss),
-        "temperature_loss": jnp.mean(outputs.temperature_loss),
-        "kl_loss": jnp.mean(outputs.kl_loss),
-        "temperature": temperature,
-        "kl_mean": jnp.mean(jnp.sum(kl_mean, axis=-1)),
-        "kl_stddev": jnp.mean(jnp.sum(kl_stddev, axis=-1)),
-    }
+    # Read off the ONLINE policy's mode, not the E-step draws: `mu_o` is what
+    # the M-step actually moves and what evaluation acts on, so it is the MPO
+    # analogue of the pre-tanh logit every other squashing actor reports. The
+    # trust region bounds each step, not the total drift, so the mean can still
+    # walk out to saturation over an episode of updates -- the reason these
+    # keys exist at all (see tests/test_diagnostics.py).
+    aux = actor_aux(
+        jnp.tanh(mu_o),
+        mu_o,
+        jnp.mean(q_values),
+        policy_loss=jnp.mean(outputs.policy_loss),
+        temperature_loss=jnp.mean(outputs.temperature_loss),
+        kl_loss=jnp.mean(outputs.kl_loss),
+        temperature=temperature,
+        kl_mean=jnp.mean(jnp.sum(kl_mean, axis=-1)),
+        kl_stddev=jnp.mean(jnp.sum(kl_stddev, axis=-1)),
+    )
     return jnp.mean(loss), aux
 
 

@@ -404,6 +404,9 @@ class Transition:
     terminal: jnp.ndarray
     log_probs: Optional[jnp.ndarray] = None    # on-policy agents only (PPO)
     value: Optional[jnp.ndarray] = None        # on-policy agents only (PPO)
+    # The pre-tanh `u` behind `action`. On-policy only, and only because the
+    # squash is not invertible in float32: see `transition_prototype`.
+    pre_action: Optional[jnp.ndarray] = None
     truncation: Optional[jnp.ndarray] = None   # off-policy n-step masking + PPO GAE
 
 
@@ -428,7 +431,16 @@ def transition_prototype(
     need it to stop n-step windows at episode boundaries the terminal flag does
     not mark; MPO, whose 1-step target reads only `terminal`, is the one agent
     that omits it. `on_policy` adds the behaviour log-prob and value estimate
-    PPO stores at acting time for its ratio and its GAE.
+    PPO stores at acting time for its ratio and its GAE, plus the PRE-TANH
+    action behind each stored action.
+
+    That last field is not redundant with `action`. PPO is the only agent that
+    re-scores a stored action under a later policy, and tanh is not invertible
+    in float32: `tanh(u)` rounds to exactly 1.0 for |u| >= 8, so recovering `u`
+    with an arctanh pins every saturated draw to the same rail (~7.25) while
+    the policy mean walks past it. The ratio then explodes and the `target_kl`
+    early stop fires on arithmetic rather than on policy drift. Storing `u`
+    keeps the density scored where it was actually drawn.
     """
     extra = {}
     if truncation:
@@ -436,6 +448,7 @@ def transition_prototype(
     if on_policy:
         extra["log_probs"] = jnp.zeros((), dtype=jnp.float32)
         extra["value"] = jnp.zeros((), dtype=jnp.float32)
+        extra["pre_action"] = jnp.zeros(env_action_size, dtype=jnp.float32)
     return Transition(
         observation=jnp.zeros(env_obs_size, dtype=jnp.float32),
         action=jnp.zeros(env_action_size, dtype=jnp.float32),

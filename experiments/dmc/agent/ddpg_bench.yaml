@@ -11,7 +11,7 @@
 #   optimisation  adam, lr 3e-4 (actor and critic), global grad-norm clip 1
 #   targets       gamma 0.99, tau 0.005
 #   replay        flat buffer 500k, min 10k, batch 512
-#   warmup        memory_warmup 30_720 = steps_before_learning 30_720
+#   warmup        memory_warmup 30_720 (also the gate on the first grad step)
 #   schedule      steps_between_updates 2_048 env steps x learning_steps 20
 #                 grad steps at batch 512  =>  replay ratio 5.0. Both are
 #                 multiples of parallel_envs 256, which is why the warmup is
@@ -38,7 +38,6 @@ critic_learning_rate: 3e-4
 target_policy_noise: 0.0
 target_noise_clip: 0.0
 memory_warmup: 30_720
-steps_before_learning: 30_720
 steps_between_updates: 2_048
 learning_steps: 20
 n_step: 5

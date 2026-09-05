@@ -19,7 +19,6 @@ v_min: -150.0
 v_max: 150.0
 num_atoms: 51
 memory_warmup: 30_000
-steps_before_learning: 30_000
 steps_between_updates: 400
 learning_steps: 100
 max_grad_norm: 1

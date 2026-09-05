@@ -28,6 +28,10 @@ actor_config:
   _target_: roxie.models.actors.StochasticActor
   features: [256, 256]
   use_layer_norm: false
+  # Surfaced rather than left to the class default: PPO's log-ratio divides by
+  # sigma, so this floor sets how fast approx_kl can move. See ppo_bench.yaml.
+  std_min: 1e-2
+  std_max: 5.0
 
 critic_config:
   _target_: roxie.models.critics.VCritic

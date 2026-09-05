@@ -6,10 +6,6 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-# Largest magnitude fed to arctanh: tanh saturates in float32 well before 1.0,
-# so the inverse must be clipped or it returns inf.
-_TANH_CLIP = 1.0 - 1e-6
-
 
 def _log_one_minus_tanh_sq(u: jnp.ndarray) -> jnp.ndarray:
     """log(1 - tanh(u)^2), numerically stable for large |u|.
@@ -32,9 +28,13 @@ class TanhNormal:
     away before it can cost anything. Squashing removes both: the mean is bounded
     by construction and the entropy saturates instead of growing without limit.
 
-    Only the methods the agents actually call are implemented (`sample`,
-    `sample_and_log_prob`, `log_prob`, `mean`, `entropy`, `stddev`); this is
-    deliberately not a full ``distrax.Distribution``.
+    Only the surface the agents actually use is implemented (`loc`,
+    `scale_diag`, `sample`, `sample_from_pre`, `log_prob_from_pre`, `mean`,
+    `entropy`, `stddev`); this is deliberately not a full
+    ``distrax.Distribution``. In particular there is NO `log_prob(action)`:
+    every density here is scored from the pre-tanh `u`, because the squash is
+    not invertible in float32 and an action-keyed overload would be the obvious
+    thing to reach for and would be silently wrong. See `log_prob_from_pre`.
     """
 
     def __init__(self, loc: jnp.ndarray, scale: jnp.ndarray):
@@ -42,49 +42,58 @@ class TanhNormal:
         # tanh correction must be summed to match.
         self._base = distrax.MultivariateNormalDiag(loc, scale)
 
-    def _log_prob_from_pre(self, u: jnp.ndarray) -> jnp.ndarray:
-        # y = tanh(u)  =>  log p_Y(y) = log p_U(u) - sum_i log(1 - tanh^2 u_i)
+    @property
+    def loc(self) -> jnp.ndarray:
+        """Pre-squash mean, under distrax's name for it.
+
+        Exposed because tanh is a bijection, so the KL between two of these
+        distributions is exactly the KL between their bases: MPO's decoupled
+        trust region keeps working verbatim on `loc` / `scale_diag` and never
+        has to account for the squash.
+        """
+        return self._base.loc
+
+    @property
+    def scale_diag(self) -> jnp.ndarray:
+        return self._base.scale_diag
+
+    def log_prob_from_pre(self, u: jnp.ndarray) -> jnp.ndarray:
+        """Log-density of ``tanh(u)``, scored from the pre-squash `u` itself.
+
+        y = tanh(u)  =>  log p_Y(y) = log p_U(u) - sum_i log(1 - tanh^2 u_i).
+
+        The only path there is, and the reason there is no action-keyed
+        overload: recovering `u` from `tanh(u)` needs an arctanh clipped short
+        of 1.0, which cannot tell saturated draws apart -- `tanh` rounds to
+        exactly 1.0 for |u| >= 8, so every such draw comes back as the same
+        rail (~7.25 in float32). Concretely:
+
+        * SAC differentiates through the draw. The clip has no gradient, so
+          routing the pathwise term through `log_prob` would kill it exactly
+          where the policy rails; from `u` it stays alive (d/du -> -2 per dim).
+        * MPO's M-step scores target-policy draws under the online policy. The
+          clip would pin every saturated draw's `u` to the same rail (~7.25 in
+          float32) while the online mean walks past it, dragging the weighted
+          maximum-likelihood fit back toward that rail.
+        * PPO recomputes a ratio against a log-prob stored one rollout earlier.
+          Same rail, and the release runs died on it: the density stopped
+          tracking the policy, `approx_kl` pinned at exp(_MAX_LOG_RATIO), and
+          `target_kl` abandoned every rollout after one minibatch. It stores
+          `u` in the buffer for this reason (`transition_prototype`).
+        """
         return self._base.log_prob(u) - jnp.sum(_log_one_minus_tanh_sq(u), axis=-1)
 
-    def sample(self, seed):
-        return jnp.tanh(self._base.sample(seed=seed))
+    def sample(self, seed, sample_shape=()):
+        return jnp.tanh(self._base.sample(seed=seed, sample_shape=sample_shape))
 
-    def sample_and_log_prob(self, seed):
-        """Sample an action and score it the way `log_prob` will score it later.
+    def sample_from_pre(self, seed, sample_shape=()):
+        """Reparameterized draw as ``(action, pre_activation)``.
 
-        The density is deliberately NOT taken from the `u` that was drawn. tanh
-        saturates in float32 long before the sampler stops producing large |u|
-        (with std_max=5, |u| > arctanh(1 - 1e-6) ~ 7.25 is routine), so the
-        returned action no longer identifies the `u` behind it: `log_prob` can
-        only recover the clipped value. Scoring the draw with the original `u`
-        would hand PPO an `old_log_probs` that its own recomputation cannot
-        reproduce -- at the first epoch, with the policy still untouched, the
-        ratio would differ from 1, reporting KL and clipping that never happened.
-        Going through `log_prob` makes the pair consistent by construction.
-
-        This costs one arctanh, and makes the returned log-prob flat w.r.t. the
-        sample once tanh saturates. That is fine here: `TanhNormal` is used by
-        PPO, whose only caller of this method is act-time action selection (see
-        `Agent.stochastic_step_fn`) and never backprops through it. A
-        reparameterized objective (SAC-style) must not route its pathwise
-        gradient through this method.
+        Pairs with `log_prob_from_pre`, where the reason to keep `u` is spelled
+        out. `u` is also what the saturation diagnostics are read off.
         """
-        action = jnp.tanh(self._base.sample(seed=seed))
-        return action, self.log_prob(action)
-
-    def log_prob(self, actions: jnp.ndarray) -> jnp.ndarray:
-        """Log-density of an already-squashed action.
-
-        Recovers the pre-squash `u` with arctanh, clipping first because tanh
-        saturates in float32 and the exact inverse would return inf. This is the
-        one path that defines `u` for a stored action -- `sample_and_log_prob`
-        routes through it too, so behaviour and current policies agree on `u`.
-        Given that, the correction term is a function of `u` alone, is identical
-        for both policies and CANCELS in PPO's importance ratio, which then
-        depends only on the base log-probs.
-        """
-        u = jnp.arctanh(jnp.clip(actions, -_TANH_CLIP, _TANH_CLIP))
-        return self._log_prob_from_pre(u)
+        u = self._base.sample(seed=seed, sample_shape=sample_shape)
+        return jnp.tanh(u), u
 
     def mean(self) -> jnp.ndarray:
         """tanh of the base mean -- the mode of the squashed density, not its
@@ -117,31 +126,14 @@ class TanhNormal:
 def deterministic_action(output) -> jnp.ndarray:
     """The evaluation action for either actor family, from one forward pass.
 
-    ``DeterministicActor.__call__`` already returns the action; a stochastic
-    actor returns a distribution, whose deterministic action is its mean (for
-    `TanhNormal`, the mode of the squashed density — see `TanhNormal.mean`).
-    Callers that must not sample (evaluation rollouts) go through this instead
-    of assuming one shape of output, so the same eval path serves PPO and the
-    deterministic agents. Dispatch is a Python-level check resolved at trace
-    time; distrax exposes ``mean`` as a method on some versions and a property
-    on others, hence the `callable` test.
+    ``DeterministicActor.__call__`` already returns the action; `StochasticActor`
+    returns a `TanhNormal`, whose deterministic action is its mean (the mode of
+    the squashed density — see `TanhNormal.mean`). Callers that must not sample
+    (evaluation rollouts) go through this instead of assuming one shape of
+    output, so the same eval path serves every agent. Dispatch is a
+    Python-level check resolved at trace time.
     """
-    if isinstance(output, jax.Array):
-        return output
-    mean = output.mean
-    return mean() if callable(mean) else mean
-
-
-def distribution_entropy(distribution, key=None) -> jnp.ndarray:
-    """Entropy for either a plain distrax distribution or a `TanhNormal`.
-
-    The squashed entropy needs a sample (see `TanhNormal.entropy`); the plain
-    Normal's is analytic and takes no key. Dispatch is a Python-level isinstance
-    check, resolved at trace time.
-    """
-    if isinstance(distribution, TanhNormal):
-        return distribution.entropy(seed=key)
-    return distribution.entropy()
+    return output if isinstance(output, jax.Array) else output.mean()
 
 
 class DeterministicActor(nnx.Module):
@@ -227,6 +219,16 @@ class DeterministicActor(nnx.Module):
 
 
 class StochasticActor(nnx.Module):
+    """MLP policy emitting a `TanhNormal` over actions in (-1, 1).
+
+    The squash is unconditional. It used to be a `squash` flag defaulting to
+    False, but every consumer now needs it: PPO for a policy mean the actuator
+    range can bound and an entropy bonus that cannot pay to inflate sigma
+    forever, SAC and MPO for that plus the stable tanh log-prob correction their
+    losses read off `TanhNormal.log_prob_from_pre`. A flag whose false branch no
+    config selects is only a way to build an agent that crashes in its loss.
+    """
+
     def __init__(
         self,
         in_features: int,
@@ -238,15 +240,12 @@ class StochasticActor(nnx.Module):
         use_layer_norm: bool = False,
         std_min: float = 1e-4,
         std_max: float = 1.0,
-        squash: bool = False,
     ):
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
         self.action_dim = action_dim
         self.std_min = std_min
         self.std_max = std_max
-        # False so SAC/MPO, which share this class, are untouched.
-        self.squash = squash
 
         hidden_layers = []
         norm_layers = []
@@ -265,9 +264,7 @@ class StochasticActor(nnx.Module):
         self.output_layer = nnx.Linear(current_features, action_dim, rngs=rngs)
         self.log_std_layer = nnx.Linear(current_features, action_dim, rngs=rngs)
 
-        self.distribution = TanhNormal if squash else distrax.MultivariateNormalDiag
-
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray) -> TanhNormal:
         for i, layer in enumerate(self.hidden_layers):
             x = layer(x)
             if self.use_layer_norm:
@@ -279,4 +276,4 @@ class StochasticActor(nnx.Module):
         std = nnx.softplus(self.log_std_layer(x)) + 1e-5
         std = jnp.clip(std, self.std_min, self.std_max)
 
-        return self.distribution(mean, std)
+        return TanhNormal(mean, std)

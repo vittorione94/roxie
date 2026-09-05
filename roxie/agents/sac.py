@@ -33,30 +33,6 @@ class LogAlpha(nnx.Module):
         self.log_alpha = nnx.Param(jnp.array(init_value, dtype=jnp.float32))
 
 
-@functools.partial(nnx.jit, static_argnames=("evaluate",))
-def _sac_step_fn(actor_model, observation, evaluate, key):
-    """Squashed action plus the deviation from the policy mode.
-
-    The second return mirrors DDPG's ``(action, noise)`` contract so the trainer
-    logs an exploration magnitude uniformly. SAC has no noise module — its
-    exploration *is* the sampling — so the analogue is how far the sample landed
-    from tanh(mean), in the same normalized [-1, 1] action units.
-    """
-    distribution = actor_model(observation)
-    try:
-        mean = distribution.mean()
-    except TypeError:
-        # Some distrax versions expose mean as a property.
-        mean = distribution.mean
-    mode = jnp.tanh(mean)
-
-    if evaluate:
-        return mode, jnp.zeros_like(mode)
-
-    action = jnp.tanh(distribution.sample(seed=key))
-    return action, mode - action
-
-
 # Not jitted on its own — called inside `_grad_steps` so N steps fuse into one
 # compiled program. `update_actor` is a *traced* boolean: under `lax.scan` the
 # step index is not static, so the delayed policy update is a runtime branch.
@@ -268,7 +244,6 @@ class SAC(Agent):
         auto_alpha: bool = True,
         target_entropy: float = None,
         target_entropy_scale: float = 1.0,
-        steps_before_learning: int = 100,
         steps_between_updates: int = 10,
         learning_steps: int = 5,
         memory_warmup: int = 100,
@@ -353,7 +328,6 @@ class SAC(Agent):
         self.action_low = action_low
         self.action_high = action_high
         self.replay = replay
-        self.steps_before_learning = steps_before_learning
         self.steps_between_updates = steps_between_updates
         self.learning_steps = learning_steps
         self.policy_delay = int(policy_delay)
@@ -404,7 +378,12 @@ class SAC(Agent):
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
 
-        action, noise = _sac_step_fn(actor, observation, evaluate, key)
+        # No bounding on top: SAC's actor is a `TanhNormal`, which squashes
+        # its own samples and owns the tanh log-prob correction its losses
+        # need.
+        action, noise, _, _, _ = Agent.stochastic_step_fn(
+            actor, observation, evaluate, key,
+        )
         return (
             Agent.scale_to_env(action, self.action_low, self.action_high),
             noise,

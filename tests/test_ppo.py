@@ -190,8 +190,6 @@ def _looped_update(state, key, agent, tensors):
                 state, step_key, *[leaf[sl] for leaf in shuffled],
                 clip_eps=agent.clip_eps,
                 entropy_coef=agent.entropy_coef,
-                action_low=agent.action_low,
-                action_high=agent.action_high,
             )
             steps += 1
             sums["actor"] += float(actor_loss)
@@ -238,7 +236,6 @@ class TestFusedUpdateMatchesTheLoop:
             fused_nodes, burst_key, *tensors,
             agent.learning_steps, agent.num_minibatches, agent.minibatch_size,
             agent.clip_eps, agent.entropy_coef, agent.target_kl,
-            agent.action_low, agent.action_high,
         )
         ref_steps, ref_stops, ref_sums = _looped_update(
             looped_state, burst_key, agent, tensors,
@@ -276,8 +273,49 @@ class TestFusedUpdateMatchesTheLoop:
             jax.random.PRNGKey(7), *tensors,
             agent.learning_steps, agent.num_minibatches, agent.minibatch_size,
             agent.clip_eps, agent.entropy_coef, agent.target_kl,
-            agent.action_low, agent.action_high,
         )
         assert 0 < int(steps) < agent.learning_steps * agent.num_minibatches, (
             f"{int(steps)} passes ran: the bound did not stop mid-rollout"
         )
+
+
+class TestSaturatedRolloutStillTrains:
+    """`tests/test_losses.py::TestRatioSurvivesSaturation` pins the loss-level
+    property; this pins the PLUMBING that feeds it.
+
+    The pre-tanh draw only reaches the loss if acting returns it, `extras`
+    carries it, the queue has a slot allocated for it, and `_prepare_rollout`
+    hands it back in the right position. Any of those silently reverting puts
+    `approx_kl` back at the rail, and the visible symptom is not a crash but a
+    trust region that abandons every rollout after its first minibatch -- which
+    is what the release runs did for their last 493M steps.
+    """
+
+    @staticmethod
+    def _saturate(agent, mean=20.0):
+        """Force the policy past the arctanh rail, where the old path lost `u`."""
+        layer = agent.state.actor.output_layer
+        layer.kernel[...] = jnp.zeros_like(layer.kernel[...])
+        layer.bias[...] = jnp.full_like(layer.bias[...], mean)
+
+    def test_saturated_policy_does_not_early_stop_every_rollout(self):
+        agent = _make_agent(learning_steps=4, num_minibatches=2, target_kl=0.03)
+        self._saturate(agent)
+        diag = _collect_and_update(agent, drift=0.0)
+
+        assert jnp.isfinite(diag["ppo/approx_kl"])
+        # The whole budget, not the one step a tripped trust region allows.
+        assert diag["ppo/steps_per_rollout"] == 8
+        assert diag["ppo/kl_early_stops"] == 0
+
+    def test_stored_pre_actions_reproduce_the_behaviour_log_probs(self):
+        """The ratio is 1 on the first pass only if the stored `u` is the `u`
+        the behaviour policy actually drew from."""
+        agent = _make_agent()
+        self._saturate(agent)
+        _norm_obs, pre_actions, old_log_probs, _returns, _adv = _prepared_rollout(
+            agent, jax.random.PRNGKey(0)
+        )
+        # Never round-tripped through tanh: past the rail that is lossy.
+        assert float(jnp.min(jnp.abs(pre_actions))) > 8.0
+        assert jnp.isfinite(old_log_probs).all()

@@ -66,7 +66,6 @@ def _config(name: str):
     # policy and a non-trivial schedule state to lose.
     for key, value in (
         ("memory_warmup", 4 * NUM_ENVS),
-        ("steps_before_learning", 4 * NUM_ENVS),
         ("steps_between_updates", NUM_ENVS),
         ("learning_steps", 2),
         ("num_minibatches", 2),

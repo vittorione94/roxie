@@ -53,35 +53,6 @@ class MPODualParams(nnx.Module):
         )
 
 
-@functools.partial(nnx.jit, static_argnames=("evaluate",))
-def _mpo_step_fn(actor_model, observation, evaluate, key):
-    """Action selection for MPO: mean when evaluating, otherwise a sample.
-
-    Actions are a plain Gaussian bounded by clipping to [-1, 1] (no tanh
-    squashing), consistent with how the loss treats them.
-
-    Returns ``(action, deviation_from_mode)``. The second value is what the
-    trainer reduces to the `noise/per_joint_abs` panel; MPO explores from its own
-    stochastic policy, so — exactly as in SAC — it is the sampled action's
-    distance from the mode rather than an injected perturbation. It is returned
-    unconditionally because the fused acting burst accumulates it inside a
-    `lax.scan`, where a `None` would change the carry's structure.
-    """
-    distribution = actor_model(observation)
-    try:
-        mean = distribution.mean()
-    except TypeError:
-        # Some distrax versions expose mean as a property.
-        mean = distribution.mean
-    mode = jnp.clip(mean, -1.0, 1.0)
-
-    if evaluate:
-        return mode, jnp.zeros_like(mode)
-
-    action = jnp.clip(distribution.sample(seed=key), -1.0, 1.0)
-    return action, mode - action
-
-
 # Not jitted on its own — called inside `_mpo_grad_steps` so N steps fuse into
 # one compiled program.
 def _mpo_grad_step(
@@ -246,7 +217,8 @@ class MPO(Agent):
 
     https://arxiv.org/abs/1806.06920
 
-    Off-policy actor-critic with a Gaussian policy. Each update alternates:
+    Off-policy actor-critic with a tanh-squashed Gaussian policy. Each update
+    alternates:
 
     - E-step: estimate a nonparametric improved policy by reweighting actions
       sampled from the target policy with ``softmax(Q / temperature)``; the
@@ -285,7 +257,6 @@ class MPO(Agent):
         init_temperature: float = 1.0,
         init_alpha_mean: float = 1.0,
         init_alpha_stddev: float = 1.0,
-        steps_before_learning: int = 100,
         steps_between_updates: int = 10,
         learning_steps: int = 5,
         memory_warmup: int = 100,
@@ -357,7 +328,6 @@ class MPO(Agent):
         self.action_low = action_low
         self.action_high = action_high
         self.replay = replay
-        self.steps_before_learning = steps_before_learning
         self.steps_between_updates = steps_between_updates
         self.learning_steps = learning_steps
         self.memory_warmup = memory_warmup
@@ -408,7 +378,12 @@ class MPO(Agent):
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
 
-        action, noise = _mpo_step_fn(actor, observation, evaluate, key)
+        # Bounded by the actor's own tanh, not by a clip on top of it: the
+        # `TanhNormal` samples already live in (-1, 1), which is also how both
+        # losses treat actions.
+        action, noise, _, _, _ = Agent.stochastic_step_fn(
+            actor, observation, evaluate, key,
+        )
         return (
             Agent.scale_to_env(action, self.action_low, self.action_high),
             noise,

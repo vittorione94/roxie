@@ -57,7 +57,7 @@ Every run is a self-contained experiment YAML under [`experiments/`](experiments
 
 All share one `Agent` base and pick their replay structure from `n_step`. Two caveats when comparing them: PPO is not replay-ratio comparable, and MPO is ~20× more expensive per gradient step.
 
-**→ [docs/agents.md](docs/agents.md)** — the shared base, buffer selection, and what makes a fair comparison.
+**→ [docs/agents.md](docs/agents.md)** — the shared base, the fused burst (`burst_nodes` and `graph_jit`, and the ~2× throughput hoisting the module-graph walk bought), buffer selection, and what makes a fair comparison.
 
 ## Configuration
 

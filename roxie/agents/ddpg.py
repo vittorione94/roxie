@@ -167,7 +167,6 @@ class DDPG(Agent):
         critic_learning_rate: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
-        steps_before_learning: int = 100,
         steps_between_updates: int = 10,
         learning_steps: int = 5,
         memory_warmup: int = 100,
@@ -222,7 +221,6 @@ class DDPG(Agent):
         self.action_low = action_low
         self.action_high = action_high
         self.replay = replay
-        self.steps_before_learning = steps_before_learning
         self.steps_between_updates = steps_between_updates
         self.learning_steps = learning_steps
         self.memory_warmup = memory_warmup

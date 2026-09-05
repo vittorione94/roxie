@@ -54,7 +54,7 @@ EXPECTED = {
     "sac": SQUASHED_ACTOR | BOOTSTRAPPED_CRITIC | TWIN | {
         "alpha", "entropy", "target_act_rail_frac",
     },
-    "mpo": BOOTSTRAPPED_CRITIC | {
+    "mpo": SQUASHED_ACTOR | BOOTSTRAPPED_CRITIC | {
         "policy_loss", "temperature_loss", "kl_loss", "temperature",
         "kl_mean", "kl_stddev", "target_act_rail_frac",
     },
@@ -99,8 +99,7 @@ def _build(name: str):
     # point is to exercise the burst, not the schedule (`test_update_schedule.py`
     # covers that).
     warmup = WARMUP_ROWS * ENVS
-    for key, value in (("steps_before_learning", warmup),
-                       ("steps_between_updates", ENVS),
+    for key, value in (("steps_between_updates", ENVS),
                        ("memory_warmup", warmup), ("learning_steps", 2)):
         if key in cfg:
             cfg[key] = value

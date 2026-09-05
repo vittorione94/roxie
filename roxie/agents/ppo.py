@@ -41,36 +41,6 @@ def _compute_gae(rewards, values, termination, truncation, gamma, gae_lambda):
     return adv
 
 
-@functools.partial(nnx.jit, static_argnames=("evaluate",))
-def _ppo_step_fn(actor_model, critic_model, observation, evaluate, key):
-    """Everything acting produces, in ONE dispatch.
-
-    The value estimate used to be a separate eager ``self.state.critic(obs)``
-    call outside the jitted actor step, so every env step cost two dispatches
-    (plus an un-jitted nnx module call) instead of one.
-
-    Returns ``(action, log_probs, value, deviation_from_mode)``. `action` is
-    pre-scaling, in [-1, 1] — that is the space its log-prob is taken in, and
-    the ratio at update time has to match it. The last value feeds the trainer's
-    `noise/per_joint_abs` panel; PPO explores from its own stochastic policy, so
-    as in SAC/MPO it is the sample's distance from the mode.
-    """
-    distribution = actor_model(observation)
-    try:
-        mode = distribution.mean()
-    except TypeError:
-        # Some distrax versions expose mean as a property.
-        mode = distribution.mean
-
-    if evaluate:
-        action = mode
-        log_probs = distribution.log_prob(action)
-    else:
-        action, log_probs = distribution.sample_and_log_prob(seed=key)
-
-    return action, log_probs, critic_model(observation), mode - action
-
-
 # Split out of the gradient step so the same rollout can be trained on
 # `learning_steps` times.
 @functools.partial(
@@ -105,7 +75,8 @@ def _prepare_rollout(
     # All leaves are (NUM_ENVS, BATCH_SIZE, ...).
     re_packed_samples = {
         "observations": data.observation,
-        "actions": data.action,
+        # The stored ACTION is never re-scored -- see `pre_actions`.
+        "pre_actions": data.pre_action,
         "log_probs": data.log_probs,
         "rewards": data.reward,
         "values": data.value,
@@ -153,7 +124,7 @@ def _prepare_rollout(
             obs_stats=state.obs_stats,
         ),
         norm_obs,
-        re_packed_samples["actions"],
+        re_packed_samples["pre_actions"],
         re_packed_samples["log_probs"],
         returns_t,
         adv_t,
@@ -166,15 +137,13 @@ def _grad_step(
     state: TrainState,
     key: jax.random.PRNGKey,
     norm_obs: jnp.ndarray,
-    actions: jnp.ndarray,
+    pre_actions: jnp.ndarray,
     old_log_probs: jnp.ndarray,
     returns_t: jnp.ndarray,
     adv_t: jnp.ndarray,
     *,
     clip_eps: float,
     entropy_coef: float,
-    action_low: jnp.ndarray,
-    action_high: jnp.ndarray,
 ):
     """One gradient step for the PPO agent on an already prepared rollout,
     MUTATING ``state`` in place.
@@ -190,10 +159,8 @@ def _grad_step(
     )(
             actor_model=state.actor,
             observations=norm_obs,
-            actions_buf=actions,
+            pre_actions=pre_actions,
             old_log_probs=old_log_probs,
-            action_low=action_low,
-            action_high=action_high,
             advantages=adv_t,
             clip_epsilon=clip_eps,
             entropy_coef=entropy_coef,
@@ -228,7 +195,7 @@ def _grad_steps(
     state: TrainState,
     key: jax.random.PRNGKey,
     norm_obs: jnp.ndarray,
-    actions: jnp.ndarray,
+    pre_actions: jnp.ndarray,
     old_log_probs: jnp.ndarray,
     returns_t: jnp.ndarray,
     adv_t: jnp.ndarray,
@@ -238,8 +205,6 @@ def _grad_steps(
     clip_eps: float,
     entropy_coef: float,
     target_kl: float,
-    action_low: jnp.ndarray,
-    action_high: jnp.ndarray,
 ):
     """Run one prepared rollout's full `learning_steps` x `num_minibatches`
     schedule as a single compiled program, stopping early on `target_kl`.
@@ -250,7 +215,7 @@ def _grad_steps(
     advanced `key` so the stream threads on exactly as the Python loop's did.
     """
     graphdef, node_carry = nnx.split(state)
-    rollout = (norm_obs, actions, old_log_probs, returns_t, adv_t)
+    rollout = (norm_obs, pre_actions, old_log_probs, returns_t, adv_t)
 
     f0, i0 = jnp.zeros((), jnp.float32), jnp.zeros((), jnp.int32)
     # (steps, actor_sum, critic_sum, kl_sum, clip_sum, early_stops,
@@ -281,7 +246,6 @@ def _grad_steps(
                     actor_loss, critic_loss, approx_kl, clip_frac = _grad_step(
                         inner, step_key, *mb,
                         clip_eps=clip_eps, entropy_coef=entropy_coef,
-                        action_low=action_low, action_high=action_high,
                     )
                     # The updates wrote through to `inner`, so re-splitting
                     # gives the post-step carry.
@@ -474,11 +438,14 @@ class PPO(Agent):
         whole rollout of acting costs one host dispatch instead of one per env
         step. Returns ``(scaled_action, deviation_from_mode, extras)``.
 
-        ``extras`` carries the behaviour log-prob and value estimate, which are
-        properties of the policy AT ACTING TIME and cannot be recovered later:
-        the ratio PPO clips is against exactly these. They reach the buffer as a
-        value rather than via ``self.last_*`` because on the fused path acting
-        and buffering are both inside one trace.
+        ``extras`` carries the behaviour log-prob, value estimate and pre-tanh
+        action, which are properties of the policy AT ACTING TIME and cannot be
+        recovered later: the ratio PPO clips is against exactly these. The
+        pre-tanh draw is in that list because it genuinely cannot be recovered —
+        `tanh` is not invertible in float32 past |u| ~ 7.25 (see
+        `transition_prototype`). They reach the buffer as a value rather than
+        via ``self.last_*`` because on the fused path acting and buffering are
+        both inside one trace.
 
         ``obs_stats`` MUST be the rollout's frozen snapshot, not live statistics
         — see ``freeze_obs_norm_per_chunk``. ``noise_module`` is accepted and
@@ -489,16 +456,18 @@ class PPO(Agent):
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
             observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
 
-        action, log_probs, value, noise = _ppo_step_fn(
-            actor, self.state.critic if critic is None else critic,
-            observation, evaluate, key,
+        # PPO's actor is a `TanhNormal`, so its samples are already bounded.
+        # The critic rides along so acting stays one dispatch.
+        action, noise, pre_action, log_probs, value = Agent.stochastic_step_fn(
+            actor, observation, evaluate, key,
+            critic_model=self.state.critic if critic is None else critic,
         )
         return (
             Agent.scale_to_env(action, self.action_low, self.action_high),
             noise,
-            # Pre-scaling: the log-prob is taken in [-1, 1], where the ratio at
-            # update time is recomputed.
-            {"log_probs": log_probs, "value": value},
+            # Unscaled: the log-prob is taken in the pre-tanh space, which is
+            # where the ratio at update time is recomputed.
+            {"log_probs": log_probs, "value": value, "pre_action": pre_action},
         )
 
     def step(
@@ -560,7 +529,8 @@ class PPO(Agent):
         layout — a length-1 time axis on every leaf.
 
         `value` alone is already (NUM_ENVS, 1) straight from the critic, so it
-        is the one field that must NOT be expanded again.
+        is the one field that must NOT be expanded again. `pre_action` carries a
+        per-actuator axis like `action`, so it gets the same `[:, None, :]`.
         """
         return Transition(
             observation=prev_obs[:, None, :],
@@ -571,6 +541,7 @@ class PPO(Agent):
             terminal=termination[:, None],
             log_probs=extras["log_probs"][:, None],
             value=extras["value"],
+            pre_action=extras["pre_action"][:, None, :],
             truncation=truncation[:, None],
         )
 
@@ -582,7 +553,7 @@ class PPO(Agent):
 
         Overridden rather than inherited because the on-policy queue's layout
         genuinely differs from the off-policy buffers': it wants an explicit
-        time axis, and it stores the two behaviour quantities `extras` carries.
+        time axis, and it stores the behaviour quantities `extras` carries.
         `self.replay.add`, not the jitted `_jit_replay_add`, because the caller
         is already inside a trace and would only nest a `pjit` in it.
         """
@@ -624,7 +595,7 @@ class PPO(Agent):
 
             (
                 norm_obs,
-                actions,
+                pre_actions,
                 old_log_probs,
                 returns_t,
                 adv_t,
@@ -657,7 +628,7 @@ class PPO(Agent):
                 self._burst_nodes,
                 agent_rng,
                 norm_obs,
-                actions,
+                pre_actions,
                 old_log_probs,
                 returns_t,
                 adv_t,
@@ -667,8 +638,6 @@ class PPO(Agent):
                 self.clip_eps,
                 self.entropy_coef,
                 self.target_kl,
-                self.action_low,
-                self.action_high,
             )
 
             # The one host sync for the whole rollout.

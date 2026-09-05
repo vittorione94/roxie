@@ -372,11 +372,10 @@ def mpo_critic_loss_fn(
     obs = samples["observations"]
     next_obs = samples["next_observations"]
 
-    # [S, B, A]. Gaussian, no squashing — bounded by clipping, as in action
-    # selection.
+    # [S, B, A]. Tanh-squashed Gaussian, so the draws are already in (-1, 1)
+    # and nothing is clipped on top — as in action selection.
     next_dist = target_actor_model(next_obs)
     next_actions = next_dist.sample(seed=key, sample_shape=(num_action_samples,))
-    next_actions = jnp.clip(next_actions, -1.0, 1.0)
     next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
 
     next_obs_tiled = jnp.broadcast_to(next_obs, (num_action_samples,) + next_obs.shape)
@@ -428,11 +427,8 @@ def sac_critic_loss_fn(
     next_obs = samples["next_observations"]
 
     next_dist = actor_model(next_obs)
-    next_u = next_dist.sample(seed=key)
-    next_actions = jnp.tanh(next_u)
-    next_log_probs = next_dist.log_prob(next_u) - jnp.sum(
-        jnp.log(1.0 - next_actions ** 2 + 1e-6), axis=-1
-    )
+    next_actions, next_pre = next_dist.sample_from_pre(seed=key)
+    next_log_probs = next_dist.log_prob_from_pre(next_pre)
 
     next_actions_scaled = Agent.scale_to_env(next_actions, action_low, action_high)
 
@@ -443,8 +439,6 @@ def sac_critic_loss_fn(
     q1, q2 = twin_critic(obs, samples["actions"])
     q1, q2 = jnp.squeeze(q1), jnp.squeeze(q2)
 
-    # Unlike DDPG/TD3 this loss IS the halved MSE, so `rlax.l2_loss`'s built-in
-    # 0.5 is exactly the factor that belongs here.
     reward = jnp.squeeze(samples["rewards"])
     td_error1 = jax.vmap(rlax.td_learning)(q1, reward, samples["bootstrap"], target_q)
     td_error2 = jax.vmap(rlax.td_learning)(q2, reward, samples["bootstrap"], target_q)

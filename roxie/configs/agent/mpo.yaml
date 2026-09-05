@@ -17,7 +17,6 @@ init_temperature: 1.0
 init_alpha_mean: 1.0
 init_alpha_stddev: 1.0
 memory_warmup: 30_000
-steps_before_learning: 30_000
 steps_between_updates: 400
 learning_steps: 20
 max_grad_norm: 1

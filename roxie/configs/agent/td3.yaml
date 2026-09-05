@@ -12,7 +12,6 @@ target_policy_noise: 0.2        # TD3 paper's target smoothing, in the actor's [
 target_noise_clip: 0.5
 policy_delay: 2                 # actor + target updates every 2 critic steps
 memory_warmup: 30_000
-steps_before_learning: 30_000
 steps_between_updates: 400
 learning_steps: 100
 max_grad_norm: 1
