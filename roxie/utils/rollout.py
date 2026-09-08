@@ -605,7 +605,12 @@ class JaxRollout:
                     obs = Agent.normalize_obs(obs, mean, std, agent.obs_clip)
                 # No noise module: its stateful update cannot be mutated
                 # across the while_loop trace level.
-                action = jnp.clip(deterministic_action(actor(obs)), -1.0, 1.0)
+                # Off the `select_action` path, so it needs its own scrub: a
+                # NaN here would otherwise reach the physics through the clip,
+                # which passes NaN straight through.
+                action = jnp.clip(
+                    Agent.finite_or_zero(deterministic_action(actor(obs))), -1.0, 1.0
+                )
                 action = Agent.scale_to_env(action, agent.action_low, agent.action_high)
 
                 # reset_pool=None: no auto-reset — each episode runs to its

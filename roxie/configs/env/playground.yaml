@@ -48,6 +48,14 @@ impl: jax
 naconmax: null
 njmax: null
 
+# Warp's CUDA-graph capture mode; MJX ignores it. null does NOT mean "mjx's
+# default" here — it means `loader.DEFAULT_WARP_GRAPH_MODE`
+# (WARP_STAGED_EX), because mjx's own default (WARP) recaptures a graph every
+# step under JAX and leaks ~0.1 GB of HOST ram per million steps, which
+# OOM-kills a long run. Set it only to test that claim: `WARP` reproduces the
+# leak, `JAX`/`NONE` avoid it eagerly and are much slower.
+graph_mode: null
+
 # null = the env's own declared `episode_length`, falling back to
 # loader.DEFAULT_MAX_EPISODE_STEPS.
 max_episode_steps: null

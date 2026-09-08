@@ -6,6 +6,8 @@ import pytest
 from flax import nnx
 
 from roxie.agents.agent import Agent, ObsStats
+from roxie.exploration.noisy import GaussianNoise
+from roxie.models.actors import TanhNormal
 from roxie.agents.utils import (
     Transition,
     fused_grad_steps,
@@ -44,6 +46,128 @@ class TestScaleToEnv:
         result = Agent.scale_to_env(x, low, high)
         expected = jnp.array([[0.0, 0.5, 1.0]])
         assert jnp.allclose(result, expected)
+
+
+class _NaNDeterministicActor(nnx.Module):
+    """Stands in for an actor whose weights have blown up."""
+
+    def __init__(self, action_dim: int):
+        self.action_dim = action_dim
+
+    def __call__(self, obs):
+        return jnp.full((obs.shape[0], self.action_dim), jnp.nan)
+
+
+class _NaNStochasticActor(nnx.Module):
+    def __init__(self, action_dim: int):
+        self.action_dim = action_dim
+
+    def __call__(self, obs):
+        nan = jnp.full((obs.shape[0], self.action_dim), jnp.nan)
+        return TanhNormal(nan, jnp.ones_like(nan))
+
+
+class TestFiniteOrZero:
+    def test_replaces_non_finite(self):
+        x = jnp.array([jnp.nan, jnp.inf, -jnp.inf, 0.5, -1.0])
+        result = Agent.finite_or_zero(x)
+        assert jnp.array_equal(result, jnp.array([0.0, 0.0, 0.0, 0.5, -1.0]))
+
+    def test_passes_finite_through(self):
+        x = jnp.array([[-1.0, 0.0, 1.0]])
+        assert jnp.array_equal(Agent.finite_or_zero(x), x)
+
+    def test_deterministic_step_is_finite(self):
+        actor = _NaNDeterministicActor(3)
+        noise = GaussianNoise(action_shape=(3,), initial_noise_scale=0.1)
+        action, applied_noise = Agent.deterministic_step_fn(
+            actor, jnp.zeros((4, 8)), jax.random.PRNGKey(0), noise
+        )
+        assert jnp.isfinite(action).all()
+        assert jnp.isfinite(applied_noise).all()
+        assert jnp.all(jnp.abs(action) <= 1.0)
+
+    def test_stochastic_step_is_finite(self):
+        actor = _NaNStochasticActor(3)
+        action, deviation, _, _, _ = Agent.stochastic_step_fn(
+            actor, jnp.zeros((4, 8)), False, jax.random.PRNGKey(0)
+        )
+        assert jnp.array_equal(action, jnp.zeros((4, 3)))
+        assert jnp.isfinite(deviation).all()
+
+    def test_stochastic_eval_step_is_finite(self):
+        actor = _NaNStochasticActor(3)
+        action, deviation, _, _, _ = Agent.stochastic_step_fn(
+            actor, jnp.zeros((4, 8)), True, jax.random.PRNGKey(0)
+        )
+        assert jnp.array_equal(action, jnp.zeros((4, 3)))
+        assert jnp.isfinite(deviation).all()
+
+
+class _FakeBufferState:
+    """A buffer_state stand-in: `_pruned_transition` reads only `.experience`."""
+
+    def __init__(self, experience):
+        self.experience = experience
+
+
+class TestNonFiniteNeverPersists:
+    """The two stores a NaN would survive in for the rest of the run.
+
+    Both are cumulative: the statistics are running sums that never recover, and
+    a buffer item is resampled into batches until the run ends. One NaN write is
+    not one bad gradient step, it is a permanently poisoned source.
+    """
+
+    def test_obs_stats_survive_a_nan_observation(self):
+        stats = Agent.init_obs_stats((3,))
+        obs = jnp.array([[1.0, 2.0, 3.0], [jnp.nan, jnp.inf, 1.0]])
+
+        stats = Agent.update_obs_stats(stats, obs)
+        mean, std = Agent.obs_mean_std(stats, 1e-8)
+
+        assert jnp.isfinite(stats.sum).all() and jnp.isfinite(stats.sumsq).all()
+        assert jnp.isfinite(mean).all() and jnp.isfinite(std).all()
+
+    def test_a_later_clean_batch_still_normalizes(self):
+        """The failure this prevents: once the sums are NaN, EVERY agent sees
+        NaN for EVERY env forever, whether or not anything is still diverging."""
+        stats = Agent.init_obs_stats((3,))
+        stats = Agent.update_obs_stats(stats, jnp.full((2, 3), jnp.nan))
+        stats = Agent.update_obs_stats(stats, jnp.ones((2, 3)))
+
+        mean, std = Agent.obs_mean_std(stats, 1e-8)
+        clean = Agent.normalize_obs(jnp.ones((1, 3)), mean, std, 10.0)
+        assert jnp.isfinite(clean).all()
+
+    def test_buffer_write_is_scrubbed(self):
+        state = _FakeBufferState(transition_prototype(3, 2))
+        written = Agent._pruned_transition(
+            state,
+            observation=jnp.full((1, 3), jnp.nan),
+            action=jnp.zeros((1, 2)),
+            reward=jnp.array([jnp.nan]),
+            terminal=jnp.array([False]),
+            truncation=jnp.array([False]),
+        )
+
+        assert jnp.array_equal(written.observation, jnp.zeros((1, 3)))
+        assert jnp.array_equal(written.reward, jnp.zeros((1,)))
+        # Flags are not floats and must pass through untouched.
+        assert written.terminal.dtype == jnp.bool_
+
+    def test_buffer_pruning_still_drops_unused_fields(self):
+        """The scrub must not resurrect a field this buffer never allocated."""
+        state = _FakeBufferState(transition_prototype(3, 2, truncation=False))
+        written = Agent._pruned_transition(
+            state,
+            observation=jnp.zeros((1, 3)),
+            action=jnp.zeros((1, 2)),
+            reward=jnp.zeros((1,)),
+            terminal=jnp.array([False]),
+            truncation=jnp.array([False]),
+        )
+        assert written.truncation is None
 
 
 class TestObsStats:

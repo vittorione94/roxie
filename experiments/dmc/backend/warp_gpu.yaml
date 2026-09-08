@@ -25,6 +25,12 @@ env:
   impl: warp
   naconmax: null
   njmax: null
+  # Stated rather than defaulted: this is the cell where it matters. mjx's own
+  # default (GraphMode.WARP) recaptures a CUDA graph every step under JAX and
+  # leaks host RAM until the OOM killer fires — ~50 GB by 450M steps, i.e. this
+  # cell cannot finish its 500M budget without this line. See
+  # `loader._set_graph_mode`.
+  graph_mode: WARP_STAGED_EX
 
 runtime:
   matmul_precision: tensorfloat32

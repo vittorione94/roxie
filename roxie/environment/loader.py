@@ -203,11 +203,56 @@ def log_loaded_backend(
     print("\n".join(lines), flush=True)
 
 
+# CUDA-graph capture mode for the Warp backend. mjx defaults to
+# ``GraphMode.WARP``, which LEAKS HOST RAM under JAX -- see `_set_graph_mode`.
+DEFAULT_WARP_GRAPH_MODE = "WARP_STAGED_EX"
+
+
+def _set_graph_mode(env: Any, graph_mode: str) -> None:
+    """Re-put a playground env's mjx model under an explicit CUDA-graph mode.
+
+    Playground calls ``mjx.put_model(mj_model, impl=...)`` inside each env's
+    ``__init__`` and exposes no way to pass ``graph_mode``, so mjx's own default
+    applies: ``GraphMode.WARP``, whose capture cache is keyed on the step's
+    input/output buffer ADDRESSES. Under JAX those addresses change every step,
+    so a new CUDA graph is captured per step, and the cache's eviction only drops
+    the Python reference -- the native host descriptors are never reclaimed.
+
+    The result is a host-RAM leak of ~0.1 GB per million env steps that nothing
+    in JAX accounts for (``jax.live_arrays()`` stays flat, GPU memory stays
+    flat), which on a 500M-step release run reaches ~50 GB and gets the process
+    OOM-killed several hours in. ``WARP_STAGED_EX`` captures the graph ONCE
+    against fixed staging buffers and replays it, so it keeps graph-replay speed;
+    the eager ``JAX``/``NONE`` modes avoid the leak too, but by launching the
+    step's many small kernels one at a time, which is much slower.
+
+    Re-putting after construction is safe: playground's ``_post_init`` reads
+    ``mj_model``, never the mjx model, and every dm_control-suite env keeps its
+    single copy on ``_mjx_model``. If that attribute ever disappears upstream,
+    fail loudly here rather than leak silently for six hours.
+    """
+    from mujoco import mjx
+    from mujoco.mjx.warp import types as mjxw_types
+
+    if not hasattr(env, "_mjx_model"):
+        raise RuntimeError(
+            f"{type(env).__name__} has no `_mjx_model` to re-put; mujoco_playground "
+            "changed shape. Without it the Warp backend runs under "
+            "GraphMode.WARP, which leaks host RAM until the OOM killer fires."
+        )
+    env._mjx_model = mjx.put_model(
+        env.mj_model,
+        impl="warp",
+        graph_mode=getattr(mjxw_types.GraphMode, graph_mode),
+    )
+
+
 def load_playground_env(
     env_name: str,
     impl: str | None = None,
     naconmax: int | None = None,
     njmax: int | None = None,
+    graph_mode: str | None = None,
 ):
     """Load a mujoco_playground env, optionally forcing the physics backend.
 
@@ -215,6 +260,11 @@ def load_playground_env(
     Warp contact/constraint budgets (``naconmax``/``njmax``). We override them
     only when explicitly provided so each env keeps its upstream-tuned default
     otherwise (e.g. Warp's per-env ``naconmax``).
+
+    ``graph_mode`` is Warp-only and defaults to ``DEFAULT_WARP_GRAPH_MODE``
+    rather than to mjx's own default, which leaks host RAM: see
+    `_set_graph_mode`. An MJX (``impl="jax"``) env captures no graphs at all and
+    is left untouched.
     """
     env_cfg = registry.get_default_config(env_name)
     if impl is not None and "impl" in env_cfg:
@@ -225,6 +275,8 @@ def load_playground_env(
         env_cfg.njmax = njmax
 
     env = registry.load(env_name, config=env_cfg)
+    if str(env_cfg.get("impl", "")) == "warp":
+        _set_graph_mode(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
     return PlaygroundFuncEnv(env), env_cfg
 
 
@@ -269,6 +321,7 @@ def build_playground_env(
     impl: str | None = "jax",
     naconmax: int | None = None,
     njmax: int | None = None,
+    graph_mode: str | None = None,
     max_episode_steps: int | None = None,
 ) -> EnvBundle:
     """Builder for mujoco_playground envs.
@@ -278,6 +331,8 @@ def build_playground_env(
     protocol (train.py passes "train", play.py "play") but playground envs load
     identically for both. Override semantics for ``naconmax``/``njmax`` match
     ``load_playground_env``: ``None`` leaves the env's upstream Warp budget.
+    ``graph_mode`` is Warp-only and does NOT fall through to mjx's default,
+    which leaks host RAM -- see `_set_graph_mode`.
 
     ``num_envs``/``test_episodes`` size the two drivers and come from the trainer:
     the same env definition is driven at 256 worlds for training and at
@@ -289,6 +344,7 @@ def build_playground_env(
     """
     func_env, env_cfg = load_playground_env(
         env_name, impl=impl, naconmax=naconmax, njmax=njmax,
+        graph_mode=graph_mode,
     )
     max_steps = int(
         max_episode_steps

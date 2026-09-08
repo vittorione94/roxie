@@ -24,6 +24,11 @@ from roxie.models.actors import deterministic_action
 from roxie.utils.checkpoint import CHECKPOINT_ITEM, checkpoint_steps
 
 
+# `Transition` fields scrubbed of non-finite values before they are stored; see
+# `Agent._pruned_transition`.
+_SCRUBBED = ("observation", "reward")
+
+
 class TrainState(nnx.Module, pytree=False):
     def __init__(
         self,
@@ -99,6 +104,28 @@ class Agent(abc.ABC):
         return low + 0.5 * (x + 1.0) * (high - low)
 
     @staticmethod
+    def finite_or_zero(x: jnp.ndarray) -> jnp.ndarray:
+        """Replace every non-finite entry with zero.
+
+        Used at the three boundaries where a NaN stops being one bad number and
+        becomes permanent: the action leaving the actor (a NaN control is
+        integrated into qpos/qvel and the world is dead), the observation
+        entering the running statistics (`update_obs_stats` sums them, so one
+        NaN poisons the mean/std for the rest of the run), and anything entering
+        the replay buffer (resampled into batches until the run ends).
+
+        Infinities are zeroed alongside NaN rather than clipped to a rail: both
+        mean something upstream has already diverged, and an inf that survives
+        is the same NaN one `0 * inf` later.
+
+        Not a substitute for looking at the losses: this bounds how far the
+        damage spreads, it does not make the actor or the physics healthy again.
+        `train/nonfinite` (see `roxie.environment.vector`) is what says whether
+        it is happening at all.
+        """
+        return jnp.where(jnp.isfinite(x), x, 0.0)
+
+    @staticmethod
     @functools.partial(nnx.jit, static_argnames=("evaluate",))
     def deterministic_step_fn(
         actor_model: nnx.Module,
@@ -109,7 +136,10 @@ class Agent(abc.ABC):
     ):
         """Pure action selection for a deterministic actor, which outputs
         actions in [-1, 1]. Returns the action and the applied noise."""
-        action = actor_model(observation)
+        # Scrubbed BEFORE the noise, so the returned diagnostic
+        # (`action - noisy_action`) stays finite too and a diverged actor does
+        # not silently NaN out the noise panel's accumulators.
+        action = Agent.finite_or_zero(actor_model(observation))
 
         noisy_action = noise_module.add_noise(action, key, evaluate)
         noisy_action = jnp.clip(noisy_action, -1.0, 1.0)
@@ -149,13 +179,19 @@ class Agent(abc.ABC):
         arctanh, which loses `u` entirely once it passes ~7.25 in float32.
         """
         distribution = actor_model(observation)
-        mode = deterministic_action(distribution)
+        mode = Agent.finite_or_zero(deterministic_action(distribution))
         # The mode's own pre-activation is the base mean; a sample's is the `u`
         # it was drawn from.
         if evaluate:
             action, pre_activation = mode, distribution.loc
         else:
             action, pre_activation = distribution.sample_from_pre(seed=key)
+        # NaN loc/scale makes both the sample and the mode NaN; both are scrubbed
+        # so the action and the deviation-from-mode diagnostic stay finite. The
+        # pre-activation, log-prob and value are NOT: they are what an on-policy
+        # loss is scored against, and a zero there would be a fabricated
+        # behaviour density rather than a bounded control.
+        action = Agent.finite_or_zero(action)
 
         if critic_model is None:
             return action, mode - action, None, None, None
@@ -178,6 +214,12 @@ class Agent(abc.ABC):
     @staticmethod
     @jax.jit
     def update_obs_stats(stats: ObsStats, batch_obs: jnp.ndarray) -> ObsStats:
+        # These are running sums, so a single non-finite observation is not one
+        # bad update: `sum`/`sumsq` stay NaN forever, `obs_mean_std` then returns
+        # NaN, and from that step on EVERY agent sees NaN for EVERY env whether
+        # or not anything is still diverging. Nothing short of a restart clears
+        # it, so the scrub belongs here rather than at each of the three callers.
+        batch_obs = Agent.finite_or_zero(batch_obs)
         b = batch_obs.shape[0]
         batch_sum = jnp.sum(batch_obs, axis=0)
         batch_sumsq = jnp.sum(jnp.square(batch_obs), axis=0)
@@ -277,9 +319,24 @@ class Agent(abc.ABC):
         which prunes its scanned fill against this prototype.
         """
         proto = buffer_state.experience
+
+        def field(name, value):
+            if getattr(proto, name, None) is None:
+                return None
+            # The buffer is the run's other permanent store: an item written
+            # once is resampled into batches until the run ends, so a NaN
+            # observation or reward here is not one bad gradient step but a
+            # poisoned sampler. Scrubbed on the way in, at the single point
+            # every buffering path goes through.
+            #
+            # PPO's behaviour extras are deliberately NOT scrubbed: `log_probs`
+            # / `value` / `pre_action` are what its ratio is scored against, a
+            # zero there would be a fabricated behaviour density, and its queue
+            # is cleared every update rather than accumulated for the run.
+            return Agent.finite_or_zero(value) if name in _SCRUBBED else value
+
         return Transition(**{
-            name: (value if getattr(proto, name, None) is not None else None)
-            for name, value in fields.items()
+            name: field(name, value) for name, value in fields.items()
         })
 
     def buffer_transitions(

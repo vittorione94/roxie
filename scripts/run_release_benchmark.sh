@@ -1,189 +1,184 @@
 #!/usr/bin/env bash
+#
 # Run the roxie v1 release benchmark grid.
-# Usage: ./run_release_benchmark.sh [OPTIONS]
-# Options: --smoke, --dry-run, --force, --offline, --allow-busy-gpu,
-#          --tasks <list>, --agents <list>, --cells <list>, --steps <N>
+#
+# Every knob below is an environment variable with a default, so a sweep is
+# launched either by editing section 1 or by prefixing the call:
+#
+#     CELLS=envpool_cpu ./scripts/run_release_benchmark.sh
+#     TASKS=HumanoidRun AGENTS=sac ./scripts/run_release_benchmark.sh
+#
+# RESOURCES — why this script is not just two nested loops. The box is 24 cores,
+# 61 GB of RAM and one 16 GB card, and the grid does not fit on it naively:
+#
+#   * A CPU-cell run peaks at ~6 logical cores and gets SLOWER when given more
+#     (XLA's CPU pool spends the extra on barriers), so runs are PINNED to
+#     disjoint 6-core slices instead of all being handed the whole box.
+#   * Every run holds its replay buffer resident — 2.4 GB (ddpg) to 7.2 GB (ppo)
+#     — so the job count is capped by MemAvailable as well as by cores. Exceeding
+#     it does not thrash, it gets a run killed by the OOM killer hours in.
+#   * The GPU cell runs in the foreground alongside the CPU jobs (the two cells
+#     are 40+ hours each; serializing them would double the grid), so a slice of
+#     cores and a slab of RAM stay reserved for it.
+#
+# A cell that finishes leaves a marker in logs/.done, and a marked cell is
+# skipped on the next launch — so an interrupted grid is relaunched with the
+# same command and picks up where it stopped. FORCE=1 ignores the markers.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-# --- Configuration ---
-ALL_AGENTS="ddpg td3 td4 d4pg sac mpo ppo"
-ALL_CELLS="warp_gpu envpool_cpu mjx_gpu mjx_cpu"
-DEFAULT_CELLS="${DEFAULT_CELLS:-warp_gpu envpool_cpu}"
-ALL_TASKS="${ALL_TASKS:-$(uv run python -c 'from roxie.environment.suites import DMC_TASKS; print(" ".join(DMC_TASKS))' 2>/dev/null)}"
-[[ -z "$ALL_TASKS" ]] && { echo "Failed to load tasks. Ensure uv sync is run." >&2; exit 1; }
+# --- 1. Configuration ---
+TASKS="${TASKS:-HumanoidStand HumanoidWalk HumanoidRun}"
+AGENTS="${AGENTS:-ddpg ppo sac}"
+CELLS="${CELLS:-warp_gpu envpool_cpu}"
+FORCE="${FORCE:-0}"
 
-# The budget lives in experiments/dmc/bench/dmc.yaml and NOWHERE ELSE: the
-# exploration anneal is sized as a fraction of it. Read it, do not restate it;
-# `--steps` still overrides for a pilot.
-STEPS="${STEPS:-$(uv run python -c 'import roxie.utils.hydra_searchpath as h; h.register()
-from hydra import compose, initialize_config_dir
-with initialize_config_dir(config_dir=str(h.REPO_ROOT / "roxie" / "configs"), version_base=None):
-    print(int(compose(config_name="dmc/bench_ddpg", overrides=["release.task=WalkerWalk"]).trainer.steps))' 2>/dev/null)}"
-[[ -z "$STEPS" ]] && { echo "Failed to read trainer.steps from the bench config." >&2; exit 1; }
-SMOKE_STEPS=100000
-SMOKE_EPOCH=25000
-OUT_ROOT="outputs/release_v1"
-MANIFEST="$OUT_ROOT/manifest.tsv"
-LOG_DIR="$OUT_ROOT/logs"
+# 6 logical cores per CPU run is the measured knee, not a round number: below it
+# the gradient burst is starved, above it XLA's CPU pool spends more on barriers
+# than on arithmetic.
+CORES_PER_RUN="${CORES_PER_RUN:-6}"
+# Resident set of one CPU run, measured: 2.4 GB (ddpg) .. 7.2 GB (ppo).
+GB_PER_RUN="${GB_PER_RUN:-8}"
+# Held back for the GPU cell's host process (dispatch, wandb) and the desktop,
+# and only when a GPU cell is actually in the grid.
+GPU_RESERVE_CORES="${GPU_RESERVE_CORES:-2}"
+GPU_RESERVE_GB="${GPU_RESERVE_GB:-8}"
 
-# --- CLI Args ---
-SMOKE=0; DRY_RUN=0; FORCE=0; OFFLINE=0; ALLOW_BUSY_GPU=0
-TASK_FILTER=""; AGENT_FILTER=""; CELL_FILTER=""
+LOG_DIR="logs"
+DONE_DIR="$LOG_DIR/.done"
+mkdir -p "$DONE_DIR"
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --smoke)          SMOKE=1 ;;
-        --dry-run|-n)     DRY_RUN=1 ;;
-        --force)          FORCE=1 ;;
-        --offline)        OFFLINE=1; export WANDB_MODE=offline ;;
-        --allow-busy-gpu) ALLOW_BUSY_GPU=1 ;;
-        --tasks)          TASK_FILTER="${2//,/ }"; shift ;;
-        --agents)         AGENT_FILTER="${2//,/ }"; shift ;;
-        --cells)          CELL_FILTER="${2//,/ }"; shift ;;
-        --steps)          STEPS="$2"; shift ;;
-        -h|--help)        grep '^#' "$0"; exit 0 ;;
-        *) echo "Unknown arg: $1" >&2; exit 2 ;;
-    esac
-    shift
-done
+# --- 2. How many CPU runs fit at once ---
+has_gpu_cell() { [[ " $CELLS " == *gpu* ]]; }
 
-# --- Helpers ---
-say()  { echo -e "\033[1m$*\033[0m"; }
-warn() { echo -e "\033[33m! $*\033[0m" >&2; }
-err()  { echo -e "\033[31mx $*\033[0m" >&2; }
-in_list() { local n="$1"; shift; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
+reserve_cores=0; reserve_gb=0
+if has_gpu_cell; then
+    reserve_cores=$GPU_RESERVE_CORES
+    reserve_gb=$GPU_RESERVE_GB
+fi
 
-hms() {
-    local s=$1
-    if (( s >= 86400 )); then printf '%dd%02dh' $((s/86400)) $(((s%86400)/3600))
-    elif (( s >= 3600 )); then printf '%dh%02dm' $((s/3600)) $(((s%3600)/60))
-    elif (( s >= 60 )); then printf '%dm%02ds' $((s/60)) $((s%60))
-    else printf '%ds' "$s"; fi
+ncores=$(nproc)
+avail_gb=$(awk '/^MemAvailable:/ {print int($2/1048576)}' /proc/meminfo 2>/dev/null)
+# No /proc (not Linux): let the core count decide alone rather than guess.
+[[ -z "$avail_gb" ]] && avail_gb=$(( ncores * GB_PER_RUN ))
+
+by_core=$(( (ncores - reserve_cores) / CORES_PER_RUN ))
+by_ram=$(( (avail_gb - reserve_gb) / GB_PER_RUN ))
+MAX_CPU_JOBS="${MAX_CPU_JOBS:-$(( by_core < by_ram ? by_core : by_ram ))}"
+(( MAX_CPU_JOBS < 1 )) && MAX_CPU_JOBS=1
+
+# Pinning needs taskset; without it every run sees all 24 cores and they fight.
+PIN=1
+command -v taskset >/dev/null || { PIN=0; echo "! taskset missing — CPU runs will not be pinned"; }
+
+echo "== grid: [$TASKS] x [$AGENTS] x [$CELLS]"
+echo "== box:  ${ncores} cores, ${avail_gb} GB available"
+echo "== plan: $MAX_CPU_JOBS concurrent CPU runs x ${CORES_PER_RUN} cores (cap: ${by_core} by cores, ${by_ram} by RAM)"
+has_gpu_cell && echo "==       + 1 GPU run, holding back ${reserve_cores} cores and ${reserve_gb} GB"
+
+# --- 3. Strict Garbage Collection (The Ctrl-C handler) ---
+cleanup() {
+    echo -e "\n[!] Caught Ctrl-C! Nuking all child processes to free VRAM & CPU..."
+    # 1. Ask nicely: Send SIGTERM to all children of this script ($$)
+    pkill -TERM -P $$ 2>/dev/null
+    sleep 3 # Give Python and wandb a moment to release memory
+
+    # 2. No mercy: Send SIGKILL to anything that refused to die
+    pkill -KILL -P $$ 2>/dev/null
+    echo "[!] Cleanup complete. Exiting."
+    exit 130
+}
+trap cleanup INT TERM HUP
+
+# --- 4. The Execution Command ---
+# `cores` is empty for the GPU cell, which is not pinned: it is GPU-bound and its
+# host thread should float across whatever the CPU jobs are not using.
+run_experiment() {
+    local task=$1 agent=$2 cell=$3 cores="${4:-}"
+    local log="$LOG_DIR/${task}_${agent}_${cell}.log"
+    local marker="$DONE_DIR/${task}_${agent}_${cell}"
+    local pinned=()
+
+    if [[ -n "$cores" && $PIN -eq 1 ]]; then
+        # OMP_NUM_THREADS as well as the affinity mask: MuJoCo's own OpenMP
+        # regions size themselves from the machine, not from the mask.
+        pinned=(taskset -c "$cores" env "OMP_NUM_THREADS=$CORES_PER_RUN")
+        echo "==> Starting: $task | $agent | $cell (cores $cores, log $log)"
+    else
+        echo "==> Starting: $task | $agent | $cell (log $log)"
+    fi
+
+    "${pinned[@]}" uv run python roxie/train.py \
+        --config-name "dmc/bench_$agent" \
+        "release.task=$task" \
+        "dmc/backend@backend=$cell" \
+        > "$log" 2>&1
+    local rc=$?
+
+    # An OOM-killed run exits 137 and the old script still printed a tick, which
+    # is how a grid could "finish" having lost half its cells. Report the code,
+    # and mark done ONLY on success so a relaunch retries exactly the failures.
+    if (( rc == 0 )); then
+        : > "$marker"
+        echo "    [OK] $task | $agent | $cell"
+    elif (( rc == 137 || rc == 9 )); then
+        echo "    [KILLED] $task | $agent | $cell — exit $rc, almost certainly the OOM killer."
+        echo "             Check: journalctl -k | grep -i 'killed process'"
+    else
+        echo "    [FAIL] $task | $agent | $cell — exit $rc. Last lines of $log:"
+        tail -n 5 "$log" | sed 's/^/             /'
+    fi
+    return $rc
 }
 
-sps_prior() {
-    case "$1" in
-        warp_gpu) echo 6600 ;; envpool_cpu) echo 13700 ;;
-        mjx_gpu) echo 8500 ;; mjx_cpu) echo 5000 ;; *) echo 0 ;;
-    esac
-}
+# --- 5. CPU slot bookkeeping ---
+# One slot per concurrent CPU run, each owning a fixed core slice above the
+# reserve. A slot is reused only once its run has exited, so two runs never
+# share cores.
+declare -a SLOT_PID
 
-# Field-exact lookup: `grep "\t"` is a literal 't' in a POSIX BRE, which
-# silently made every run look unseen and recomputed the whole grid.
-already_done() {
-    [[ $FORCE -eq 1 ]] && return 1
-    [[ -f "$MANIFEST" ]] || return 1
-    awk -F'\t' -v t="$1" -v c="$2" -v a="$3" -v s="$4" \
-        '$1=="ok" && $2==t && $3==c && $4==a && $5==s {found=1; exit} END {exit !found}' "$MANIFEST"
-}
-
-get_cells() {
-    for c in $ALL_CELLS; do
-        if [[ -n "$CELL_FILTER" ]]; then in_list "$c" $CELL_FILTER && echo "$c"
-        else in_list "$c" $DEFAULT_CELLS && echo "$c"; fi
+claim_slot() {
+    local slot=-1
+    while (( slot < 0 )); do
+        for (( i = 0; i < MAX_CPU_JOBS; i++ )); do
+            if [[ -z "${SLOT_PID[i]:-}" ]] || ! kill -0 "${SLOT_PID[i]}" 2>/dev/null; then
+                slot=$i; break
+            fi
+        done
+        # Every slot busy: block until one of them exits, then look again.
+        (( slot < 0 )) && wait -n
     done
+    echo "$slot"
 }
 
-# --- Preflight ---
-preflight() {
-    local needs_gpu=0
-    [[ "$(get_cells)" == *gpu* ]] && needs_gpu=1
+# --- 6. The Loop ---
+for task in $TASKS; do
+    for agent in $AGENTS; do
+        for cell in $CELLS; do
 
-    if [[ $needs_gpu -eq 1 ]]; then
-        command -v nvidia-smi >/dev/null || { err "nvidia-smi missing."; return 1; }
-        local busy=$(nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits | awk '{s+=$1} END {print s+0}')
-        if (( busy > 2000 )); then
-            [[ $ALLOW_BUSY_GPU -eq 1 ]] || { err "GPU busy (${busy}MB). Use --allow-busy-gpu."; return 1; }
-        fi
-        uv run python scripts/check_warp.py >/dev/null 2>&1 || { err "Warp check failed."; return 1; }
-    fi
-
-    if [[ "${WANDB_MODE:-online}" != "offline" && "${WANDB_MODE:-online}" != "disabled" ]]; then
-        [[ -n "${WANDB_API_KEY:-}" ]] || grep -q "api.wandb.ai" "${NETRC:-$HOME/.netrc}" 2>/dev/null || \
-            { err "Wandb not logged in. Use --offline or set WANDB_API_KEY."; return 1; }
-    fi
-    return 0
-}
-
-# --- Setup Queue ---
-mkdir -p "$LOG_DIR"
-MANIFEST_HDR=$'status\ttask\tcell\tagent\tsteps\tseconds\tsps\trun_dir'
-[[ -f "$MANIFEST" ]] && [[ "$(head -n 1 "$MANIFEST")" != "$MANIFEST_HDR" ]] && \
-    { err "Manifest schema mismatch. Move $MANIFEST aside."; exit 2; }
-[[ -f "$MANIFEST" ]] || echo "$MANIFEST_HDR" > "$MANIFEST"
-
-steps=$([[ $SMOKE -eq 1 ]] && echo $SMOKE_STEPS || echo $STEPS)
-QUEUE=(); total_est=0; selected=0; skip_count=0
-
-# Drop what the manifest already has here, not in the run loop, so the count
-# and the estimate below describe the work that is actually left.
-for task in $ALL_TASKS; do
-    [[ -n "$TASK_FILTER" ]] && ! in_list "$task" $TASK_FILTER && continue
-    for agent in $ALL_AGENTS; do
-        [[ -n "$AGENT_FILTER" ]] && ! in_list "$agent" $AGENT_FILTER && continue
-        for cell in $(get_cells); do
-            ((selected++))
-            if already_done "$task" "$cell" "$agent" "$steps"; then
-                echo "-- skipping $task/$cell/$agent (already in manifest)"
-                ((skip_count++))
+            if [[ $FORCE -ne 1 && -f "$DONE_DIR/${task}_${agent}_${cell}" ]]; then
+                echo "--- skipping $task | $agent | $cell (already done)"
                 continue
             fi
-            QUEUE+=("$task|$agent|$cell|$steps")
-            sps=$(sps_prior "$cell")
-            (( sps > 0 )) && total_est=$(( total_est + steps / sps ))
+
+            if [[ "$cell" == *"gpu"* ]]; then
+                # GPU: one at a time, in the foreground. There is one card.
+                run_experiment "$task" "$agent" "$cell"
+            else
+                # CPU: parallel, pinned, capped by cores AND by RAM.
+                slot=$(claim_slot)
+                lo=$(( reserve_cores + slot * CORES_PER_RUN ))
+                hi=$(( lo + CORES_PER_RUN - 1 ))
+                run_experiment "$task" "$agent" "$cell" "$lo-$hi" &
+                SLOT_PID[slot]=$!
+            fi
+
         done
     done
 done
 
-(( selected == 0 )) && { err "No runs selected by filters."; exit 2; }
-[[ ${#QUEUE[@]} -eq 0 ]] && { say "\nAll $skip_count selected runs are already in the manifest. Nothing to do."; exit 0; }
-
-say "\nroxie benchmark: ${#QUEUE[@]} runs to go, $skip_count already done | Est compute: $(hms $total_est)\nPreflight checks..."
-preflight || [[ $DRY_RUN -eq 1 ]] || exit 1
-[[ $DRY_RUN -eq 1 ]] && { say "Dry run complete."; exit 0; }
-
-# --- Execution ---
-ok_count=0; fail_count=0; INTERRUPTED=0
-trap 'INTERRUPTED=1' INT TERM
-
-for item in "${QUEUE[@]}"; do
-    IFS='|' read -r task agent cell run_steps <<< "$item"
-    stamp=$(date +%Y-%m-%d_%H-%M-%S)
-    run_dir="$OUT_ROOT/$task/$cell/$agent/$stamp"
-    log="$LOG_DIR/$task.$cell.$agent.log"
-
-    cmd=(uv run python roxie/train.py --config-name "dmc/bench_$agent" "release.task=$task" "dmc/backend@backend=$cell" "trainer.steps=$run_steps" "hydra.run.dir=$run_dir")
-    [[ $SMOKE -eq 1 ]] && cmd+=("trainer.epoch_steps=$SMOKE_EPOCH" "logging.wandb.enabled=false")
-
-    say "\n== $task / $cell / $agent ($run_steps steps) -> log: $log"
-    
-    t0=$SECONDS
-    "${cmd[@]}" > "$log" 2>&1
-    rc=$?
-    elapsed=$(( SECONDS - t0 ))
-
-    sps_actual=$(awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="sys/sps") c=i; next} c&&$c!="None"{v=$c} END{if(v!="") printf "%.0f", v}' "$run_dir/log.csv" 2>/dev/null)
-    [[ -z "$sps_actual" ]] && sps_actual="-"
-
-    if (( INTERRUPTED == 1 || rc == 130 || rc == 143 )); then
-        err "Interrupted! Aborting the grid."
-        [[ -d "$run_dir/checkpoints" ]] && warn "Checkpoint found! Resume via:\n  ${cmd[*]/#hydra.run.dir=*/hydra.run.dir=$run_dir.resume} resume=$run_dir"
-        exit 130
-    elif [[ $rc -eq 0 ]]; then
-        ((ok_count++))
-        echo -e "\033[32m== ok\033[0m $(hms $elapsed) | ${sps_actual} sps"
-        printf "ok\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$task" "$cell" "$agent" "$run_steps" "$elapsed" "$sps_actual" "$run_dir" >> "$MANIFEST"
-    else
-        ((fail_count++))
-        err "Failed (exit $rc)! Last 10 lines of $log:"
-        tail -n 10 "$log" >&2
-        [[ -d "$run_dir/checkpoints" ]] && warn "Checkpoint found! Resume via:\n  ${cmd[*]/#hydra.run.dir=*/hydra.run.dir=$run_dir.resume} resume=$run_dir"
-        printf "fail\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$task" "$cell" "$agent" "$run_steps" "$elapsed" "$sps_actual" "$run_dir" >> "$MANIFEST"
-    fi
-done
-
-say "\nDone: $ok_count ok, $fail_count failed, $skip_count skipped."
-[[ $fail_count -gt 0 ]] && exit 1 || exit 0
+echo "All jobs dispatched. Waiting for remaining background jobs to finish..."
+wait
+echo "All experiments complete! ($(ls -1 "$DONE_DIR" | wc -l) cells marked done in $DONE_DIR)"

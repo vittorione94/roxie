@@ -45,6 +45,22 @@ values — the true next observation, which is what the replay buffer must
 store — while the returned ``VecState`` holds the POST-reset observation, which
 is what the next action is selected from. For a pool that resets in C++ the two
 observations are the same array; see ``EnvPoolVectorEnv``.
+
+NON-FINITE PHYSICS
+------------------
+Both drivers guarantee one thing no env underneath them can guarantee for
+itself: a ``Timestep`` never carries a non-finite observation or reward. An env
+cannot do it because ``terminal`` is written as a comparison, and every
+comparison against NaN is False — a diverged world reports itself perfectly
+healthy, so nothing resets it and it emits NaN for the rest of the run. That is
+not one bad step: those NaNs land in the replay buffer, which resamples them
+forever, and in the running observation statistics, whose sums never recover.
+
+``JaxVectorEnv`` zeroes such a world and forces it TERMINATED, so the auto-reset
+gather in the same call replaces it with a fresh start. ``EnvPoolVectorEnv``
+zeroes it but leaves the episode boundary to the pool, which owns resets in C++.
+Both report the per-step fraction of diverged worlds as the ``nonfinite`` entry
+of ``info["metrics"]``, which the trainer logs as ``train/nonfinite``.
 """
 
 from __future__ import annotations
@@ -84,6 +100,28 @@ class Timestep(NamedTuple):
     terminated: jax.Array
     truncated: jax.Array
     info: dict
+
+
+def nonfinite_worlds(obs, reward, xp=jnp):
+    """Per-world mask: did this step produce a non-finite observation or reward?
+
+    Observation and reward rather than the whole state: the state pytree is
+    hundreds of physics arrays and reducing all of them every step is not free,
+    while anything that matters to the agent reaches it through one of these
+    two. A world whose corruption never surfaces in either is, by definition,
+    not one the agent can be hurt by.
+    """
+    n = obs.shape[0]
+    finite_obs = xp.all(xp.isfinite(obs).reshape(n, -1), axis=1)
+    return ~(finite_obs & xp.isfinite(reward))
+
+
+def zero_worlds(mask, x, xp=jnp):
+    """``x`` with every world selected by ``mask`` zeroed, for a leaf of any
+    rank. A select, not arithmetic, so the NaN it is replacing cannot leak into
+    the worlds that are still healthy."""
+    x = xp.asarray(x)
+    return xp.where(mask.reshape((-1,) + (1,) * (x.ndim - 1)), 0.0, x)
 
 
 class JaxVectorEnv:
@@ -175,14 +213,51 @@ class JaxVectorEnv:
         # last step is still a fall.
         terminal = self._v_terminal(next_env_state, keys, params)
         truncal = self._v_truncal(next_env_state, keys, params)
+
+        # A world whose physics has diverged CANNOT report its own failure:
+        # every comparison against NaN is False, so a `terminal` written as
+        # "height < 0.8" says the world is fine, the auto-reset below never
+        # fires for it, and it goes on emitting NaN observations and NaN rewards
+        # for the rest of the run -- one dead world silently NaN-ing the epoch's
+        # mean return, the replay buffer and the observation statistics. This is
+        # the only place that can actually bring it back, because the reset
+        # gather is right here.
+        #
+        # Termination, not truncation: `FuncEnv.terminal` names a NaN a failure,
+        # and a failure zeroes the bootstrap -- which is the right value for a
+        # state the physics could not represent. It is forced past `truncal`
+        # too, since a diverged world's cutoff is not a clean one.
+        diverged = nonfinite_worlds(obs, reward)
+        obs = zero_worlds(diverged, obs)
+        reward = zero_worlds(diverged, reward)
+
         steps = state.steps + 1
         step_truncated = (
             steps >= self.max_episode_steps if self.max_episode_steps > 0
             else jnp.zeros_like(terminal)
         )
-        terminated = jnp.logical_and(terminal, jnp.logical_not(truncal))
+        terminated = jnp.logical_or(
+            jnp.logical_and(terminal, jnp.logical_not(truncal)), diverged
+        )
         truncated = jnp.logical_or(truncal, step_truncated)
-        done = jnp.logical_or(jnp.logical_or(terminal, truncal), step_truncated)
+        done = jnp.logical_or(jnp.logical_or(terminated, truncal), step_truncated)
+
+        # The env's own metrics are zeroed for a diverged world for the same
+        # reason its reward is -- whatever it reported, it did not happen -- and
+        # without that one dead world NaNs every `train/<metric>` for the epoch.
+        # `nonfinite` is the driver's own key, logged as `train/nonfinite`, so a
+        # run that is quietly resetting dead worlds says so instead of just
+        # looking like a policy that stopped improving.
+        info = {
+            **info,
+            "metrics": {
+                **{
+                    key: zero_worlds(diverged, value)
+                    for key, value in info.get("metrics", {}).items()
+                },
+                "nonfinite": diverged.astype(jnp.float32),
+            },
+        }
 
         timestep = Timestep(
             obs=obs, reward=reward, terminated=terminated, truncated=truncated,
@@ -366,12 +441,30 @@ class EnvPoolVectorEnv:
             np.asarray(action)
         )
         obs = self._flat_obs(obs)
+        reward = np.asarray(reward, dtype=np.float32)
+
+        # The same guard `JaxVectorEnv.step` applies, minus the forced
+        # termination: episode boundaries here are the pool's, decided in C++,
+        # and a `terminated` this class invents would be one the pool never
+        # acts on -- it would re-fire every step, counting one dead world as
+        # thousands of finished episodes. So a diverged world is zeroed (which
+        # is what keeps it out of the replay buffer and the observation
+        # statistics) and reported, and ending it stays the pool's business.
+        diverged = nonfinite_worlds(obs, reward, np)
+        obs = zero_worlds(diverged, obs, np)
+        reward = zero_worlds(diverged, reward, np)
+
+        info = dict(info) if isinstance(info, dict) else {}
+        info["metrics"] = {
+            **info.get("metrics", {}),
+            "nonfinite": diverged.astype(np.float32),
+        }
         timestep = Timestep(
             obs=obs,
-            reward=np.asarray(reward, dtype=np.float32),
+            reward=reward,
             terminated=np.asarray(terminated, dtype=bool),
             truncated=np.asarray(truncated, dtype=bool),
-            info=info if isinstance(info, dict) else {},
+            info=info,
         )
         # Same array in both slots — see the class docstring.
         return VecState(env_state=None, obs=obs), timestep
