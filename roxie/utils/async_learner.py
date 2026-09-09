@@ -37,6 +37,7 @@ while the learner runs; the trainer brackets eval and checkpointing with
 
 from __future__ import annotations
 
+import functools
 import queue
 import threading
 
@@ -93,6 +94,14 @@ class AsyncLearner:
         self._behavior_actor = None
         self._behavior_stats = None
         self._behavior_version = -1
+        # The acting thread's compiled `select_action`, and the split of the
+        # behaviour actor it runs against. See `_make_act_fn`.
+        self._act_fn = None
+        self._behavior_split = None
+        # The agent's exploration noise, if it has any. Owned by the ACTING
+        # thread: the learner never reads it, and its decay counter has to
+        # advance once per env frame acted.
+        self._noise_nodes = getattr(agent, "_noise_nodes", None)
 
     @classmethod
     def started(cls, agent, agent_key, state, *, initial_steps=0, chunk=8):
@@ -128,21 +137,88 @@ class AsyncLearner:
         self._publish_snapshot()
         self._thread.start()
 
+    def _make_act_fn(self):
+        """Behaviour-policy action selection, compiled.
+
+        The acting thread's half of `EnvPoolRollout`'s fused step — and the only
+        half this learner can have. **Buffering cannot follow it.** That half
+        writes and DONATES `state.buffer_state` and `state.obs_stats`, which
+        this learner's thread owns and donates again on every `_grad_steps`; an
+        acting thread writing into them would not merely be racing, it would be
+        writing to arrays a burst has already deleted. The queue is what stands
+        in for it, and `EnvPoolRollout` falls back to the per-step loop whenever
+        `fusable` sees a learner that `owns_state`.
+
+        Acting has no such conflict. The behaviour actor, its frozen statistics
+        and the noise module all belong to the ACTING thread — the learner only
+        ever publishes a fresh snapshot for it to adopt — so the ten dispatches
+        `select_action` used to issue can be one, exactly as on the sync path.
+
+        No critic: only an on-policy agent needs one at acting time, and the
+        async path is gated on a public `learn`, which only the off-policy
+        agents expose. That makes this split smaller than the sync rollout's,
+        and it is re-taken once a BURST rather than once a chunk, since the
+        actor's arrays only move when the learner publishes.
+        """
+        agent = self._agent
+
+        @functools.partial(jax.jit, static_argnums=(0, 1), donate_argnums=(3,))
+        def act_fn(actor_graphdef, noise_graphdef, actor_pytree, noise_pytree,
+                   obs_stats, obs, key):
+            (actor,) = nnx.merge(actor_graphdef, actor_pytree)
+            noise_module = (
+                None if noise_graphdef is None
+                else nnx.merge(noise_graphdef, noise_pytree)[0]
+            )
+            action, applied_noise, _extras = agent.select_action(
+                actor, obs_stats, obs, key, evaluate=False,
+                noise_module=noise_module,
+            )
+            if noise_graphdef is not None:
+                _, noise_pytree = nnx.split((noise_module,))
+            return noise_pytree, action, applied_noise
+
+        return act_fn
+
     def act(self, obs, key):
         """Select actions from the behaviour snapshot — decoupled from the
-        learner's live networks — re-syncing only when it advances."""
+        learner's live networks — re-syncing only when it advances.
+
+        Extras (PPO's stored log-prob / value) are DROPPED, and the queue
+        carries none: the async path is gated on a public `learn`, which only
+        the extras-free off-policy agents expose.
+        """
         version, snapshot = self._latest_snapshot()
         if version != self._behavior_version and snapshot is not None:
             nnx.update(self._behavior_actor, snapshot[0])
             self._behavior_stats = snapshot[1]
             self._behavior_version = version
-        # Extras (PPO's stored log-prob / value) are DROPPED, and the queue
-        # carries none: the async path is gated on a public `learn`, which only
-        # the extras-free off-policy agents expose.
-        action, noise, _extras = self._agent.select_action(
-            self._behavior_actor, self._behavior_stats, obs, key, evaluate=False,
+            # A split holds the actor's ARRAYS, so publishing new ones is
+            # exactly when it has to be re-taken — once a burst, not once a
+            # step.
+            self._behavior_split = None
+
+        if self._act_fn is None:
+            self._act_fn = self._make_act_fn()
+        if self._behavior_split is None:
+            self._behavior_split = nnx.split((self._behavior_actor,))
+        actor_graphdef, actor_pytree = self._behavior_split
+
+        # Through the handle rather than held across steps, so the live module
+        # stays authoritative for whatever reads it between chunks — the decay
+        # counter is checkpointed. `replace` leaves the split fresh, so this
+        # costs a cached lookup rather than an `nnx.split` per env step.
+        noise_nodes = self._noise_nodes
+        noise_graphdef, noise_pytree = (
+            noise_nodes.split() if noise_nodes is not None else (None, None)
         )
-        return action, noise
+        noise_pytree, action, applied_noise = self._act_fn(
+            actor_graphdef, noise_graphdef, actor_pytree, noise_pytree,
+            self._behavior_stats, obs, key,
+        )
+        if noise_nodes is not None:
+            noise_nodes.replace(noise_pytree)
+        return action, applied_noise
 
     def buffer(self, prev_obs, timestep, actions):
         """Hand the transition to the learner thread. The action travels WITH it

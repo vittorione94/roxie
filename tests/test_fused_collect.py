@@ -22,6 +22,8 @@ one, across a donated pytree threaded through a Python loop on the other — and
 stub cannot exercise that.
 """
 
+import copy
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -306,3 +308,83 @@ def test_eval_leaves_the_exploration_noise_alone():
     before = int(agent.noise_module.step_count.value)
     rollout.evaluate(agent)
     assert int(agent.noise_module.step_count.value) == before
+
+
+# --- the async learner's acting -------------------------------------------
+#
+# `AsyncLearner` cannot use the rollout's fused step — `fusable` rejects it,
+# because buffering donates state its own thread owns — but its ACTING touches
+# only the behaviour snapshot and the noise module, both the acting thread's, so
+# it compiles that half itself. It has to select the same action doing so.
+
+
+def _behaviour_reference(agent, learner, obs, key):
+    """`AsyncLearner.act` as it was before it compiled its selection."""
+    return agent.select_action(
+        learner._behavior_actor, learner._behavior_stats, obs, key,
+        evaluate=False,
+    )
+
+
+def test_async_acting_matches_uncompiled_select_action():
+    from roxie.utils.async_learner import AsyncLearner
+
+    agent, rollout, state = _build("td3", "envpool")
+    learner = AsyncLearner(agent, jax.random.PRNGKey(0))
+    # Just the behaviour snapshot `started` would have seeded; no thread, so
+    # nothing is racing the assertions and `agent.state` stays this test's.
+    learner._behavior_actor = copy.deepcopy(agent.state.actor)
+    learner._behavior_stats = agent.state.obs_stats
+
+    key = jax.random.PRNGKey(7)
+    obs = np.asarray(state.obs)
+
+    before = int(agent.noise_module.step_count.value)
+    action, noise = learner.act(obs, key)
+    after_compiled = int(agent.noise_module.step_count.value)
+
+    ref_action, ref_noise, _extras = _behaviour_reference(agent, learner, obs, key)
+    after_reference = int(agent.noise_module.step_count.value)
+
+    np.testing.assert_allclose(
+        np.asarray(action), np.asarray(ref_action), rtol=1e-5, atol=1e-5,
+        err_msg="async acting diverged from the uncompiled select_action",
+    )
+    np.testing.assert_allclose(
+        np.asarray(noise), np.asarray(ref_noise), rtol=1e-5, atol=1e-5,
+    )
+    # The decay counter advances by env frames, and the compiled call carries
+    # the noise module through a plain `jax.jit`, where a mutation escapes only
+    # because the pytree is threaded back out. Dropping that would freeze
+    # exploration at its initial scale for the whole run.
+    assert after_compiled - before == NUM_ENVS
+    assert after_reference - after_compiled == NUM_ENVS
+
+
+def test_async_acting_re_splits_when_the_learner_publishes():
+    """The split holds the behaviour actor's ARRAYS, so a new snapshot has to
+    invalidate it — otherwise acting keeps running the weights from whenever the
+    split was first taken, and the behaviour policy silently stops improving."""
+    from roxie.utils.async_learner import AsyncLearner
+
+    agent, rollout, state = _build("td3", "envpool")
+    learner = AsyncLearner(agent, jax.random.PRNGKey(0))
+    learner._behavior_actor = copy.deepcopy(agent.state.actor)
+    learner._behavior_stats = agent.state.obs_stats
+
+    key = jax.random.PRNGKey(7)
+    obs = np.asarray(state.obs)
+    first, _ = learner.act(obs, key)
+
+    # Publish a different actor, exactly as the learner thread would.
+    moved = copy.deepcopy(agent.state.actor)
+    params = nnx.state(moved, nnx.Param)
+    nnx.update(moved, jax.tree.map(lambda x: x + 1.0, params))
+    with learner._lock:
+        learner._snapshot = (nnx.state(moved, nnx.Param), learner._behavior_stats)
+        learner._snapshot_version += 1
+
+    second, _ = learner.act(obs, key)
+    assert not np.allclose(np.asarray(first), np.asarray(second)), (
+        "acting ignored a freshly published behaviour actor"
+    )

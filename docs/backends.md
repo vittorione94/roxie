@@ -157,9 +157,22 @@ In the hybrid configuration the loop is otherwise fully serial: step the CPU phy
 
 `trainer.async_learner: true` moves gradient updates onto a background thread that is the **sole owner** of `agent.state` (networks, optimizers, replay buffer, obs stats). The acting thread never touches it: it selects actions from a behaviour-actor snapshot the learner publishes, steps the envs, and pushes transitions through a queue. That single-owner rule is not stylistic — the fused `_grad_steps` donates the whole train state including the replay buffer, and donation is only sound because nothing else references it concurrently (the donation contract, and the split handle both bursts exchange with the device, are in [agents.md](agents.md#the-fused-burst-burst_nodes-and-graph_jit)). Eval and checkpointing bracket themselves with `pause()`/`resume()` so they observe a quiescent state.
 
-Replay ratio is preserved (the learner runs one burst per `steps_between_updates` boundary crossed, so it can never run ahead of collected data); the behaviour policy lags by up to one burst, which is standard for async off-policy RL. `learner_chunk` trades interleaving granularity against per-dispatch overhead.
+Replay ratio is preserved (the learner runs one burst per `steps_between_updates` boundary crossed, so it can never run ahead of collected data); the behaviour policy lags by up to one burst, which is standard for async off-policy RL. `learner_chunk` trades interleaving granularity against per-dispatch overhead. Note that `train/gradient_steps` *under-reports* on this path: the trainer captures it before `pause()` flushes the bursts still in flight, so read `<agent>/updates_per_env_step` for the realized ratio.
 
-This is an `envpool`-loop-only option, and it is pointless when the agent is also on CPU — there are no two devices to overlap.
+**Acting is compiled here too, and buffering cannot be** (`AsyncLearner._make_act_fn`). `EnvPoolRollout`'s fused step has two halves and `fusable` rejects this learner outright, because the buffering half writes and *donates* `state.buffer_state` / `state.obs_stats` — which this learner's thread owns and donates again on every `_grad_steps`. An acting thread writing into those would not merely be racing; it would be writing to arrays a burst has already deleted. That is what the queue stands in for. Acting has no such conflict — the behaviour actor, its statistics and the noise module all belong to the acting thread — so it compiles that half itself, re-splitting the actor once a *burst* rather than once a chunk. Worth ~20%: TD3 42.9k → 51.5k sps and D4PG 49.4k → 58.8k in the hybrid.
+
+**Measured, it still loses — everywhere.** Per-epoch steady state on the 7900X + RTX 5080, CheetahRun / 256 envs, against sync with the fused collect:
+
+| | sync + fused | async (acting fused) |
+|---|---|---|
+| GPU-free, TD3 | **32.4k** | 28.2k |
+| GPU-free, D4PG | **23.3k** | 21.1k |
+| Hybrid, TD3 | **61.6k** | 51.5k |
+| Hybrid, D4PG | **65.6k** | 58.8k |
+
+On the **GPU-free** cell the reason is not that the learner is too fast to overlap — it is that there is nothing to overlap *with*. Both threads' JAX work queues on the one XLA CPU thread pool, so moving a burst to another Python thread creates no execution resource. The utilization says so directly: a sync run uses 324% of its 600% affinity budget and an async run 313% — async does slightly *less* work per second, not more. What the box is short of is parallel *width* in the work itself (see the section below), and threads cannot manufacture that.
+
+In the **hybrid** there genuinely are two devices, and the overlap is real — but at dm_control scale it does not pay for itself against a fused sync loop, because the GPU burst is short enough that serializing it costs less than async's queue marshalling plus the buffering fusion it has to give up. The figures at the top of this section, where the split did pay, are from a humanoid-scale learner (obs 1069, nets `[1024, 512, 256]`) — an order of magnitude more work per burst than `[256, 256]` on a 17-dim observation. **So: leave it off for the release grid, and reach for it only when the learner is genuinely humanoid-scale.**
 
 ## CPU parallelism: fewer threads, not more
 
