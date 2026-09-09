@@ -178,7 +178,7 @@ class TestFusedBurst:
 
     def test_qualifies_for_the_fused_acting_path(self, agent):
         """The pure `select_action` / `buffer_transitions` pair is what
-        `JaxRollout._fusable` tests for, and without it a whole
+        `rollout.fusable` tests for, and without it a whole
         `steps_between_updates` window of acting is dispatched one env step at a
         time. That cost MPO ~4x throughput on the v1 grid (26k sps against SAC's
         114k at an identical update schedule), so it is pinned here."""

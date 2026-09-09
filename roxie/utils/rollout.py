@@ -21,11 +21,20 @@ one host dispatch per env step, and on GPU physics that dispatch IS the cost:
 one `env.step` call costs 3.6 ms against 0.15 ms for the same step inside a
 `lax.scan` (AcrobotSwingup, 256 envs, mujoco_warp on an RTX 5080). So the JAX
 rollout scans a whole chunk of acting — select, step, buffer, score — into ONE
-dispatch, and the EnvPool rollout, whose physics runs in C++ and cannot be
-traced, runs the same body as a Python loop. Both return the same per-chunk
-episode summary, which is what keeps one trainer loop over both.
+dispatch. Measured on that machine, end to end: 22.9k -> 103k env steps/s.
 
-Measured on that machine, end to end: 22.9k -> 103k env steps/s.
+The EnvPool rollout cannot do that: its physics runs in C++ and cannot be
+traced, so a chunk is irreducibly a Python loop. What it CAN do is compile
+everything between two pool steps, which is two dispatches an env step against
+about ten — see `EnvPoolRollout._make_step_fns`, and note there that WHICH state
+each compiled half is handed matters more than how many dispatches are saved.
+Measured on a 12C/24T 7900X, CheetahRun / 256 envs, per-epoch steady state:
+TD3 28.7k -> 29.9k env steps/s and PPO 43.1k -> 50.6k, the split being that
+TD3's gradient burst is ~80% of its loop where PPO's acting is 62% of its own.
+
+Both rollouts return the same per-chunk episode summary, which is what keeps one
+trainer loop over both, and `tests/test_fused_collect.py` holds each compiled
+path byte-for-byte against the per-step loop it replaced.
 
 Fitting the chunk cost against its length gave 5.6 ms fixed per dispatch plus
 0.134 ms per env step — and that marginal figure IS the raw scanned physics, so
@@ -137,6 +146,52 @@ def accumulate_episodes(acc, scores, lengths, done, xp):
     acc["len_sq"] = acc["len_sq"] + xp.sum(ep_len ** 2)
     acc["count"] = acc["count"] + done_sum
     return done_sum
+
+
+class _BufferSlots:
+    """The two `TrainState` fields buffering writes, on their own.
+
+    `Agent.buffer_transitions` and PPO's override touch exactly
+    `state.buffer_state` and `state.obs_stats`, so handing them these instead of
+    the whole train state is what keeps `EnvPoolRollout`'s compiled buffer step
+    at 10 pytree leaves rather than TD3's 142 — the difference between 0.038 and
+    0.726 ms per env step, since a jit call flattens its arguments and books
+    their donation in Python, per leaf.
+
+    `__slots__` so that an agent whose buffering grows a third field fails here,
+    loudly, instead of silently writing it to a shim nobody reads back.
+    """
+
+    __slots__ = ("buffer_state", "obs_stats")
+
+    def __init__(self, buffer_state, obs_stats):
+        self.buffer_state = buffer_state
+        self.obs_stats = obs_stats
+
+
+def fusable(agent, learner) -> bool:
+    """May a rollout compile acting and buffering itself, rather than
+    dispatching them op by op through the learner?
+
+    Two conditions, and both rollouts ask the same question.
+
+    The AGENT has to expose the pure `select_action` / `buffer_transitions`
+    pair — the same capability test `build_learner` uses for the async
+    learner. Pure means they take the actor, the observation statistics and the
+    train state EXPLICITLY instead of reading `self.state`, so they can run
+    against a `lax.scan` carry or a donated pytree. Every agent here does;
+    a bare baseline (`agents.basic`) does not, and keeps the per-step loop.
+
+    The LEARNER must not own `agent.state`. The async learner's thread is its
+    sole owner, and there `act`/`buffer` are a hand-off — behaviour snapshot
+    out, transitions into a queue — rather than plain calls, so bypassing them
+    would both race it and drop transitions. Only reachable from
+    `EnvPoolRollout`, the one backend whose `supports_async` is True.
+    """
+    return not learner.owns_state and all(
+        hasattr(agent, name)
+        for name in ("select_action", "buffer_transitions")
+    )
 
 
 def stepwise_collect(rollout, state, n_steps, learner):
@@ -382,22 +437,6 @@ class JaxRollout:
         )
         return state, prev_obs, timestep
 
-    def _fusable(self) -> bool:
-        """Can this agent's acting and buffering be traced?
-
-        The same capability test `build_learner` already uses for the async
-        learner: an agent qualifies by exposing PURE `select_action` and
-        `buffer_transitions` — ones that take the actor, the obs stats and the
-        train state explicitly instead of reading `self.state`, so they can run
-        against a `lax.scan` carry. Every off-policy agent does — DDPG (and
-        TD3/TD4/D4PG), SAC and MPO; PPO does not, and falls back to the per-step
-        loop until it does.
-        """
-        return all(
-            hasattr(self.agent, name)
-            for name in ("select_action", "buffer_transitions")
-        )
-
     def _make_collect_fn(self, n_steps: int):
         """Compile one `n_steps` acting burst into a single dispatch.
 
@@ -515,13 +554,13 @@ class JaxRollout:
     def collect(self, state, n_steps, learner):
         """Advance the envs `n_steps` times, buffering and scoring as it goes.
 
-        One dispatch for the whole chunk on the fused path. `learner` is unused
-        there — `supports_async` is False for this backend, so the learner is
-        always the synchronous one and `agent.state` is not shared with another
-        thread — and drives the per-step fallback for agents that cannot be
+        One dispatch for the whole chunk on the fused path. The `learner` only
+        decides WHICH path: `supports_async` is False for this backend, so it is
+        always the synchronous one and `fusable` never rejects it on that count;
+        past the check it drives the per-step fallback for agents that cannot be
         traced.
         """
-        if not self._fusable():
+        if not fusable(self.agent, learner):
             return stepwise_collect(self, state, n_steps, learner)
 
         # Before the burst, which donates the train state: the snapshot has to
@@ -657,8 +696,10 @@ class JaxRollout:
 class EnvPoolRollout:
     """C++ pools: native physics, auto-reset and adaptive state owned by the pool.
 
-    The pool batches natively, so no vmap/jit wrapping is needed: the rollout is
-    a plain Python loop over host-side arrays. The agent still runs in JAX.
+    The pool batches natively, so no vmap/jit wrapping is needed: the loop over
+    steps is Python and the episode bookkeeping is numpy on host-side arrays.
+    The agent still runs in JAX, and `collect` compiles its per-step work rather
+    than dispatching it op by op — see `_make_step_fns`.
     """
 
     xp = np
@@ -675,6 +716,9 @@ class EnvPoolRollout:
         self.rng = rngs.envs()
         self.action_size = space_size(environment.single_action_space)
         self.action_low, self.action_high = agent.action_low, agent.action_high
+        # Built on first use and reused for the run: unlike `JaxRollout`'s
+        # scanned chunk these do not close over the chunk length.
+        self._step_fns = None
 
     def _random_actions(self, key):
         u = jax.random.uniform(key, (self.num_envs, self.action_size))
@@ -722,15 +766,181 @@ class EnvPoolRollout:
         state, timestep = self.environment.step(state, actions)
         return state, prev_obs, timestep
 
+    def _make_step_fns(self):
+        """Compile the two halves of an env step: acting, and buffering.
+
+        The pool steps in C++ and cannot be traced, so there is no whole chunk
+        to scan into one dispatch the way `JaxRollout` does — but everything
+        BETWEEN two pool steps can still be compiled instead of dispatched op by
+        op. The per-step loop this replaces issues about ten: `random.split`,
+        `obs_mean_std` (six UN-jitted eager ops), `normalize_obs`, the actor's
+        step function, `scale_to_env`, `_pruned_transition` (whose
+        `finite_or_zero` scrub is eager too), `replay_add`, `concatenate` and
+        `update_obs_stats`.
+
+        The actor's step function is the expensive one, because it is an
+        `nnx.jit` and therefore re-walks the module graph IN PYTHON on every env
+        step — the exact cost `agents.utils.SplitNodes` was written to remove,
+        and the one path it was never removed from, since only a C++ pool still
+        calls it per step.
+
+        TWO programs rather than one, because the pool step sits between them:
+        acting has to finish before the physics can run, and what to buffer is
+        not known until it has.
+
+        EACH TAKES ONLY WHAT IT TOUCHES, which is the whole difficulty. The
+        obvious version hands both halves the agent's `burst_nodes` pytree, as
+        the gradient burst and the JAX rollout do — and it is SLOWER than the
+        loop it replaces, because a jit call flattens its arguments and books
+        their donation in PYTHON, per leaf, and TD3's train state is 142 of them
+        against the 10 buffering writes. Measured on TD3 / CheetahRun / 256
+        envs, per env step:
+
+                                        act     buffer    total
+            the per-step loop          0.570    0.164     0.734 ms
+            whole train state in       0.635    0.726     1.361 ms   <- worse
+            only what it touches       0.369    0.038     0.407 ms
+
+        So acting takes the actor and critic as their own split (34 leaves) —
+        sound because the trainer sizes a chunk to one update window, so neither
+        moves inside one — and buffering takes the two `TrainState` fields it
+        writes (10). The observation statistics thread through both, because
+        acting normalizes against the live ones exactly as the per-step loop
+        did.
+
+        The critic rides along for every agent though only PPO reads it at
+        acting time, which costs the other six 0.095 ms a step (0.369 -> 0.274
+        with an actor-only split), or ~1% end to end. Deliberately not taken:
+        the saving is small, and the flag it needs would be a silent
+        correctness hazard rather than a loud one — `PPO.select_action` falls
+        back to `self.state.critic` when handed None, which inside this trace is
+        a captured constant that would go stale at the first gradient burst.
+        """
+        agent = self.agent
+
+        @functools.partial(jax.jit, static_argnums=(0, 1), donate_argnums=(3,))
+        def act_fn(acting_graphdef, noise_graphdef, acting_pytree, noise_pytree,
+                   frozen_stats, obs_stats, rng, obs):
+            actor, critic = nnx.merge(acting_graphdef, acting_pytree)
+            noise_module = (
+                None if noise_graphdef is None
+                else nnx.merge(noise_graphdef, noise_pytree)[0]
+            )
+            # The SAME three-way split, in the same order, as the per-step loop:
+            # a C++ pool owns its RNG and drops `step_key`, but drawing it is
+            # what keeps the two paths on one stream.
+            rng, act_key, _step_key = jax.random.split(rng, 3)
+            # `None` means "normalize against the live statistics"; PPO hands
+            # back its pin. See `Agent.freeze_acting_norm`.
+            acting_stats = frozen_stats if frozen_stats is not None else obs_stats
+            action, applied_noise, extras = agent.select_action(
+                actor, acting_stats, obs, act_key,
+                noise_module=noise_module, critic=critic,
+            )
+            if noise_graphdef is not None:
+                _, noise_pytree = nnx.split((noise_module,))
+            return noise_pytree, rng, action, applied_noise, extras
+
+        @functools.partial(jax.jit, donate_argnums=(0, 1))
+        def buffer_fn(buffer_state, obs_stats, prev_obs, action, reward,
+                      terminated, truncated, next_obs, extras):
+            slots = _BufferSlots(buffer_state, obs_stats)
+            agent.buffer_transitions(
+                slots, prev_obs, action, reward, terminated, truncated,
+                next_obs, extras,
+            )
+            # On top of the update `buffer_transitions` already performs — the
+            # same deliberate double count `SyncLearner.buffer` and the fused
+            # JAX burst both make. Dropping it reweights the statistics away
+            # from every run logged so far.
+            slots.obs_stats = Agent.update_obs_stats(slots.obs_stats, next_obs)
+            return slots.buffer_state, slots.obs_stats
+
+        return act_fn, buffer_fn
+
     def collect(self, state, n_steps, learner):
         """Advance the pool `n_steps` times, buffering and scoring as it goes.
 
-        A plain Python loop: the physics runs in C++ and cannot be traced, so
-        there is nothing to fuse — and going through the learner per step is
-        what lets the async learner overlap those C++ steps with GPU gradient
-        bursts, which is this backend's whole reason for supporting it.
+        Two dispatches per env step, against about ten for the per-step loop it
+        replaces. The physics runs in C++ between them and cannot be traced,
+        which is what stops the whole chunk collapsing into one dispatch as it
+        does on `JaxRollout`; episode bookkeeping stays numpy on host arrays,
+        where it costs 0.009 ms a step and a device round trip would cost more.
+
+        Falls back to the per-step loop for an agent without the pure pair and
+        for the async learner, which owns `agent.state` — see `fusable`.
         """
-        return stepwise_collect(self, state, n_steps, learner)
+        if not fusable(self.agent, learner):
+            return stepwise_collect(self, state, n_steps, learner)
+
+        agent = self.agent
+        # Before anything is split or donated: PPO pins its acting statistics
+        # here, and reading `agent.state` to do it re-materializes the live
+        # nodes. `None` from any other agent.
+        frozen_stats = agent.freeze_acting_norm()
+
+        compiling = self._step_fns is None
+        if compiling:
+            self._step_fns = self._make_step_fns()
+            print("Compiling fused acting step...", flush=True)
+            t0 = time.time()
+        act_fn, buffer_fn = self._step_fns
+
+        # Re-split every chunk rather than held across them: the gradient burst
+        # between two chunks updates these modules in place through
+        # `burst_nodes`, which a cached split of its own would not see.
+        acting_graphdef, acting_pytree = nnx.split(
+            (agent.state.actor, agent.state.critic)
+        )
+        # None for agents that explore from their own stochastic policy: a
+        # static None graphdef, so the merge is skipped inside the trace.
+        noise_nodes = getattr(agent, "_noise_nodes", None)
+        noise_graphdef, noise_pytree = (
+            noise_nodes.split() if noise_nodes is not None else (None, None)
+        )
+        buffer_state = agent.state.buffer_state
+        obs_stats = agent.state.obs_stats
+
+        sums = new_chunk_sums(np)
+        # A pool hands back one numpy observation that is both `state.obs` and
+        # `timestep.obs` (see the class docstring), so one transfer per step
+        # serves acting now and the `next_obs` of the transition buffered below.
+        obs = jnp.asarray(state.obs)
+        for _ in range(n_steps):
+            noise_pytree, self.rng, action, applied_noise, extras = act_fn(
+                acting_graphdef, noise_graphdef, acting_pytree, noise_pytree,
+                frozen_stats, obs_stats, self.rng, obs,
+            )
+            prev_obs = obs
+            state, timestep = self.environment.step(state, action)
+            obs = jnp.asarray(state.obs)
+            buffer_state, obs_stats = buffer_fn(
+                buffer_state, obs_stats, prev_obs, action, timestep.reward,
+                timestep.terminated, timestep.truncated, obs, extras,
+            )
+
+            reward = np.asarray(timestep.reward)
+            done = np.asarray(timestep.terminated) | np.asarray(timestep.truncated)
+            self.scores = self.scores + reward
+            self.lengths = self.lengths + 1
+            accumulate_episodes(sums, self.scores, self.lengths, done, np)
+            sums["noise"] = sums["noise"] + np.mean(np.abs(applied_noise))
+            for key, value in timestep.info.get("metrics", {}).items():
+                sums["metrics"][key] = sums["metrics"].get(key, 0.0) + np.mean(value)
+            self.scores = np.where(done, 0, self.scores)
+            self.lengths = np.where(done, 0, self.lengths)
+
+        # The buffering donated its inputs, so the agent must adopt what came
+        # back or the gradient burst reads deleted buffers. The acting modules
+        # were never written to and need no write-back.
+        agent.state.buffer_state = buffer_state
+        agent.state.obs_stats = obs_stats
+        if noise_nodes is not None:
+            noise_nodes.replace(noise_pytree)
+        if compiling:
+            print(f"  {time.time() - t0:.1f}s (first chunk, includes compile)",
+                  flush=True)
+        return state, sums
 
     def epoch_refresh(self, state):
         refresh = getattr(self.environment, "epoch_refresh", None)

@@ -46,6 +46,11 @@ from flax import nnx
 
 
 class AsyncLearner:
+    # This learner's thread is the SOLE owner of `agent.state`, so a rollout
+    # must go through `act`/`buffer` (the hand-off) and must NOT compile its own
+    # acting against the train state. See `rollout.fusable`.
+    owns_state = True
+
     def __init__(self, agent, agent_key, *, initial_steps: int = 0,
                  chunk: int = 8, queue_maxsize: int = 512):
         self._agent = agent

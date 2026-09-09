@@ -36,6 +36,7 @@ internally, which is what ``roxie.environment.vector.EnvPoolVectorEnv`` presents
 so ``build_envpool_env`` below is a builder and nothing more.
 """
 
+import os
 from typing import Any, NamedTuple
 
 import jax
@@ -490,6 +491,52 @@ def resolve_placement(cfg: Any) -> tuple[str | None, str | None, str | None]:
         agent_device = "cpu"
     platform = None if agent_device in (None, "gpu") else agent_device
     return agent_device, env_device, platform
+
+
+def pin_cpu_cores(cores: Any, platform: str | None) -> int | None:
+    """Restrict this process to ``cores`` of the CPUs it currently has.
+
+    XLA's CPU thread pool sizes itself from ``sched_getaffinity`` when the
+    client initializes and then fans EVERY op across all of it. That is the
+    wrong trade for a gradient burst: its per-parameter half -- Adam, the two
+    soft updates, the global-norm clip, each a handful of small arrays -- pays a
+    thread fork/join per op that costs more than the arithmetic. Splitting the
+    burst into its batch-dependent (GEMM) and batch-independent halves by
+    fitting time against batch size, on a 12C/24T 7900X, TD3 / CheetahRun / 256
+    envs / envpool_cpu::
+
+        cores      1      2      6     12     24
+        fixed    9.7   14.7   23.2   22.3   30.3   ms/burst
+        slope   .290   .152   .066   .086   .100   ms per batch-unit
+
+    Only the GEMM half scales, and only to ~6 threads; the other half gets 3x
+    WORSE from 1 to 24 and is ~44% of the burst at batch 512. End to end on that
+    box: 21.4k -> 28.4k env steps/s, three consecutive epochs each way.
+
+    The affinity mask is the ONLY knob that resizes the pool. No XLA CPU flag
+    recovers any of it -- ``--xla_cpu_use_onednn=true``, XNNPACK graph fusion,
+    ``--xla_cpu_prefer_vector_width=512``, ``--xla_cpu_max_isa=AVX512`` and
+    ``--xla_cpu_enable_fast_math=true`` all land within noise of the default,
+    as does ``--xla_cpu_multi_thread_eigen=false``.
+
+    Taken as a SUBSET of the current mask, never as an absolute core list, so an
+    outer ``taskset`` still chooses WHICH cores this run gets: the concurrent
+    slot dispatcher in ``scripts/run_release_benchmark.sh`` already hands each
+    job 6 of them, and this is then a no-op inside it.
+
+    Must be called BEFORE the first ``jax.*`` call -- the mask is read once, at
+    client init. A no-op off the CPU platform (a GPU run's host work is dispatch,
+    not arithmetic) and on an OS with no affinity call. Returns the count now in
+    force, or None when nothing changed.
+    """
+    if not cores or str(platform) != "cpu" or not hasattr(os, "sched_setaffinity"):
+        return None
+    available = sorted(os.sched_getaffinity(0))
+    cores = int(cores)
+    if cores >= len(available):
+        return None
+    os.sched_setaffinity(0, set(available[:cores]))
+    return cores
 
 
 def build_env(

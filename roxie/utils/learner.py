@@ -12,11 +12,17 @@ background thread. Two implementations:
 
 Shared surface:
 
+    owns_state                        does this learner own `agent.state`?
     act(obs, key)                     -> (actions, last_noise)
     buffer(prev_obs, timestep, actions)
     update(steps)                     run the gated gradient burst, if due
     drain()                           -> (gradient_steps_since_start, [(a, c)])
     pause() / resume()                quiesce for eval and checkpointing
+
+`owns_state` is what tells a rollout whether it may bypass `act`/`buffer` and
+compile them itself: only the async learner owns `agent.state`, and there the
+two calls are the hand-off (behaviour snapshot out, transitions into a queue)
+rather than plain function calls.
 
 `buffer` and `update` are separate because the rollout calls them at different
 granularities: buffering happens once per env step, the gradient burst once per
@@ -39,6 +45,10 @@ from roxie.agents.agent import Agent
 
 class SyncLearner:
     """Act, buffer and grad-step inline — the loop's default."""
+
+    # `agent.state` stays on the acting thread, so the rollout may compile
+    # acting and buffering against it directly. See `rollout.fusable`.
+    owns_state = False
 
     def __init__(self, agent, agent_key):
         self._agent = agent

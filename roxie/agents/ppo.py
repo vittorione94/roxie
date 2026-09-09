@@ -493,7 +493,7 @@ class PPO(Agent):
         whole rollout had already moved, which is the drift the freeze exists to
         prevent. Idempotent within a rollout: `update()` is what clears the pin.
         """
-        self._frozen_obs_stats()
+        return self._frozen_obs_stats()
 
     def _frozen_obs_stats(self):
         """The `ObsStats` the current rollout is pinned to, snapshotting if

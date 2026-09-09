@@ -25,3 +25,16 @@ env:
 
 runtime:
   matmul_precision: null
+  # Cap this process at 6 of the CPUs it is given. XLA's CPU thread pool sizes
+  # itself from the affinity mask and fans every op across all of it, which the
+  # gradient burst's per-parameter half (Adam, the soft updates, the norm clip)
+  # loses on badly: measured 21.4k -> 28.4k env steps/s here, TD3 / CheetahRun /
+  # 256 envs, on a 12C/24T box. `loader.pin_cpu_cores` carries the decomposition
+  # and the flags that do NOT work.
+  #
+  # A SUBSET of the current mask, so it composes with the outer `taskset` that
+  # `run_release_benchmark.sh` uses to run several of these cells at once -- it
+  # already hands each job 6 cores, and this is a no-op inside one. 6 is where
+  # the burst stops scaling at these net/batch sizes, not a property of the box;
+  # re-measure before trusting it on much wider nets.
+  cpu_cores: 6

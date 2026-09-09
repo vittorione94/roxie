@@ -28,3 +28,8 @@ env:
 
 runtime:
   matmul_precision: null
+  # Deliberately unset, unlike backend/envpool_cpu.yaml: capping the pool is
+  # measured for a C++ pool plus a JAX learner, and this cell also runs the
+  # PHYSICS through XLA, whose vmapped step is exactly the large-op shape that
+  # does want the cores. Measure before setting it.
+  cpu_cores: null

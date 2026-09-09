@@ -1,16 +1,25 @@
-"""The fused acting burst must be the per-step loop, only faster.
+"""The fused acting path must be the per-step loop, only faster.
 
-`JaxRollout.collect` scans a whole update window — select, step, buffer, score —
-into one dispatch, because a per-step Python loop spends 3.6 ms of host dispatch
-on an env step whose device work is 0.15 ms. That is only a throughput change if
-it lands byte-for-byte where the old loop landed, so these run the same seed
-through both paths and compare everything a run carries forward: the replay
-buffer, the observation statistics, the noise module's decay counter, the env
-state, and the episode sums the epoch metrics are built from.
+Both rollouts compile the work the per-step loop used to dispatch op by op, for
+the same reason and to different depths:
 
-Driven through a real (tiny) env rather than stubs: what the fused path has to
-get right is the nnx split/merge of a mutated train state across `lax.scan`, and
-a stub cannot exercise that.
+* `JaxRollout` scans a whole update window — select, step, buffer, score — into
+  ONE dispatch, because a per-step Python loop spends 3.6 ms of host dispatch on
+  an env step whose device work is 0.15 ms.
+* `EnvPoolRollout` cannot scan a chunk (its physics is C++ and untraceable), so
+  it compiles the two halves that sit either side of the pool step instead: ~10
+  dispatches per env step become 2.
+
+Either is only a throughput change if it lands byte-for-byte where the old loop
+landed, so these run the same seed through both paths and compare everything a
+chunk carries forward: the replay buffer, the observation statistics, the noise
+module's decay counter, the env state, the rollout's own rng, and the episode
+sums the epoch metrics are built from.
+
+Driven through a real (tiny) env rather than stubs: what the fused paths have to
+get right is the nnx split/merge of a mutated train state — across `lax.scan` on
+one, across a donated pytree threaded through a Python loop on the other — and a
+stub cannot exercise that.
 """
 
 import jax
@@ -23,7 +32,7 @@ from roxie.agents.utils import build_agent
 from roxie.environment.functional import space_size
 from roxie.environment.loader import build_env
 from roxie.utils.learner import SyncLearner
-from roxie.utils.rollout import JaxRollout, stepwise_collect
+from roxie.utils.rollout import build_rollout, fusable, stepwise_collect
 
 CHUNK = 4
 NUM_ENVS = 4
@@ -49,7 +58,12 @@ _OVERRIDES = {
 }
 
 
-def _build(agent_name):
+# The `backend` group decides which rollout `build_rollout` returns: the default
+# (playground) is a vmapped JAX env, `envpool_cpu` a C++ pool.
+BACKENDS = ("jax", "envpool")
+
+
+def _build(agent_name, backend):
     from hydra import compose, initialize_config_dir
     from pathlib import Path
 
@@ -63,6 +77,8 @@ def _build(agent_name):
         cfg = compose(
             config_name=f"dmc/bench_{agent_name}",
             overrides=[
+                *((f"dmc/backend@backend=envpool_cpu",)
+                  if backend == "envpool" else ()),
                 "release.task=CartpoleBalance",
                 f"env.parallel_envs={NUM_ENVS}",
                 # Enough to condition the observation statistics first:
@@ -87,7 +103,9 @@ def _build(agent_name):
     if "noise" in cfg:
         kwargs["noise_config"] = cfg.noise
     agent = build_agent(cfg.agent, **kwargs)
-    rollout = JaxRollout(env, test_env, agent, NUM_ENVS, nnx.Rngs(envs=0), 2)
+    rollout = build_rollout(
+        env, test_env, agent, NUM_ENVS, nnx.Rngs(envs=0), 2,
+    )
     state = rollout.prepare()
     # On-policy agents have no warmup to run (and no replay to fill).
     warmup_steps = getattr(agent, "memory_warmup", 0) // NUM_ENVS
@@ -152,13 +170,19 @@ def _fingerprint(agent, rollout, state, sums):
     noise_module = getattr(agent, "noise_module", None)
     if noise_module is not None:
         out["noise_steps"] = np.asarray(noise_module.step_count.value)
+    # The acting key stream. `EnvPoolRollout` draws its three-way split inside
+    # the compiled act step rather than on the host, so this is what pins the
+    # two paths to one stream rather than merely to one distribution.
+    out["rng"] = np.asarray(jax.random.key_data(rollout.rng))
     return out
 
 
-def _run(agent_name, fused):
-    agent, rollout, state = _build(agent_name)
-    assert rollout._fusable(), f"{agent_name} should qualify for the fused path"
+def _run(agent_name, backend, fused):
+    agent, rollout, state = _build(agent_name, backend)
     learner = SyncLearner(agent, jax.random.PRNGKey(0))
+    assert fusable(agent, learner), (
+        f"{agent_name} should qualify for the fused path"
+    )
     if fused:
         state, sums = rollout.collect(state, CHUNK, learner)
     else:
@@ -166,22 +190,38 @@ def _run(agent_name, fused):
     return _fingerprint(agent, rollout, state, sums)
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("agent_name", ["td3", "sac", "mpo", "ppo"])
-def test_fused_collect_matches_the_per_step_loop(agent_name):
-    fused, stepwise = _run(agent_name, True), _run(agent_name, False)
+def test_fused_collect_matches_the_per_step_loop(agent_name, backend):
+    fused = _run(agent_name, backend, True)
+    stepwise = _run(agent_name, backend, False)
     assert set(fused) == set(stepwise)
     for key in sorted(fused):
         np.testing.assert_allclose(
             fused[key], stepwise[key], rtol=1e-5, atol=1e-5,
-            err_msg=f"{agent_name}: {key} diverged between the two paths",
+            err_msg=f"{agent_name}/{backend}: {key} diverged between the paths",
         )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_the_async_learner_keeps_the_per_step_loop(backend):
+    """The async learner's thread owns `agent.state`, so a rollout must hand it
+    transitions through `buffer` rather than compiling its own writes to the
+    buffer underneath it."""
+    agent, _rollout, _state = _build("td3", backend)
+
+    class _Owning:
+        owns_state = True
+
+    assert fusable(agent, SyncLearner(agent, jax.random.PRNGKey(0)))
+    assert not fusable(agent, _Owning())
 
 
 def test_the_noise_schedule_advances_by_env_frames_inside_the_scan():
     """`add_noise` counts env frames, not calls, so the anneal means the same
     thing at 1 parallel env and at 4000. Inside the scan that counter lives on
     the carry — if it were dropped, exploration would never decay."""
-    agent, rollout, state = _build("td3")
+    agent, rollout, state = _build("td3", "jax")
     learner = SyncLearner(agent, jax.random.PRNGKey(0))
     before = int(agent.noise_module.step_count.value)
     rollout.collect(state, CHUNK, learner)

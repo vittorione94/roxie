@@ -31,6 +31,7 @@ from roxie.environment.functional import space_size
 from roxie.environment.loader import (
     build_env,
     log_loaded_backend,
+    pin_cpu_cores,
     resolve_placement,
 )
 from roxie.utils import hydra_searchpath, logger
@@ -68,6 +69,14 @@ def main(cfg: DictConfig):
     agent_device, env_device, platform = resolve_placement(cfg)
     if platform and not _device:
         jax.config.update("jax_platforms", str(platform))
+
+    # Before ANY `jax.*` call and before the env is built: XLA's CPU thread pool
+    # and EnvPool's C++ workers both size themselves from the affinity mask, and
+    # both read it once. See `loader.pin_cpu_cores` for why fewer is faster.
+    pinned = pin_cpu_cores(runtime_cfg.get("cpu_cores", None), _device or platform)
+    if pinned:
+        print(f"CPU affinity: {pinned} cores "
+              f"({sorted(os.sched_getaffinity(0))})")
 
     # XLA GPU autotuning hangs on Blackwell GPUs; harmless on CPU.
     os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")

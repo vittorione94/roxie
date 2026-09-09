@@ -89,13 +89,21 @@ class Agent(abc.ABC):
     freeze_obs_norm_per_chunk = False
 
     def freeze_acting_norm(self):
-        """Pin acting normalization to the current statistics.
+        """Pin acting normalization to the current statistics, and return the
+        `ObsStats` acting must use for the chunk now starting.
 
         The host-side half of `freeze_obs_norm_per_chunk`: the rollout calls it
         at every chunk boundary, and the agent that pins (PPO) captures its
         snapshot there. A no-op for everyone else, who normalize against live
-        statistics.
+        statistics — hence `None`, which every caller reads as "use the live
+        ones off the train state".
+
+        `EnvPoolRollout` is what wants it back: its acting is one dispatch PER
+        STEP, so the pin has to arrive as an argument. `JaxRollout` hoists the
+        same value off its traced pytree instead, because there the whole chunk
+        is a single dispatch and the pytree is already its only channel in.
         """
+        return None
 
     @staticmethod
     @jax.jit

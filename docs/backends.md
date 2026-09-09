@@ -36,7 +36,11 @@ Every env in roxie — playground, EnvPool, a task living in its own repo — pr
 - **Agents gate their own updates.** The trainer calls `agent.update(steps=...)` unconditionally and the agent decides internally whether to run gradient steps. The trainer is explicitly forbidden from reading buffer device state (e.g. a flashbax `can_sample`) to make that decision.
 - **Everything is precompiled up front**, with timings printed: reset, reset pool, train step, agent step, replay add, warmup rollout, replay fill, gradient step. A cold compile mid-run is a stall.
 
-**`EnvPoolRollout` has none of those constraints and should not pretend to.** The pool steps in C++, hands back numpy, and Python branching is free. So it is a plain loop with numpy accumulators and a Python `for` eval loop. Trying to force the JAX idioms here would only add dispatch overhead.
+**`EnvPoolRollout` has none of those constraints and should not pretend to.** The pool steps in C++, hands back numpy, and Python branching is free. So the chunk is a plain Python loop with numpy accumulators, and so is the eval loop — a device round trip to decide "is this episode done" would cost more than the numpy that answers it.
+
+What it does borrow is the *compilation*, not the idioms. Everything between two pool steps — the acting half and the buffering half — is one compiled program each, so an env step costs two dispatches rather than about ten; only the C++ step in the middle stops the whole chunk collapsing into one the way `JaxRollout`'s does. The catch is that it is the ARGUMENT LIST, not the dispatch count, that decides whether this wins: handing each half the agent's whole train state, as the gradient burst does, is *slower* than the loop it replaces, because a jit call flattens its arguments and books their donation in Python, per leaf, and that state is 142 of them against the 10 buffering writes. `EnvPoolRollout._make_step_fns` carries the table.
+
+Worth ~1.04x on the off-policy agents, whose gradient burst dominates anyway, and ~1.17x on PPO, where acting is 62% of the loop.
 
 What the two *must* agree on is semantics. The termination rule is now shared code (`JaxVectorEnv.step`, mirrored explicitly in the CPU pool), but the rest is still maintained by hand:
 
@@ -155,9 +159,22 @@ Replay ratio is preserved (the learner runs one burst per `steps_between_updates
 
 This is an `envpool`-loop-only option, and it is pointless when the agent is also on CPU — there are no two devices to overlap.
 
-## CPU parallelism: Amdahl, not cores
+## CPU parallelism: fewer threads, not more
 
-EnvPool owns its own C++ thread pool, so on the `envpool_cpu` cell there is nothing here to tune — which is most of the argument for using it rather than writing a pool.
+The first thing to know about the `envpool_cpu` cell is that **it is slower for having 24 cores.** XLA's CPU thread pool sizes itself from the process's affinity mask when the client initializes, then fans *every* op across all of it — and a gradient burst is not one big op. Fit its time against batch size and it splits into a batch-dependent (GEMM) half and a batch-independent one — Adam, the two soft updates, the global-norm clip, each a handful of small arrays:
+
+| cores | 1 | 2 | 6 | 12 | 24 |
+|---|---|---|---|---|---|
+| fixed (ms/burst) | 9.7 | 14.7 | 23.2 | 22.3 | **30.3** |
+| slope (ms per batch-unit) | .290 | .152 | .066 | .086 | .100 |
+
+Only the GEMM half scales, and only to about 6 threads; the other half gets **3× worse** from 1 to 24, and at batch 512 it is ~44% of the burst. So `runtime.cpu_cores` in [`backend/envpool_cpu.yaml`](../experiments/dmc/backend/envpool_cpu.yaml) caps the process at 6 of whatever CPUs it was given (a *subset*, so an outer `taskset` still chooses which). Per-epoch steady state on a 12C/24T 7900X, CheetahRun / 256 envs: TD3 **21.2k → 28.7k** env steps/s, PPO 40.2k → 43.1k. `loader.pin_cpu_cores` is where this lives.
+
+The affinity mask is the only knob that does it. Every XLA CPU flag was tried and none moves the number: `--xla_cpu_use_onednn=true`, XNNPACK graph fusion, `--xla_cpu_prefer_vector_width=512`, `--xla_cpu_max_isa=AVX512`, `--xla_cpu_enable_fast_math=true` and `--xla_cpu_multi_thread_eigen=false` all land within noise of the default.
+
+Because one run peaks at ~6 cores, the box fits several: `scripts/run_release_benchmark.sh` pins one `taskset` slot per concurrent job and gets ~4.5× the aggregate throughput of a single unpinned run. `6` is where the burst stops scaling at *these* net and batch sizes, not a property of the machine — re-measure before trusting it on much wider nets.
+
+EnvPool owns its own C++ thread pool on top of that, sized independently; passing `num_threads: 6` alongside is worth a further ~3% but couples two knobs, so it is left off by default. Note that everything above is about the *learner's* threads — the physics side needs no tuning at all, which is most of the argument for using EnvPool rather than writing a pool.
 
 If you *do* write one (roxie drives any pool that speaks the Gymnasium 5-tuple), the lessons from the hand-written one that used to live here, now in [roxie-mocap](https://github.com/vittorione94/roxie-mocap), are worth having. It ran one `MjData` per env behind a persistent `ThreadPoolExecutor`; MuJoCo's Python bindings release the GIL inside `mj_step`, so threads scale across cores without pickling, and on the 7900X 24 threads beat 16 once env count was well above core count because the SMT siblings absorb memory stalls. The physics saturated the machine; what capped average utilization was the **single-threaded numpy between physics passes**, and the rule that emerged was entirely about *operation size*:
 
