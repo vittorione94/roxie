@@ -28,9 +28,13 @@ traced, so a chunk is irreducibly a Python loop. What it CAN do is compile
 everything between two pool steps, which is two dispatches an env step against
 about ten — see `EnvPoolRollout._make_step_fns`, and note there that WHICH state
 each compiled half is handed matters more than how many dispatches are saved.
-Measured on a 12C/24T 7900X, CheetahRun / 256 envs, per-epoch steady state:
-TD3 28.7k -> 29.9k env steps/s and PPO 43.1k -> 50.6k, the split being that
-TD3's gradient burst is ~80% of its loop where PPO's acting is 62% of its own.
+The eval rollout gets the same treatment and gains more from it, having no
+gradient burst to hide behind — see `_make_eval_act_fn`.
+
+Measured on a 12C/24T 7900X, CheetahRun / 256 envs, per-epoch steady state at
+the release grid's 500k epoch cadence: TD3 33.9k -> 35.2k env steps/s and PPO
+82.8k -> 96.4k. The split is the whole story — TD3's gradient burst is ~80% of
+its loop, where PPO's acting is 62% of its own.
 
 Both rollouts return the same per-chunk episode summary, which is what keeps one
 trainer loop over both, and `tests/test_fused_collect.py` holds each compiled
@@ -719,6 +723,7 @@ class EnvPoolRollout:
         # Built on first use and reused for the run: unlike `JaxRollout`'s
         # scanned chunk these do not close over the chunk length.
         self._step_fns = None
+        self._eval_act_fn = None
 
     def _random_actions(self, key):
         u = jax.random.uniform(key, (self.num_envs, self.action_size))
@@ -946,9 +951,101 @@ class EnvPoolRollout:
         refresh = getattr(self.environment, "epoch_refresh", None)
         return state, (bool(refresh()) if refresh is not None else False)
 
+    def _make_eval_act_fn(self):
+        """Action selection for the eval loop, compiled.
+
+        The eval loop stays Python for the same reason `collect`'s does — a C++
+        pool between the steps — and it was paying the same per-step dispatch
+        tax, `agent.step` being about ten of them with the actor's `nnx.jit`
+        re-walking the module graph in Python every time. It is a LARGER share
+        here than in collect, because eval has no gradient burst to hide behind.
+        Measured on CheetahRun, per eval step, of which there are up to
+        `max_episode_steps` once an epoch:
+
+                    eval step    of which `agent.step`
+            TD3      0.766 ms          0.445 ms
+            PPO      1.138 ms          0.810 ms
+
+        Its own program rather than `_make_step_fns`'s `act_fn`, because each of
+        the three differences would be a bug if forced through one function.
+        `evaluate` is static and flips a stochastic actor from a sample to its
+        mode. NOTHING is donated: eval must not consume the weights it is
+        scoring. And eval reuses ONE fixed key for every step instead of
+        advancing a stream, which is half of what makes consecutive evals of the
+        same policy identical (the pinned pool reseed below is the other half).
+        """
+        agent = self.agent
+
+        @functools.partial(jax.jit, static_argnums=(0, 1))
+        def eval_act_fn(acting_graphdef, noise_graphdef, acting_pytree,
+                        noise_pytree, obs_stats, obs, key):
+            actor, critic = nnx.merge(acting_graphdef, acting_pytree)
+            # Carried, though no agent's noise module does anything under
+            # `evaluate=True` — `add_noise` returns the action untouched and
+            # never advances its counter, which is why eval can leave the live
+            # module alone rather than adopting one back.
+            noise_module = (
+                None if noise_graphdef is None
+                else nnx.merge(noise_graphdef, noise_pytree)[0]
+            )
+            action, _noise, _extras = agent.select_action(
+                actor, obs_stats, obs, key, evaluate=True,
+                noise_module=noise_module, critic=critic,
+            )
+            return action
+
+        return eval_act_fn
+
+    def _eval_select(self, agent):
+        """The `obs -> action` the eval loop calls, compiled where it can be.
+
+        Only the AGENT half of `fusable` applies: eval reads the actor and
+        writes nothing, and `Trainer._end_of_epoch` quiesces the learner around
+        it, so which thread owns `agent.state` cannot matter. An agent without
+        the pure `select_action` — a bare baseline — keeps `agent.step`.
+        """
+        eval_key = jax.random.PRNGKey(0)
+        if not hasattr(agent, "select_action"):
+            return lambda obs: agent.step(obs, evaluate=True, key=eval_key)
+
+        if self._eval_act_fn is None:
+            self._eval_act_fn = self._make_eval_act_fn()
+        # Re-split per eval, not held across them: the point of an eval is to
+        # score THIS epoch's weights, which the gradient bursts since the last
+        # one updated in place through `burst_nodes`.
+        acting_graphdef, acting_pytree = nnx.split(
+            (agent.state.actor, agent.state.critic)
+        )
+        noise_nodes = getattr(agent, "_noise_nodes", None)
+        noise_graphdef, noise_pytree = (
+            noise_nodes.split() if noise_nodes is not None else (None, None)
+        )
+        # Exactly the statistics `agent.step` would have used: the live ones for
+        # everyone, except PPO, which scores against the pin its own rollout ran
+        # under. See `Agent.freeze_acting_norm`.
+        frozen_stats = agent.freeze_acting_norm()
+        obs_stats = (
+            agent.state.obs_stats if frozen_stats is None else frozen_stats
+        )
+
+        def select(obs):
+            return self._eval_act_fn(
+                acting_graphdef, noise_graphdef, acting_pytree, noise_pytree,
+                obs_stats, obs, eval_key,
+            )
+
+        return select
+
     def evaluate(self, agent):
-        """Eval rollout: a plain Python loop until all episodes are done or
-        max_episode_steps is reached."""
+        """Eval rollout: a Python loop until all episodes are done or
+        max_episode_steps is reached.
+
+        The loop is host-side on purpose, unlike `JaxRollout`'s compiled
+        `while_loop`: the pool hands back numpy, so `np.all(dones)` is a free
+        host read here rather than the pipeline-serializing device sync it would
+        be there. Only the action selection inside it is compiled — see
+        `_eval_select`.
+        """
         test_env = self.test_environment
         max_steps = int(test_env.max_episode_steps or 1000)
 
@@ -967,12 +1064,12 @@ class EnvPoolRollout:
         dones = np.zeros(num_tests, dtype=bool)
         start_obs = np.asarray(state.obs).reshape(num_tests, -1)
 
-        eval_key = jax.random.PRNGKey(0)
+        select = self._eval_select(agent)
 
         for _ in range(max_steps):
             if np.all(dones):
                 break
-            actions = agent.step(state.obs, evaluate=True, key=eval_key)
+            actions = select(state.obs)
             state, timestep = test_env.step(state, actions)
             active = ~dones
             scores += np.asarray(timestep.reward) * active

@@ -32,7 +32,12 @@ from roxie.agents.utils import build_agent
 from roxie.environment.functional import space_size
 from roxie.environment.loader import build_env
 from roxie.utils.learner import SyncLearner
-from roxie.utils.rollout import build_rollout, fusable, stepwise_collect
+from roxie.utils.rollout import (
+    _EVAL_SEED,
+    build_rollout,
+    fusable,
+    stepwise_collect,
+)
 
 CHUNK = 4
 NUM_ENVS = 4
@@ -63,7 +68,7 @@ _OVERRIDES = {
 BACKENDS = ("jax", "envpool")
 
 
-def _build(agent_name, backend):
+def _build(agent_name, backend, extra=()):
     from hydra import compose, initialize_config_dir
     from pathlib import Path
 
@@ -88,6 +93,7 @@ def _build(agent_name, backend):
                 "agent.learning_steps=1",
                 "logging.wandb.enabled=false",
                 *_OVERRIDES.get(agent_name, _OFF_POLICY_OVERRIDES),
+                *extra,
             ],
         )
     env, test_env, _ = build_env(
@@ -226,3 +232,77 @@ def test_the_noise_schedule_advances_by_env_frames_inside_the_scan():
     before = int(agent.noise_module.step_count.value)
     rollout.collect(state, CHUNK, learner)
     assert int(agent.noise_module.step_count.value) - before == CHUNK * NUM_ENVS
+
+
+# --- the eval loop ---------------------------------------------------------
+#
+# `EnvPoolRollout.evaluate` compiles its action selection for the same reason
+# `collect` does, and has the same obligation: score a policy exactly as the
+# `agent.step` loop it replaced did. Its episodes are capped hard here — the
+# comparison is per-step, so 25 of them catch what 1000 would.
+
+_SHORT_EPISODES = ("env.max_episode_steps=25",)
+
+
+def _reference_eval(agent, rollout):
+    """`EnvPoolRollout.evaluate` as it was before its selection was compiled.
+
+    Kept verbatim rather than reached through a flag: what is under test is a
+    rewrite, and a reference that shares code with the thing it checks would
+    stop being one.
+    """
+    test_env = rollout.test_environment
+    max_steps = int(test_env.max_episode_steps or 1000)
+    reseed = getattr(test_env, "reseed", None)
+    if reseed is not None:
+        reseed(_EVAL_SEED)
+
+    state, _ = test_env.reset()
+    num_tests = int(state.obs.shape[0])
+    scores = np.zeros(num_tests, dtype=np.float32)
+    lengths = np.zeros(num_tests, dtype=np.int32)
+    dones = np.zeros(num_tests, dtype=bool)
+    start_obs = np.asarray(state.obs).reshape(num_tests, -1)
+    eval_key = jax.random.PRNGKey(0)
+
+    for _ in range(max_steps):
+        if np.all(dones):
+            break
+        actions = agent.step(state.obs, evaluate=True, key=eval_key)
+        state, timestep = test_env.step(state, actions)
+        active = ~dones
+        scores += np.asarray(timestep.reward) * active
+        lengths += active.astype(np.int32)
+        dones |= np.asarray(timestep.terminated | timestep.truncated)
+
+    return scores, lengths, start_obs
+
+
+@pytest.mark.parametrize("agent_name", ["td3", "sac", "mpo", "ppo"])
+def test_envpool_eval_matches_the_per_step_loop(agent_name):
+    """Both runs face the same pinned pool — `reseed` at `_EVAL_SEED` is what
+    makes two evals of one policy comparable at all — so a difference in the
+    score is a difference in the action, not in the draw."""
+    agent, rollout, _state = _build(agent_name, "envpool", _SHORT_EPISODES)
+
+    compiled = rollout.evaluate(agent)
+    reference = _reference_eval(agent, rollout)
+
+    for name, got, want in zip(
+        ("scores", "lengths", "start_obs"), compiled, reference
+    ):
+        np.testing.assert_allclose(
+            got, want, rtol=1e-5, atol=1e-5,
+            err_msg=f"{agent_name}: eval {name} diverged from the per-step loop",
+        )
+    assert reference[1].max() > 0, "the reference eval never stepped"
+
+
+def test_eval_leaves_the_exploration_noise_alone():
+    """Eval must not advance the decay counter it is not exploring with: the
+    compiled step carries the noise module through its trace, and adopting a
+    mutated one back would anneal exploration by an epoch's eval every epoch."""
+    agent, rollout, _state = _build("td3", "envpool", _SHORT_EPISODES)
+    before = int(agent.noise_module.step_count.value)
+    rollout.evaluate(agent)
+    assert int(agent.noise_module.step_count.value) == before

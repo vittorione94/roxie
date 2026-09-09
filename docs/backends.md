@@ -40,7 +40,9 @@ Every env in roxie — playground, EnvPool, a task living in its own repo — pr
 
 What it does borrow is the *compilation*, not the idioms. Everything between two pool steps — the acting half and the buffering half — is one compiled program each, so an env step costs two dispatches rather than about ten; only the C++ step in the middle stops the whole chunk collapsing into one the way `JaxRollout`'s does. The catch is that it is the ARGUMENT LIST, not the dispatch count, that decides whether this wins: handing each half the agent's whole train state, as the gradient burst does, is *slower* than the loop it replaces, because a jit call flattens its arguments and books their donation in Python, per leaf, and that state is 142 of them against the 10 buffering writes. `EnvPoolRollout._make_step_fns` carries the table.
 
-Worth ~1.04x on the off-policy agents, whose gradient burst dominates anyway, and ~1.17x on PPO, where acting is 62% of the loop.
+The **eval** loop gets the same treatment and gains more from it, because it has no gradient burst to hide behind: its action selection is one compiled program (`_make_eval_act_fn`), which took an eval step from 0.766 to 0.443 ms on TD3 and from 1.138 to 0.380 ms on PPO — an epoch's eval from 1.1 s to 0.4 s. It is deliberately *not* the same program as acting: `evaluate` is static and flips a stochastic actor to its mode, nothing is donated (eval must not consume the weights it is scoring), and eval reuses one fixed key rather than advancing a stream.
+
+Worth, per-epoch steady state at the grid's own 500k epoch cadence: TD3 33.9k → 35.2k sps and PPO 82.8k → 96.4k. The gap between the two is the whole story — TD3's gradient burst is ~80% of its loop, so compiling around it can only do so much, where PPO's acting and eval are most of its own.
 
 What the two *must* agree on is semantics. The termination rule is now shared code (`JaxVectorEnv.step`, mirrored explicitly in the CPU pool), but the rest is still maintained by hand:
 
