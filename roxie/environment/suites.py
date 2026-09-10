@@ -1,16 +1,15 @@
 """The benchmark's task list, and the one place the two backends are matched up.
 
-The v1 release benchmark runs the **dm_control suite** twice: once through
-``mujoco_playground`` (GPU physics, MJX or Warp kernels) and once through
-``envpool`` (native MuJoCo stepped on CPU threads). Those are two independent
-implementations of the same 25 tasks, from the same dm_control definitions, with
-the same 0-1000 episode-return scale — which is what makes a per-task
-GPU-vs-CPU score comparison meaningful rather than a coincidence.
+The v1 release benchmark runs the dm_control suite twice: through
+``mujoco_playground`` (GPU physics) and through ``envpool`` (native MuJoCo on
+CPU threads). Two independent implementations of the same 25 tasks, from the
+same definitions and on the same 0-1000 return scale, which is what makes a
+per-task GPU-vs-CPU comparison meaningful.
 
-Their naming does not quite line up: envpool suffixes a version (``-v1``) and
-disambiguates two tasks that playground names without a difficulty. That is the
-whole content of this module, and it lives here rather than in each experiment
-yaml so the mapping is stated once and checked by a test.
+Their naming does not line up: envpool suffixes a version (``-v1``) and
+disambiguates two tasks that playground names without a difficulty. That mapping
+is the whole content of this module, stated here once rather than in each
+experiment yaml, and checked by a test.
 
 ``register_resolvers()`` exposes it to Hydra as ``${envpool_task:<Task>}``, so a
 backend group can write::

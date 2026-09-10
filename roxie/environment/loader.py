@@ -12,23 +12,21 @@ below is the one place that instantiates it; ``TRAINER_ENV_KEYS`` lists the keys
 that live in the block but belong to the trainer rather than the builder.
 
 ``FuncEnv``'s eight methods split into the two that MAKE PHYSICS HAPPEN
-(``initial``, ``transition``) and the six that ANSWER QUESTIONS ABOUT A STATE
-(``observation``, ``reward``, ``terminal``, ``truncal``, ``state_info``,
-``transition_info``). Every MuJoCo env here answers the six identically — read
-the field off ``mjx_env.State`` — but produces that state differently. That split
-is the class split::
+(``initial``, ``transition``) and the six that ANSWER QUESTIONS ABOUT A STATE.
+Every MuJoCo env here answers the six identically — read the field off
+``mjx_env.State`` — but produces that state differently, which is the class
+split::
 
     FuncEnv                  the interface; knows nothing about MuJoCo
     └── MuJoCoFuncEnv        + "my state is an mjx_env.State" -> the 6 accessors
         └── PlaygroundFuncEnv    + initial/transition by WRAPPING a playground env
 
 The middle class deliberately carries no ``initial``/``transition``, so a bespoke
-MuJoCo env in another repo inherits the six accessors instead of rewriting them.
-That matters most for ``terminal`` versus ``truncal``, where a mistake is silent
-and expensive: call a non-failure cutoff a termination and the critic zeroes its
-bootstrap there. The accessors read fields back rather than recomputing them
-because Playground produces physics, observation, reward and termination in one
-``step``; recomputing any of them would pay for the physics twice.
+MuJoCo env in another repo inherits the six accessors instead of rewriting them
+— ``terminal`` versus ``truncal`` above all, where a mistake is silent and
+expensive. The accessors read fields back rather than recomputing them, since
+Playground produces physics, observation, reward and termination in one
+``step``.
 
 EnvPool needs no adapter: its ``env_type="gymnasium"`` pools already return
 ``(obs, reward, terminated, truncated, info)`` and auto-reset and time-limit
@@ -213,24 +211,22 @@ def _set_graph_mode(env: Any, graph_mode: str) -> None:
     """Re-put a playground env's mjx model under an explicit CUDA-graph mode.
 
     Playground calls ``mjx.put_model(mj_model, impl=...)`` inside each env's
-    ``__init__`` and exposes no way to pass ``graph_mode``, so mjx's own default
+    ``__init__`` and exposes no way to pass ``graph_mode``, so mjx's default
     applies: ``GraphMode.WARP``, whose capture cache is keyed on the step's
-    input/output buffer ADDRESSES. Under JAX those addresses change every step,
-    so a new CUDA graph is captured per step, and the cache's eviction only drops
-    the Python reference -- the native host descriptors are never reclaimed.
+    input/output buffer ADDRESSES. Under JAX those change every step, so a new
+    CUDA graph is captured per step and eviction drops only the Python reference
+    -- the native host descriptors are never reclaimed. That leaks ~0.1 GB of
+    host RAM per million env steps, invisible to ``jax.live_arrays()``, which on
+    a 500M-step run OOM-kills the process hours in.
 
-    The result is a host-RAM leak of ~0.1 GB per million env steps that nothing
-    in JAX accounts for (``jax.live_arrays()`` stays flat, GPU memory stays
-    flat), which on a 500M-step release run reaches ~50 GB and gets the process
-    OOM-killed several hours in. ``WARP_STAGED_EX`` captures the graph ONCE
-    against fixed staging buffers and replays it, so it keeps graph-replay speed;
-    the eager ``JAX``/``NONE`` modes avoid the leak too, but by launching the
-    step's many small kernels one at a time, which is much slower.
+    ``WARP_STAGED_EX`` captures the graph once against fixed staging buffers and
+    replays it, keeping graph-replay speed; the eager ``JAX``/``NONE`` modes
+    avoid the leak too, but launch the step's many small kernels one at a time.
 
     Re-putting after construction is safe: playground's ``_post_init`` reads
     ``mj_model``, never the mjx model, and every dm_control-suite env keeps its
-    single copy on ``_mjx_model``. If that attribute ever disappears upstream,
-    fail loudly here rather than leak silently for six hours.
+    single copy on ``_mjx_model``. If that attribute disappears upstream, fail
+    loudly here rather than leak silently for six hours.
     """
     from mujoco import mjx
     from mujoco.mjx.warp import types as mjxw_types
@@ -497,30 +493,19 @@ def pin_cpu_cores(cores: Any, platform: str | None) -> int | None:
     """Restrict this process to ``cores`` of the CPUs it currently has.
 
     XLA's CPU thread pool sizes itself from ``sched_getaffinity`` when the
-    client initializes and then fans EVERY op across all of it. That is the
+    client initializes and then fans every op across all of it, which is the
     wrong trade for a gradient burst: its per-parameter half -- Adam, the two
     soft updates, the global-norm clip, each a handful of small arrays -- pays a
-    thread fork/join per op that costs more than the arithmetic. Splitting the
-    burst into its batch-dependent (GEMM) and batch-independent halves by
-    fitting time against batch size, on a 12C/24T 7900X, TD3 / CheetahRun / 256
-    envs / envpool_cpu::
+    thread fork/join per op that costs more than the arithmetic. Only the GEMM
+    half scales, and only to ~6 threads; the other half is ~44% of the burst at
+    batch 512 and gets 3x worse from 1 to 24 threads.
 
-        cores      1      2      6     12     24
-        fixed    9.7   14.7   23.2   22.3   30.3   ms/burst
-        slope   .290   .152   .066   .086   .100   ms per batch-unit
+    The affinity mask is the only knob that resizes the pool -- every XLA CPU
+    flag (onednn, XNNPACK fusion, vector width, ISA, fast math, eigen
+    multithreading) lands within noise of the default.
 
-    Only the GEMM half scales, and only to ~6 threads; the other half gets 3x
-    WORSE from 1 to 24 and is ~44% of the burst at batch 512. End to end on that
-    box: 21.4k -> 28.4k env steps/s, three consecutive epochs each way.
-
-    The affinity mask is the ONLY knob that resizes the pool. No XLA CPU flag
-    recovers any of it -- ``--xla_cpu_use_onednn=true``, XNNPACK graph fusion,
-    ``--xla_cpu_prefer_vector_width=512``, ``--xla_cpu_max_isa=AVX512`` and
-    ``--xla_cpu_enable_fast_math=true`` all land within noise of the default,
-    as does ``--xla_cpu_multi_thread_eigen=false``.
-
-    Taken as a SUBSET of the current mask, never as an absolute core list, so an
-    outer ``taskset`` still chooses WHICH cores this run gets: the concurrent
+    Taken as a subset of the current mask, never as an absolute core list, so an
+    outer ``taskset`` still chooses which cores this run gets: the concurrent
     slot dispatcher in ``scripts/run_release_benchmark.sh`` already hands each
     job 6 of them, and this is then a no-op inside it.
 

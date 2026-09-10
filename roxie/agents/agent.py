@@ -1,5 +1,6 @@
 import abc
 import copy
+import dataclasses
 import functools
 import inspect
 from pathlib import Path
@@ -22,10 +23,11 @@ from roxie.agents.utils import (
 )
 from roxie.models.actors import deterministic_action
 from roxie.utils.checkpoint import CHECKPOINT_ITEM, checkpoint_steps
+from roxie.utils.math import finite_or_zero, normalize_obs, scale_to_env
 
 
 # `Transition` fields scrubbed of non-finite values before they are stored; see
-# `Agent._pruned_transition`.
+# `Agent._transition`.
 _SCRUBBED = ("observation", "reward")
 
 
@@ -92,46 +94,16 @@ class Agent(abc.ABC):
         """Pin acting normalization to the current statistics, and return the
         `ObsStats` acting must use for the chunk now starting.
 
-        The host-side half of `freeze_obs_norm_per_chunk`: the rollout calls it
-        at every chunk boundary, and the agent that pins (PPO) captures its
-        snapshot there. A no-op for everyone else, who normalize against live
-        statistics — hence `None`, which every caller reads as "use the live
-        ones off the train state".
+        The host-side half of `freeze_obs_norm_per_chunk`, called by the rollout
+        at every chunk boundary. `None` for the agents that normalize against
+        live statistics, which every caller reads as "use the ones off the train
+        state".
 
-        `EnvPoolRollout` is what wants it back: its acting is one dispatch PER
-        STEP, so the pin has to arrive as an argument. `JaxRollout` hoists the
-        same value off its traced pytree instead, because there the whole chunk
-        is a single dispatch and the pytree is already its only channel in.
+        `EnvPoolRollout` is what wants it back: its acting is one dispatch per
+        step, so the pin has to arrive as an argument. `JaxRollout` hoists the
+        same value off its traced pytree instead.
         """
         return None
-
-    @staticmethod
-    @jax.jit
-    def scale_to_env(x: jnp.ndarray, low: jnp.ndarray, high: jnp.ndarray):
-        # x in [-1, 1] -> [low, high]
-        return low + 0.5 * (x + 1.0) * (high - low)
-
-    @staticmethod
-    def finite_or_zero(x: jnp.ndarray) -> jnp.ndarray:
-        """Replace every non-finite entry with zero.
-
-        Used at the three boundaries where a NaN stops being one bad number and
-        becomes permanent: the action leaving the actor (a NaN control is
-        integrated into qpos/qvel and the world is dead), the observation
-        entering the running statistics (`update_obs_stats` sums them, so one
-        NaN poisons the mean/std for the rest of the run), and anything entering
-        the replay buffer (resampled into batches until the run ends).
-
-        Infinities are zeroed alongside NaN rather than clipped to a rail: both
-        mean something upstream has already diverged, and an inf that survives
-        is the same NaN one `0 * inf` later.
-
-        Not a substitute for looking at the losses: this bounds how far the
-        damage spreads, it does not make the actor or the physics healthy again.
-        `train/nonfinite` (see `roxie.environment.vector`) is what says whether
-        it is happening at all.
-        """
-        return jnp.where(jnp.isfinite(x), x, 0.0)
 
     @staticmethod
     @functools.partial(nnx.jit, static_argnames=("evaluate",))
@@ -147,7 +119,7 @@ class Agent(abc.ABC):
         # Scrubbed BEFORE the noise, so the returned diagnostic
         # (`action - noisy_action`) stays finite too and a diverged actor does
         # not silently NaN out the noise panel's accumulators.
-        action = Agent.finite_or_zero(actor_model(observation))
+        action = finite_or_zero(actor_model(observation))
 
         noisy_action = noise_module.add_noise(action, key, evaluate)
         noisy_action = jnp.clip(noisy_action, -1.0, 1.0)
@@ -162,44 +134,39 @@ class Agent(abc.ABC):
         key: jax.Array,
         critic_model: nnx.Module = None,
     ):
-        """Action selection for every stochastic-policy agent, in ONE dispatch.
+        """Action selection for every stochastic-policy agent, in one dispatch.
 
         Returns ``(action, deviation_from_mode, pre_activation, log_probs,
-        value)``. `action` is pre-scaling, in [-1, 1] — every stochastic actor
-        here emits a `TanhNormal`, so that range is the distribution's own
-        support and nothing has to bound it on the way out.
-        `deviation_from_mode` is what the trainer reduces to the
-        `noise/per_joint_abs` panel: these agents explore from their own policy,
-        so the analogue of DDPG's injected noise is how far the sample landed
-        from the mode. It is returned unconditionally (zero under `evaluate`)
-        because the fused acting burst accumulates it inside a `lax.scan`, where
-        a `None` would change the carry's structure.
+        value)``. `action` is pre-scaling, in [-1, 1] — the support of the
+        `TanhNormal` every stochastic actor here emits.
+
+        `deviation_from_mode` is these agents' analogue of DDPG's injected
+        noise, feeding the `noise/per_joint_abs` panel. Returned unconditionally
+        (zero under `evaluate`) because the fused acting burst accumulates it
+        inside a `lax.scan`, where a `None` would change the carry's structure.
 
         `critic_model` is given only by an on-policy agent, which needs the
-        behaviour quantities at acting time: the value estimate, the pre-tanh
-        draw, and the log-prob its ratio is recomputed against. Folding them in
-        here keeps acting a single dispatch. Off-policy callers pass no critic
-        and get None for all three, so neither the density nor the value ever
-        enters their acting graph.
+        behaviour quantities at acting time; folding them in here keeps acting a
+        single dispatch. Off-policy callers pass no critic and get None for all
+        three, so neither the density nor the value enters their acting graph.
 
         The density is scored from the pre-tanh `u`, never re-derived from the
         action: `TanhNormal.log_prob` has to invert the squash through a clipped
         arctanh, which loses `u` entirely once it passes ~7.25 in float32.
         """
         distribution = actor_model(observation)
-        mode = Agent.finite_or_zero(deterministic_action(distribution))
+        mode = finite_or_zero(deterministic_action(distribution))
         # The mode's own pre-activation is the base mean; a sample's is the `u`
         # it was drawn from.
         if evaluate:
             action, pre_activation = mode, distribution.loc
         else:
             action, pre_activation = distribution.sample_from_pre(seed=key)
-        # NaN loc/scale makes both the sample and the mode NaN; both are scrubbed
-        # so the action and the deviation-from-mode diagnostic stay finite. The
-        # pre-activation, log-prob and value are NOT: they are what an on-policy
-        # loss is scored against, and a zero there would be a fabricated
-        # behaviour density rather than a bounded control.
-        action = Agent.finite_or_zero(action)
+        # The pre-activation, log-prob and value are deliberately left
+        # unscrubbed: they are what an on-policy loss is scored against, and a
+        # zero there would be a fabricated behaviour density rather than a
+        # bounded control.
+        action = finite_or_zero(action)
 
         if critic_model is None:
             return action, mode - action, None, None, None
@@ -222,12 +189,10 @@ class Agent(abc.ABC):
     @staticmethod
     @jax.jit
     def update_obs_stats(stats: ObsStats, batch_obs: jnp.ndarray) -> ObsStats:
-        # These are running sums, so a single non-finite observation is not one
-        # bad update: `sum`/`sumsq` stay NaN forever, `obs_mean_std` then returns
-        # NaN, and from that step on EVERY agent sees NaN for EVERY env whether
-        # or not anything is still diverging. Nothing short of a restart clears
-        # it, so the scrub belongs here rather than at each of the three callers.
-        batch_obs = Agent.finite_or_zero(batch_obs)
+        # Running sums, so a single non-finite observation is not one bad
+        # update: `sum`/`sumsq` stay NaN forever and nothing short of a restart
+        # clears it. Hence the scrub here rather than at each of the callers.
+        batch_obs = finite_or_zero(batch_obs)
         b = batch_obs.shape[0]
         batch_sum = jnp.sum(batch_obs, axis=0)
         batch_sumsq = jnp.sum(jnp.square(batch_obs), axis=0)
@@ -246,11 +211,6 @@ class Agent(abc.ABC):
         # is tiny and dividing by it saturates every feature at the clip bound.
         std = jnp.where(stats.count > 1.0, jnp.sqrt(var + eps), 1.0)
         return mean, std
-
-    @staticmethod
-    @jax.jit
-    def normalize_obs(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, clip: float):
-        return jnp.clip((x - mean) / std, -clip, clip)
 
     @staticmethod
     def normalize_samples(
@@ -273,13 +233,34 @@ class Agent(abc.ABC):
             return samples
         return {
             **samples,
-            "observations": Agent.normalize_obs(
+            "observations": normalize_obs(
                 samples["observations"], mean, std, clip
             ),
-            "next_observations": Agent.normalize_obs(
+            "next_observations": normalize_obs(
                 samples["next_observations"], mean, std, clip
             ),
         }
+
+    # The TD horizon the buffer was laid out for. 1 is the flat-buffer layout —
+    # MPO's 1-step target and PPO's on-policy queue both leave it here.
+    n_step = 1
+
+    @property
+    def stores_time_axis(self) -> bool:
+        """Does this agent's store want an explicit time axis on every leaf?
+
+        True for the n-step trajectory buffer, and for the on-policy queue,
+        which overrides this because its horizon is not an `n_step`. False for
+        the flat buffer, which takes the env batch as-is.
+        """
+        return self.n_step > 1
+
+    # The per-step acting path's hand-off to `add`: `step` leaves the action it
+    # chose, plus any behaviour extras its buffer stores, for the `add` that
+    # follows. Declared so every agent answers them, the baselines whose `step`
+    # sets neither included.
+    last_action = None
+    last_extras = None
 
     # Compiled lazily on first use, so an agent built from a checkpoint (or a
     # subclass that never buffers) pays nothing.
@@ -293,11 +274,10 @@ class Agent(abc.ABC):
         batch as-is. Callers go through here so they need not know which is
         active.
 
-        Jitted and buffer-donating: flashbax's add is a dozen index computations
-        and one `dynamic_update_slice` per leaf, and dispatching those eagerly
-        cost 3.5 ms per env step against 0.05 ms compiled (measured on
-        AcrobotSwingup / 256 envs). Donation is safe because every caller
-        reassigns the slot it passed in.
+        Jitted and buffer-donating: flashbax's add is a dozen index
+        computations and one `dynamic_update_slice` per leaf, which cost 3.5 ms
+        per env step dispatched eagerly against 0.05 ms compiled. Donation is
+        safe because every caller reassigns the slot it passed in.
         """
         if self._replay_add_jit is None:
             self._replay_add_jit = jax.jit(self._replay_add, donate_argnums=(0,))
@@ -306,128 +286,75 @@ class Agent(abc.ABC):
     def _replay_add(self, buffer_state, transitions):
         """The un-jitted body of `replay_add`, so a caller already inside a
         trace (the fused acting burst) skips the nested `pjit`.
-
-        `n_step` defaults to 1 for an agent that declares no TD horizon (MPO,
-        whose target is 1-step), which is the flat-buffer layout — no time axis.
         """
-        if getattr(self, "n_step", 1) > 1:
+        if self.stores_time_axis:
             transitions = jax.tree.map(lambda x: x[:, None], transitions)
         return self.replay.add(buffer_state, transitions)
 
     @staticmethod
-    def _pruned_transition(buffer_state, **fields):
-        """A `Transition` carrying only the fields this buffer allocated.
+    def _transition(buffer_state, transition):
+        """`transition`, carrying only the fields this buffer allocated.
 
         `transition_prototype` leaves a field off as `None` — an empty pytree
-        node — and an add whose tree has a leaf where the store has None does not
-        typecheck. MPO is the one agent that omits `truncation` (its 1-step
-        target reads only `terminal`), so rather than have it reimplement the
-        whole buffering path to drop one field, every caller builds through here
-        and the buffer's own layout decides. Same idiom as `JaxRollout.warmup`,
-        which prunes its scanned fill against this prototype.
+        node — and an add whose tree has a leaf where the store has None does
+        not typecheck. MPO omits `truncation` (its 1-step target reads only
+        `terminal`), so every caller builds through here and the buffer's own
+        layout decides.
+
+        Also the seam the on-policy queue overrides: it wants an explicit time
+        axis on every leaf, which the flat and n-step buffers do not.
         """
         proto = buffer_state.experience
 
-        def field(name, value):
-            if getattr(proto, name, None) is None:
+        def field(name):
+            value = getattr(transition, name)
+            if value is None or getattr(proto, name, None) is None:
                 return None
-            # The buffer is the run's other permanent store: an item written
-            # once is resampled into batches until the run ends, so a NaN
-            # observation or reward here is not one bad gradient step but a
-            # poisoned sampler. Scrubbed on the way in, at the single point
-            # every buffering path goes through.
-            #
-            # PPO's behaviour extras are deliberately NOT scrubbed: `log_probs`
-            # / `value` / `pre_action` are what its ratio is scored against, a
-            # zero there would be a fabricated behaviour density, and its queue
-            # is cleared every update rather than accumulated for the run.
-            return Agent.finite_or_zero(value) if name in _SCRUBBED else value
+            # An item written once is resampled until the run ends, so a NaN
+            # observation or reward is a poisoned sampler rather than one bad
+            # gradient step. PPO's behaviour extras are deliberately excluded:
+            # they are what its ratio is scored against, so a zero there would
+            # be a fabricated behaviour density.
+            return finite_or_zero(value) if name in _SCRUBBED else value
 
         return Transition(**{
-            name: field(name, value) for name, value in fields.items()
+            f.name: field(f.name) for f in dataclasses.fields(Transition)
         })
 
-    def buffer_transitions(
-        self, state, prev_obs, action, reward, termination, truncation, next_obs,
-        extras=None,
-    ):
+    def buffer_transitions(self, transition, next_obs, *, state=None):
         """Write one env-step batch into `state`, IN PLACE.
 
-        `state` is explicit rather than `self.state` so the same body serves the
-        imperative per-step path and the fused acting burst, where the train
-        state is a `lax.scan` carry rather than the agent's live attribute.
+        `transition` is the batch as the caller assembled it, a leading env axis
+        on every leaf. `next_obs` is the observation the step landed on, which
+        the buffer does not store but the running statistics need.
+
+        `state` is the traced train state a fused burst carries, where it is a
+        `lax.scan` carry rather than the agent's live attribute. Omit it and the
+        agent's own `state` is used with the jitted, donating add — the shape a
+        caller dispatching from Python once per env step wants. The two always
+        go together: a caller that has its own state is inside a trace, where
+        the jitted wrapper would only nest a `pjit`.
 
         `terminal` is true termination only: marking a time-limit truncation
         terminal zeroes its bootstrap and collapses Q at the cutoff, for every
         env at once since they hit the limit in lockstep. `truncation` is stored
-        separately so n-step windows stop there too — in the flat stream the item
-        after any done is a reset state.
+        separately so n-step windows stop there too.
 
-        `extras` are the per-step fields an agent's `select_action` computed and
-        its buffer stores alongside the standard five — PPO's behaviour log-prob
-        and value estimate. They have to travel from acting to buffering as a
-        VALUE because on the fused path both run inside one `lax.scan`, where
-        the `self.last_*` attribute the per-step loop uses would be a traced
-        value escaping its trace.
+        The on-policy behaviour fields an agent's `select_action` computed —
+        PPO's `log_probs`, `value` and `pre_action` — ride on the transition
+        rather than being read back off `self`, because on the fused path acting
+        and buffering run inside one `lax.scan`, where a `self.last_*` attribute
+        would be a traced value escaping its trace.
         """
-        experiences = self._pruned_transition(
-            state.buffer_state,
-            observation=prev_obs,
-            action=action,
-            reward=reward,
-            terminal=termination,
-            truncation=truncation,
-            **(extras or {}),
+        traced = state is not None
+        state = state if traced else self.state
+        add = self._replay_add if traced else self.replay_add
+        state.buffer_state = add(
+            state.buffer_state, self._transition(state.buffer_state, transition)
         )
-        state.buffer_state = self._replay_add(state.buffer_state, experiences)
-
         if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_obs, next_obs], axis=0)
+            obs_batch = jnp.concatenate([transition.observation, next_obs], axis=0)
             state.obs_stats = Agent.update_obs_stats(state.obs_stats, obs_batch)
-
-    def add_transitions(
-        self, prev_obs, action, reward, termination, truncation, next_obs,
-        extras=None,
-    ):
-        """`buffer_transitions` against the agent's live state.
-
-        Split out so the async learner (which owns `self.state` on its own
-        thread) can add transitions whose action travelled with them through the
-        hand-off queue, rather than reading `self.last_action`, which the acting
-        thread overwrites every step.
-        """
-        # Not `_replay_add`: dispatched from Python once per env step, so it
-        # wants the jitted, donating variant.
-        experiences = self._pruned_transition(
-            self.state.buffer_state,
-            observation=prev_obs,
-            action=action,
-            reward=reward,
-            terminal=termination,
-            truncation=truncation,
-            **(extras or {}),
-        )
-        self.state.buffer_state = self.replay_add(
-            self.state.buffer_state, experiences
-        )
-        if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_obs, next_obs], axis=0)
-            self.state.obs_stats = Agent.update_obs_stats(
-                self.state.obs_stats, obs_batch
-            )
-
-    def add(self, prev_obs, timestep):
-        self.add_transitions(
-            prev_obs,
-            self.last_action,
-            timestep.reward,
-            timestep.terminated,
-            timestep.truncated,
-            timestep.obs,
-            # The per-step counterpart to the fused path's carried `extras`:
-            # `step` leaves them here for the `add` that follows.
-            getattr(self, "last_extras", None),
-        )
 
     def _init_train_state(
         self,
@@ -495,26 +422,17 @@ class Agent(abc.ABC):
     def due_for_update(self, steps: int) -> bool:
         """True at most once per `steps_between_updates` env steps past warmup.
 
-        `memory_warmup` is the gate, and the only one: learning starts once the
-        prefill is in the buffer. Sampling before that is not merely premature —
-        flashbax allocates with `jnp.empty_like`, so a batch drawn below the
-        buffer's `min_length` is uninitialized memory rather than an error.
+        `memory_warmup` is the only gate. Sampling before it is not merely
+        premature — flashbax allocates with `jnp.empty_like`, so a batch drawn
+        below the buffer's `min_length` is uninitialized memory rather than an
+        error.
 
-        There used to be a second knob, `steps_before_learning`, and every
-        config set it equal to `memory_warmup`. It could not do anything else:
-        the trainer runs the warmup to completion before the loop's first call,
-        so any value at or below the warmup gave a bit-identical schedule, and
-        any value above it meant acting with an untrained policy while refusing
-        to learn from the result.
+        Do NOT write this as `(steps - memory_warmup) % between == 0`: the
+        trainer advances `steps` in strides of `parallel_envs`, so that fires
+        only when the offset is itself a multiple of the stride, and otherwise
+        the residue cycles without reaching 0 and no gradient step ever runs.
 
-        Do NOT write this as `(steps - memory_warmup) % between == 0`. The
-        trainer advances `steps` in strides of `parallel_envs`, so that test
-        only fires when the offset is itself a multiple of the stride;
-        otherwise the residue cycles without reaching 0 and no gradient step
-        ever runs. Tracking the last boundary served makes the schedule depend
-        only on elapsed env steps.
-
-        No backlog is queued: the boundary jumps to wherever `steps` now is, so
+        No backlog is queued — the boundary jumps to wherever `steps` now is, so
         a restored checkpoint resumes on schedule rather than firing a catch-up
         storm.
         """
@@ -529,23 +447,21 @@ class Agent(abc.ABC):
         self._last_update_boundary = boundary
         return True
 
-    def update(self, old_states, new_states, steps, agent_rng):
-        """Informs the agent of the latest transitions during training."""
-        gradient_steps, actor_loss, critic_loss = 0, 0, 0
-        return gradient_steps, actor_loss, critic_loss
+    def update(self, steps, agent_rng):
+        """Run whatever gradient work is due, and report what it cost.
 
-    def test_update(self, observations, rewards, resets, terminations, steps):
-        """Informs the agent of the latest transitions during testing."""
-        pass
+        Returns `(gradient_steps, actor_loss, critic_loss)`. The base body is
+        what a non-learning baseline inherits, so it does nothing and reports
+        nothing.
+        """
+        return 0, 0, 0
 
     # ---- Diagnostics ------------------------------------------------------
     #
-    # Every learning agent reports the health of its own update through the
-    # same two calls: `record_diagnostics` at the end of a gradient burst, and
-    # `pop_diagnostics`, which the trainer drains once per epoch. What differs
-    # between agents is only the KEYS — TD3's saturation and value-inflation
-    # metrics, SAC's temperature and entropy, MPO's duals and KLs, PPO's trust
-    # region — never the plumbing.
+    # Every learning agent reports the health of its own update through
+    # `record_diagnostics` at the end of a gradient burst and `pop_diagnostics`,
+    # which the trainer drains once per epoch. Only the keys differ between
+    # agents, never the plumbing.
 
     # Set by `_init_train_state`. Class level so a non-learning baseline, which
     # never gets one, still answers `pop_diagnostics` rather than raising.
@@ -553,9 +469,6 @@ class Agent(abc.ABC):
     # Run-to-date gradient steps recorded, so the rates below read as levels
     # rather than per-epoch spikes.
     _diag_steps = 0
-    # What the last drain covered, for an override reporting a per-burst rate.
-    _diag_drained_bursts = 0
-    _diag_drained_steps = 0
 
     # Replay capacity, set by the agents that have one (DDPG, SAC, MPO and
     # their subclasses). None means "not replay-driven", which is what suppresses
@@ -572,9 +485,7 @@ class Agent(abc.ABC):
         how many gradient steps it covered, and weights the epoch mean.
 
         Appended from whichever thread owns the learner; `list.append` is atomic
-        under the GIL, as is the swap in `pop_diagnostics`. The list is bounded
-        by the bursts of one epoch, since the trainer drains it at every epoch
-        boundary.
+        under the GIL, as is the swap in `pop_diagnostics`.
         """
         self._diag_bursts.append((int(steps), diagnostics))
         self._diag_steps += int(steps)
@@ -584,8 +495,7 @@ class Agent(abc.ABC):
 
         The trainer calls this on every agent once per epoch and logs the result
         under `train/`. Returns `{}` when no gradient burst ran, so nothing is
-        logged rather than a misleading zero — which is indistinguishable from a
-        converged metric and renders as a value rather than a gap.
+        logged rather than a zero indistinguishable from a converged metric.
 
         Keys are reduced across the epoch's bursts by the same rule that reduced
         each burst across its steps (`DIAGNOSTIC_MAX_KEYS` / `SUM`, otherwise a
@@ -598,9 +508,6 @@ class Agent(abc.ABC):
         bursts, self._diag_bursts = self._diag_bursts, []
         if not bursts:
             return {}
-
-        self._diag_drained_bursts = len(bursts)
-        self._diag_drained_steps = sum(steps for steps, _ in bursts)
 
         prefix = type(self).__name__.lower()
         weights = jnp.asarray([float(steps) for steps, _ in bursts])
@@ -620,8 +527,7 @@ class Agent(abc.ABC):
         if env_steps > 0:
             # The realized replay ratio. Off the configured
             # `learning_steps / steps_between_updates` means the update gate is
-            # not firing as intended — how the release_v1 walker grid was found
-            # to have run at zero gradient steps.
+            # not firing as intended.
             out[f"{prefix}/updates_per_env_step"] = self._diag_steps / env_steps
             if self.buffer_size is not None:
                 # Below 1.0 the sampler draws from a narrower window than
@@ -691,7 +597,6 @@ class Agent(abc.ABC):
     def checkpoint_payload(
         self,
         *,
-        format_version: int = 1,
         include_buffer: bool = False,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
@@ -716,7 +621,8 @@ class Agent(abc.ABC):
             self.state.buffer_state = None
         try:
             return {
-                "format_version": format_version,
+                # Never varied; kept so a checkpoint still says what wrote it.
+                "format_version": 1,
                 # No graphdef: `restore` re-derives it from the live modules.
                 "trainstate_state": jax.device_get(nnx.split(self.state)[1]),
                 "extra_state": {
@@ -730,34 +636,6 @@ class Agent(abc.ABC):
         finally:
             self.state.buffer_state = saved_buffer
 
-    def save(
-        self,
-        path: str | Path,
-        *,
-        format_version: int = 1,
-        include_buffer: bool = False,
-        extra_metadata: Optional[Dict[str, Any]] = None,
-    ):
-        """Write one self-contained checkpoint to `path`.
-
-        Training runs do not come through here: `Trainer` saves through a
-        `CheckpointManager`. This is the one-off path (tests, ad-hoc saves), and
-        it writes a single directory rather than a manager's step/item pair —
-        `_read_checkpoint` accepts both.
-        """
-        payload = self.checkpoint_payload(
-            format_version=format_version,
-            include_buffer=include_buffer,
-            extra_metadata=extra_metadata,
-        )
-        if payload is None:
-            print(f"[Agent.save] {type(self).__name__} has no state; skipping {path}.")
-            return
-        path = Path(path).resolve()
-        with ocp.StandardCheckpointer() as checkpointer:
-            checkpointer.save(path, payload)
-        print(f"[Agent.save] Saved to {path}")
-
     @classmethod
     def load(
         cls,
@@ -768,11 +646,9 @@ class Agent(abc.ABC):
     ):
         """Rebuild an agent from a checkpoint.
 
-        `config_blocks` are the yaml-side construction blocks (`actor_config`,
-        `critic_config`, `memory_config`, `noise_config`, the
-        `*_optimizer_config` blocks), taken as keywords so an agent that grows or
-        drops one needs no change here. Everything else comes from the
-        checkpoint's `hyperparams`.
+        `config_blocks` are the yaml-side construction blocks, taken as keywords
+        so an agent that grows or drops one needs no change here. Everything
+        else comes from the checkpoint's `hyperparams`.
 
         This is the playback entry point (`play.py`), where the checkpoint is the
         only source of truth. To resume training, build the agent from its run
@@ -781,9 +657,7 @@ class Agent(abc.ABC):
         path = Path(path).resolve()
         loaded = _read_checkpoint(path)
 
-        ckpt_state = loaded["trainstate_state"]
         hyper = loaded.get("hyperparams", {})
-        print(hyper)
 
         # Across the whole MRO: subclasses forward via ``*args, **kwargs``, so
         # inspecting only ``cls.__init__`` would drop the parent's hyperparams.
@@ -823,18 +697,13 @@ class Agent(abc.ABC):
         self,
         path: str | Path,
         *,
-        restore_optimizers: bool = True,
         _payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Load a checkpoint's numeric state into this already-built agent.
 
-        This is what resuming training goes through: the agent is constructed
-        from the run's config, so the yaml stays the source of truth for every
+        What resuming training goes through: the agent is constructed from the
+        run's config, so the yaml stays the source of truth for every
         hyperparameter and only the numbers come from disk.
-
-        `restore_optimizers=False` reloads the policy but starts the optimizers
-        cold — a fine-tune rather than a resume, since dropping Adam's moments
-        changes how the first updates after it behave.
 
         Returns the trainer-progress metadata the checkpoint was written with
         (`steps`, `epochs`, `episodes`, `gradient_steps`), plus
@@ -857,34 +726,13 @@ class Agent(abc.ABC):
             if name not in source:
                 print(f"Info: '{name}' not in checkpoint; keeping live {name}.")
                 return
-            sub_ckpt = _to_jax(source[name])
-            sub_live = getattr(owner, name)
-            gdef, _ = nnx.split(sub_live)
-            try:
-                setattr(owner, name, nnx.merge(gdef, sub_ckpt))
-            except ValueError as e:
-                # Architecture drift or partial state: fall back to params only.
-                print(
-                    f"Warning: merge({name}) failed ({e}). Falling back to param-only copy."
-                )
-                try:
-                    src_params = (
-                        sub_ckpt.get("params", None)
-                        if isinstance(sub_ckpt, dict)
-                        else None
-                    )
-                    if src_params is None:
-                        print(f"Warning: no 'params' found for {name}; skipping.")
-                    else:
-                        nnx.update(sub_live, {"params": src_params})
-                except Exception as ee:
-                    print(
-                        f"Warning: param-only update for {name} failed ({ee}). Skipping."
-                    )
+            gdef, _ = nnx.split(getattr(owner, name))
+            setattr(owner, name, nnx.merge(gdef, _to_jax(source[name])))
 
-        names = ["actor", "critic", "target_actor", "target_critic"]
-        if restore_optimizers:
-            names += ["actor_optimizer", "critic_optimizer"]
+        names = [
+            "actor", "critic", "target_actor", "target_critic",
+            "actor_optimizer", "critic_optimizer",
+        ]
         for name in names:
             # `target_actor` is None for SAC/PPO and absent from their
             # checkpoints, so a missing entry is normal.
@@ -893,22 +741,17 @@ class Agent(abc.ABC):
 
         extra_ckpt = loaded.get("extra_state") or {}
         for name in self._checkpoint_modules():
-            if restore_optimizers or not name.endswith("optimizer"):
-                _restore_module(self, name, extra_ckpt)
+            _restore_module(self, name, extra_ckpt)
 
         if "obs_stats" in ckpt_state:
-            try:
-                obs = ckpt_state["obs_stats"]
-                if isinstance(obs, dict):
-                    self.state.obs_stats = ObsStats(
-                        count=jnp.asarray(obs["count"]),
-                        sum=jnp.asarray(obs["sum"]),
-                        sumsq=jnp.asarray(obs["sumsq"]),
-                    )
-                else:  # already a struct-compatible tree
-                    self.state.obs_stats = _to_jax(obs)
-            except Exception as e:
-                print(f"Warning: could not restore obs_stats ({e}); using live stats.")
+            # Orbax hands every payload back as plain nested dicts of numpy
+            # leaves, so the struct has to be rebuilt around them.
+            obs = ckpt_state["obs_stats"]
+            self.state.obs_stats = ObsStats(
+                count=jnp.asarray(obs["count"]),
+                sum=jnp.asarray(obs["sum"]),
+                sumsq=jnp.asarray(obs["sumsq"]),
+            )
 
         # Only present if saved with `include_buffer=True`.
         buffer_restored = False

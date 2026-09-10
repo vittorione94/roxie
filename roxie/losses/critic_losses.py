@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import rlax
 
-from roxie.agents.agent import Agent
+from roxie.utils.math import scale_to_env
 
 
 def _smoothed_target_actions(
@@ -64,7 +64,7 @@ def _smoothed_target_actions(
     # `scale_to_env` is an increasing affine map, so clipping in [-1, 1] first
     # gives the same set as clipping to [action_low, action_high].
     next_actions = jnp.clip(next_actions + clipped_noise, -1.0, 1.0)
-    return Agent.scale_to_env(next_actions, action_low, action_high), smooth_clip_frac
+    return scale_to_env(next_actions, action_low, action_high), smooth_clip_frac
 
 
 def categorical_mean(logits, atoms) -> jnp.ndarray:
@@ -376,7 +376,7 @@ def mpo_critic_loss_fn(
     # and nothing is clipped on top — as in action selection.
     next_dist = target_actor_model(next_obs)
     next_actions = next_dist.sample(seed=key, sample_shape=(num_action_samples,))
-    next_actions = Agent.scale_to_env(next_actions, action_low, action_high)
+    next_actions = scale_to_env(next_actions, action_low, action_high)
 
     next_obs_tiled = jnp.broadcast_to(next_obs, (num_action_samples,) + next_obs.shape)
     next_q = target_critic_model(next_obs_tiled, next_actions)  # [S, B, 1]
@@ -430,7 +430,7 @@ def sac_critic_loss_fn(
     next_actions, next_pre = next_dist.sample_from_pre(seed=key)
     next_log_probs = next_dist.log_prob_from_pre(next_pre)
 
-    next_actions_scaled = Agent.scale_to_env(next_actions, action_low, action_high)
+    next_actions_scaled = scale_to_env(next_actions, action_low, action_high)
 
     target_q1, target_q2 = target_twin_critic(next_obs, next_actions_scaled)
     target_q = jnp.minimum(jnp.squeeze(target_q1), jnp.squeeze(target_q2))

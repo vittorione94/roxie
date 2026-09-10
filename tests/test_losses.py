@@ -27,6 +27,7 @@ from roxie.losses.critic_losses import (
 )
 from roxie.models.actors import DeterministicActor, StochasticActor
 from roxie.models.critics import QCritic, VCritic, TwinCritic
+from roxie.utils.math import scale_to_env
 
 
 OBS_DIM = 8
@@ -566,7 +567,7 @@ class TestTargetSmoothingUnits:
         smoothed, clip_frac = _smoothed_target_actions(
             det_actor, obs, jax.random.PRNGKey(1), 0.0, 0.0, low, high
         )
-        expected = Agent.scale_to_env(det_actor(obs), low, high)
+        expected = scale_to_env(det_actor(obs), low, high)
         assert jnp.allclose(smoothed, expected, atol=1e-6)
         assert float(clip_frac) == 0.0
 

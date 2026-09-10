@@ -9,8 +9,24 @@ from omegaconf import OmegaConf
 
 import roxie.agents  # noqa: F401  (avoid circular import)
 from roxie.agents.ppo import PPO, _grad_step, _grad_steps, _prepare_rollout
-from roxie.agents.utils import SplitNodes
+from roxie.agents.utils import SplitNodes, Transition
 from roxie.environment.vector import Timestep
+
+
+def _buffer(agent, prev_obs, timestep):
+    """What `SyncLearner.buffer` does: assemble the batch the agent stores."""
+    agent.buffer_transitions(
+        Transition(
+            observation=prev_obs,
+            action=agent.last_action,
+            reward=timestep.reward,
+            terminal=timestep.terminated,
+            truncation=timestep.truncated,
+            **(agent.last_extras or {}),
+        ),
+        timestep.obs,
+    )
+
 
 NUM_ENVS = 4
 OBS_DIM = 6
@@ -74,7 +90,7 @@ def _collect_and_update(agent, drift=2.0, unfreeze_norm=False):
         key, act_key, step_key = jax.random.split(key, 3)
         agent.step(obs, evaluate=False, key=act_key)
         timestep = _timestep(step_key, 1.0 + drift * t)
-        agent.add(obs, timestep)
+        _buffer(agent, obs, timestep)
         obs = timestep.obs
 
     if unfreeze_norm:
@@ -122,8 +138,8 @@ class TestPPOObsNormFreeze:
     def test_unnormalized_agent_leaves_obs_untouched(self):
         """With normalization off the stats stay empty; obs must not be rescaled.
 
-        `_prepare_rollout` used to normalize unconditionally, which divided by a
-        zero-variance std and pinned every feature to the clip bound.
+        Normalizing unconditionally divides by a zero-variance std and pins
+        every feature to the clip bound.
         """
         agent = _make_agent(normalize_observations=False)
         diag = _collect_and_update(agent)
@@ -145,7 +161,7 @@ def _prepared_rollout(agent, key):
         key, act_key, step_key = jax.random.split(key, 3)
         agent.step(obs, evaluate=False, key=act_key)
         timestep = _timestep(step_key, 1.0)
-        agent.add(obs, timestep)
+        _buffer(agent, obs, timestep)
         obs = timestep.obs
 
     obs_mean, obs_std = agent._frozen_obs_norm()
@@ -167,13 +183,8 @@ def _prepared_rollout(agent, key):
 
 
 def _looped_update(state, key, agent, tensors):
-    """The Python loop `_grad_steps` replaced, kept here as the reference.
-
-    Deliberately a transcription of the original — nested loops, a host `float`
-    on `approx_kl`, and a `break` that abandons the rest of the rollout — so the
-    scanned version is measured against what it is meant to reproduce rather
-    than against itself.
-    """
+    """The reference `_grad_steps` is held against: nested loops, a host `float`
+    on `approx_kl`, and a `break` that abandons the rest of the rollout."""
     mb = agent.minibatch_size
     steps = stops = 0
     sums = dict(actor=0.0, critic=0.0, kl=0.0, clip=0.0)

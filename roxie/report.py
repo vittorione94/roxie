@@ -12,18 +12,15 @@ per task, each holding the agent comparison for that task.
     uv run python roxie/report.py --tasks CheetahRun,WalkerWalk
     uv run python roxie/report.py --entity my-team
 
-Why one project per env rather than one project with env tags: a project is the
-unit W&B gives a workspace, a run table and cross-run charts to. Making it the
-env means its default view is already the comparison that means something — same
-task, same budget, every agent — instead of 350 runs on incomparable score
-scales needing a filter before any chart says anything.
+One project per env rather than env tags, because a project is the unit W&B
+gives a workspace, a run table and cross-run charts to: its default view is then
+already the comparison that means something — same task, same budget, every
+agent — instead of 350 runs on incomparable score scales.
 
-The report has to live in ONE project, though, so it is written into whichever
-project `--report-project` names (by default the first task's). Its runsets
-reach across the others; that is a normal cross-project report.
+The report itself must live in one project, so it is written into whichever
+`--report-project` names (by default the first task's) and its runsets reach
+across the others.
 
-It is idempotent in the sense that re-running it after more runs land rebuilds
-the report from whatever is now in the projects — nothing here is hand-placed.
 W&B has no "overwrite report by title" API, so each invocation publishes a NEW
 report and prints its URL; delete superseded ones in the UI.
 

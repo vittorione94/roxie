@@ -20,8 +20,7 @@ from roxie.losses.critic_losses import d4pg_critic_loss_fn
 
 
 # DDPG's step, except the losses go through the categorical critic and so need
-# the fixed support `atoms`. Not jitted on its own — called inside `_grad_steps`
-# so N steps fuse into one compiled program.
+# the fixed support `atoms`.
 def _grad_step(
     state: TrainState,
     key: jax.random.PRNGKey,
@@ -44,12 +43,9 @@ def _grad_step(
     """One D4PG step, mutating `state` in place. `obs_mean`/`obs_std` are hoisted
     in by `_grad_steps` (the stats are loop-constant), as is `atoms`. `n_step` is
     the TD horizon (NOT the scan length `n_steps` in _grad_steps)."""
-    # `repack_samples` folds the n-step return, bootstrap coefficient and
-    # bootstrap obs into the dict — what shifts the categorical support.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalized once here: both losses read the same `observations`.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
@@ -138,8 +134,6 @@ def _grad_steps(
         ),
     )
 
-    # No `policy_delay` here, so the actor and critic ran on every fused step
-    # and share a denominator.
     diagnostics = {
         **reduce_diagnostics(actor_aux, n_steps),
         **reduce_diagnostics(critic_aux, n_steps),

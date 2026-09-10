@@ -25,22 +25,21 @@ two calls are the hand-off (behaviour snapshot out, transitions into a queue)
 rather than plain function calls.
 
 `buffer` and `update` are separate because the rollout calls them at different
-granularities: buffering happens once per env step, the gradient burst once per
+granularities: buffering once per env step, the gradient burst once per
 `steps_between_updates` window. The fused JAX rollout buffers on-device inside
-its scan and never calls `buffer` at all — it calls `update` once per chunk,
-which is the same cadence the per-step loop produced.
+its scan and never calls `buffer` at all.
 
 ``drain`` reports gradient steps *since this run started*, not including any
 restored from a resume — the trainer adds that back, so a resumed run's
 `train/gradient_steps` continues one curve regardless of which learner is in
-use. (The async path used to overwrite the counter instead, silently dropping
-the restored total on resume.)
+use.
 """
 
 import jax
 from flax import nnx
 
 from roxie.agents.agent import Agent
+from roxie.agents.utils import Transition
 
 
 class SyncLearner:
@@ -61,14 +60,25 @@ class SyncLearner:
         return actions, getattr(self._agent, "last_noise", None)
 
     def buffer(self, prev_obs, timestep, actions):
-        # Already on `agent.last_action`, which is what `add` reads; taken only
-        # to share the async learner's signature, where it travels by queue.
+        # Already on `agent.last_action`; taken only to share the async
+        # learner's signature, where it travels by queue instead.
         del actions
         agent = self._agent
-        agent.add(prev_obs, timestep)
+        agent.buffer_transitions(
+            Transition(
+                observation=prev_obs,
+                action=agent.last_action,
+                reward=timestep.reward,
+                terminal=timestep.terminated,
+                truncation=timestep.truncated,
+                **(agent.last_extras or {}),
+            ),
+            timestep.obs,
+        )
 
-        # On top of the update `add` already performs. Redundant-looking, but
-        # dropping it reweights the statistics away from every run logged so far.
+        # On top of the update `buffer_transitions` already performs.
+        # Redundant-looking, but dropping it reweights the statistics away from
+        # every run logged so far.
         if getattr(agent, "normalize_observations", False):
             agent.state.obs_stats = Agent.update_obs_stats(
                 agent.state.obs_stats, timestep.obs,

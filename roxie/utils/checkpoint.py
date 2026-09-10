@@ -1,20 +1,18 @@
 """Locating a run's checkpoints on disk.
 
 A run writes `<output_dir>/checkpoints/<N>/`, one directory per save, where `N`
-is the env-step count. To resume, `train.py` needs the exact step directory —
-but the path a user has at hand is usually the run directory they copied out of
-the console, or the `checkpoints/` dir. This module reduces any of those three
-to the one directory `Agent.restore` reads, so `resume=` accepts all of them.
+is the env-step count. `Agent.restore` reads the step directory, but the path a
+user has at hand is usually the run directory or the `checkpoints/` dir, so this
+module reduces any of the three to the one — which is what lets `resume=` accept
+all of them.
 
 `checkpoints/` is an `orbax.CheckpointManager` directory: it owns the step
-naming and the retention policy (`Trainer.replace_checkpoint` -> `max_to_keep`),
-and it nests the payload one level further down, under an item subdirectory.
-Everything here works on the step directory itself, which is the unit a user
-names, that `resume=` accepts, and that `play.py` resolves its run config
-relative to.
+naming and the retention policy, and nests the payload one level further under
+an item subdirectory. Everything here works on the step directory itself, the
+unit a user names and that `play.py` resolves its run config relative to.
 
-Nothing here imports JAX: it is pure path arithmetic, so it stays usable (and
-testable) without a device.
+Nothing here imports JAX — pure path arithmetic, usable and testable without a
+device.
 """
 
 import re

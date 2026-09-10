@@ -1,32 +1,28 @@
 """Writing an environment: a stateless, JAX-transformable interface.
 
-This is roxie's version of ``gymnasium.functional.FuncEnv`` — the same method
-set, the same ``params`` convention, the same spaces — so a Gymnasium
-``FuncEnv`` subclass satisfies this structurally and drops in unchanged. It is
-re-declared here rather than imported because upstream still ships it under
-``gymnasium.experimental`` and documents it as "predominantly for internal
-use... This API is likely to change". Roxie's *entire* env boundary sits on
-this, so pinning it to an API upstream reserves the right to break is a worse
-trade than forty lines.
+Roxie's version of ``gymnasium.functional.FuncEnv`` — same method set, same
+``params`` convention, same spaces — so a Gymnasium ``FuncEnv`` subclass
+satisfies this structurally. Re-declared rather than imported because upstream
+still ships it under ``gymnasium.experimental`` and documents the API as likely
+to change, and roxie's entire env boundary sits on it.
 
 An env written against this class owns no mutable state: every method takes the
-state it operates on and returns a new one. That is what lets the driver in
-``roxie.environment.vector`` ``vmap`` the env across a thousand worlds, ``jit``
-a whole step, and ``scan`` an entire warmup rollout into one dispatch.
+state it operates on and returns a new one, which is what lets the driver in
+``roxie.environment.vector`` ``vmap`` across a thousand worlds, ``jit`` a whole
+step, and ``scan`` an entire warmup rollout into one dispatch.
 
 ``params`` is the escape hatch for values that change between calls but must
-stay TRACED — refreshing them must not retrigger a compile. An env that ADAPTS
-its own ``params`` as training goes (a start-state curriculum, say) owns that
-adaptation itself, through ``init_params`` / ``observe_params`` /
-``epoch_refresh``; the driver only carries the value and hands it back. See
-those three methods.
+stay TRACED, so refreshing them does not retrigger a compile. An env that adapts
+its own ``params`` (a start-state curriculum, say) owns that adaptation through
+``init_params`` / ``observe_params`` / ``epoch_refresh``; the driver only
+carries the value and hands it back.
 
-One deliberate deviation from Gymnasium: ``truncal``. Gymnasium's driver
-hardcodes ``truncated = steps >= time_limit`` and its ``FuncEnv`` has no way to
-say "this episode ended for a non-failure reason of the env's own". A motion-
-tracking env has exactly that — the reference clip runs out — and it must stay
-OUT of ``terminal``, or the critic zeroes the bootstrap at the cutoff and Q
-collapses there. It defaults to False, so a plain Gymnasium ``FuncEnv`` is unaffected.
+One deliberate deviation from Gymnasium: ``truncal``. Gymnasium hardcodes
+``truncated = steps >= time_limit``, leaving an env no way to say "this episode
+ended for a non-failure reason of my own" — a motion-tracking env's reference
+clip running out, say, which must stay OUT of ``terminal`` or the critic zeroes
+the bootstrap at the cutoff. Defaults to False, so a plain Gymnasium
+``FuncEnv`` is unaffected.
 """
 
 from __future__ import annotations

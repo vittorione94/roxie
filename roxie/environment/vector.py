@@ -11,56 +11,40 @@ Two implementations of one surface:
 them — trainer, learner, agents — sees only this surface and never asks which it
 is driving.
 
-WHY NOT ``gymnasium.envs.functional_jax_env.FunctionalJaxVectorEnv``
---------------------------------------------------------------------
-The shape below is deliberately Gymnasium's; the implementation cannot be.
-Upstream's vector env is unusable here for three independent reasons:
-
-  1. ``step`` branches on ``if jnp.any(self.prev_done):`` — a device-to-host
-     sync EVERY step. A release cell runs 5e7 env steps; that one line would
-     dominate the loop.
-  2. It resets with ``self.state.at[to_reset].set(...)``, which assumes the
-     state is a single array. Roxie's states are pytrees (``mjx.Data``), and
-     ``.at[]`` raises on every env in this repo.
-  3. It keeps the state on ``self``, so warmup cannot be a ``lax.scan``. Roxie
-     fills the replay buffer in ONE dispatch; a per-step Python loop costs
-     minutes at the step counts warmup needs.
-
-Hence: same public shape, functional core. The caller carries the state, and a
-whole step — physics, reward, termination, auto-reset — is one jittable
-function.
+The shape above is deliberately Gymnasium's; the implementation cannot be.
+``FunctionalJaxVectorEnv`` syncs device-to-host every step (``if
+jnp.any(self.prev_done)``), resets with ``self.state.at[...]`` which assumes a
+single array rather than a pytree like ``mjx.Data``, and keeps the state on
+``self``, which puts a ``lax.scan`` warmup out of reach.
 
 AUTO-RESET
 ----------
-Roxie resets a done env IN THE SAME STEP, by gathering a fresh start from a
-pre-built pool of reset states, rather than on the next step as Gymnasium's
-``AutoresetMode.NEXT_STEP`` does. The reason is mechanical: resetting "however
-many envs happen to be done" has a data-dependent shape and cannot be jitted,
-whereas a gather from a fixed-size pool can. The pool is passed IN to ``step``
-rather than read off ``self`` so regenerating it each epoch does not invalidate
-the caller's compiled step.
+A done env is reset IN THE SAME STEP, by gathering a fresh start from a
+pre-built pool, rather than on the next step as ``AutoresetMode.NEXT_STEP``
+does: resetting "however many envs happen to be done" has a data-dependent shape
+and cannot be jitted, whereas a gather from a fixed-size pool can. The pool is
+passed IN to ``step`` rather than read off ``self`` so regenerating it each
+epoch does not invalidate the caller's compiled step.
 
-This is why ``step`` returns two things. ``Timestep`` holds the PRE-reset
-values — the true next observation, which is what the replay buffer must
-store — while the returned ``VecState`` holds the POST-reset observation, which
-is what the next action is selected from. For a pool that resets in C++ the two
-observations are the same array; see ``EnvPoolVectorEnv``.
+Hence ``step`` returning two things. ``Timestep`` holds the PRE-reset values —
+the true next observation, which is what the replay buffer must store — while
+the returned ``VecState`` holds the POST-reset observation, which is what the
+next action is selected from. For a pool that resets in C++ the two are the same
+array.
 
 NON-FINITE PHYSICS
 ------------------
-Both drivers guarantee one thing no env underneath them can guarantee for
-itself: a ``Timestep`` never carries a non-finite observation or reward. An env
-cannot do it because ``terminal`` is written as a comparison, and every
-comparison against NaN is False — a diverged world reports itself perfectly
-healthy, so nothing resets it and it emits NaN for the rest of the run. That is
-not one bad step: those NaNs land in the replay buffer, which resamples them
-forever, and in the running observation statistics, whose sums never recover.
+Both drivers guarantee what no env underneath them can: a ``Timestep`` never
+carries a non-finite observation or reward. An env cannot, because ``terminal``
+is a comparison and every comparison against NaN is False — a diverged world
+reports itself healthy, so nothing resets it and it emits NaN for the rest of
+the run.
 
 ``JaxVectorEnv`` zeroes such a world and forces it TERMINATED, so the auto-reset
 gather in the same call replaces it with a fresh start. ``EnvPoolVectorEnv``
 zeroes it but leaves the episode boundary to the pool, which owns resets in C++.
 Both report the per-step fraction of diverged worlds as the ``nonfinite`` entry
-of ``info["metrics"]``, which the trainer logs as ``train/nonfinite``.
+of ``info["metrics"]``, logged as ``train/nonfinite``.
 """
 
 from __future__ import annotations
@@ -130,11 +114,10 @@ class JaxVectorEnv:
     Args:
         func_env: the environment. NOT mutated — unlike Gymnasium, which calls
             ``func_env.transform(jax.vmap)`` in place, this builds its vmapped
-            callables locally. A builder may hand the SAME env object to the
-            train and the eval driver — that is the point of doing so, since the
-            mjx model and any per-env reference data are then loaded once — and
-            mutating it in place would double-vmap the second driver. It also
-            keeps the env callable on single states, which ``play.py`` needs.
+            callables locally, so a builder can hand the SAME env object to the
+            train and the eval driver (loading the mjx model once) without
+            double-vmapping the second. It also keeps the env callable on single
+            states, which ``play.py`` needs.
         num_envs: worlds stepped per call.
         max_episode_steps: the driver's step limit; 0 disables it. Reported as
             TRUNCATION, never termination.
@@ -214,19 +197,15 @@ class JaxVectorEnv:
         terminal = self._v_terminal(next_env_state, keys, params)
         truncal = self._v_truncal(next_env_state, keys, params)
 
-        # A world whose physics has diverged CANNOT report its own failure:
-        # every comparison against NaN is False, so a `terminal` written as
-        # "height < 0.8" says the world is fine, the auto-reset below never
-        # fires for it, and it goes on emitting NaN observations and NaN rewards
-        # for the rest of the run -- one dead world silently NaN-ing the epoch's
-        # mean return, the replay buffer and the observation statistics. This is
-        # the only place that can actually bring it back, because the reset
-        # gather is right here.
+        # A diverged world cannot report its own failure: every comparison
+        # against NaN is False, so a `terminal` written as "height < 0.8" says
+        # the world is fine and the auto-reset below never fires for it. This is
+        # the only place that can bring it back, the reset gather being here.
         #
-        # Termination, not truncation: `FuncEnv.terminal` names a NaN a failure,
-        # and a failure zeroes the bootstrap -- which is the right value for a
-        # state the physics could not represent. It is forced past `truncal`
-        # too, since a diverged world's cutoff is not a clean one.
+        # Termination, not truncation: a failure zeroes the bootstrap, which is
+        # the right value for a state the physics could not represent. Forced
+        # past `truncal` too, since a diverged world's cutoff is not a clean
+        # one.
         diverged = nonfinite_worlds(obs, reward)
         obs = zero_worlds(diverged, obs)
         reward = zero_worlds(diverged, reward)
@@ -242,12 +221,11 @@ class JaxVectorEnv:
         truncated = jnp.logical_or(truncal, step_truncated)
         done = jnp.logical_or(jnp.logical_or(terminated, truncal), step_truncated)
 
-        # The env's own metrics are zeroed for a diverged world for the same
-        # reason its reward is -- whatever it reported, it did not happen -- and
-        # without that one dead world NaNs every `train/<metric>` for the epoch.
-        # `nonfinite` is the driver's own key, logged as `train/nonfinite`, so a
-        # run that is quietly resetting dead worlds says so instead of just
-        # looking like a policy that stopped improving.
+        # A diverged world's metrics are zeroed for the same reason its reward
+        # is: whatever it reported, it did not happen. Without that, one dead
+        # world NaNs every `train/<metric>` for the epoch. `nonfinite` is the
+        # driver's own key, so a run quietly resetting dead worlds says so
+        # rather than just looking like a policy that stopped improving.
         info = {
             **info,
             "metrics": {
@@ -342,10 +320,8 @@ class EnvPoolVectorEnv:
 
     ``VecState.env_state`` is ``None`` and ``VecState.obs`` is the same array as
     ``Timestep.obs``: the pool resets in C++ and hands back only the POST-reset
-    observation, so the terminal transition's stored ``next_obs`` is the reset
-    obs. That is a pre-existing property of this path, not something introduced
-    here, and it is harmless because a true termination zeroes the bootstrap
-    anyway.
+    observation, so a terminal transition's stored ``next_obs`` is the reset obs.
+    Harmless, because a true termination zeroes the bootstrap.
     """
 
     metadata = {"jax": False, "impl": "envpool"}
@@ -444,12 +420,11 @@ class EnvPoolVectorEnv:
         reward = np.asarray(reward, dtype=np.float32)
 
         # The same guard `JaxVectorEnv.step` applies, minus the forced
-        # termination: episode boundaries here are the pool's, decided in C++,
-        # and a `terminated` this class invents would be one the pool never
-        # acts on -- it would re-fire every step, counting one dead world as
-        # thousands of finished episodes. So a diverged world is zeroed (which
-        # is what keeps it out of the replay buffer and the observation
-        # statistics) and reported, and ending it stays the pool's business.
+        # termination: episode boundaries here belong to the pool, and a
+        # `terminated` this class invents is one the pool never acts on -- it
+        # would re-fire every step, counting one dead world as thousands of
+        # finished episodes. So a diverged world is zeroed and reported, and
+        # ending it stays the pool's business.
         diverged = nonfinite_worlds(obs, reward, np)
         obs = zero_worlds(diverged, obs, np)
         reward = zero_worlds(diverged, reward, np)

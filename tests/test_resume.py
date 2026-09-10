@@ -24,15 +24,32 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 import pytest
 from flax import nnx, struct
 from omegaconf import OmegaConf
 
-from roxie.agents.utils import build_agent
+from roxie.agents.utils import Transition, build_agent
 from roxie.environment import functional
 from roxie.environment.vector import JaxVectorEnv, Timestep
 from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
 from roxie.utils.trainer import Trainer
+
+
+def _buffer(agent, prev_obs, timestep):
+    """What `SyncLearner.buffer` does: assemble the batch the agent stores."""
+    agent.buffer_transitions(
+        Transition(
+            observation=prev_obs,
+            action=agent.last_action,
+            reward=timestep.reward,
+            terminal=timestep.terminated,
+            truncation=timestep.truncated,
+            **(agent.last_extras or {}),
+        ),
+        timestep.obs,
+    )
+
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -184,7 +201,7 @@ def _drive(agent, iterations, key, num_envs=NUM_ENVS):
         next_obs = jnp.tanh(
             obs + 0.05 * jax.random.normal(step_key, (num_envs, OBS))
         )
-        agent.add(obs, _timestep(next_obs, t + 1))
+        _buffer(agent, obs, _timestep(next_obs, t + 1))
         obs, t = next_obs, t + 1
     return obs
 
@@ -260,6 +277,18 @@ def _trained(name, seed_key, iterations=8):
     return agent
 
 
+def _save(agent, path, **kwargs):
+    """Write one self-contained checkpoint, the way `Trainer._save` does.
+
+    A single directory rather than a manager's step/item pair — `Agent.restore`
+    reads both, and these tests want a path they chose themselves.
+    """
+    payload = agent.checkpoint_payload(**kwargs)
+    assert payload is not None, f"{type(agent).__name__} produced no payload"
+    with ocp.StandardCheckpointer() as checkpointer:
+        checkpointer.save(Path(path).resolve(), payload)
+
+
 # Locating a checkpoint
 
 
@@ -300,7 +329,7 @@ def test_restore_recovers_every_checkpointed_module(name, tmp_path):
     extra modules all come back."""
     agent = _trained(name, jax.random.PRNGKey(0))
     path = tmp_path / "1024"
-    agent.save(path, include_buffer=True)
+    _save(agent, path, include_buffer=True)
 
     fresh = _build(name)
     assert _differs(agent, fresh), "the trained agent must differ from a fresh one"
@@ -324,7 +353,7 @@ def test_resume_matches_an_uninterrupted_run(name, tmp_path):
     uninterrupted = _trained(name, key)
 
     path = tmp_path / "1024"
-    uninterrupted.save(path, include_buffer=True)
+    _save(uninterrupted, path, include_buffer=True)
     resumed = _build(name)
     resumed.restore(path)
 
@@ -345,23 +374,24 @@ def test_optimizer_moments_are_restored_not_reinitialized(name, tmp_path):
     exactly where the checkpoint says it had converged."""
     agent = _trained(name, jax.random.PRNGKey(2))
     path = tmp_path / "1024"
-    agent.save(path)
+    _save(agent, path)
 
     restored = _build(name)
     restored.restore(path)
-    cold = _build(name)
-    cold.restore(path, restore_optimizers=False)
 
     def moments(a):
         return _leaves(a.state.actor_optimizer)
 
     saved = moments(agent)
     assert any(np.any(x != 0) for x in saved), "no optimizer moments to restore"
+    # A fresh agent carries the cold-start moments, so this is what a restore
+    # that reinitialized would have produced — without it the equality below
+    # would pass for an optimizer that was never trained.
+    assert any(
+        not np.array_equal(x, y) for x, y in zip(saved, moments(_build(name)))
+    ), "the trained moments are indistinguishable from a fresh agent's"
     for x, y in zip(saved, moments(restored)):
         np.testing.assert_array_equal(x, y)
-    assert any(
-        not np.array_equal(x, y) for x, y in zip(saved, moments(cold))
-    ), "restore_optimizers=False still restored the optimizer"
 
 
 @pytest.mark.parametrize("name", AGENTS)
@@ -371,7 +401,7 @@ def test_buffer_is_opt_in_and_its_absence_is_reported(name, tmp_path):
     warmup instead of sampling zeros."""
     agent = _trained(name, jax.random.PRNGKey(3))
     path = tmp_path / "1024"
-    agent.save(path)
+    _save(agent, path)
 
     restored = _build(name)
     metadata = restored.restore(path)
@@ -390,7 +420,7 @@ def test_a_buffer_from_a_different_env_count_is_refused(tmp_path):
     buffer into the agent; it falls back to refilling."""
     agent = _trained("td3", jax.random.PRNGKey(6))
     path = tmp_path / "1024"
-    agent.save(path, include_buffer=True)
+    _save(agent, path, include_buffer=True)
 
     cfg = _config("td3")
     cfg.memory_config.add_batch_size = NUM_ENVS * 2
@@ -424,7 +454,7 @@ def test_exploration_schedule_does_not_restart(tmp_path):
     assert count > 0
 
     path = tmp_path / "1024"
-    agent.save(path)
+    _save(agent, path)
     restored = _build("td3")
     assert int(restored.noise_module.step_count.value) == 0
 
@@ -444,7 +474,7 @@ def test_sac_temperature_and_mpo_duals_survive(tmp_path):
         (mpo, lambda a: float(np.ravel(np.asarray(a.dual_params.log_temperature.value))[0])),
     ):
         path = tmp_path / str(id(agent))
-        agent.save(path)
+        _save(agent, path)
         fresh = _build("sac" if agent is sac else "mpo")
         assert read(fresh) != pytest.approx(read(agent)), "value never moved"
         fresh.restore(path)
@@ -463,7 +493,7 @@ def test_stateless_agent_restores_metadata_only(tmp_path):
     path = tmp_path / "64"
     # The base `save` declines (no `state`) rather than raising, so write a
     # checkpoint through an agent that has one and restore it into the baseline.
-    _trained("td3", jax.random.PRNGKey(11)).save(path, extra_metadata={"steps": 64})
+    _save(_trained("td3", jax.random.PRNGKey(11)), path, extra_metadata={"steps": 64})
 
     metadata = agent.restore(path)
     assert int(metadata["steps"]) == 64
@@ -653,7 +683,7 @@ def test_transition_prototype_is_unchanged_by_a_round_trip(tmp_path):
     dict orbax hands back — a dict would fail at the next `add`."""
     agent = _trained("sac", jax.random.PRNGKey(12))
     path = tmp_path / "1024"
-    agent.save(path, include_buffer=True)
+    _save(agent, path, include_buffer=True)
 
     restored = _build("sac")
     restored.restore(path)

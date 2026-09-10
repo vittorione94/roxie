@@ -1,5 +1,33 @@
+import jax
 import jax.numpy as jnp
 from jax import vmap
+
+
+@jax.jit
+def scale_to_env(x: jnp.ndarray, low: jnp.ndarray, high: jnp.ndarray):
+    # x in [-1, 1] -> [low, high]
+    return low + 0.5 * (x + 1.0) * (high - low)
+
+
+def finite_or_zero(x: jnp.ndarray) -> jnp.ndarray:
+    """Replace every non-finite entry with zero.
+
+    Used at the three boundaries where a NaN stops being one bad number and
+    becomes permanent: the action leaving the actor (integrated into qpos/qvel,
+    and the world is dead), the observation entering the running statistics
+    (summed, so one NaN poisons the mean/std for the rest of the run), and
+    anything entering the replay buffer (resampled until the run ends).
+
+    Infinities are zeroed alongside NaN rather than clipped to a rail: both mean
+    something upstream has diverged, and an inf that survives is the same NaN one
+    `0 * inf` later.
+    """
+    return jnp.where(jnp.isfinite(x), x, 0.0)
+
+
+@jax.jit
+def normalize_obs(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, clip: float):
+    return jnp.clip((x - mean) / std, -clip, clip)
 
 def quat_conjugate(q):
     return jnp.concatenate([q[..., :1], -q[..., 1:]], axis=-1)
@@ -27,9 +55,9 @@ def batched_quat_diff(q_from, q_to):
 
 
 def quaternion_distance(q1, q2):
-    """
-    Computes the angular geodesic distance between two unit quaternions in radians.
-    Expects quaternions in the format: (x, y, z, w) or (w, x, y, z)
+    """Angular geodesic distance between two unit quaternions, in radians.
+
+    Accepts either (x, y, z, w) or (w, x, y, z) ordering.
     """
     # abs() folds the double cover (q and -q are the same rotation); the clip
     # guards arccos against NaN from float round-off just outside [-1, 1].
@@ -65,15 +93,11 @@ def quat_to_rot6d(q):
 def mat_to_rot6d(mat):
     """3x3 rotation matrix -> 6D continuous rotation rep.
 
-    Same representation and rationale as `quat_to_rot6d` (Zhou et al.), but taken
-    straight from a rotation MATRIX instead of a quaternion. Feeds directly off
+    Same representation and rationale as `quat_to_rot6d`, and the same output
+    ordering, so the two are interchangeable network inputs. Feeds directly off
     MuJoCo `xmat`, whose layout differs by backend: native MjData stores each
-    body frame row-major as 9 contiguous floats [r00, r01, r02, ...], while mjx
-    keeps it as an explicit (3, 3). Both are accepted — a trailing 9 is folded to
-    (3, 3). The 6D rep is the matrix's first two columns, flattened as
-    [c0x, c0y, c0z, c1x, c1y, c1z] — identical ordering to `quat_to_rot6d`, so
-    both are interchangeable network inputs. Assumes `mat` is a proper rotation
-    (orthonormal columns).
+    body frame row-major as 9 contiguous floats, mjx as an explicit (3, 3). Both
+    are accepted. Assumes `mat` is a proper rotation.
 
     Batches over leading dims: (..., 9) or (..., 3, 3) -> (..., 6).
     """

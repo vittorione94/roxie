@@ -19,22 +19,17 @@ def _log_one_minus_tanh_sq(u: jnp.ndarray) -> jnp.ndarray:
 class TanhNormal:
     """Diagonal Normal pushed through tanh, so samples live in (-1, 1).
 
-    Why this exists: with an unsquashed Normal nothing bounds the policy mean.
-    Once it drifts past the actuator range the environment clips it, the control
-    effect saturates and the gradient pulling it back vanishes -- while any
-    action-magnitude or action-rate reward term keeps charging for output the
-    simulator discarded. The unbounded entropy (const + sum log sigma) also lets
-    an entropy bonus inflate sigma for free, since the extra spread is clipped
-    away before it can cost anything. Squashing removes both: the mean is bounded
-    by construction and the entropy saturates instead of growing without limit.
+    With an unsquashed Normal nothing bounds the policy mean: once it drifts
+    past the actuator range the env clips it, the control effect saturates and
+    the gradient pulling it back vanishes, while any action-magnitude reward term
+    keeps charging for output the simulator discarded. Its unbounded entropy
+    (const + sum log sigma) also lets an entropy bonus inflate sigma for free.
+    Squashing removes both.
 
-    Only the surface the agents actually use is implemented (`loc`,
-    `scale_diag`, `sample`, `sample_from_pre`, `log_prob_from_pre`, `mean`,
-    `entropy`, `stddev`); this is deliberately not a full
-    ``distrax.Distribution``. In particular there is NO `log_prob(action)`:
-    every density here is scored from the pre-tanh `u`, because the squash is
-    not invertible in float32 and an action-keyed overload would be the obvious
-    thing to reach for and would be silently wrong. See `log_prob_from_pre`.
+    Only the surface the agents use is implemented — deliberately not a full
+    ``distrax.Distribution``. In particular there is NO `log_prob(action)`: the
+    squash is not invertible in float32, so every density is scored from the
+    pre-tanh `u`. See `log_prob_from_pre`.
     """
 
     def __init__(self, loc: jnp.ndarray, scale: jnp.ndarray):
@@ -64,22 +59,12 @@ class TanhNormal:
 
         The only path there is, and the reason there is no action-keyed
         overload: recovering `u` from `tanh(u)` needs an arctanh clipped short
-        of 1.0, which cannot tell saturated draws apart -- `tanh` rounds to
-        exactly 1.0 for |u| >= 8, so every such draw comes back as the same
-        rail (~7.25 in float32). Concretely:
-
-        * SAC differentiates through the draw. The clip has no gradient, so
-          routing the pathwise term through `log_prob` would kill it exactly
-          where the policy rails; from `u` it stays alive (d/du -> -2 per dim).
-        * MPO's M-step scores target-policy draws under the online policy. The
-          clip would pin every saturated draw's `u` to the same rail (~7.25 in
-          float32) while the online mean walks past it, dragging the weighted
-          maximum-likelihood fit back toward that rail.
-        * PPO recomputes a ratio against a log-prob stored one rollout earlier.
-          Same rail, and the release runs died on it: the density stopped
-          tracking the policy, `approx_kl` pinned at exp(_MAX_LOG_RATIO), and
-          `target_kl` abandoned every rollout after one minibatch. It stores
-          `u` in the buffer for this reason (`transition_prototype`).
+        of 1.0, and `tanh` rounds to exactly 1.0 for |u| >= 8, so every
+        saturated draw comes back as the same rail (~7.25 in float32). That
+        kills SAC's pathwise gradient exactly where the policy rails, drags
+        MPO's weighted maximum-likelihood fit back toward the rail, and makes
+        PPO's stored log-prob stop tracking its policy — which is why PPO keeps
+        `u` in its buffer (`transition_prototype`).
         """
         return self._base.log_prob(u) - jnp.sum(_log_one_minus_tanh_sq(u), axis=-1)
 
@@ -139,20 +124,15 @@ def deterministic_action(output) -> jnp.ndarray:
 class DeterministicActor(nnx.Module):
     """MLP policy whose output is squashed into [-1, 1] by a final tanh.
 
-    NOTE ON SATURATION: the deterministic policy gradient (``-Q(s, pi(s))``)
-    pushes each action dimension monotonically outward and nothing in the DPG
-    objective prices the *pre-tanh* magnitude, so the logits drift until tanh
-    saturates. Past that point ``d(tanh u)/du = 1 - tanh^2 u`` underflows to
-    zero, the actor gradient dies, and the policy is frozen as a bang-bang
-    controller. Two defences live here and in the actor losses:
-
-    * ``output_init_scale`` starts the final layer deep inside tanh's linear
-      region (the original DDPG paper's small-final-layer trick), so the
-      logits have to be *driven* out rather than starting near the knee.
-    * ``forward`` also returns the pre-activation, so the actor loss can add a
-      one-sided penalty on it (``pre_activation_coef`` on the agents). Without
-      that penalty a small init only delays the collapse, it does not prevent
-      it.
+    SATURATION: the deterministic policy gradient (``-Q(s, pi(s))``) pushes each
+    action dimension monotonically outward and nothing in the DPG objective
+    prices the *pre-tanh* magnitude, so the logits drift until tanh saturates,
+    ``d(tanh u)/du`` underflows and the policy freezes as a bang-bang
+    controller. Two defences: ``output_init_scale`` starts the final layer deep
+    inside tanh's linear region, so the logits have to be driven out; and
+    ``forward`` returns the pre-activation, so the actor loss can charge a
+    one-sided penalty on it (``pre_activation_coef``). A small init alone only
+    delays the collapse.
     """
 
     def __init__(
@@ -221,12 +201,10 @@ class DeterministicActor(nnx.Module):
 class StochasticActor(nnx.Module):
     """MLP policy emitting a `TanhNormal` over actions in (-1, 1).
 
-    The squash is unconditional. It used to be a `squash` flag defaulting to
-    False, but every consumer now needs it: PPO for a policy mean the actuator
-    range can bound and an entropy bonus that cannot pay to inflate sigma
-    forever, SAC and MPO for that plus the stable tanh log-prob correction their
-    losses read off `TanhNormal.log_prob_from_pre`. A flag whose false branch no
-    config selects is only a way to build an agent that crashes in its loss.
+    The squash is unconditional: PPO needs a policy mean the actuator range can
+    bound and an entropy bonus that cannot pay to inflate sigma forever, and SAC
+    and MPO additionally need the stable tanh log-prob correction their losses
+    read off `TanhNormal.log_prob_from_pre`.
     """
 
     def __init__(

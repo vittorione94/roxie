@@ -2,15 +2,13 @@
 
 experiments/dmc/agent/ddpg_bench.yaml calls the four deterministic arms "a clean
 algorithm-only A/B" on the strength of them carrying the same
-`pre_activation_coef`. They did carry the same value — but only TD3's actor loss
-took the argument, so DDPG, D4PG and TD4 ran at an effective 0 while TD3 paid a
-0.1 penalty nothing else paid. On AcrobotSwingup that was worth roughly 2x in
-score, and nothing in the run reported it: the value round-tripped through the
-config, the checkpoint and the hyperparameter log either way.
+`pre_activation_coef`. An arm whose actor loss quietly ignores the argument
+still round-trips the value through the config, the checkpoint and the
+hyperparameter log, so nothing in the run reports the difference.
 
-So the invariant is tested by DIFFERENTIATION, not by reading the configs: run
-the same burst at two coefficients and require the actor to have moved
-differently.
+Hence testing the invariant by DIFFERENTIATION rather than by reading the
+configs: run the same burst at two coefficients and require the actor to have
+moved differently.
 """
 
 import jax
@@ -24,6 +22,7 @@ from roxie.agents.d4pg import D4PG
 from roxie.agents.ddpg import DDPG
 from roxie.agents.td3 import TD3
 from roxie.agents.td4 import TD4
+from roxie.agents.utils import Transition
 
 OBS, ACT, ENVS = 6, 3, 8
 
@@ -81,12 +80,14 @@ def _build(cls, critic_target, coef, extra):
 
     rng = np.random.default_rng(0)
     for _ in range(40):
-        agent.add_transitions(
-            jnp.asarray(rng.standard_normal((ENVS, OBS)), jnp.float32),
-            jnp.asarray(rng.standard_normal((ENVS, ACT)), jnp.float32),
-            jnp.asarray(rng.standard_normal(ENVS), jnp.float32),
-            jnp.zeros(ENVS, jnp.bool_),
-            jnp.zeros(ENVS, jnp.bool_),
+        agent.buffer_transitions(
+            Transition(
+                observation=jnp.asarray(rng.standard_normal((ENVS, OBS)), jnp.float32),
+                action=jnp.asarray(rng.standard_normal((ENVS, ACT)), jnp.float32),
+                reward=jnp.asarray(rng.standard_normal(ENVS), jnp.float32),
+                terminal=jnp.zeros(ENVS, jnp.bool_),
+                truncation=jnp.zeros(ENVS, jnp.bool_),
+            ),
             jnp.asarray(rng.standard_normal((ENVS, OBS)), jnp.float32),
         )
     for i in range(8):

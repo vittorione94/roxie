@@ -6,33 +6,26 @@ Where the learner dominates (e.g. D4PG's distributional critic), that caps
 throughput well below the CPU physics ceiling.
 
 ``AsyncLearner`` moves the gradient updates onto a background thread that is the
-*sole owner* of ``agent.state`` (networks, optimizers, replay buffer, obs
-stats). The main (acting) thread never touches ``agent.state``: it selects
-actions from a **behaviour actor** snapshot the learner publishes, steps the
-envs on CPU, and hands the transitions to the learner through a queue, so the
-physics and the gradient bursts overlap in wall-clock time.
-
-That ownership split is what makes the agents' fused ``_grad_steps`` donation of
-the whole train state safe: nothing else references the buffer concurrently. The
-acting thread reads an independent behaviour actor and pushes raw transition
-arrays; it never aliases the buffer.
+*sole owner* of ``agent.state``. The acting thread selects from a behaviour
+actor snapshot the learner publishes, steps the envs on CPU, and hands
+transitions over through a queue, so physics and gradient bursts overlap in
+wall-clock time. That ownership split is also what makes the agents' fused
+``_grad_steps`` donation of the whole train state safe: nothing else references
+the buffer concurrently.
 
 Semantics vs. the synchronous loop:
   * Replay ratio is preserved: the learner runs one ``learning_steps`` burst
     each time the number of *buffered* transitions crosses a
-    ``steps_between_updates`` boundary past ``memory_warmup``, the same
-    cadence sync ``update`` uses. Behind, it runs bursts back-to-back; ahead, it
-    waits for data — so the ratio matches sync on average and never runs ahead
-    of collected data.
-  * The behaviour policy lags the learner by up to one burst (standard for
-    async off-policy RL), which an off-policy replay buffer tolerates.
+    ``steps_between_updates`` boundary past ``memory_warmup``. Behind, it runs
+    bursts back-to-back; ahead, it waits for data.
+  * The behaviour policy lags the learner by up to one burst, which an
+    off-policy replay buffer tolerates.
 
 Concurrency contract: the only cross-thread shared objects are the transition
-queue (thread-safe) and a lock-guarded snapshot/metrics slot. The lock is held
-only for cheap reference swaps, never across device compute, so JAX dispatch on
-both threads can overlap. It is NOT safe to call ``agent.step`` / ``agent.save``
-while the learner runs; the trainer brackets eval and checkpointing with
-``pause()`` / ``resume()``.
+queue and a lock-guarded snapshot/metrics slot, and the lock is held only for
+reference swaps, never across device compute. It is NOT safe to call
+``agent.step`` / ``agent.save`` while the learner runs; the trainer brackets
+eval and checkpointing with ``pause()`` / ``resume()``.
 """
 
 from __future__ import annotations
@@ -44,6 +37,8 @@ import threading
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+from roxie.agents.utils import Transition
 
 
 class AsyncLearner:
@@ -288,8 +283,17 @@ class AsyncLearner:
         if item is None:  # stop / wake sentinel
             return 0
         prev_obs, action, reward, termination, truncation, next_obs = item
-        self._agent.add_transitions(
-            prev_obs, action, reward, termination, truncation, next_obs
+        # The action came through the queue with this transition, rather than
+        # off `agent.last_action`, which the acting thread overwrites every step.
+        self._agent.buffer_transitions(
+            Transition(
+                observation=prev_obs,
+                action=action,
+                reward=reward,
+                terminal=termination,
+                truncation=truncation,
+            ),
+            next_obs,
         )
         return int(reward.shape[0])
 
@@ -309,10 +313,7 @@ class AsyncLearner:
         gradient work. Without it the loop exits only when the queue is
         momentarily empty, and when acting is cheaper than buffering (dm_control
         physics at 256 envs is nearly free) the acting thread refills faster than
-        `_add_item` drains, so the learner never reaches its `learn` call. That
-        livelock neither deadlocks nor raises: the run just finishes at a
-        fraction of its replay ratio, silently untrained — DDPG/AcrobotSwingup
-        took 40 of the 2,640 gradient steps the schedule asks for.
+        `_add_item` drains, so the learner never reaches its `learn` call.
 
         `pause()` still wants the unbounded form: there the acting thread is
         quiesced, so the queue does drain, and stranded data would be lost.

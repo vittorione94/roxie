@@ -9,9 +9,7 @@ def tree_shapes(x):
     return jax.tree_util.tree_map(lambda a: tuple(a.shape), x)
 
 def make_fake_batch(add_batch_size, add_sequence_length, obs_dim, offset=0.0):
-    """
-    Create a batch shaped (B, T, ...), matching TrajectoryQueue expectations.
-    """
+    """A batch shaped (B, T, ...), matching TrajectoryQueue expectations."""
     B, T = add_batch_size, add_sequence_length
     obs = (jnp.arange(B * T * obs_dim, dtype=jnp.float32)
              .reshape(B, T, obs_dim)) + offset
@@ -26,14 +24,12 @@ def unwrap_experience(sample_obj):
     return getattr(sample_obj, "experience", sample_obj)
 
 def main():
-    # ---- Config ----
-    ADD_BATCH_SIZE = 2          # number of envs/streams added per 'add'
-    ADD_SEQ_LEN = 4             # timesteps per add
-    SAMPLE_SEQ_LEN = 3          # timesteps per sample
-    MAX_LENGTH_TIME_AXIS = 10   # time capacity of the queue
+    ADD_BATCH_SIZE = 2
+    ADD_SEQ_LEN = 4
+    SAMPLE_SEQ_LEN = 3
+    MAX_LENGTH_TIME_AXIS = 10
     OBS_DIM = 3
 
-    # ---- Build the queue (note required sample_sequence_length) ----
     buffer = fbx.buffers.make_trajectory_queue(
         add_batch_size=ADD_BATCH_SIZE,
         add_sequence_length=ADD_SEQ_LEN,
@@ -41,7 +37,7 @@ def main():
         max_length_time_axis=MAX_LENGTH_TIME_AXIS,
     )
 
-    # ---- Init (prototype has no leading B/T dims) ----
+    # The prototype has no leading B/T dims.
     example_timestep = {
         "obs": jnp.zeros((OBS_DIM,), dtype=jnp.float32),
         "action": jnp.array(0, dtype=jnp.int32),
@@ -54,7 +50,6 @@ def main():
     print("can_add?     ", bool(buffer.can_add(state)))
     print("can_sample?  ", bool(buffer.can_sample(state)))
 
-    # ---- Add two (B,T,...) batches ----
     batch0 = make_fake_batch(ADD_BATCH_SIZE, ADD_SEQ_LEN, OBS_DIM, offset=0.0)
     state = buffer.add(state, batch0)
     print("\n=== After 1st add ===")
@@ -67,22 +62,20 @@ def main():
     print("can_add?     ", bool(buffer.can_add(state)))
     print("can_sample?  ", bool(buffer.can_sample(state)))
 
-    # ---- Sample once; handle both possible return signatures ----
     try:
-        state, sample = buffer.sample(state)  # common: returns (state, sample)
+        state, sample = buffer.sample(state)
     except TypeError:
-        sample = buffer.sample(state)         # some versions: returns sample only
+        sample = buffer.sample(state)  # some versions return the sample alone
 
     exp = unwrap_experience(sample)
 
     print("\n=== Sampled experience shapes ===")
     print(tree_shapes(exp))  # expect (ADD_BATCH_SIZE, SAMPLE_SEQ_LEN, ...)
 
-    # Show a quick peek at values to verify FIFO over time
     print("\nExample obs for env 0 across sampled timesteps:")
-    print(exp["obs"][0])  # shape (SAMPLE_SEQ_LEN, OBS_DIM)
+    print(exp["obs"][0])
 
-    # ---- Fill beyond capacity to show FIFO behavior along time axis ----
+    # Past capacity, to show FIFO along the time axis.
     batch2 = make_fake_batch(ADD_BATCH_SIZE, ADD_SEQ_LEN, OBS_DIM, offset=200.0)
     state = buffer.add(state, batch2)
 

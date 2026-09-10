@@ -16,34 +16,35 @@ from roxie.agents.utils import (
     soft_update,
     transition_prototype,
 )
+from roxie.utils.math import finite_or_zero, normalize_obs, scale_to_env
 
 
 class TestScaleToEnv:
     def test_center(self):
         x = jnp.array([0.0])
-        result = Agent.scale_to_env(x, jnp.array([-1.0]), jnp.array([1.0]))
+        result = scale_to_env(x, jnp.array([-1.0]), jnp.array([1.0]))
         assert jnp.isclose(result, 0.0)
 
     def test_low_bound(self):
         x = jnp.array([-1.0])
-        result = Agent.scale_to_env(x, jnp.array([-2.0]), jnp.array([2.0]))
+        result = scale_to_env(x, jnp.array([-2.0]), jnp.array([2.0]))
         assert jnp.isclose(result, -2.0)
 
     def test_high_bound(self):
         x = jnp.array([1.0])
-        result = Agent.scale_to_env(x, jnp.array([-2.0]), jnp.array([2.0]))
+        result = scale_to_env(x, jnp.array([-2.0]), jnp.array([2.0]))
         assert jnp.isclose(result, 2.0)
 
     def test_asymmetric_bounds(self):
         x = jnp.array([0.0])
-        result = Agent.scale_to_env(x, jnp.array([0.0]), jnp.array([10.0]))
+        result = scale_to_env(x, jnp.array([0.0]), jnp.array([10.0]))
         assert jnp.isclose(result, 5.0)
 
     def test_batch(self):
         x = jnp.array([[-1.0, 0.0, 1.0]])
         low = jnp.array([0.0, 0.0, 0.0])
         high = jnp.array([1.0, 1.0, 1.0])
-        result = Agent.scale_to_env(x, low, high)
+        result = scale_to_env(x, low, high)
         expected = jnp.array([[0.0, 0.5, 1.0]])
         assert jnp.allclose(result, expected)
 
@@ -70,12 +71,12 @@ class _NaNStochasticActor(nnx.Module):
 class TestFiniteOrZero:
     def test_replaces_non_finite(self):
         x = jnp.array([jnp.nan, jnp.inf, -jnp.inf, 0.5, -1.0])
-        result = Agent.finite_or_zero(x)
+        result = finite_or_zero(x)
         assert jnp.array_equal(result, jnp.array([0.0, 0.0, 0.0, 0.5, -1.0]))
 
     def test_passes_finite_through(self):
         x = jnp.array([[-1.0, 0.0, 1.0]])
-        assert jnp.array_equal(Agent.finite_or_zero(x), x)
+        assert jnp.array_equal(finite_or_zero(x), x)
 
     def test_deterministic_step_is_finite(self):
         actor = _NaNDeterministicActor(3)
@@ -105,7 +106,7 @@ class TestFiniteOrZero:
 
 
 class _FakeBufferState:
-    """A buffer_state stand-in: `_pruned_transition` reads only `.experience`."""
+    """A buffer_state stand-in: `_transition` reads only `.experience`."""
 
     def __init__(self, experience):
         self.experience = experience
@@ -137,18 +138,20 @@ class TestNonFiniteNeverPersists:
         stats = Agent.update_obs_stats(stats, jnp.ones((2, 3)))
 
         mean, std = Agent.obs_mean_std(stats, 1e-8)
-        clean = Agent.normalize_obs(jnp.ones((1, 3)), mean, std, 10.0)
+        clean = normalize_obs(jnp.ones((1, 3)), mean, std, 10.0)
         assert jnp.isfinite(clean).all()
 
     def test_buffer_write_is_scrubbed(self):
         state = _FakeBufferState(transition_prototype(3, 2))
-        written = Agent._pruned_transition(
+        written = Agent._transition(
             state,
-            observation=jnp.full((1, 3), jnp.nan),
-            action=jnp.zeros((1, 2)),
-            reward=jnp.array([jnp.nan]),
-            terminal=jnp.array([False]),
-            truncation=jnp.array([False]),
+            Transition(
+                observation=jnp.full((1, 3), jnp.nan),
+                action=jnp.zeros((1, 2)),
+                reward=jnp.array([jnp.nan]),
+                terminal=jnp.array([False]),
+                truncation=jnp.array([False]),
+            ),
         )
 
         assert jnp.array_equal(written.observation, jnp.zeros((1, 3)))
@@ -159,13 +162,15 @@ class TestNonFiniteNeverPersists:
     def test_buffer_pruning_still_drops_unused_fields(self):
         """The scrub must not resurrect a field this buffer never allocated."""
         state = _FakeBufferState(transition_prototype(3, 2, truncation=False))
-        written = Agent._pruned_transition(
+        written = Agent._transition(
             state,
-            observation=jnp.zeros((1, 3)),
-            action=jnp.zeros((1, 2)),
-            reward=jnp.zeros((1,)),
-            terminal=jnp.array([False]),
-            truncation=jnp.array([False]),
+            Transition(
+                observation=jnp.zeros((1, 3)),
+                action=jnp.zeros((1, 2)),
+                reward=jnp.zeros((1,)),
+                terminal=jnp.array([False]),
+                truncation=jnp.array([False]),
+            ),
         )
         assert written.truncation is None
 
@@ -205,7 +210,7 @@ class TestObsStats:
         x = jnp.array([10.0, 20.0])
         mean = jnp.array([5.0, 10.0])
         std = jnp.array([5.0, 5.0])
-        result = Agent.normalize_obs(x, mean, std, clip=5.0)
+        result = normalize_obs(x, mean, std, clip=5.0)
         expected = jnp.array([1.0, 2.0])
         assert jnp.allclose(result, expected)
 
@@ -213,7 +218,7 @@ class TestObsStats:
         x = jnp.array([100.0])
         mean = jnp.array([0.0])
         std = jnp.array([1.0])
-        result = Agent.normalize_obs(x, mean, std, clip=3.0)
+        result = normalize_obs(x, mean, std, clip=3.0)
         assert jnp.isclose(result, 3.0)
 
     def test_full_pipeline(self):
@@ -222,7 +227,7 @@ class TestObsStats:
             batch = jnp.array([[float(i), float(i) * 2]])
             stats = Agent.update_obs_stats(stats, batch)
         mean, std = Agent.obs_mean_std(stats, eps=1e-8)
-        normalized = Agent.normalize_obs(jnp.array([50.0, 100.0]), mean, std, clip=5.0)
+        normalized = normalize_obs(jnp.array([50.0, 100.0]), mean, std, clip=5.0)
         assert jnp.all(jnp.abs(normalized) <= 5.0)
 
 

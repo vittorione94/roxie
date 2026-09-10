@@ -20,6 +20,7 @@ from roxie.agents.utils import (
 )
 from roxie.losses.actor_losses import mpo_actor_loss_fn
 from roxie.losses.critic_losses import mpo_critic_loss_fn
+from roxie.utils.math import normalize_obs, scale_to_env
 
 
 def _inv_softplus(y: float) -> float:
@@ -85,7 +86,6 @@ def _mpo_grad_step(
         "next_observations": samples.experience.second.observation,
         "terminals": samples.experience.first.terminal,
     }
-    # Normalized once here: both losses read the same `observations`.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
@@ -360,23 +360,19 @@ class MPO(Agent):
 
         Taking the actor and the stats as arguments rather than reading
         ``self.state`` is what lets the fused acting burst run this against a
-        ``lax.scan`` carry, so a whole ``steps_between_updates`` window of acting
-        costs one host dispatch instead of one per env step. Returns
-        ``(scaled_action, deviation_from_mode, extras)``; `extras` is the
-        per-step fields the buffer stores beyond the standard five, and is empty
-        here — only PPO has any.
+        ``lax.scan`` carry. Returns ``(scaled_action, deviation_from_mode,
+        extras)``; `extras` is empty — only PPO stores anything beyond the
+        standard five.
 
-``critic`` is accepted and ignored too: only an on-policy agent
-        stores a value estimate at acting time.
-
-        ``noise_module`` is accepted and ignored: MPO explores from its own
-        stochastic policy and carries no noise module. The argument is part of
-        the shared signature the fused acting burst calls through.
+        ``noise_module`` and ``critic`` are part of the shared signature the
+        fused acting burst calls through, and ignored here: MPO explores from
+        its own stochastic policy, and only an on-policy agent stores a value
+        estimate at acting time.
         """
         del noise_module, critic
         if self.normalize_observations:
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
-            observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
+            observation = normalize_obs(observation, mean, std, self.obs_clip)
 
         # Bounded by the actor's own tanh, not by a clip on top of it: the
         # `TanhNormal` samples already live in (-1, 1), which is also how both
@@ -385,7 +381,7 @@ class MPO(Agent):
             actor, observation, evaluate, key,
         )
         return (
-            Agent.scale_to_env(action, self.action_low, self.action_high),
+            scale_to_env(action, self.action_low, self.action_high),
             noise,
             {},
         )
@@ -410,7 +406,7 @@ class MPO(Agent):
         Deliberately named `_learn`, not `learn`: the trainer treats a public
         `learn` as the signal that an agent can be driven by the async learner
         (`Trainer._run`). MPO now satisfies the rest of that contract
-        (`select_action` / `add_transitions`, which is also what puts it on the
+        (`select_action` / `buffer_transitions`, which is also what puts it on the
         fused acting path), so this name is the ONLY thing keeping it
         synchronous — and it should stay that way until an async run is actually
         validated against the sync curves. Renaming it is the whole opt-in.

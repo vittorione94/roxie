@@ -1,12 +1,9 @@
 """End-to-end guards for the fused MPO gradient burst.
 
-MPO used to run its `learning_steps` as a Python loop of separate `nnx.jit`
-dispatches; it now fuses them into one `lax.scan` with a donated train state,
-like SAC/TD3/DDPG. The Lagrange duals (temperature + the two decoupled KL
-multipliers) and their Adam slots ride in the scan carry, which is exactly the
-kind of thing that silently stops updating (or fails to trace) without a real
-burst exercising it — hence these tests rather than unit tests of the loss
-functions alone.
+The Lagrange duals (temperature + the two decoupled KL multipliers) and their
+Adam slots ride in the `lax.scan` carry, which is exactly the kind of thing that
+silently stops updating (or fails to trace) without a real burst exercising it —
+hence these tests rather than unit tests of the loss functions alone.
 """
 
 import copy
@@ -177,13 +174,13 @@ class TestFusedBurst:
         )
 
     def test_qualifies_for_the_fused_acting_path(self, agent):
-        """The pure `select_action` / `buffer_transitions` pair is what
-        `rollout.fusable` tests for, and without it a whole
-        `steps_between_updates` window of acting is dispatched one env step at a
-        time. That cost MPO ~4x throughput on the v1 grid (26k sps against SAC's
-        114k at an identical update schedule), so it is pinned here."""
-        for name in ("select_action", "buffer_transitions"):
-            assert hasattr(agent, name), f"MPO lost `{name}`; acting un-fuses"
+        """The pure `select_action` is what `rollout.fusable` tests for, and
+        without it a whole `steps_between_updates` window of acting is
+        dispatched one env step at a time — ~4x throughput on the v1 grid.
+
+        Its partner `buffer_transitions` is not worth asserting: `Agent` defines
+        it, so every agent has one whether or not it can be fused."""
+        assert hasattr(agent, "select_action"), "MPO lost it; acting un-fuses"
 
     def test_select_action_reads_the_actor_it_is_handed(self, agent):
         """`select_action` has to run against a `lax.scan` carry, so it must take
@@ -215,7 +212,7 @@ class TestFusedBurst:
 
     def test_buffer_layout_survives_the_shared_add(self, agent):
         """MPO is the one agent whose buffer omits `truncation`, and the shared
-        `add`/`buffer_transitions` path is handed one anyway. The base prunes
+        shared `buffer_transitions` path is handed one anyway. The base prunes
         against this agent's own prototype; if that regressed, the add would not
         typecheck and the stored tree would grow a field."""
         assert agent.state.buffer_state.experience.truncation is None
@@ -223,13 +220,15 @@ class TestFusedBurst:
         # The flat buffer is allocated for `add_batch_size` rows per add, so
         # this has to be NUM_ENVS wide.
         obs = jnp.zeros((NUM_ENVS, OBS_DIM), dtype=jnp.float32)
-        agent.add_transitions(
-            obs,
-            jnp.zeros((NUM_ENVS, ACT_DIM), dtype=jnp.float32),
-            jnp.zeros((NUM_ENVS,), dtype=jnp.float32),
-            jnp.zeros((NUM_ENVS,), dtype=jnp.bool_),
-            # Truncation is offered by the shared caller and must be dropped.
-            jnp.ones((NUM_ENVS,), dtype=jnp.bool_),
+        agent.buffer_transitions(
+            Transition(
+                observation=obs,
+                action=jnp.zeros((NUM_ENVS, ACT_DIM), dtype=jnp.float32),
+                reward=jnp.zeros((NUM_ENVS,), dtype=jnp.float32),
+                terminal=jnp.zeros((NUM_ENVS,), dtype=jnp.bool_),
+                # Offered by the shared caller, and must be dropped.
+                truncation=jnp.ones((NUM_ENVS,), dtype=jnp.bool_),
+            ),
             obs,
         )
         assert agent.state.buffer_state.experience.truncation is None
@@ -237,13 +236,10 @@ class TestFusedBurst:
     def test_update_gate_respects_schedule(self, agent):
         """One burst per `steps_between_updates` of ELAPSED env steps.
 
-        This used to assert that `update(105)` fires nothing because 105 is not
-        exactly a boundary. That is the behaviour that broke the v1 release grid:
-        the trainer advances `steps` in strides of `parallel_envs` and only ever
-        lands exactly on a boundary when the stride divides the offset, so an
-        unaligned warmup offset disarmed learning completely. The gate
-        now serves a boundary on the first call at or past it — see
-        tests/test_update_schedule.py.
+        The gate serves a boundary on the first call at or past it, never only
+        on an exact hit: the trainer advances `steps` in strides of
+        `parallel_envs`, so an exact test disarms learning entirely whenever the
+        stride does not divide the warmup offset.
         """
         _fill_buffer(agent)
         agent.memory_warmup = 100

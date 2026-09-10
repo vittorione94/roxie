@@ -21,8 +21,7 @@ from roxie.models.critics import TwinCritic
 
 
 # D4PG's step (categorical critic on the fixed support `atoms`) with TD3's twin
-# critic and delayed policy update bolted on. Not jitted on its own — called
-# inside `_grad_steps` so N steps fuse into one compiled program.
+# critic and delayed policy update bolted on.
 def _grad_step(
     state: TrainState,
     key: jax.random.PRNGKey,
@@ -48,13 +47,9 @@ def _grad_step(
     actor and target updates run under `nnx.cond` so the delayed-policy-update
     trick survives the `lax.scan` (where the step index is no longer static).
     `n_step` is the TD horizon (NOT the scan length `n_steps`)."""
-    # `repack_samples` folds the n-step return, bootstrap coefficient and
-    # bootstrap obs into the dict — what shifts the categorical support.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalized once here: the critic and actor losses read the same
-    # `observations`.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
@@ -91,7 +86,6 @@ def _grad_step(
         )
         state.actor_optimizer.update(state.actor, actor_grads)
 
-        # Both targets move with the policy, not with the critic.
         soft_update(state.target_actor, state.actor, tau)
         soft_update(state.target_critic, state.critic, tau)
         return actor_loss, actor_aux
@@ -161,8 +155,6 @@ def _grad_steps(
         extras=(update_mask,),
     )
 
-    # Actor loss only on update steps → average over those; critic over all steps.
-    # The diagnostics split the same way: the skipped steps contributed zeros.
     n_actor_updates = jnp.maximum(jnp.sum(update_mask), 1)
     actor_loss = jnp.sum(actor_losses) / n_actor_updates
     diagnostics = {

@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from roxie.agents.agent import Agent, _read_checkpoint
+from roxie.utils.math import scale_to_env
 
 
 class NormalRandom(Agent):
@@ -125,16 +126,17 @@ class OrnsteinUhlenbeck(Agent):
         actions = actions + self.scale * jnp.sqrt(self.dt) * noise
         self.actions = jnp.clip(actions, -1.0, 1.0)
 
-        self.last_action = Agent.scale_to_env(
+        self.last_action = scale_to_env(
             self.actions, self.action_low, self.action_high
         )
         return self.last_action
 
-    def add(self, prev_obs, timestep):
-        # Nothing to store, but the OU state is decorrelated for any env whose
-        # episode just ended so a fresh episode starts from zero noise.
+    def buffer_transitions(self, transition, next_obs, *, state=None):
+        # Nothing to store — no buffer and no train state here, so `state` goes
+        # unread. The OU process is decorrelated for any env whose episode just
+        # ended, so a fresh episode starts from zero noise.
         if self.actions is not None:
-            done = jnp.logical_or(timestep.terminated, timestep.truncated)
+            done = jnp.logical_or(transition.terminal, transition.truncation)
             keep = (1.0 - done.astype(self.actions.dtype))[:, None]
             self.actions = self.actions * keep
 
@@ -154,10 +156,11 @@ class OrnsteinUhlenbeck(Agent):
 
     # No learned params: just the hyperparameters and action bounds, so ``play``
     # can rebuild an identical agent. Overriding only the payload leaves the
-    # writing to ``Agent.save``, so ``Agent``'s reader still reads it.
-    def checkpoint_payload(self, *, format_version: int = 1, extra_metadata=None, **_):
+    # writing to the trainer's ``CheckpointManager``, so ``Agent``'s reader
+    # still reads it.
+    def checkpoint_payload(self, *, extra_metadata=None, **_):
         return {
-            "format_version": format_version,
+            "format_version": 1,
             "hyperparams": self._export_hyperparams(),
             "action_low": np.asarray(jax.device_get(self.action_low)),
             "action_high": np.asarray(jax.device_get(self.action_high)),

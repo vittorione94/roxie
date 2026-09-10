@@ -1,20 +1,10 @@
 """The fused acting path must be the per-step loop, only faster.
 
-Both rollouts compile the work the per-step loop used to dispatch op by op, for
-the same reason and to different depths:
-
-* `JaxRollout` scans a whole update window — select, step, buffer, score — into
-  ONE dispatch, because a per-step Python loop spends 3.6 ms of host dispatch on
-  an env step whose device work is 0.15 ms.
-* `EnvPoolRollout` cannot scan a chunk (its physics is C++ and untraceable), so
-  it compiles the two halves that sit either side of the pool step instead: ~10
-  dispatches per env step become 2.
-
-Either is only a throughput change if it lands byte-for-byte where the old loop
-landed, so these run the same seed through both paths and compare everything a
-chunk carries forward: the replay buffer, the observation statistics, the noise
-module's decay counter, the env state, the rollout's own rng, and the episode
-sums the epoch metrics are built from.
+Either rollout is a throughput change only if it lands byte-for-byte where the
+per-step loop lands, so these run the same seed through both paths and compare
+everything a chunk carries forward: the replay buffer, the observation
+statistics, the noise module's decay counter, the env state, the rollout's own
+rng, and the episode sums the epoch metrics are built from.
 
 Driven through a real (tiny) env rather than stubs: what the fused paths have to
 get right is the nnx split/merge of a mutated train state — across `lax.scan` on

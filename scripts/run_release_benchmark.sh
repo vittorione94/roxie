@@ -31,8 +31,8 @@ cd "$REPO_ROOT" || exit 1
 
 # --- 1. Configuration ---
 TASKS="${TASKS:-HumanoidStand HumanoidWalk HumanoidRun}"
-AGENTS="${AGENTS:-ddpg ppo sac}"
-CELLS="${CELLS:-warp_gpu envpool_cpu}"
+AGENTS="${AGENTS:-ddpg ppo sac mpo d4pg td3 td4}"
+CELLS="${CELLS:-warp_gpu}"
 FORCE="${FORCE:-0}"
 
 # 6 logical cores per CPU run is the measured knee, not a round number: below it
@@ -78,14 +78,12 @@ echo "== box:  ${ncores} cores, ${avail_gb} GB available"
 echo "== plan: $MAX_CPU_JOBS concurrent CPU runs x ${CORES_PER_RUN} cores (cap: ${by_core} by cores, ${by_ram} by RAM)"
 has_gpu_cell && echo "==       + 1 GPU run, holding back ${reserve_cores} cores and ${reserve_gb} GB"
 
-# --- 3. Strict Garbage Collection (The Ctrl-C handler) ---
+# --- 3. Ctrl-C handler ---
 cleanup() {
     echo -e "\n[!] Caught Ctrl-C! Nuking all child processes to free VRAM & CPU..."
-    # 1. Ask nicely: Send SIGTERM to all children of this script ($$)
     pkill -TERM -P $$ 2>/dev/null
-    sleep 3 # Give Python and wandb a moment to release memory
+    sleep 3  # let Python and wandb release memory
 
-    # 2. No mercy: Send SIGKILL to anything that refused to die
     pkill -KILL -P $$ 2>/dev/null
     echo "[!] Cleanup complete. Exiting."
     exit 130
@@ -117,9 +115,9 @@ run_experiment() {
         > "$log" 2>&1
     local rc=$?
 
-    # An OOM-killed run exits 137 and the old script still printed a tick, which
-    # is how a grid could "finish" having lost half its cells. Report the code,
-    # and mark done ONLY on success so a relaunch retries exactly the failures.
+    # Marked done ONLY on success, so a relaunch retries exactly the failures:
+    # an OOM-killed run exits 137, and a tick there lets a grid "finish" having
+    # lost half its cells.
     if (( rc == 0 )); then
         : > "$marker"
         echo "    [OK] $task | $agent | $cell"

@@ -71,12 +71,14 @@ def agent():
 def _fill_buffer(agent, n_batches=40, seed=0):
     rng = np.random.default_rng(seed)
     for _ in range(n_batches):
-        agent.add_transitions(
-            jnp.asarray(rng.standard_normal((NUM_ENVS, OBS_DIM)), jnp.float32),
-            jnp.asarray(rng.standard_normal((NUM_ENVS, ACT_DIM)), jnp.float32),
-            jnp.asarray(rng.standard_normal(NUM_ENVS), jnp.float32),
-            jnp.zeros(NUM_ENVS, jnp.bool_),
-            jnp.zeros(NUM_ENVS, jnp.bool_),
+        agent.buffer_transitions(
+            Transition(
+                observation=jnp.asarray(rng.standard_normal((NUM_ENVS, OBS_DIM)), jnp.float32),
+                action=jnp.asarray(rng.standard_normal((NUM_ENVS, ACT_DIM)), jnp.float32),
+                reward=jnp.asarray(rng.standard_normal(NUM_ENVS), jnp.float32),
+                terminal=jnp.zeros(NUM_ENVS, jnp.bool_),
+                truncation=jnp.zeros(NUM_ENVS, jnp.bool_),
+            ),
             jnp.asarray(rng.standard_normal((NUM_ENVS, OBS_DIM)), jnp.float32),
         )
 

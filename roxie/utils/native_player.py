@@ -1,22 +1,16 @@
 """Generic native-MuJoCo (CPU) playback stepper.
 
-Envs in this repo are written in MJX — a GPU-first, batch-oriented rewrite of
-MuJoCo. A single world on CPU is impractically slow there, so for interactive
-playback (watch a checkpoint while the GPU is busy training) we step the physics
-with native ``mujoco.mj_step`` instead.
+Envs here are written in MJX, which is GPU-first and impractically slow for a
+single world on CPU, so interactive playback steps the physics with native
+``mujoco.mj_step`` instead.
 
-This module is env-agnostic: ``NativePlayer`` owns only the native ``MjData`` and
-the step orchestration. Everything env-specific — how to seed a fresh episode,
-how to turn state into an observation, how to map an action onto ctrl, how to
-score/terminate a step — is delegated to a small ``native_*`` protocol the env
-implements (see ``NativeSteppable``). Which env (and therefore which native
-implementation) is used is decided entirely by the Hydra ``env`` config block;
-nothing here knows about any particular task.
+``NativePlayer`` owns only the native ``MjData`` and the step orchestration;
+everything env-specific is delegated to the small ``native_*`` protocol the env
+implements (see ``NativeSteppable``).
 
 ``reset(key)`` / ``step(state, action)`` mirror the jitted env's signatures and
-return an object shaped like the ``mjx_env.State`` that path produces
-(``obs``/``data``/``reward``/``done``/``metrics``/``info``), so ``play.py``
-drives this through the exact same loop it uses for the MJX path.
+return an object shaped like the ``mjx_env.State`` that path produces, so
+``play.py`` drives this through the same loop it uses for MJX.
 """
 
 from __future__ import annotations

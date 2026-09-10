@@ -1,11 +1,7 @@
 """Package trained policies out of the release grid into publishable bundles.
 
-The benchmark leaves ~10 checkpoints per run buried in a timestamped output tree
-alongside the wandb dir, the console log and a 100-row log.csv, one such tree
-per (task, cell, agent). None of that is what you attach to a release. This
-script picks ONE checkpoint per (task, agent) — the best-scoring one, not the
-last — and copies it into a self-contained bundle `roxie/play.py` can open on
-its own:
+Picks one checkpoint per (task, agent) out of the benchmark's timestamped output
+trees and copies it into a self-contained bundle `roxie/play.py` can open:
 
     weights/CheetahRun/td3.warp_gpu/
       .hydra/config.yaml        the run's resolved config (play.py reads this)
@@ -13,32 +9,24 @@ its own:
       checkpoints/<N>/          the orbax checkpoint itself
       metadata.json             what it scored, where it came from, which commit
 
-The layout is not cosmetic: play.py resolves its config as
-`<checkpoint>/../../.hydra/config.yaml`, so the bundle has to mirror a run dir's
-shape for the checkpoint path to stay openable. That is why the checkpoint keeps
-its `checkpoints/<N>/` nesting instead of being flattened.
+play.py resolves its config as `<checkpoint>/../../.hydra/config.yaml`, so the
+bundle has to mirror a run dir's shape for the checkpoint path to stay openable
+— hence the preserved `checkpoints/<N>/` nesting.
 
     uv run python scripts/export_release_weights.py --dry-run
     uv run python scripts/export_release_weights.py
     uv run python scripts/export_release_weights.py --verify --archive
 
-WHICH TASKS. Every task the manifest has an `ok` run for on the chosen cell, so
-a full grid publishes 25 x 7 policies and a partial one publishes what it has.
-`--tasks` narrows it.
-
-WHICH RUN. The manifest (`outputs/release_v1/manifest.tsv`) is the source of
-truth, and only rows recorded `ok` are eligible — a run that crashed at 40% has
-checkpoints on disk that look perfectly loadable and are not a release result.
-Among those, only runs at the LONGEST completed budget for the task/cell, which
-is what keeps a `--smoke` run out: smoke records itself `ok` in the same ledger
-at 100k steps, and "the newest ok run" would publish that the moment anyone
-validated the grid after training it. `--steps` pins a specific budget instead;
-`--any-budget` opts out and takes the newest run whatever it is.
+WHICH RUN. Only manifest rows recorded `ok` are eligible: a run that crashed at
+40% has checkpoints on disk that look perfectly loadable and are not a release
+result. Among those, only runs at the longest completed budget for the
+task/cell, which is what keeps a `--smoke` run out — it records itself `ok` in
+the same ledger at 100k steps. `--steps` pins a specific budget instead;
+`--any-budget` takes the newest run whatever it is.
 
 WHICH CHECKPOINT. The best `test/score` in the run's own log.csv, among the
-steps that actually have a checkpoint. Taking the last checkpoint instead would
-publish whatever the policy happened to be doing when the budget ran out, which
-on a saturating arm is measurably worse than its own peak.
+steps that actually have a checkpoint — on a saturating arm the last checkpoint
+is measurably worse than the run's own peak.
 """
 
 from __future__ import annotations
@@ -410,7 +398,8 @@ def verify(bundle: Path) -> str | None:
         payload = _read_checkpoint(path)
     except Exception as error:  # orbax raises a wide variety here
         return f"unreadable ({type(error).__name__}: {error})"
-    for key in ("trainstate_state", "trainstate_graphdef", "hyperparams"):
+    # No graphdef: `checkpoint_payload` re-derives it from the live modules.
+    for key in ("trainstate_state", "hyperparams"):
         if key not in payload:
             return f"payload missing {key!r}"
     recorded = (payload.get("metadata") or {}).get("steps")

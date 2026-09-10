@@ -1,16 +1,10 @@
 """The trainer's counters and accumulators, shared by every backend.
 
-`_run_jax` and `_run_envpool` used to be two loops keeping these books
-separately, in duplicated blocks that had already drifted (warmup episodes
-counted on one path only, a random-action gate on one path only). There is now
-one `Trainer._run`, with the backend behind `roxie.utils.rollout` and the
-learning strategy behind `roxie.utils.learner`.
-
-These drive the helpers directly: they are plain arithmetic over the trainer's
-own state and need no env, no agent and no replay buffer. The parity test is the
+These drive the helpers directly: plain arithmetic over the trainer's own state,
+needing no env, no agent and no replay buffer. The parity test is the
 load-bearing one — it pins that the JAX rollout's on-device accumulation and the
 EnvPool rollout's host-side accumulation compute the same numbers, which is what
-lets a single loop serve both.
+lets one `Trainer._run` serve both.
 """
 
 import jax
@@ -242,13 +236,15 @@ class _StubAgent:
     def __init__(self, per_update=0):
         self.per_update = per_update
         self.added = 0
+        # Both halves of the acting hand-off `SyncLearner.buffer` reads.
         self.last_action = None
+        self.last_extras = None
 
     def step(self, obs, evaluate, key):
         self.last_action = obs
         return obs
 
-    def add(self, prev_obs, timestep):
+    def buffer_transitions(self, transition, next_obs, *, state=None):
         self.added += 1
 
     def update(self, steps, agent_rng):
@@ -261,7 +257,12 @@ class _AsyncCapableAgent(_StubAgent):
 
 
 class _StubTimestep:
+    """The fields `SyncLearner.buffer` unpacks to build a `Transition`."""
+
     obs = None
+    reward = None
+    terminated = None
+    truncated = None
 
 
 class _StubRollout:
@@ -341,8 +342,7 @@ class _PacingAgent(_AsyncCapableAgent):
     learning_steps = 20
     memory_warmup = 0
     steps_between_updates = 2_048
-
-    def add_transitions(self, *args):
+    def buffer_transitions(self, *args, **kwargs):
         pass
 
 

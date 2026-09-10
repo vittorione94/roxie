@@ -45,11 +45,11 @@ def build_agent(config, **kwargs):
 def build_optimizer(config, *, learning_rate: float, max_grad_norm: float = None):
     """Build one network's optax transform from a hydra `_target_` config.
 
-    `config` names the optimizer family and its own hyperparameters (betas, eps,
-    weight decay, ...); `learning_rate` comes from the agent's
-    `<net>_learning_rate` arg so it stays a first-class swept/logged/checkpointed
-    hyperparameter rather than hiding inside the optimizer block. A block that
-    declares its own `learning_rate` wins — that is how a schedule is passed:
+    `config` names the optimizer family and its own hyperparameters;
+    `learning_rate` comes from the agent's `<net>_learning_rate` arg so it stays
+    a first-class swept/logged/checkpointed hyperparameter rather than hiding
+    inside the optimizer block. A block that declares its own `learning_rate`
+    wins — that is how a schedule is passed:
 
         actor_optimizer_config:
           _target_: optax.adamw
@@ -121,40 +121,25 @@ def soft_update(target: nnx.Module, source: nnx.Module, tau: float) -> None:
 class SplitNodes:
     """The nnx graph nodes a fused burst mutates, held in split form.
 
-    `nnx.jit` re-walks the module graph in Python on EVERY call — measured on
-    this repo's train states: 2.2 ms for DDPG's (98 leaves), 3.5 ms for TD3's
-    (142). The training loop makes two such calls per update window (the acting
-    burst in `JaxRollout` and the agent's own `_grad_steps`) against a ~16 ms
-    window, so on AcrobotSwingup/warp_gpu that walk was 28% of DDPG's loop and
-    36% of TD3's — pure host time, with the GPU at ~50% util. Handing a plain
-    `jax.jit` the graphdef as a STATIC argument and the state as a pytree costs
-    one pytree traversal instead: 0.4 / 0.6 ms.
+    `nnx.jit` re-walks the module graph in Python on every call — 2.2 ms for
+    DDPG's train state, 3.5 ms for TD3's, twice per ~16 ms update window.
+    Handing a plain `jax.jit` the graphdef as a static argument and the state as
+    a pytree costs one pytree traversal instead, and moves no computation,
+    ordering or RNG stream.
 
-    The end-to-end gain is larger than that subtraction, because the host was
-    not merely adding time — it was starving the device. Same box, same config:
-    DDPG 130k -> 245k sps, TD3 97k -> 199k, GPU util 53% -> 99% / 88%, power
-    101 W -> 136 W. The curves are BIT-FOR-BIT identical across the first seven
-    epochs of a matched-seed run: this moves no computation, no ordering and no
-    RNG stream, only where the graph is walked.
+    `nnx.cached_partial` is the flax-native answer and does not work here: it
+    requires every attribute of a cached node to be an `nnx.Variable`, and
+    `TrainState` holds `buffer_state` and `obs_stats` as raw arrays (see the
+    `TODO(cgarciae): support Array attribute updates` in
+    `graphlib._cached_partial`, flax 0.12.9).
 
-    `nnx.cached_partial` is the flax-native answer to this and does not work
-    here: it requires every attribute of a cached node to be an `nnx.Variable`,
-    and `TrainState` holds `buffer_state` and `obs_stats` as raw arrays
-    (`AttributeError: 'ArrayImpl' object has no attribute 'get_raw_value'`,
-    flax 0.12.9 — the `# TODO(cgarciae): support Array attribute updates` in
-    `graphlib._cached_partial`).
+    Not thread-safe, and need not be: `AsyncLearner` makes its learner thread
+    the sole owner of `agent.state`.
 
-    NOT thread-safe, and does not need to be: `AsyncLearner` makes its learner
-    thread the sole owner of `agent.state` (the acting thread reads a published
-    snapshot, and `pause()` quiesces the learner before eval or checkpointing
-    touches it), so no two threads ever reach this handle at once.
-
-    THE LIVE NODES STAY THE AUTHORITY once host code has materialized them.
+    The live nodes stay the authority once host code has materialized them —
     `checkpoint_payload` detaches and reattaches `buffer_state`, `restore`
-    merges into the live modules, eval reads the actor — all in place — so
-    `split()` re-derives after any `.live` access rather than trusting a cached
-    pytree. That is one `nnx.split` per epoch boundary instead of two per
-    window, which is the whole point.
+    merges into the live modules, eval reads the actor — so `split()` re-derives
+    after any `.live` access rather than trusting a cached pytree.
     """
 
     __slots__ = ("_graphdef", "_pytree", "_live", "_fresh")
@@ -214,8 +199,8 @@ class BurstNode:
     Two handles exist because the two bursts mutate different sets: the gradient
     burst takes `_burst_nodes` (train state + any side modules), the acting
     burst takes `_burst_nodes` plus `_noise_nodes`. Keeping the noise module out
-    of the gradient burst's split is what spares four agents a `noise_module`
-    parameter they would only pass through.
+    of the gradient burst's split spares four agents a `noise_module` parameter
+    they would only pass through.
     """
 
     def __init__(self, index: int, handle: str = "_burst_nodes",
@@ -251,17 +236,15 @@ def graph_jit(fn=None, *, static_argnames=(), num_nodes: int = 1, donate: bool =
     """`nnx.jit` for a burst whose leading arguments and returns are graph nodes,
     with the module-graph walk hoisted out of the call.
 
-    The wrapped function is written exactly as it was under `nnx.jit` — it takes
-    live nodes and returns them first — but the caller passes the agent's
-    `SplitNodes` in their place, and the graphdef rides as a static argument.
-    The nodes' pytree is donated, as it was before: the replay buffer threads
+    The wrapped function takes live nodes and returns them first, but the caller
+    passes the agent's `SplitNodes` in their place and the graphdef rides as a
+    static argument. The nodes' pytree is donated: the replay buffer threads
     unchanged through the scan, so without donation XLA allocates a second copy
     of it per burst.
 
     `SplitNodes` is updated in place, so a call site drops the node from both
     sides of its assignment:
 
-        self.state, actor_loss, critic_loss = _grad_steps(self.state, key, ...)
         actor_loss, critic_loss = _grad_steps(self._burst_nodes, key, ...)
     """
     if fn is None:
@@ -270,7 +253,7 @@ def graph_jit(fn=None, *, static_argnames=(), num_nodes: int = 1, donate: bool =
             donate=donate,
         )
 
-    # `jax.jit` infers argnums from argnames ONLY when one of the two is
+    # `jax.jit` infers argnums from argnames only when one of the two is
     # omitted; giving both (as the graphdef forces) disables inference, so the
     # positions are mapped here or a positional `gamma` arrives as a tracer.
     # `fn`'s node arguments collapse into `(graphdef, pytree)`, hence the shift.
@@ -304,14 +287,13 @@ def graph_jit(fn=None, *, static_argnames=(), num_nodes: int = 1, donate: bool =
 
 
 def fused_grad_steps(nodes, key: jax.Array, n_steps: int, step_fn, extras=()):
-    """Run `step_fn` `n_steps` times on-device as ONE compiled program.
+    """Run `step_fn` `n_steps` times on-device as one compiled program.
 
-    Every learning agent's burst has the same shape, and this is it: split the
-    graph nodes into a static graphdef plus their trainable pytree, carry only
-    the pytree through a `lax.scan`, and stack whatever per-step scalars the body
-    reports. The scan (rather than a Python loop, which would unroll) is what
-    keeps compile time and HLO size flat as `n_steps` grows, and the single
-    dispatch is why a burst costs one host round-trip instead of `n_steps`.
+    Split the graph nodes into a static graphdef plus their trainable pytree,
+    carry only the pytree through a `lax.scan`, and stack whatever per-step
+    scalars the body reports. The scan (rather than a Python loop, which would
+    unroll) keeps compile time and HLO size flat as `n_steps` grows, and the
+    single dispatch costs one host round-trip instead of `n_steps`.
 
     Call it from inside the agent's own `nnx.jit`-ed entry point, which is where
     the loop-constant arguments (`gamma`, `tau`, the sampler, the normalization
@@ -319,23 +301,21 @@ def fused_grad_steps(nodes, key: jax.Array, n_steps: int, step_fn, extras=()):
 
     Args:
       nodes: the graph node — or tuple of them — to carry. A tuple is split as a
-        unit, which is how an agent's side modules (SAC's temperature and its
-        optimizer, MPO's duals and theirs) keep updating across the fused steps
-        instead of being reset to their entry values on every one.
+        unit, which is how an agent's side modules (SAC's temperature, MPO's
+        duals, and their optimizers) keep updating across the fused steps
+        instead of resetting to their entry values on every one.
       key: split into one key per step and scanned over.
       n_steps: static; it is the scan length.
-      step_fn: `(nodes, step_key, *extras_t) -> per_step_outputs`. It receives
-        the merged nodes and mutates them in place (optimizer updates,
-        `soft_update`); the carry is taken from those same objects afterwards, so
-        it need not — and should not — rebuild them.
+      step_fn: `(nodes, step_key, *extras_t) -> per_step_outputs`. Mutates the
+        merged nodes in place; the carry is taken from those same objects
+        afterwards, so it should not rebuild them.
       extras: additional per-step `xs`, stacked on the leading axis, e.g. TD3's
-        delayed-update mask. A `None` entry is an empty pytree node: it rides
-        along and arrives as `None`, which is how `policy_delay == 1` skips the
-        branch entirely rather than tracing a mask of all-True.
+        delayed-update mask. A `None` entry is an empty pytree node and arrives
+        as `None`, which is how `policy_delay == 1` skips the branch rather than
+        tracing an all-True mask.
 
     Returns `(nodes, outputs)` — the merged nodes after the last step, and the
-    per-step outputs stacked on a leading `n_steps` axis for the caller to
-    reduce.
+    per-step outputs stacked on a leading `n_steps` axis.
     """
     graphdef, carry = nnx.split(nodes)
 
@@ -419,28 +399,24 @@ def transition_prototype(
 ) -> Transition:
     """One zero-filled transition, the schema `replay.init` allocates against.
 
-    Shapes and dtypes here are what every leaf of the buffer is sized and typed
-    from, so this is the one place a mismatch between agents could creep in —
-    hence a single factory rather than a literal per agent. A field left off is
-    `None`, an empty pytree node, and costs no memory.
+    Every leaf of the buffer is sized and typed from here, so a single factory
+    rather than a literal per agent. A field left off is `None`, an empty pytree
+    node, and costs no memory.
 
     `truncation` is stored alongside `terminal` (never folded into one `done`)
     because the two mean different things to a Bellman target: a genuine
     termination zeroes the bootstrap, while a time-limit / clip-end truncation
     must still bootstrap the next-state value. Off-policy agents additionally
     need it to stop n-step windows at episode boundaries the terminal flag does
-    not mark; MPO, whose 1-step target reads only `terminal`, is the one agent
-    that omits it. `on_policy` adds the behaviour log-prob and value estimate
-    PPO stores at acting time for its ratio and its GAE, plus the PRE-TANH
-    action behind each stored action.
+    not mark; MPO, whose 1-step target reads only `terminal`, omits it.
 
-    That last field is not redundant with `action`. PPO is the only agent that
-    re-scores a stored action under a later policy, and tanh is not invertible
-    in float32: `tanh(u)` rounds to exactly 1.0 for |u| >= 8, so recovering `u`
-    with an arctanh pins every saturated draw to the same rail (~7.25) while
-    the policy mean walks past it. The ratio then explodes and the `target_kl`
-    early stop fires on arithmetic rather than on policy drift. Storing `u`
-    keeps the density scored where it was actually drawn.
+    `on_policy` adds the behaviour log-prob and value estimate PPO stores at
+    acting time, plus the pre-tanh `u` behind each stored action. That last is
+    not redundant with `action`: tanh is not invertible in float32 — `tanh(u)`
+    rounds to exactly 1.0 for |u| >= 8, so recovering `u` with an arctanh pins
+    every saturated draw to the same rail (~7.25) while the policy mean walks
+    past it, and the ratio explodes until `target_kl` fires on arithmetic rather
+    than policy drift.
     """
     extra = {}
     if truncation:

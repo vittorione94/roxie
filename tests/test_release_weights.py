@@ -2,11 +2,11 @@
 
 Two things are pinned here.
 
-`scripts/export_release_weights.py` decides what ships with the release. Its
-selection rules are the whole point of the script — publish the BEST checkpoint
-of a COMPLETED run — and both are silent when they go wrong: a bundle built from
-the final checkpoint of a crashed pilot loads perfectly and is simply the wrong
-policy. The logic is pure CSV/path arithmetic, so it tests without a device.
+`scripts/export_release_weights.py` decides what ships with the release: the
+BEST checkpoint of a COMPLETED run. Both rules are silent when they go wrong — a
+bundle built from the final checkpoint of a crashed pilot loads perfectly and is
+simply the wrong policy. The logic is pure CSV/path arithmetic, so it tests
+without a device.
 
 The benchmark's exploration anneal is measured in env steps, so it is tied to
 `trainer.steps` — at 40% of the budget by its own design note. Raising the

@@ -10,25 +10,21 @@ import jax
 import jax.numpy as jnp
 import rlax
 
-from roxie.agents.agent import Agent
+from roxie.utils.math import scale_to_env
 
 # Pre-tanh magnitude past which the saturation penalty starts charging.
 # tanh(1) = 0.76, so the policy keeps the useful range for free and is pushed
 # back only once it heads for the rails.
 PRE_ACTIVATION_THRESHOLD = 1.0
 
-# Bound on PPO's log importance ratio before it is exponentiated.
-# `exp` overflows float32 at 88.7, and the overflow is not merely a large
-# number: `jnp.minimum` hands the unclipped branch a zero cotangent whenever the
-# clipped one is selected, so the backward pass computes `0 * inf = NaN` while
-# the forward loss still reads a perfectly healthy -(1 + clip_eps) * advantage.
-# One such transition in one minibatch is terminal, because `clip_by_global_norm`
-# rescales by 1 / global_norm and a NaN norm poisons every parameter in the tree.
-# 20 is ~2 orders of magnitude outside any ratio the clip leaves meaningful
-# (e^20 = 4.9e8 against a clip range of [0.8, 1.2]), so it binds only where the
-# surrogate has already stopped saying anything useful, and the `target_kl`
-# early stop -- which now sees a finite `approx_kl` -- is what actually abandons
-# the rollout.
+# Bound on PPO's log importance ratio before it is exponentiated. `exp`
+# overflows float32 at 88.7, and the overflow is not merely a large number:
+# `jnp.minimum` hands the unclipped branch a zero cotangent whenever the clipped
+# one is selected, so the backward pass computes `0 * inf = NaN` while the
+# forward loss still reads a healthy -(1 + clip_eps) * advantage. One such
+# transition is terminal, `clip_by_global_norm` rescaling by 1 / global_norm.
+# 20 (e^20 = 4.9e8 against a clip range of [0.8, 1.2]) binds only where the
+# surrogate has already stopped saying anything useful.
 _MAX_LOG_RATIO = 20.0
 
 # rlax's MPO ops default `projection_operator` to a `jnp.clip(a_min=...)`
@@ -131,7 +127,7 @@ def ddpg_actor_loss_fn(
     """
     obs = samples["observations"]
     actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
-    scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
+    scaled_actions = scale_to_env(actions, action_low, action_high)
     q_values = critic_model(obs, scaled_actions)
     actor_q = jnp.mean(q_values)
     penalty = pre_activation_penalty(pre_activation)
@@ -155,7 +151,7 @@ def d4pg_actor_loss_fn(
     """
     obs = samples["observations"]
     actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
-    scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
+    scaled_actions = scale_to_env(actions, action_low, action_high)
     logits = critic_model(obs, scaled_actions)  # (B, num_atoms)
     q_values = jnp.sum(jax.nn.softmax(logits, axis=-1) * atoms, axis=-1)
     actor_q = jnp.mean(q_values)
@@ -184,7 +180,7 @@ def td3_actor_loss_fn(
     """
     obs = samples["observations"]
     actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
-    scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
+    scaled_actions = scale_to_env(actions, action_low, action_high)
     q1, _ = twin_critic(obs, scaled_actions)
     actor_q = jnp.mean(q1)
     penalty = pre_activation_penalty(pre_activation)
@@ -212,7 +208,7 @@ def td4_actor_loss_fn(
     """
     obs = samples["observations"]
     actions, pre_activation = actor_model.forward(obs)  # [-1, 1], pre-tanh
-    scaled_actions = Agent.scale_to_env(actions, action_low, action_high)
+    scaled_actions = scale_to_env(actions, action_low, action_high)
     logits1, _ = twin_critic(obs, scaled_actions)  # (B, num_atoms)
     q_values = jnp.sum(jax.nn.softmax(logits1, axis=-1) * atoms, axis=-1)
     actor_q = jnp.mean(q_values)
@@ -258,10 +254,7 @@ def ppo_loss_fn(
     # log-ratio overflows to `inf`, and an `inf` ratio makes this loss's own
     # gradient NaN even though its value stays finite (see `_MAX_LOG_RATIO`).
     # A backstop, not a mechanism: scoring from `pre_actions` keeps the ratio
-    # bounded by the policy's actual drift, so this should never bind. It used
-    # to bind on EVERY step -- the arctanh path pinned saturated draws at the
-    # rail, `approx_kl` came out at exp(_MAX_LOG_RATIO), and the `target_kl`
-    # early stop then abandoned all but the first minibatch of every rollout.
+    # bounded by the policy's actual drift, so this should never bind.
     log_ratio = jnp.clip(
         logp_new[:, :-1] - old_log_probs[:, :-1],
         -_MAX_LOG_RATIO,
@@ -283,10 +276,9 @@ def ppo_loss_fn(
 
     # Schulman's low-variance estimator of KL(pi_old || pi_new): >= 0, and 0 iff
     # the ratio is 1 everywhere. Taken against `log_ratio` rather than
-    # `jnp.log(ratio)` -- exact, one op cheaper, and finite by construction. The
-    # difference is not cosmetic: an unbounded `ratio` made this NaN, and
-    # `approx_kl > target_kl` is False for NaN, so the trust region silently
-    # switched itself off at exactly the moment it was needed.
+    # `jnp.log(ratio)` -- exact, cheaper, and finite by construction. That last
+    # matters: `approx_kl > target_kl` is False for NaN, so a NaN here switches
+    # the trust region off at exactly the moment it is needed.
     approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
     clip_frac = jnp.mean((jnp.abs(ratio - 1.0) > clip_epsilon).astype(jnp.float32))
 
@@ -315,7 +307,7 @@ def sac_actor_loss_fn(
     distribution = actor_model(obs)
     actions, u = distribution.sample_from_pre(seed=key)
     log_probs = distribution.log_prob_from_pre(u)
-    actions_scaled = Agent.scale_to_env(actions, action_low, action_high)
+    actions_scaled = scale_to_env(actions, action_low, action_high)
     q1, q2 = twin_critic(obs, actions_scaled)
     min_q = jnp.minimum(jnp.squeeze(q1), jnp.squeeze(q2))
     actor_loss = jnp.mean(alpha * log_probs - min_q)
@@ -370,7 +362,7 @@ def mpo_actor_loss_fn(
 
     # No gradient flows into the policy through Q; it only shapes the E-step
     # weights and the temperature.
-    actions_scaled = Agent.scale_to_env(actions, action_low, action_high)
+    actions_scaled = scale_to_env(actions, action_low, action_high)
     obs_tiled = jnp.broadcast_to(obs, (num_action_samples,) + obs.shape)
     q_values = critic_model(obs_tiled, actions_scaled)  # [S, B, 1]
     q_values = jax.lax.stop_gradient(jnp.squeeze(q_values, axis=-1))  # [S, B]
@@ -427,12 +419,11 @@ def mpo_actor_loss_fn(
         sample_axis=0,
     )
 
-    # Read off the ONLINE policy's mode, not the E-step draws: `mu_o` is what
-    # the M-step actually moves and what evaluation acts on, so it is the MPO
-    # analogue of the pre-tanh logit every other squashing actor reports. The
-    # trust region bounds each step, not the total drift, so the mean can still
-    # walk out to saturation over an episode of updates -- the reason these
-    # keys exist at all (see tests/test_diagnostics.py).
+    # Read off the online policy's mode, not the E-step draws: `mu_o` is what
+    # the M-step moves and what evaluation acts on, so it is the MPO analogue of
+    # the pre-tanh logit every other squashing actor reports. The trust region
+    # bounds each step, not the total drift, so the mean can still walk out to
+    # saturation over an episode of updates.
     aux = actor_aux(
         jnp.tanh(mu_o),
         mu_o,

@@ -26,6 +26,7 @@ from roxie.losses.actor_losses import (
 )
 from roxie.losses.critic_losses import sac_critic_loss_fn
 from roxie.models.critics import TwinCritic
+from roxie.utils.math import normalize_obs, scale_to_env
 
 
 class LogAlpha(nnx.Module):
@@ -33,9 +34,8 @@ class LogAlpha(nnx.Module):
         self.log_alpha = nnx.Param(jnp.array(init_value, dtype=jnp.float32))
 
 
-# Not jitted on its own — called inside `_grad_steps` so N steps fuse into one
-# compiled program. `update_actor` is a *traced* boolean: under `lax.scan` the
-# step index is not static, so the delayed policy update is a runtime branch.
+# `update_actor` is a *traced* boolean: under `lax.scan` the step index is not
+# static, so the delayed policy update is a runtime branch.
 def _grad_step(
     nodes,
     key: jax.random.PRNGKey,
@@ -56,13 +56,9 @@ def _grad_step(
 ):
     state, log_alpha_module, alpha_optimizer = nodes
 
-    # `repack_samples` folds the n-step return, bootstrap coefficient and
-    # bootstrap obs into the dict, so the critic loss never sees gamma/terminals.
     key, sample_key, actor_key, critic_key = jax.random.split(key, 4)
     samples = replay_sample_fn(state.buffer_state, sample_key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalized once here: the critic and actor losses read the same
-    # `observations`, and neither normalizes.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
@@ -195,8 +191,6 @@ def _grad_steps(
         extras=(update_mask,),
     )
 
-    # Actor loss only on update steps → average over those; critic over all.
-    # The diagnostics split the same way: the skipped steps contributed zeros.
     n_actor_updates = (
         n_steps if update_mask is None else jnp.maximum(jnp.sum(update_mask), 1)
     )
@@ -359,24 +353,22 @@ class SAC(Agent):
     ) -> tuple[jnp.ndarray, jnp.ndarray, dict]:
         """Pure action selection from an explicit actor + obs stats.
 
-        Factored out of ``step`` so the async learner's acting thread can select
-        actions from a behaviour actor snapshot — decoupled from the learner's
-        live ``self.state.actor`` — through the same normalization path. Returns
-        ``(scaled_action, deviation_from_mode, extras)``; `extras` is the
-        per-step fields the buffer stores beyond the standard five, and is empty
-        here — only PPO has any.
+        Taking the actor and the stats as arguments rather than reading
+        ``self.state`` is what lets the fused acting burst run this against a
+        ``lax.scan`` carry, and the async learner's acting thread select from a
+        behaviour snapshot. Returns ``(scaled_action, deviation_from_mode,
+        extras)``; `extras` is empty — only PPO stores anything beyond the
+        standard five.
 
-``critic`` is accepted and ignored too: only an on-policy agent
-        stores a value estimate at acting time.
-
-        ``noise_module`` is accepted and ignored: SAC explores from its own
-        stochastic policy and carries no noise module. The argument is part of
-        the shared signature the fused acting burst calls through.
+        ``noise_module`` and ``critic`` are part of the shared signature the
+        fused acting burst calls through, and ignored here: SAC explores from
+        its own stochastic policy, and only an on-policy agent stores a value
+        estimate at acting time.
         """
         del noise_module, critic
         if self.normalize_observations:
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
-            observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
+            observation = normalize_obs(observation, mean, std, self.obs_clip)
 
         # No bounding on top: SAC's actor is a `TanhNormal`, which squashes
         # its own samples and owns the tanh log-prob correction its losses
@@ -385,7 +377,7 @@ class SAC(Agent):
             actor, observation, evaluate, key,
         )
         return (
-            Agent.scale_to_env(action, self.action_low, self.action_high),
+            scale_to_env(action, self.action_low, self.action_high),
             noise,
             {},
         )

@@ -1,16 +1,9 @@
 """`pop_diagnostics` is a contract every learning agent honours, identically.
 
-It used to be an optional hook the trainer duck-typed with `getattr`, and only
-TD3 and PPO implemented it — so the five other agents ran blind on exactly the
-metrics TD3's tuning turns on. TD4 was the sharpest case: it is TD3 plus a
-distributional critic, but it inherits from D4PG, so it reported nothing about
-the tanh saturation that `pre_activation_coef` exists to fight.
-
-This file is what keeps that from coming back. It drives each agent from its own
-shipped config through a real rollout and a real update — the diagnostics are
-built inside `lax.scan` (and, under a `policy_delay`, inside a nested
-`nnx.cond`), where a missing key or a mismatched pytree fails at trace time
-rather than at review time.
+Each agent is driven from its own shipped config through a real rollout and a
+real update, because the diagnostics are built inside `lax.scan` (and, under a
+`policy_delay`, inside a nested `nnx.cond`), where a missing key or a mismatched
+pytree fails at trace time rather than at review time.
 """
 
 from pathlib import Path
@@ -21,8 +14,24 @@ import pytest
 from omegaconf import OmegaConf
 
 import roxie.agents  # noqa: F401  (avoid circular import)
-from roxie.agents.utils import build_agent
+from roxie.agents.utils import Transition, build_agent
 from roxie.environment.vector import Timestep
+
+
+def _buffer(agent, prev_obs, timestep):
+    """What `SyncLearner.buffer` does: assemble the batch the agent stores."""
+    agent.buffer_transitions(
+        Transition(
+            observation=prev_obs,
+            action=agent.last_action,
+            reward=timestep.reward,
+            terminal=timestep.terminated,
+            truncation=timestep.truncated,
+            **(agent.last_extras or {}),
+        ),
+        timestep.obs,
+    )
+
 
 REPO = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO / "roxie" / "configs" / "agent"
@@ -137,7 +146,7 @@ def _run(agent, steps=ROLLOUT_STEPS) -> int:
             truncated=false,
             info={},
         )
-        agent.add(obs, timestep)
+        _buffer(agent, obs, timestep)
         obs = timestep.obs
         env_steps += ENVS
         agent.update(steps=env_steps, agent_rng=upd_key)

@@ -7,13 +7,13 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import (
-    Transition,
     graph_jit,
     network_rngs,
     transition_prototype,
 )
 from roxie.losses.actor_losses import ppo_loss_fn
 from roxie.losses.critic_losses import ppo_critic_loss_fn
+from roxie.utils.math import normalize_obs, scale_to_env
 
 
 def _compute_gae(rewards, values, termination, truncation, gamma, gae_lambda):
@@ -87,7 +87,7 @@ def _prepare_rollout(
     # The snapshot the behaviour policy ran under: live stats would make the
     # clip and KL early stop fire on normalization drift.
     norm_obs = (
-        Agent.normalize_obs(re_packed_samples["observations"], obs_mean, obs_std, obs_clip)
+        normalize_obs(re_packed_samples["observations"], obs_mean, obs_std, obs_clip)
         if normalize
         else re_packed_samples["observations"]
     )
@@ -178,12 +178,12 @@ def _grad_step(
     return actor_loss, critic_loss, approx_kl, clip_frac
 
 
-# The whole rollout's passes as ONE host dispatch, with the `target_kl` early
+# The whole rollout's passes as one host dispatch, with the `target_kl` early
 # stop as a sticky flag in the scan carry rather than a Python `break` on a
 # host-synced `approx_kl`. Exactly equivalent, not an approximation: the check
 # happens after the update, `lax.cond` is a real branch outside vmap so skipped
 # steps cost nothing, and the RNG splits live inside the taken branch so the key
-# stream advances exactly as far as the Python loop advanced it.
+# stream advances exactly as far as a Python loop would advance it.
 @functools.partial(
     graph_jit,
     static_argnames=(
@@ -301,6 +301,13 @@ class PPO(Agent):
     # reading the carry's live statistics.
     freeze_obs_norm_per_chunk = True
 
+    # The queue is a trajectory store — (NUM_ENVS, TIME, ...) on every leaf —
+    # but its horizon is the rollout length, not a TD `n_step`, so it says so
+    # here rather than by claiming an n-step target it does not have.
+    @property
+    def stores_time_axis(self) -> bool:
+        return True
+
     def __init__(
         self,
         env_obs_size: int,
@@ -376,10 +383,6 @@ class PPO(Agent):
 
         buffer_state = replay.init(prototype)
 
-        # Without donation flashbax's `add` copies the whole queue on every env
-        # step. Safe: the input dies as `add` reassigns `self.state.buffer_state`.
-        self._jit_replay_add = jax.jit(replay.add, donate_argnums=(0,))
-
         # No target networks: the trust region does the job targets do elsewhere.
         self._init_train_state(
             actor,
@@ -434,15 +437,12 @@ class PPO(Agent):
         """Pure action selection from an explicit actor, critic and obs stats.
 
         Taking all three as arguments rather than reading ``self.state`` is what
-        lets the fused acting burst run this against a ``lax.scan`` carry, so a
-        whole rollout of acting costs one host dispatch instead of one per env
-        step. Returns ``(scaled_action, deviation_from_mode, extras)``.
+        lets the fused acting burst run this against a ``lax.scan`` carry.
+        Returns ``(scaled_action, deviation_from_mode, extras)``.
 
         ``extras`` carries the behaviour log-prob, value estimate and pre-tanh
-        action, which are properties of the policy AT ACTING TIME and cannot be
-        recovered later: the ratio PPO clips is against exactly these. The
-        pre-tanh draw is in that list because it genuinely cannot be recovered —
-        `tanh` is not invertible in float32 past |u| ~ 7.25 (see
+        action — properties of the policy AT ACTING TIME that the ratio PPO
+        clips is scored against and that cannot be recovered later (see
         `transition_prototype`). They reach the buffer as a value rather than
         via ``self.last_*`` because on the fused path acting and buffering are
         both inside one trace.
@@ -454,7 +454,7 @@ class PPO(Agent):
         del noise_module
         if self.normalize_observations:
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
-            observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
+            observation = normalize_obs(observation, mean, std, self.obs_clip)
 
         # PPO's actor is a `TanhNormal`, so its samples are already bounded.
         # The critic rides along so acting stays one dispatch.
@@ -463,11 +463,19 @@ class PPO(Agent):
             critic_model=self.state.critic if critic is None else critic,
         )
         return (
-            Agent.scale_to_env(action, self.action_low, self.action_high),
+            scale_to_env(action, self.action_low, self.action_high),
             noise,
             # Unscaled: the log-prob is taken in the pre-tanh space, which is
             # where the ratio at update time is recomputed.
-            {"log_probs": log_probs, "value": value, "pre_action": pre_action},
+            {
+                "log_probs": log_probs,
+                # Squeezed to (NUM_ENVS,) — the critic's trailing unit axis is
+                # not a time axis, and the queue allocates `value` as a scalar
+                # per item exactly like `reward`. Leaving it on would make this
+                # the one field the shared time-axis expansion has to skip.
+                "value": value.squeeze(-1),
+                "pre_action": pre_action,
+            },
         )
 
     def step(
@@ -520,69 +528,6 @@ class PPO(Agent):
                 self._frozen_obs_stats(), self.obs_eps
             )
         return self._obs_norm
-
-    @staticmethod
-    def _rollout_transition(
-        prev_obs, action, reward, termination, truncation, extras,
-    ):
-        """One env-step batch in the trajectory queue's (NUM_ENVS, TIME, ...)
-        layout — a length-1 time axis on every leaf.
-
-        `value` alone is already (NUM_ENVS, 1) straight from the critic, so it
-        is the one field that must NOT be expanded again. `pre_action` carries a
-        per-actuator axis like `action`, so it gets the same `[:, None, :]`.
-        """
-        return Transition(
-            observation=prev_obs[:, None, :],
-            action=action[:, None, :],
-            reward=reward[:, None],
-            # Stored separately rather than as one `done`: GAE bootstraps the
-            # value at a truncation but zeroes it at a termination.
-            terminal=termination[:, None],
-            log_probs=extras["log_probs"][:, None],
-            value=extras["value"],
-            pre_action=extras["pre_action"][:, None, :],
-            truncation=truncation[:, None],
-        )
-
-    def buffer_transitions(
-        self, state, prev_obs, action, reward, termination, truncation, next_obs,
-        extras=None,
-    ):
-        """Write one env-step batch into `state`, IN PLACE — the traced path.
-
-        Overridden rather than inherited because the on-policy queue's layout
-        genuinely differs from the off-policy buffers': it wants an explicit
-        time axis, and it stores the behaviour quantities `extras` carries.
-        `self.replay.add`, not the jitted `_jit_replay_add`, because the caller
-        is already inside a trace and would only nest a `pjit` in it.
-        """
-        state.buffer_state = self.replay.add(
-            state.buffer_state,
-            self._rollout_transition(
-                prev_obs, action, reward, termination, truncation, extras,
-            ),
-        )
-        if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_obs, next_obs], axis=0)
-            state.obs_stats = Agent.update_obs_stats(state.obs_stats, obs_batch)
-
-    def add(self, prev_obs, timestep):
-        # The per-step path. Uses the jitted, donating add: dispatched from
-        # Python once per env step, it would otherwise copy the whole queue.
-        self.state.buffer_state = self._jit_replay_add(
-            self.state.buffer_state,
-            self._rollout_transition(
-                prev_obs, self.last_action, timestep.reward,
-                timestep.terminated, timestep.truncated, self.last_extras,
-            ),
-        )
-
-        if self.normalize_observations:
-            obs_batch = jnp.concatenate([prev_obs, timestep.obs], axis=0)
-            self.state.obs_stats = Agent.update_obs_stats(
-                self.state.obs_stats, obs_batch
-            )
 
     def update(self, steps, agent_rng):
         gradient_steps = 0
@@ -679,9 +624,13 @@ class PPO(Agent):
         `ppo/clip_frac`, which near 1 means the surrogate is saturated — reduces
         the same way it does for every other agent.
         """
+        # Read before the drain, which empties `_diag_bursts`.
+        bursts = len(self._diag_bursts)
+        steps = sum(n for n, _ in self._diag_bursts)
+
         out = super().pop_diagnostics(env_steps)
         if out:
-            per_rollout = self._diag_drained_steps / self._diag_drained_bursts
+            per_rollout = steps / bursts
             out["ppo/steps_per_rollout"] = per_rollout
             out["ppo/epochs_per_rollout"] = per_rollout / self.num_minibatches
         return out

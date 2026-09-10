@@ -20,6 +20,7 @@ from roxie.agents.utils import (
 )
 from roxie.losses.actor_losses import ddpg_actor_loss_fn
 from roxie.losses.critic_losses import ddpg_critic_loss_fn
+from roxie.utils.math import normalize_obs, scale_to_env
 
 
 def _grad_step(
@@ -44,12 +45,9 @@ def _grad_step(
     runs inside `_grad_steps` below, which fuses N steps into one compiled
     program. `n_step` is the TD horizon, not the scan length.
     """
-    # `repack_samples` folds the n-step return, bootstrap coefficient and
-    # bootstrap obs into the dict, so the critic loss never sees gamma/terminals.
     key, noise_key = jax.random.split(key)
     samples = replay_sample_fn(state.buffer_state, key)
     re_packed_samples = repack_samples(samples, gamma, n_step)
-    # Normalized once here: both losses read the same `observations`.
     re_packed_samples = Agent.normalize_samples(
         re_packed_samples, obs_mean, obs_std, obs_clip, normalize
     )
@@ -262,25 +260,22 @@ class DDPG(Agent):
     ) -> tuple[jnp.ndarray, jnp.ndarray, dict]:
         """Pure action selection from an explicit actor + obs stats.
 
-        Factored out of ``step`` so the async learner's acting thread can select
-        actions from a behaviour actor snapshot — decoupled from the learner's
-        live ``self.state.actor`` — through the same normalization + noise path.
-        Returns ``(scaled_action, applied_noise, extras)``; `extras` is the
-        per-step fields the buffer stores beyond the standard five, and is empty
-        here — only PPO has any.
+        Taking the actor and the stats as arguments rather than reading
+        ``self.state`` is what lets the fused acting burst run this against a
+        ``lax.scan`` carry, and the async learner's acting thread select from a
+        behaviour snapshot. Returns ``(scaled_action, applied_noise, extras)``;
+        `extras` is empty — only PPO stores anything beyond the standard five.
 
-        ``noise_module`` is explicit for the same reason the actor is: the fused
-        acting burst carries the module through a ``lax.scan``, and its decay
-        counter has to advance on the carry rather than on ``self``.
-
-        ``critic`` is accepted and ignored: only an on-policy agent stores a
-        value estimate at acting time. It is part of the shared signature the
-        fused acting burst calls through.
+        ``noise_module`` is explicit for the same reason the actor is: the burst
+        carries the module through the scan, and its decay counter has to
+        advance on the carry rather than on ``self``. ``critic`` is part of the
+        same shared signature and ignored — only an on-policy agent stores a
+        value estimate at acting time.
         """
         del critic
         if self.normalize_observations:
             mean, std = Agent.obs_mean_std(obs_stats, self.obs_eps)
-            observation = Agent.normalize_obs(observation, mean, std, self.obs_clip)
+            observation = normalize_obs(observation, mean, std, self.obs_clip)
 
         action, noise = Agent.deterministic_step_fn(
             actor,
@@ -290,7 +285,7 @@ class DDPG(Agent):
             evaluate,
         )
         return (
-            Agent.scale_to_env(action, self.action_low, self.action_high),
+            scale_to_env(action, self.action_low, self.action_high),
             noise,
             {},
         )
