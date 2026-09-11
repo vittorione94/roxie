@@ -8,10 +8,8 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import (
-    BurstNode,
     build_replay,
     fused_grad_steps,
-    graph_jit,
     network_rngs,
     reduce_diagnostics,
     repack_samples,
@@ -86,10 +84,13 @@ def _grad_step(
 
 
 @functools.partial(
-    graph_jit,
+    jax.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "n_step", "normalize",
     ),
+    # The replay buffer threads unchanged through the scan; without donation XLA
+    # allocates a second copy of it per burst.
+    donate_argnums=(0,),
 )
 def _grad_steps(
     state: TrainState,
@@ -143,10 +144,6 @@ def _grad_steps(
 
 
 class DDPG(Agent):
-    # Its own split: the ACTING burst mutates it (the decay counter advances
-    # per step inside the scan) but the gradient burst never touches it.
-    noise_module = BurstNode(0, handle="_noise_nodes", size=1)
-
     def __init__(
         self,
         env_obs_size: int,
@@ -316,8 +313,8 @@ class DDPG(Agent):
         for the acting thread's forward pass.
         """
         burst_steps = self.learning_steps if n_steps is None else int(n_steps)
-        actor_loss, critic_loss, diagnostics = _grad_steps(
-            self._burst_nodes,
+        self.state, actor_loss, critic_loss, diagnostics = _grad_steps(
+            self.state,
             agent_rng,
             burst_steps,
             self.gamma,

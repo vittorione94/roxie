@@ -9,7 +9,6 @@ from roxie.agents.agent import Agent, TrainState
 from roxie.agents.ddpg import DDPG
 from roxie.agents.utils import (
     fused_grad_steps,
-    graph_jit,
     network_rngs,
     reduce_diagnostics,
     repack_samples,
@@ -86,10 +85,13 @@ def _grad_step(
 
 
 @functools.partial(
-    graph_jit,
+    jax.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps", "n_step", "normalize",
     ),
+    # The replay buffer threads unchanged through the scan; without donation XLA
+    # allocates a second copy of it per burst.
+    donate_argnums=(0,),
 )
 def _grad_steps(
     state: TrainState,
@@ -190,8 +192,8 @@ class D4PG(DDPG):
         `atoms` support into the fused grad step). See DDPG.learn for the
         sync/async sharing rationale."""
         burst_steps = self.learning_steps if n_steps is None else int(n_steps)
-        actor_loss, critic_loss, diagnostics = _grad_steps(
-            self._burst_nodes,
+        self.state, actor_loss, critic_loss, diagnostics = _grad_steps(
+            self.state,
             agent_rng,
             burst_steps,
             self.gamma,

@@ -16,7 +16,6 @@ from flax import nnx
 from roxie.agents.utils import (
     DIAGNOSTIC_MAX_KEYS,
     DIAGNOSTIC_SUM_KEYS,
-    BurstNode,
     Transition,
     make_optimizer,
     serialize_bound,
@@ -31,7 +30,32 @@ from roxie.utils.math import finite_or_zero, normalize_obs, scale_to_env
 _SCRUBBED = ("observation", "reward")
 
 
-class TrainState(nnx.Module, pytree=False):
+class TrainState(nnx.Module):
+    """Everything one gradient step reads and writes, as a single JAX pytree.
+
+    A pytree — not an opaque nnx graph node — so a burst hands it straight to
+    `jax.jit` and `lax.scan` with no `nnx.split`/`merge` at the boundary. That
+    is the whole reason `nnx.jit` is nowhere near the hot loop: it re-walks the
+    module graph in Python on every call (2.2 ms for DDPG's state, 3.5 ms for
+    TD3's), while flattening this pytree costs 0.7 ms.
+
+    `buffer_state` and `obs_stats` are annotated `nnx.data()` because they are
+    raw arrays rather than `nnx.Variable`s; without it pytree mode files them as
+    static attributes and refuses the assignment.
+
+    The two target slots are annotated for a different reason: they are `None`
+    for SAC and PPO, and a slot that is born `None` is classified STATIC, so
+    later assigning a real module into it raises. The annotation pins them as
+    data from the start. Neither annotation changes what `nnx.split` produces —
+    a `None` slot is absent from the state either way — so the checkpoint layout
+    is untouched.
+    """
+
+    target_actor: Optional[nnx.Module] = nnx.data()
+    target_critic: Optional[nnx.Module] = nnx.data()
+    buffer_state: Any = nnx.data()
+    obs_stats: Any = nnx.data()
+
     def __init__(
         self,
         *,
@@ -66,23 +90,11 @@ class ObsStats:
 class Agent(abc.ABC):
     """Abstract class used to build agents."""
 
-    # How many nnx nodes this agent's fused bursts mutate, and therefore how
-    # many `BurstNode` views it declares.
-    _num_burst_nodes = 1
-
-    # Held split so a burst costs a pytree pass rather than an `nnx.jit`
-    # module-graph walk; see `roxie.agents.utils.SplitNodes`.
-    state = BurstNode(0)
-
-    @property
-    def burst_nodes(self):
-        """The `SplitNodes` a fused burst exchanges with the device.
-
-        The acting burst (`JaxRollout`) and the gradient burst share it, so a
-        window pays at most one `nnx.split` — and none at all unless host code
-        materialized the live nodes in between.
-        """
-        return self._burst_nodes
+    # `state` is deliberately NOT declared here. `_init_train_state` sets it on
+    # the instances that learn, which is what keeps `hasattr(agent, "state")`
+    # False for the stateless baselines in `roxie.agents.basic` —
+    # `checkpoint_payload`, `restore` and the trainer all branch on it. Adding
+    # `state = None` to this class would silently flip that to True.
 
     # Does acting read the observation statistics as they stood at the START of
     # a collect chunk, rather than as they stand at each step inside it? Only

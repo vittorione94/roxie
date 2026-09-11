@@ -8,10 +8,8 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import (
-    BurstNode,
     build_replay,
     fused_grad_steps,
-    graph_jit,
     make_optimizer,
     network_rngs,
     reduce_diagnostics,
@@ -127,14 +125,14 @@ def _grad_step(
 
 
 @functools.partial(
-    graph_jit,
+    jax.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "n_steps",
         "target_entropy", "auto_alpha", "policy_delay", "n_step", "normalize",
     ),
     # The temperature and its optimizer are mutated alongside the train state,
-    # so all three ride in one split.
-    num_nodes=3,
+    # so all three are donated and all three come back.
+    donate_argnums=(0, 1, 2),
 )
 def _grad_steps(
     state: TrainState,
@@ -209,12 +207,6 @@ def _grad_steps(
 
 
 class SAC(Agent):
-    _num_burst_nodes = 3
-    # Mutated by every gradient burst, so held in the same split as the train
-    # state.
-    log_alpha_module = BurstNode(1)
-    alpha_optimizer = BurstNode(2)
-
     def __init__(
         self,
         env_obs_size: int,
@@ -404,8 +396,17 @@ class SAC(Agent):
         buffer-donating ``_grad_steps`` stays valid unchanged.
         """
         burst_steps = self.learning_steps if n_steps is None else int(n_steps)
-        actor_loss, critic_loss, diagnostics = _grad_steps(
-            self._burst_nodes,
+        (
+            self.state,
+            self.log_alpha_module,
+            self.alpha_optimizer,
+            actor_loss,
+            critic_loss,
+            diagnostics,
+        ) = _grad_steps(
+            self.state,
+            self.log_alpha_module,
+            self.alpha_optimizer,
             agent_rng,
             burst_steps,
             self.gamma,

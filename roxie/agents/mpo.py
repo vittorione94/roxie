@@ -9,9 +9,7 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import (
-    BurstNode,
     fused_grad_steps,
-    graph_jit,
     make_optimizer,
     network_rngs,
     reduce_diagnostics,
@@ -133,14 +131,14 @@ def _mpo_grad_step(
 
 
 @functools.partial(
-    graph_jit,
+    jax.jit,
     static_argnames=(
         "gamma", "tau", "replay_sample_fn", "num_action_samples", "n_steps",
         "normalize",
     ),
     # The duals and their optimizer are mutated alongside the train state, so
-    # all three ride in one split.
-    num_nodes=3,
+    # all three are donated and all three come back.
+    donate_argnums=(0, 1, 2),
 )
 def _mpo_grad_steps(
     state: TrainState,
@@ -207,12 +205,6 @@ def _mpo_grad_steps(
 
 
 class MPO(Agent):
-    _num_burst_nodes = 3
-    # Mutated by every gradient burst, so held in the same split as the train
-    # state.
-    dual_params = BurstNode(1)
-    dual_optimizer = BurstNode(2)
-
     """Maximum a Posteriori Policy Optimization (Abdolmaleki et al., 2018).
 
     https://arxiv.org/abs/1806.06920
@@ -412,8 +404,17 @@ class MPO(Agent):
         validated against the sync curves. Renaming it is the whole opt-in.
         """
         burst_steps = self.learning_steps if n_steps is None else int(n_steps)
-        actor_loss, critic_loss, diagnostics = _mpo_grad_steps(
-            self._burst_nodes,
+        (
+            self.state,
+            self.dual_params,
+            self.dual_optimizer,
+            actor_loss,
+            critic_loss,
+            diagnostics,
+        ) = _mpo_grad_steps(
+            self.state,
+            self.dual_params,
+            self.dual_optimizer,
             agent_rng,
             burst_steps,
             self.gamma,

@@ -89,14 +89,12 @@ class AsyncLearner:
         self._behavior_actor = None
         self._behavior_stats = None
         self._behavior_version = -1
-        # The acting thread's compiled `select_action`, and the split of the
-        # behaviour actor it runs against. See `_make_act_fn`.
+        # The acting thread's compiled `select_action`. See `_make_act_fn`.
         self._act_fn = None
-        self._behavior_split = None
         # The agent's exploration noise, if it has any. Owned by the ACTING
         # thread: the learner never reads it, and its decay counter has to
         # advance once per env frame acted.
-        self._noise_nodes = getattr(agent, "_noise_nodes", None)
+        self._noise_module = getattr(agent, "noise_module", None)
 
     @classmethod
     def started(cls, agent, agent_key, state, *, initial_steps=0, chunk=8):
@@ -112,7 +110,8 @@ class AsyncLearner:
         learner = cls(agent, learner_key, initial_steps=initial_steps, chunk=chunk)
 
         learner._behavior_actor = copy.deepcopy(agent.state.actor)
-        learner._behavior_stats = agent.state.obs_stats
+        # Copied, not referenced: the `agent.learn` below donates these arrays.
+        learner._behavior_stats = jax.tree.map(jnp.copy, agent.state.obs_stats)
         warm_action, _, _ = agent.select_action(
             learner._behavior_actor, learner._behavior_stats,
             state.obs, agent_key, evaluate=False,
@@ -151,27 +150,18 @@ class AsyncLearner:
 
         No critic: only an on-policy agent needs one at acting time, and the
         async path is gated on a public `learn`, which only the off-policy
-        agents expose. That makes this split smaller than the sync rollout's,
-        and it is re-taken once a BURST rather than once a chunk, since the
-        actor's arrays only move when the learner publishes.
+        agents expose. So this takes fewer leaves than the sync rollout's
+        acting step.
         """
         agent = self._agent
 
-        @functools.partial(jax.jit, static_argnums=(0, 1), donate_argnums=(3,))
-        def act_fn(actor_graphdef, noise_graphdef, actor_pytree, noise_pytree,
-                   obs_stats, obs, key):
-            (actor,) = nnx.merge(actor_graphdef, actor_pytree)
-            noise_module = (
-                None if noise_graphdef is None
-                else nnx.merge(noise_graphdef, noise_pytree)[0]
-            )
+        @functools.partial(jax.jit, donate_argnums=(1,))
+        def act_fn(actor, noise_module, obs_stats, obs, key):
             action, applied_noise, _extras = agent.select_action(
                 actor, obs_stats, obs, key, evaluate=False,
                 noise_module=noise_module,
             )
-            if noise_graphdef is not None:
-                _, noise_pytree = nnx.split((noise_module,))
-            return noise_pytree, action, applied_noise
+            return noise_module, action, applied_noise
 
         return act_fn
 
@@ -188,31 +178,19 @@ class AsyncLearner:
             nnx.update(self._behavior_actor, snapshot[0])
             self._behavior_stats = snapshot[1]
             self._behavior_version = version
-            # A split holds the actor's ARRAYS, so publishing new ones is
-            # exactly when it has to be re-taken — once a burst, not once a
-            # step.
-            self._behavior_split = None
 
         if self._act_fn is None:
             self._act_fn = self._make_act_fn()
-        if self._behavior_split is None:
-            self._behavior_split = nnx.split((self._behavior_actor,))
-        actor_graphdef, actor_pytree = self._behavior_split
 
-        # Through the handle rather than held across steps, so the live module
-        # stays authoritative for whatever reads it between chunks — the decay
-        # counter is checkpointed. `replace` leaves the split fresh, so this
-        # costs a cached lookup rather than an `nnx.split` per env step.
-        noise_nodes = self._noise_nodes
-        noise_graphdef, noise_pytree = (
-            noise_nodes.split() if noise_nodes is not None else (None, None)
+        # The noise module is donated and re-adopted every step, because its
+        # decay counter advances on every env frame acted. The rebind is also
+        # published back to the agent, which is what a checkpoint reads.
+        self._noise_module, action, applied_noise = self._act_fn(
+            self._behavior_actor, self._noise_module, self._behavior_stats,
+            obs, key,
         )
-        noise_pytree, action, applied_noise = self._act_fn(
-            actor_graphdef, noise_graphdef, actor_pytree, noise_pytree,
-            self._behavior_stats, obs, key,
-        )
-        if noise_nodes is not None:
-            noise_nodes.replace(noise_pytree)
+        if self._noise_module is not None:
+            self._agent.noise_module = self._noise_module
         return action, applied_noise
 
     def buffer(self, prev_obs, timestep, actions):

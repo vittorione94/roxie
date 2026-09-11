@@ -9,7 +9,7 @@ from omegaconf import OmegaConf
 
 import roxie.agents  # noqa: F401  (avoid circular import)
 from roxie.agents.ppo import PPO, _grad_step, _grad_steps, _prepare_rollout
-from roxie.agents.utils import SplitNodes, Transition
+from roxie.agents.utils import Transition
 from roxie.environment.vector import Timestep
 
 
@@ -165,11 +165,10 @@ def _prepared_rollout(agent, key):
         obs = timestep.obs
 
     obs_mean, obs_std = agent._frozen_obs_norm()
-    # Both bursts take the agent's split rather than a live state; `SplitNodes`
-    # is mutated in place, so the new state is read back off the handle.
-    nodes = SplitNodes((agent.state,))
-    tensors = _prepare_rollout(
-        nodes,
+    # `_prepare_rollout` returns the state it was handed, so the agent re-adopts
+    # it — the same contract every burst has.
+    agent.state, *tensors = _prepare_rollout(
+        agent.state,
         gamma=agent.gamma,
         gae_lambda=agent.gae_lambda,
         replay_get_fn=agent.replay.sample,
@@ -178,7 +177,6 @@ def _prepared_rollout(agent, key):
         obs_mean=obs_mean,
         obs_std=obs_std,
     )
-    agent.state = nodes.live[0]
     return tuple(tensors)
 
 
@@ -237,14 +235,14 @@ class TestFusedUpdateMatchesTheLoop:
         tensors = _prepared_rollout(agent, jax.random.PRNGKey(0))
 
         burst_key = jax.random.PRNGKey(7)
-        fused_nodes = SplitNodes((copy.deepcopy(agent.state),))
+        fused_state = copy.deepcopy(agent.state)
         looped_state = copy.deepcopy(agent.state)
 
         (
-            _key, steps, actor_sum, critic_sum,
+            new_state, _key, steps, actor_sum, critic_sum,
             kl_sum, clip_sum, stops, _last_kl, _last_clip,
         ) = _grad_steps(
-            fused_nodes, burst_key, *tensors,
+            fused_state, burst_key, *tensors,
             agent.learning_steps, agent.num_minibatches, agent.minibatch_size,
             agent.clip_eps, agent.entropy_coef, agent.target_kl,
         )
@@ -263,7 +261,6 @@ class TestFusedUpdateMatchesTheLoop:
 
         # The parameters are the real assertion: the diagnostics could agree
         # while the updates landed differently.
-        new_state = fused_nodes.live[0]
         for network in ("actor", "critic"):
             for fused, looped in zip(_params(getattr(new_state, network)),
                                      _params(getattr(looped_state, network))):
@@ -279,8 +276,8 @@ class TestFusedUpdateMatchesTheLoop:
             learning_steps=3, num_minibatches=2, target_kl=1e-9,
         )
         tensors = _prepared_rollout(agent, jax.random.PRNGKey(0))
-        _, steps, *_rest = _grad_steps(
-            SplitNodes((copy.deepcopy(agent.state),)),
+        _state, _key, steps, *_rest = _grad_steps(
+            copy.deepcopy(agent.state),
             jax.random.PRNGKey(7), *tensors,
             agent.learning_steps, agent.num_minibatches, agent.minibatch_size,
             agent.clip_eps, agent.entropy_coef, agent.target_kl,

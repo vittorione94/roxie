@@ -7,7 +7,6 @@ from flax import nnx
 
 from roxie.agents.agent import Agent, TrainState
 from roxie.agents.utils import (
-    graph_jit,
     network_rngs,
     transition_prototype,
 )
@@ -44,15 +43,15 @@ def _compute_gae(rewards, values, termination, truncation, gamma, gae_lambda):
 # Split out of the gradient step so the same rollout can be trained on
 # `learning_steps` times.
 @functools.partial(
-    graph_jit,
+    jax.jit,
     static_argnames=(
         "gamma",
         "gae_lambda",
         "replay_get_fn",
         "normalize",
     ),
-    # Read-only on the buffer side and called once per rollout.
-    donate=False,
+    # NOT donated: read-only on the buffer side, called once per rollout, and
+    # `update` reads `state.buffer_state` straight back out of it.
 )
 def _prepare_rollout(
     state: TrainState,
@@ -113,16 +112,7 @@ def _prepare_rollout(
     adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
     return (
-        TrainState(
-            actor=state.actor,
-            critic=state.critic,
-            actor_optimizer=state.actor_optimizer,
-            target_actor=state.target_actor,
-            target_critic=state.target_critic,
-            critic_optimizer=state.critic_optimizer,
-            buffer_state=state.buffer_state,
-            obs_stats=state.obs_stats,
-        ),
+        state,
         norm_obs,
         re_packed_samples["pre_actions"],
         re_packed_samples["log_probs"],
@@ -185,11 +175,12 @@ def _grad_step(
 # steps cost nothing, and the RNG splits live inside the taken branch so the key
 # stream advances exactly as far as a Python loop would advance it.
 @functools.partial(
-    graph_jit,
+    jax.jit,
     static_argnames=(
         "learning_steps", "num_minibatches", "minibatch_size",
         "clip_eps", "entropy_coef", "target_kl",
     ),
+    donate_argnums=(0,),
 )
 def _grad_steps(
     state: TrainState,
@@ -214,7 +205,6 @@ def _grad_steps(
     than means so the caller can fold several rollouts together, and the
     advanced `key` so the stream threads on exactly as the Python loop's did.
     """
-    graphdef, node_carry = nnx.split(state)
     rollout = (norm_obs, pre_actions, old_log_probs, returns_t, adv_t)
 
     f0, i0 = jnp.zeros((), jnp.float32), jnp.zeros((), jnp.int32)
@@ -224,7 +214,7 @@ def _grad_steps(
 
     def epoch(carry, _):
         def run(carry):
-            node_carry, rng, stopped, stats = carry
+            state, rng, stopped, stats = carry
             rng, perm_key = jax.random.split(rng)
             # Cuts the ENV axis only, never time: GAE, the ratio and the value
             # target are per-trajectory, so a trajectory must stay whole inside
@@ -234,7 +224,7 @@ def _grad_steps(
 
             def minibatch(carry, m):
                 def run_mb(carry):
-                    node_carry, rng, _stopped, stats = carry
+                    state, rng, _stopped, stats = carry
                     rng, step_key = jax.random.split(rng)
                     mb = tuple(
                         jax.lax.dynamic_slice_in_dim(
@@ -242,14 +232,10 @@ def _grad_steps(
                         )
                         for leaf in shuffled
                     )
-                    inner = nnx.merge(graphdef, node_carry)
                     actor_loss, critic_loss, approx_kl, clip_frac = _grad_step(
-                        inner, step_key, *mb,
+                        state, step_key, *mb,
                         clip_eps=clip_eps, entropy_coef=entropy_coef,
                     )
-                    # The updates wrote through to `inner`, so re-splitting
-                    # gives the post-step carry.
-                    _, node_carry = nnx.split(inner)
 
                     steps, a_sum, c_sum, kl_sum, cf_sum, stops, _, _ = stats
                     # Total drift from the behaviour policy, not this step's
@@ -269,25 +255,25 @@ def _grad_steps(
                         approx_kl,
                         clip_frac,
                     )
-                    return node_carry, rng, trip, stats_out
+                    return state, rng, trip, stats_out
 
                 return jax.lax.cond(carry[2], lambda c: c, run_mb, carry), None
 
             carry, _ = jax.lax.scan(
-                minibatch, (node_carry, rng, stopped, stats),
+                minibatch, (state, rng, stopped, stats),
                 jnp.arange(num_minibatches),
             )
             return carry
 
         return jax.lax.cond(carry[2], lambda c: c, run, carry), None
 
-    (node_carry, key, _stopped, stats), _ = jax.lax.scan(
+    (state, key, _stopped, stats), _ = jax.lax.scan(
         epoch,
-        (node_carry, key, jnp.zeros((), jnp.bool_), init_stats),
+        (state, key, jnp.zeros((), jnp.bool_), init_stats),
         None,
         length=learning_steps,
     )
-    return (nnx.merge(graphdef, node_carry), key, *stats)
+    return (state, key, *stats)
 
 
 class PPO(Agent):
@@ -539,13 +525,14 @@ class PPO(Agent):
             obs_mean, obs_std = self._frozen_obs_norm()
 
             (
+                self.state,
                 norm_obs,
                 pre_actions,
                 old_log_probs,
                 returns_t,
                 adv_t,
             ) = _prepare_rollout(
-                self._burst_nodes,
+                self.state,
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
                 replay_get_fn=self.replay.sample,
@@ -560,6 +547,7 @@ class PPO(Agent):
             self._obs_norm = None
 
             (
+                self.state,
                 agent_rng,
                 steps_taken,
                 actor_sum,
@@ -570,7 +558,7 @@ class PPO(Agent):
                 last_kl,
                 last_clip_frac,
             ) = _grad_steps(
-                self._burst_nodes,
+                self.state,
                 agent_rng,
                 norm_obs,
                 pre_actions,

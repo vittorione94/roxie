@@ -385,42 +385,30 @@ class JaxRollout:
         """Compile one `n_steps` acting burst into a single dispatch.
 
         The carry is everything a step mutates: the agent's train state and
-        noise module (split/merged around the body as `fused_grad_steps` does),
-        the env state, the rng, the env's own `params`, the per-env episode
-        counters and this chunk's sums. `reset_pool` is loop-constant — the
-        epoch boundary regenerates it — so it rides in as a plain argument.
+        noise module (both pytrees, so both are carried as they are), the env
+        state, the rng, the env's own `params`, the per-env episode counters and
+        this chunk's sums. `reset_pool` is loop-constant — the epoch boundary
+        regenerates it — so it rides in as a plain argument.
         """
         agent = self.agent
         environment = self.environment
         observe_params = self._observe_params
         metric_keys = self._metric_keys
 
-        # `jax.jit` with the graphdefs static, not `nnx.jit`, which re-walks
-        # the module graph in Python on every call — see
-        # `agents.utils.SplitNodes`. The train state carries the replay buffer,
-        # so donate it.
-        @functools.partial(
-            jax.jit, static_argnums=(0, 1), donate_argnums=(2,)
-        )
-        def collect_fn(agent_graphdef, noise_graphdef, agent_pytree,
-                       noise_pytree, state, rng, reset_pool, params, scores,
-                       lengths):
+        # `jax.jit` over the state itself, not `nnx.jit`, which re-walks the
+        # module graph in Python on every call. `TrainState` is a pytree, so it
+        # needs no boundary conversion. It carries the replay buffer, so donate
+        # it — and the noise module, whose counter advances every step.
+        @functools.partial(jax.jit, donate_argnums=(0, 1))
+        def collect_fn(train_state, noise_module, state, rng, reset_pool,
+                       params, scores, lengths):
             # Read once here, not off the carry: inside the scan `obs_stats`
-            # advances on every add. Merging is trace-time only.
-            frozen_stats = nnx.merge(agent_graphdef, agent_pytree)[0].obs_stats
+            # advances on every add.
+            frozen_stats = train_state.obs_stats
 
             def body(carry, _):
-                (agent_pytree, noise_pytree, state, rng, params, scores,
+                (train_state, noise_module, state, rng, params, scores,
                  lengths, sums) = carry
-                # `agent_pytree` covers every node the gradient burst owns;
-                # acting reads only the train state, the rest ride through so
-                # both bursts share one split.
-                agent_nodes = nnx.merge(agent_graphdef, agent_pytree)
-                train_state = agent_nodes[0]
-                noise_module = (
-                    None if noise_graphdef is None
-                    else nnx.merge(noise_graphdef, noise_pytree)[0]
-                )
 
                 rng, act_key, step_key = jax.random.split(rng, 3)
                 prev_obs = state.obs
@@ -473,27 +461,19 @@ class JaxRollout:
                 scores = jnp.where(done, 0.0, scores)
                 lengths = jnp.where(done, 0, lengths)
 
-                # The writes above went through `train_state`, which is
-                # `agent_nodes[0]`, so re-splitting gives the post-step carry.
-                _, agent_pytree = nnx.split(agent_nodes)
-                if noise_graphdef is not None:
-                    _, noise_pytree = nnx.split((noise_module,))
+                # The writes above went through `train_state` and
+                # `noise_module` in place, so they ARE the post-step carry.
                 return (
-                    agent_pytree, noise_pytree, state, rng, params, scores,
+                    train_state, noise_module, state, rng, params, scores,
                     lengths, sums,
                 ), None
 
             init = (
-                agent_pytree, noise_pytree, state, rng, params, scores, lengths,
+                train_state, noise_module, state, rng, params, scores, lengths,
                 new_chunk_sums(jnp, metric_keys),
             )
             carry, _ = jax.lax.scan(body, init, None, length=n_steps)
-            (agent_pytree, noise_pytree, state, rng, params, scores, lengths,
-             sums) = carry
-            return (
-                agent_pytree, noise_pytree, state, rng, params,
-                scores, lengths, sums,
-            )
+            return carry
 
         return collect_fn
 
@@ -517,28 +497,22 @@ class JaxRollout:
             print(f"Compiling {n_steps}-step acting burst...", flush=True)
             t0 = time.time()
 
-        agent_nodes = self.agent.burst_nodes
-        agent_graphdef, agent_pytree = agent_nodes.split()
-        # None for agents that explore from their own stochastic policy: a
-        # static None graphdef, so the merge is skipped inside the trace.
-        noise_nodes = getattr(self.agent, "_noise_nodes", None)
-        noise_graphdef, noise_pytree = (
-            noise_nodes.split() if noise_nodes is not None else (None, None)
-        )
+        # `None` for agents that explore from their own stochastic policy; an
+        # empty pytree node, so it rides through the trace as one.
+        noise_module = getattr(self.agent, "noise_module", None)
 
-        (agent_pytree, noise_pytree, state, self.rng, self.params, self.scores,
-         self.lengths, sums) = self._collect_fn(
-            agent_graphdef, noise_graphdef, agent_pytree, noise_pytree, state,
-            self.rng, self.reset_pool, self.params, self.scores, self.lengths,
+        (self.agent.state, noise_module, state, self.rng, self.params,
+         self.scores, self.lengths, sums) = self._collect_fn(
+            self.agent.state, noise_module, state, self.rng, self.reset_pool,
+            self.params, self.scores, self.lengths,
         )
         if compiling:
             jax.block_until_ready(jax.tree.leaves(sums))
             print(f"  {time.time() - t0:.1f}s", flush=True)
-        # The burst donated its inputs, so the agent must adopt what came back
-        # or the next one reads deleted buffers.
-        agent_nodes.replace(agent_pytree)
-        if noise_nodes is not None:
-            noise_nodes.replace(noise_pytree)
+        # The burst donated both, so the agent must adopt what came back or the
+        # next one reads deleted buffers.
+        if noise_module is not None:
+            self.agent.noise_module = noise_module
         return state, sums
 
     def epoch_refresh(self, state):
@@ -725,13 +699,13 @@ class EnvPoolRollout:
         not known until it has.
 
         Each takes only what it touches, which is the whole difficulty. Handing
-        both halves the agent's `burst_nodes` pytree, as the JAX rollout does,
+        both halves the agent's whole train state, as the JAX rollout does,
         is SLOWER than the per-step loop it replaces: a jit call flattens its
         arguments and books their donation in Python, per leaf, and TD3's train
         state is 142 of them against the 10 that buffering writes. So acting
-        takes the actor and critic as their own split — sound because a chunk is
-        one update window, so neither moves inside it — and buffering takes the
-        two `TrainState` fields it writes.
+        takes the actor and critic on their own — sound because a chunk is one
+        update window, so neither moves inside it — and buffering takes the two
+        `TrainState` fields it writes.
 
         The critic rides along for every agent though only PPO reads it at
         acting time. Splitting it out for the rest saves ~1% end to end and is
@@ -741,14 +715,9 @@ class EnvPoolRollout:
         """
         agent = self.agent
 
-        @functools.partial(jax.jit, static_argnums=(0, 1), donate_argnums=(3,))
-        def act_fn(acting_graphdef, noise_graphdef, acting_pytree, noise_pytree,
-                   frozen_stats, obs_stats, rng, obs):
-            actor, critic = nnx.merge(acting_graphdef, acting_pytree)
-            noise_module = (
-                None if noise_graphdef is None
-                else nnx.merge(noise_graphdef, noise_pytree)[0]
-            )
+        @functools.partial(jax.jit, donate_argnums=(2,))
+        def act_fn(actor, critic, noise_module, frozen_stats, obs_stats, rng,
+                   obs):
             # The same three-way split, in the same order, as the per-step
             # loop: a C++ pool owns its RNG and drops `step_key`, but drawing it
             # is what keeps the two paths on one stream.
@@ -760,9 +729,7 @@ class EnvPoolRollout:
                 actor, acting_stats, obs, act_key,
                 noise_module=noise_module, critic=critic,
             )
-            if noise_graphdef is not None:
-                _, noise_pytree = nnx.split((noise_module,))
-            return noise_pytree, rng, action, applied_noise, extras
+            return noise_module, rng, action, applied_noise, extras
 
         @functools.partial(jax.jit, donate_argnums=(0, 1))
         def buffer_fn(buffer_state, obs_stats, prev_obs, action, reward,
@@ -804,9 +771,8 @@ class EnvPoolRollout:
             return stepwise_collect(self, state, n_steps, learner)
 
         agent = self.agent
-        # Before anything is split or donated: PPO pins its acting statistics
-        # here, and reading `agent.state` to do it re-materializes the live
-        # nodes. `None` from any other agent.
+        # Before anything is donated: PPO pins its acting statistics here.
+        # `None` from any other agent.
         frozen_stats = agent.freeze_acting_norm()
 
         compiling = self._step_fns is None
@@ -816,18 +782,12 @@ class EnvPoolRollout:
             t0 = time.time()
         act_fn, buffer_fn = self._step_fns
 
-        # Re-split every chunk rather than held across them: the gradient burst
-        # between two chunks updates these modules in place through
-        # `burst_nodes`, which a cached split of its own would not see.
-        acting_graphdef, acting_pytree = nnx.split(
-            (agent.state.actor, agent.state.critic)
-        )
-        # None for agents that explore from their own stochastic policy: a
-        # static None graphdef, so the merge is skipped inside the trace.
-        noise_nodes = getattr(agent, "_noise_nodes", None)
-        noise_graphdef, noise_pytree = (
-            noise_nodes.split() if noise_nodes is not None else (None, None)
-        )
+        # Read off the state every chunk rather than held across them: the
+        # gradient burst between two chunks donates the previous arrays.
+        actor, critic = agent.state.actor, agent.state.critic
+        # `None` for agents that explore from their own stochastic policy; an
+        # empty pytree node, so it rides through the trace as one.
+        noise_module = getattr(agent, "noise_module", None)
         buffer_state = agent.state.buffer_state
         obs_stats = agent.state.obs_stats
 
@@ -837,9 +797,9 @@ class EnvPoolRollout:
         # serves acting now and the `next_obs` of the transition buffered below.
         obs = jnp.asarray(state.obs)
         for _ in range(n_steps):
-            noise_pytree, self.rng, action, applied_noise, extras = act_fn(
-                acting_graphdef, noise_graphdef, acting_pytree, noise_pytree,
-                frozen_stats, obs_stats, self.rng, obs,
+            noise_module, self.rng, action, applied_noise, extras = act_fn(
+                actor, critic, noise_module, frozen_stats, obs_stats, self.rng,
+                obs,
             )
             prev_obs = obs
             state, timestep = self.environment.step(state, action)
@@ -865,8 +825,8 @@ class EnvPoolRollout:
         # were never written to and need no write-back.
         agent.state.buffer_state = buffer_state
         agent.state.obs_stats = obs_stats
-        if noise_nodes is not None:
-            noise_nodes.replace(noise_pytree)
+        if noise_module is not None:
+            agent.noise_module = noise_module
         if compiling:
             print(f"  {time.time() - t0:.1f}s (first chunk, includes compile)",
                   flush=True)
@@ -888,17 +848,11 @@ class EnvPoolRollout:
         """
         agent = self.agent
 
-        @functools.partial(jax.jit, static_argnums=(0, 1))
-        def eval_act_fn(acting_graphdef, noise_graphdef, acting_pytree,
-                        noise_pytree, obs_stats, obs, key):
-            actor, critic = nnx.merge(acting_graphdef, acting_pytree)
+        @jax.jit
+        def eval_act_fn(actor, critic, noise_module, obs_stats, obs, key):
             # Carried, but inert: under `evaluate=True` `add_noise` returns the
             # action untouched and never advances its counter, which is why eval
             # need not adopt a module back.
-            noise_module = (
-                None if noise_graphdef is None
-                else nnx.merge(noise_graphdef, noise_pytree)[0]
-            )
             action, _noise, _extras = agent.select_action(
                 actor, obs_stats, obs, key, evaluate=True,
                 noise_module=noise_module, critic=critic,
@@ -920,16 +874,11 @@ class EnvPoolRollout:
 
         if self._eval_act_fn is None:
             self._eval_act_fn = self._make_eval_act_fn()
-        # Re-split per eval, not held across them: the point of an eval is to
-        # score THIS epoch's weights, which the gradient bursts since the last
-        # one updated in place through `burst_nodes`.
-        acting_graphdef, acting_pytree = nnx.split(
-            (agent.state.actor, agent.state.critic)
-        )
-        noise_nodes = getattr(agent, "_noise_nodes", None)
-        noise_graphdef, noise_pytree = (
-            noise_nodes.split() if noise_nodes is not None else (None, None)
-        )
+        # Read per eval, not held across them: the point of an eval is to score
+        # THIS epoch's weights, and the gradient bursts since the last one
+        # donated the arrays these names used to point at.
+        actor, critic = agent.state.actor, agent.state.critic
+        noise_module = getattr(agent, "noise_module", None)
         # Exactly the statistics `agent.step` would have used: the live ones for
         # everyone, except PPO, which scores against the pin its own rollout ran
         # under. See `Agent.freeze_acting_norm`.
@@ -940,8 +889,7 @@ class EnvPoolRollout:
 
         def select(obs):
             return self._eval_act_fn(
-                acting_graphdef, noise_graphdef, acting_pytree, noise_pytree,
-                obs_stats, obs, eval_key,
+                actor, critic, noise_module, obs_stats, obs, eval_key,
             )
 
         return select
