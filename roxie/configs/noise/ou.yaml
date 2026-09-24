@@ -1,0 +1,10 @@
+_target_: roxie.exploration.noisy.OrnsteinUhlenbeckNoise
+initial_noise_scale: 0.1
+decay_schedule:
+  _target_: roxie.exploration.schedulers.LinearDecay
+  decay_steps: 1_000_000_000
+  final_value: 0.01
+theta: 0.15
+dt: 0.025
+clip: 2.0
+mu: 0.0

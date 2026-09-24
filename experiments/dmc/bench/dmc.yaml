@@ -1,0 +1,36 @@
+# @package _global_
+
+release:
+  grid: release-v1
+  task: WalkerWalk
+  agent: ???
+  cell: ???
+
+env:
+  seed: 0
+  parallel_envs: 1024
+  max_episode_steps: null
+
+trainer:
+  steps: 500_000_000
+  epoch_steps: 500_000
+  save_steps: 5_000_000
+  test_episodes: 10
+  show_progress: true
+  replace_checkpoint: false
+  save_buffer: false
+
+logging:
+  wandb:
+    enabled: true
+    project: roxie-${release.task}
+    entity: null
+    name: ${release.agent}.${release.cell}
+    group: ${release.grid}
+    job_type: ${release.cell}
+    mode: online
+    relogin: false
+
+hydra:
+  run:
+    dir: outputs/release_v1/${release.task}/${release.cell}/${release.agent}/${now:%Y-%m-%d_%H-%M-%S}

@@ -1,0 +1,16 @@
+# @package _global_
+
+release:
+  cell: mjx_cpu
+
+env:
+  _target_: roxie.environment.loader.build_playground_env
+  env_name: ${release.task}
+  impl: jax
+  naconmax: null
+  njmax: null
+
+runtime:
+  device: cpu
+  matmul_precision: null
+  cpu_cores: null

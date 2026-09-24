@@ -1,0 +1,10 @@
+_target_: roxie.agents.OrnsteinUhlenbeck
+
+# Non-learning Ornstein-Uhlenbeck baseline: no networks, no replay, no
+# optimizers.
+scale: 0.5     # noise magnitude
+theta: 0.15    # mean-reversion (higher => less temporal correlation)
+dt: 1e-2       # integration step
+clip: 2.0      # per-step gaussian sample clip
+mu: 0.0        # mean the OU state reverts toward
+seed: 0        # PRNG seed for the driving noise

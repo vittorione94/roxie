@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - agent: td4_bench
+  - noise: bench_gaussian
+  - bench: dmc
+  - backend: envpool_cpu
+  - _self_
+
+release:
+  agent: td4

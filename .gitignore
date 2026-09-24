@@ -1,0 +1,77 @@
+# Byte-compiled / optimized / C extensions
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.pdf
+
+# Distribution / packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+*.whl
+.python-version
+
+# PyInstaller
+#  Usually these files are created by PyInstaller.
+#  If you are shipping binary files this way, consider NOT ignoring them.
+*.spec
+
+# Virtual Environments
+.env
+.venv
+venv/
+env.bak/
+venv.bak/
+
+# IDE / Editor / agent tooling
+.idea/
+.vscode/
+.claude/
+*.sublime-project
+*.sublime-workspace
+
+# Testing
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+
+# Secrets & Credentials - IMPORTANT: Never commit secrets!
+.env.*
+!.env.example
+secrets.yml
+*.pem
+*.key
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Log files
+*.log
+logs/
+
+outputs/
+
+# scripts/export_release_weights.py stages here under --dest. It publishes to
+# Hugging Face and normally stages in a temp dir, so this only catches an
+# inspection run — the bundles are a release asset and never a committed one.
+weights/

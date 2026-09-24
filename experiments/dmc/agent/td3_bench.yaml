@@ -1,0 +1,80 @@
+_target_: roxie.agents.TD3
+
+
+hyperparams:
+  _target_: roxie.agents.hyperparams.TD3Hyperparams
+
+  gamma: 0.99
+  tau: 0.005
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  target_policy_noise: 0.2
+  target_noise_clip: 0.5
+  policy_delay: 2
+  twin_q_weight: 0.5
+  memory_warmup: 30_720
+  steps_between_updates: 2_048
+  learning_steps: 20
+  n_step: 5
+  max_grad_norm: 1
+  pre_activation_coef: 0.0
+  normalize_observations: true
+  obs_norm_clip: 5.0
+  obs_norm_eps: 1e-08
+  seed: 0
+
+actor_config:
+  _target_: roxie.models.actors.DeterministicActor
+  in_features: ${env.obs_size}
+  action_dim: ${env.action_size}
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+  output_init_scale: 0.01
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${agent.hyperparams.seed}
+    offset: 0
+
+
+critic_config:
+  _target_: roxie.models.critics.TwinCritic
+  critic1:
+    _target_: roxie.models.critics.QCritic
+    in_features: ${env.obs_action_size}
+    features: [256, 256]
+    use_layer_norm: true
+    dropout_rate: 0.
+    rngs:
+      _target_: roxie.agents.utils.network_rngs
+      seed: ${agent.hyperparams.seed}
+      offset: 2
+  critic2:
+    _target_: roxie.models.critics.QCritic
+    in_features: ${env.obs_action_size}
+    features: [256, 256]
+    use_layer_norm: true
+    dropout_rate: 0.
+    rngs:
+      _target_: roxie.agents.utils.network_rngs
+      seed: ${agent.hyperparams.seed}
+      offset: 4
+
+memory_config:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 500_000
+  min_length: 10_000
+  sample_batch_size: 512
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
+
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

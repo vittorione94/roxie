@@ -1,0 +1,16 @@
+# @package _global_
+
+release:
+  cell: warp_gpu
+
+env:
+  _target_: roxie.environment.loader.build_playground_env
+  env_name: ${release.task}
+  impl: warp
+  naconmax: null
+  njmax: null
+  graph_mode: WARP_STAGED_EX
+
+runtime:
+  device: gpu
+  matmul_precision: tensorfloat32

@@ -1,0 +1,85 @@
+_target_: roxie.agents.PPO
+
+hyperparams:
+  _target_: roxie.agents.hyperparams.PPOHyperparams
+
+  gamma: 0.99
+  gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
+  clip_eps: 0.2                   # PPO surrogate clip range
+  entropy_coef: 0.002             # entropy bonus weight in the actor loss
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  learning_steps: 5               # EPOCHS: passes over each rollout
+  num_minibatches: 4              # MINIBATCHES: splits per pass
+  adv_norm_decay: 0.0
+  target_kl: null
+  max_grad_norm: 1
+  normalize_observations: true
+  obs_norm_clip: null
+  obs_norm_eps: 1e-08
+  seed: 0
+
+actor_config:
+  _target_: roxie.models.actors.StochasticActor
+  in_features: ${env.obs_size}
+  action_dim: ${env.action_size}
+  features: [256, 256]
+  activation_fn:
+    _target_: jax.nn.elu
+    _partial_: true
+  use_layer_norm: false
+  squash: false
+  log_std_param: true
+  std_min: 1e-2
+  std_max: 5.0
+  torch_init: true
+  output_init_scale: 0.01
+  init_std: 0.4                   # exp(LOG_STD)
+  state_dependent_std: false
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${agent.hyperparams.seed}
+    offset: 0
+
+critic_config:
+  _target_: roxie.models.critics.VCritic
+  in_features: ${env.obs_size}
+  features: [256, 256]
+  activation_fn:
+    _target_: jax.nn.elu
+    _partial_: true
+  use_layer_norm: false
+  dropout_rate: 0.
+  torch_init: true
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${agent.hyperparams.seed}
+    offset: 2
+
+memory_config:
+  _target_: flashbax.buffers.make_trajectory_queue
+  max_length_time_axis: 64
+  add_batch_size: ${env.parallel_envs}
+  add_sequence_length: 1
+  sample_sequence_length: 32
+
+actor_optimizer_config:
+  _target_: optax.adam
+  learning_rate:
+    _target_: optax.linear_schedule
+    init_value: 3e-4
+    end_value: 1e-4
+    transition_steps: 16000
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  learning_rate:
+    _target_: optax.linear_schedule
+    init_value: 3e-4
+    end_value: 1e-4
+    transition_steps: 16000
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

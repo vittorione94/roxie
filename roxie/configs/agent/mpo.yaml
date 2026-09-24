@@ -1,0 +1,78 @@
+_target_: roxie.agents.MPO
+
+hyperparams:
+  _target_: roxie.agents.hyperparams.MPOHyperparams
+
+  gamma: 0.99
+  n_step: 5
+  tau: 0.005
+  actor_learning_rate: 3e-4
+  critic_learning_rate: 3e-4
+  dual_learning_rate: 1e-2
+  num_action_samples: 20          # actions sampled per state for the E-step
+  epsilon: 0.1                    # E-step temperature KL bound
+  epsilon_mean: 1e-3             # M-step KL bound on the policy mean
+  epsilon_stddev: 1e-5          # M-step KL bound on the policy covariance
+  init_temperature: 1.0
+  init_alpha_mean: 1.0
+  init_alpha_stddev: 1.0
+  memory_warmup: 30_000
+  steps_between_updates: 400
+  learning_steps: 20
+  max_grad_norm: 1
+  normalize_observations: true
+  obs_norm_clip: 5.0
+  obs_norm_eps: 1e-08
+  seed: 0
+
+actor_config:
+  _target_: roxie.models.actors.StochasticActor
+  in_features: ${env.obs_size}
+  action_dim: ${env.action_size}
+  features: [256, 256]
+  use_layer_norm: false
+  std_min: 1e-4
+  std_max: 2.0
+  output_init_scale: 0.01
+  init_std: 0.5
+  state_dependent_std: true
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${agent.hyperparams.seed}
+    offset: 0
+
+critic_config:
+  _target_: roxie.models.critics.QCritic
+  in_features: ${env.obs_action_size}
+  features: [256, 256]
+  use_layer_norm: false
+  dropout_rate: 0.
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${agent.hyperparams.seed}
+    offset: 2
+
+memory_config:
+  _target_: flashbax.buffers.make_flat_buffer
+  max_length: 1_000_000
+  min_length: 1_000
+  sample_batch_size: 256
+  add_sequences: False
+  add_batch_size: ${env.parallel_envs}
+
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8
+# Lagrange duals: a handful of scalars, so they are NOT global-norm clipped.
+dual_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

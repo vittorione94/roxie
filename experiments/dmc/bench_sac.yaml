@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - agent: sac_bench
+  - bench: dmc
+  - backend: envpool_cpu
+  - _self_
+
+release:
+  agent: sac

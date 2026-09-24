@@ -1,0 +1,29 @@
+# @package _global_
+
+release:
+  cell: envpool_cpu
+
+env:
+  _target_: roxie.environment.loader.build_envpool_env
+  task_id: ${envpool_task:${release.task}}
+  # EnvPool's own C++ pool, independent of the learner's XLA pool
+  # (`runtime.cpu_cores` below) and not reliably sized from it by
+  # auto-detection alone — pinned explicitly to the same core count to avoid
+  # oversubscribing the taskset slot.
+  num_threads: 12
+
+runtime:
+  device: cpu
+  matmul_precision: null
+  # `bfloat16` narrows the hidden Linear layers' GEMM operands (params,
+  # gradients and reductions stay float32 — see `precision.linear_kwargs`).
+  # LEFT OFF: it only pays through oneDNN's custom call, and that rewriter
+  # aborts real learner graphs on this XLA build with a shape RET_CHECK
+  # (minimal MLPs compile fine). Without the flag bf16 is slower than float32.
+  # Retry after an XLA bump — the upside is small either way.
+  matmul_dtype: float32
+  # Kept equal to env.num_threads above: pin_cpu_cores narrows the process's
+  # OS affinity to this count, so a smaller value here than num_threads packs
+  # more EnvPool worker threads onto fewer cores than the taskset slot gave
+  # it — active oversubscription, not a no-op.
+  cpu_cores: 12
