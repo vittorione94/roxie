@@ -1,0 +1,50 @@
+# @package _global_
+
+# SAC balancing a cartpole from pixels alone: mujoco_playground renders a
+# 64x64 stack of three grayscale frames through mujoco_warp, and every network
+# reads it through the `vision` group's conv encoder. GPU only — the renderer
+# is warp.
+#
+#   uv run python roxie/train.py --config-name vision/cartpole_sac
+#
+# The `/vision` default is what any launchable adds to see; listing it as
+# `- /vision: null` instead makes it switchable from the command line
+# (`vision=cnn`). `+vision=cnn` cannot work from a launchable in a
+# subdirectory: Hydra looks for the group under the launchable's own folder.
+
+defaults:
+  - /agent: sac
+  - /env: playground
+  - /vision: cnn
+  - _self_
+
+env:
+  env_name: CartpoleBalance
+  impl: warp
+  vision: true
+  # Also the render context's `nworld`, which warp allocates up front.
+  parallel_envs: 1024
+  # The vision task ends its episodes at 250 steps of its own 0.02 s control
+  # step, not the 1000 its registry config advertises.
+  max_episode_steps: 250
+
+agent:
+  memory_config:
+    # Pixels are stored as float32: 48 KB a frame, so ~5 GB at this length.
+    max_length: 100_000
+
+runtime:
+  device: gpu
+
+trainer:
+  steps: 5_000_000
+  epoch_steps: 100_000
+  save_steps: 1_000_000
+  test_episodes: 10
+  show_progress: true
+  replace_checkpoint: false
+  save_buffer: false
+
+hydra:
+  run:
+    dir: outputs/vision/cartpole_sac/${now:%Y-%m-%d_%H-%M-%S}

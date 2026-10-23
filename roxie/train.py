@@ -96,7 +96,10 @@ def main(cfg: DictConfig):
     )
 
     obs_space, act_space = env.single_observation_space, env.single_action_space
-    publish_env_shapes(cfg.env, space_size(obs_space), space_size(act_space))
+    publish_env_shapes(
+        cfg.env, space_size(obs_space), space_size(act_space),
+        pixel_shape=env.pixel_shape,
+    )
 
     output_dir = HydraConfig.get().runtime.output_dir
 

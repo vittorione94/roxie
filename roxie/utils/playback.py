@@ -118,7 +118,9 @@ def load_policy(
     func_env = env.func_env
     obs_size = space_size(func_env.observation_space)
     action_size = space_size(func_env.action_space)
-    publish_env_shapes(cfg.env, obs_size, action_size)
+    publish_env_shapes(
+        cfg.env, obs_size, action_size, pixel_shape=func_env.pixel_shape,
+    )
 
     agent_args = {k: v for k, v in cfg.agent.items() if k.endswith("_config")}
     if "noise" in cfg:

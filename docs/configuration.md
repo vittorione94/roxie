@@ -14,15 +14,17 @@ Hardware placement is not an agent key: `runtime.device` (`cpu`/`gpu`/null) plac
 
 The env block follows the same convention: `env._target_` names a **builder**, instantiated by [`loader.build_env`](../roxie/environment/loader.py). So the core training loop never branches on an env-type string and never names a specific task — the builder can live in another repo. Same for the viewer hook (`env.viewer`).
 
-A few keys under `env:` are *not* builder arguments, because roxie consumes them itself: `parallel_envs` and `test_episodes` reach the builder as the injected `num_envs`/`test_episodes`, `viewer`/`player` are `play.py`'s hooks, and `obs_size`/`action_size`/`obs_action_size` are written *back* into the block by `publish_env_shapes` once the env exists, so an agent yaml can interpolate `${env.obs_size}`. They are listed as `loader.TRAINER_ENV_KEYS` and stripped before instantiation. Everything else in the block is a builder keyword: a stale key is a `TypeError` at launch, which is also what lets `build_envpool_env` collect per-task options in a `**task_kwargs` tail.
+A few keys under `env:` are *not* builder arguments, because roxie consumes them itself: `parallel_envs` and `test_episodes` reach the builder as the injected `num_envs`/`test_episodes`, `viewer`/`player` are `play.py`'s hooks, and `obs_size`/`action_size`/`obs_action_size`/`pixel_shape` are written *back* into the block by `publish_env_shapes` once the env exists, so an agent yaml can interpolate `${env.obs_size}`. They are listed as `loader.TRAINER_ENV_KEYS` and stripped before instantiation. Everything else in the block is a builder keyword: a stale key is a `TypeError` at launch, which is also what lets `build_envpool_env` collect per-task options in a `**task_kwargs` tail.
 
 ## Layout
 
 - [`roxie/configs/agent/`](../roxie/configs/agent/) — one file per algorithm (`ddpg`, `td3`, `td4`, `d4pg`, `sac`, `mpo`, `ppo`, plus the play-only baselines in [`roxie/agents/basic.py`](../roxie/agents/basic.py), which `Trainer.run` refuses to train).
 - [`roxie/configs/env/`](../roxie/configs/env/) — one file per env builder (`playground`, `envpool`): a complete `env:` block, pulled into a launchable's `defaults:` as `- /env: playground`. The leading `/` is required from a launchable in a subdirectory of `experiments/`, exactly as for `/agent:`.
 - [`roxie/configs/noise/`](../roxie/configs/noise/) — exploration noise modules (`ou`, `gaussian`, `adaptive`). Agents that explore from their own policy (SAC, MPO, PPO) take **no** noise group; adding one is a launch-time error.
+- [`roxie/configs/vision/`](../roxie/configs/vision/) — the pixel encoder every network puts in front of its MLP (`cnn`). See [Vision](#vision).
 - [`experiments/<env>/`](../experiments/) — launchable experiments. `--config-name` includes the folder.
 - [`experiments/dmc/`](../experiments/dmc/) — the release benchmark, carrying its own groups: `agent/`, `backend/`, `bench/` and `noise/`.
+- [`experiments/vision/`](../experiments/vision/) — training from pixels.
 
 ## A launchable
 
@@ -60,3 +62,43 @@ hydra:
 ```
 
 See [running trainings](training.md) for command-line overrides and the two argv-parsed specials (`device=`, `resume=`).
+
+## Vision
+
+Any agent can learn from pixels. The encoder is a network knob like `features`: every actor and critic block in every agent yaml carries
+
+```yaml
+vision: ${oc.select:vision,null}
+```
+
+which is `null` — a plain MLP — unless a top-level `vision` group is selected, and then every network in the agent builds a [`PixelEncoder`](../roxie/models/vision.py) from it:
+
+```yaml
+defaults:
+  - /agent: sac
+  - /env: playground
+  - /vision: cnn
+  - _self_
+
+env:
+  env_name: CartpoleBalance
+  impl: warp
+  vision: true
+
+vision:
+  channels: [32, 32, 32, 32]   # one entry per conv layer
+  kernel_sizes: [3, 3, 3, 3]
+  strides: [2, 1, 1, 1]
+  latent_dim: 50
+```
+
+The architecture comes from [`vision/cnn.yaml`](../roxie/configs/vision/cnn.yaml) and is overridden like any other block (`vision.latent_dim=100`); one network's own block can diverge from the rest (`agent.critic_config.critic1.vision.latent_dim=100`). [`experiments/vision/cartpole_sac.yaml`](../experiments/vision/cartpole_sac.yaml) is a complete launchable. List `- /vision: null` instead to leave it to the command line — `+vision=cnn` cannot reach the group from a launchable in a subdirectory.
+
+**Observations stay flat.** The env flattens its image row-major from `(H, W, C)` and puts it at the *front* of the observation vector, any state after it, and advertises the shape as `pixel_shape`, which `publish_env_shapes` writes to `env.pixel_shape` for the encoder block to read. The replay buffer, the running observation statistics, the rollout and the losses never know the difference; only a network with a `vision` block reshapes that leading slice back into an image, encodes it (conv stack → linear → LayerNorm → tanh), and hands its MLP the latent followed by the rest. An env without pixels publishes `pixel_shape: null`, which the encoder refuses at construction.
+
+**Each network owns its encoder.** The actor, the critic and each twin head train their own from their own loss, and target networks copy them like any other layer. That is a conv stack per network rather than one shared trunk, in exchange for working unchanged under all seven agents' targets, optimizers and checkpoints.
+
+**Where pixels come from.** On mujoco_playground, `env.vision: true` renders through mujoco_warp — so `impl: warp`, a CUDA GPU, and a task that implements a vision mode (today the dense Cartpole tasks). A `FuncEnv` of your own opts in by setting `pixel_shape` and returning the flat layout above. EnvPool's dm_control tasks render nothing.
+
+**Replay memory.** Pixels are stored as float32: a 64×64×3 frame is 48 KB, so size `agent.memory_config.max_length` for it.
+

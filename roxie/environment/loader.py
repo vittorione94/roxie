@@ -1,6 +1,8 @@
 """Environment loading, MuJoCo adapters, and vector environment builders."""
 
+import math
 import os
+from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 import jax
@@ -38,10 +40,24 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
 
     def __init__(self, env: Any, impl: str | None = None):
         self.env = env
-        self.observation_space = functional.unbounded_box(env.observation_size)
+        obs_size = env.observation_size
+        if isinstance(obs_size, Mapping):
+            self._obs_keys, self.pixel_shape = _obs_layout(obs_size)
+            obs_size = sum(math.prod(obs_size[k]) for k in self._obs_keys)
+        else:
+            self._obs_keys = None
+        self.observation_space = functional.unbounded_box(obs_size)
         ctrl_range = env.mj_model.actuator_ctrlrange
         self.action_space = functional.box(ctrl_range[:, 0], ctrl_range[:, 1])
         self.metadata = {"jax": True, "impl": impl or _read_impl(env)}
+
+    def observation(self, state, rng, params=None):
+        if self._obs_keys is None:
+            return state.obs
+        return jnp.concatenate([
+            state.obs[key].reshape(-1).astype(jnp.float32)
+            for key in self._obs_keys
+        ])
 
     def initial(self, rng, params=None):
         return self.env.reset(rng)
@@ -53,6 +69,24 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
         if name.startswith("__") or "env" not in self.__dict__:
             raise AttributeError(name)
         return getattr(self.env, name)
+
+
+def _obs_layout(sizes: Mapping) -> tuple[tuple[str, ...], tuple[int, ...] | None]:
+    """Orders a dict observation's groups for flattening, the image first.
+
+    Returns:
+        `(keys, pixel_shape)` — every group in concatenation order, and the
+        shape of the `pixels/` group, or `None` when there is none.
+    """
+    pixels = sorted(key for key in sizes if key.startswith("pixels/"))
+    if len(pixels) > 1:
+        raise ValueError(
+            f"the env renders {len(pixels)} cameras ({pixels}); the pixel "
+            f"encoder reads exactly one"
+        )
+    rest = sorted(key for key in sizes if not key.startswith("pixels/"))
+    pixel_shape = tuple(int(d) for d in sizes[pixels[0]]) if pixels else None
+    return tuple(pixels + rest), pixel_shape
 
 
 def _read_impl(env: Any) -> str:
@@ -151,8 +185,13 @@ def load_playground_env(
     naconmax: int | None = None,
     njmax: int | None = None,
     graph_mode: str | None = None,
+    vision: bool = False,
+    nworld: int = 1,
 ):
-    """Loads a `mujoco_playground` environment with optional overrides."""
+    """Loads a `mujoco_playground` environment with optional overrides.
+
+    `nworld` sizes the render context under `vision`, and nothing otherwise.
+    """
     env_cfg = registry.get_default_config(env_name)
     if impl is not None and "impl" in env_cfg:
         env_cfg.impl = impl
@@ -160,6 +199,18 @@ def load_playground_env(
         env_cfg.naconmax = naconmax
     if njmax is not None and "njmax" in env_cfg:
         env_cfg.njmax = njmax
+    if vision:
+        if "vision" not in env_cfg:
+            raise ValueError(f"{env_name} has no vision mode in mujoco_playground")
+        # `mjx.render` and `refit_bvh` raise NotImplementedError off the warp
+        # impl, but only once the first reset is traced; fail before the load.
+        if str(env_cfg.get("impl", "")) != "warp":
+            raise ValueError(
+                f"{env_name} renders pixels through mujoco_warp; set "
+                f"env.impl=warp (got {env_cfg.get('impl', None)!r})"
+            )
+        env_cfg.vision = True
+        env_cfg.vision_config.nworld = int(nworld)
 
     env = registry.load(env_name, config=env_cfg)
     if str(env_cfg.get("impl", "")) == "warp":
@@ -185,15 +236,24 @@ TRAINER_ENV_KEYS = frozenset({
     "obs_size",
     "action_size",
     "obs_action_size",
+    "pixel_shape",
 })
 
 
-def publish_env_shapes(cfg_env: DictConfig, obs_size: int, action_size: int) -> None:
-    """Writes observation and action dimensions into the Hydra configuration block."""
+def publish_env_shapes(
+    cfg_env: DictConfig,
+    obs_size: int,
+    action_size: int,
+    pixel_shape: tuple[int, ...] | None = None,
+) -> None:
+    """Writes the observation, action and pixel shapes into the env block."""
     with open_dict(cfg_env):
         cfg_env.obs_size = int(obs_size)
         cfg_env.action_size = int(action_size)
         cfg_env.obs_action_size = int(obs_size) + int(action_size)
+        cfg_env.pixel_shape = (
+            None if pixel_shape is None else [int(d) for d in pixel_shape]
+        )
 
 
 def build_playground_env(
@@ -207,13 +267,20 @@ def build_playground_env(
     naconmax: int | None = None,
     njmax: int | None = None,
     graph_mode: str | None = None,
+    vision: bool = False,
     max_episode_steps: int | None = None,
 ) -> EnvBundle:
     """Instantiates vectorized training and test drivers for `mujoco_playground` tasks."""
-    func_env, env_cfg = load_playground_env(
-        env_name, impl=impl, naconmax=naconmax, njmax=njmax,
-        graph_mode=graph_mode,
-    )
+    def load(nworld: int):
+        return load_playground_env(
+            env_name, impl=impl, naconmax=naconmax, njmax=njmax,
+            graph_mode=graph_mode, vision=vision, nworld=nworld,
+        )
+
+    func_env, env_cfg = load(num_envs)
+    # A render context is allocated for a fixed `nworld` that JAX cannot see, so
+    # the eval batch needs its own env rather than sharing the training one.
+    test_func_env = load(test_episodes)[0] if vision else func_env
     max_steps = int(
         max_episode_steps
         or env_cfg.get("episode_length", None)
@@ -221,7 +288,9 @@ def build_playground_env(
     )
     return EnvBundle(
         env=JaxVectorEnv(func_env, num_envs, max_episode_steps=max_steps),
-        test_env=JaxVectorEnv(func_env, test_episodes, max_episode_steps=max_steps),
+        test_env=JaxVectorEnv(
+            test_func_env, test_episodes, max_episode_steps=max_steps,
+        ),
         env_cfg=env_cfg,
     )
 

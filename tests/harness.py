@@ -42,21 +42,26 @@ OBS, ACT, ENVS = 8, 3, 8
 WARMUP_ITERS = 8
 
 
-def agent_config(name: str, **hyperparams):
-    """The shipped config for `name`, shrunk to what a CPU test can drive."""
+def agent_config(name: str, *, vision=None, obs_size: int = OBS, **hyperparams):
+    """The shipped config for `name`, shrunk to what a CPU test can drive.
+
+    `vision` is the top-level block a launchable's `/vision` group selection
+    composes in; the network blocks read it through `oc.select`.
+    """
     # The env shapes `loader.publish_env_shapes` would have written back; the
     # network blocks interpolate them.
-    cfg = OmegaConf.create(
-        {
-            "env": {
-                "parallel_envs": ENVS,
-                "obs_size": OBS,
-                "action_size": ACT,
-                "obs_action_size": OBS + ACT,
-            },
-            "agent": OmegaConf.load(CONFIGS / "agent" / f"{name}.yaml"),
-        }
-    ).agent
+    root = {
+        "env": {
+            "parallel_envs": ENVS,
+            "obs_size": obs_size,
+            "action_size": ACT,
+            "obs_action_size": obs_size + ACT,
+        },
+        "agent": OmegaConf.load(CONFIGS / "agent" / f"{name}.yaml"),
+    }
+    if vision is not None:
+        root["vision"] = vision
+    cfg = OmegaConf.create(root).agent
 
     cfg.actor_config.features = [16, 16]
     for critic in _critic_blocks(cfg.critic_config):
@@ -91,11 +96,11 @@ def agent_config(name: str, **hyperparams):
     return cfg
 
 
-def build(name: str, **hyperparams):
+def build(name: str, *, vision=None, obs_size: int = OBS, **hyperparams):
     """Construct the agent `name` the way `train.py` does."""
-    cfg = agent_config(name, **hyperparams)
+    cfg = agent_config(name, vision=vision, obs_size=obs_size, **hyperparams)
     kwargs = dict(
-        env_obs_size=OBS,
+        env_obs_size=obs_size,
         env_action_size=ACT,
         action_low=-jnp.ones(ACT, dtype=jnp.float32),
         action_high=jnp.ones(ACT, dtype=jnp.float32),
@@ -130,6 +135,7 @@ def drive(agent, iterations: int, key, obs=None, drift: float = 0.0) -> int:
         obs = jax.random.normal(
             jax.random.PRNGKey(1), (ENVS, OBS), dtype=jnp.float32
         )
+    width = obs.shape[-1]
     false = jnp.zeros((ENVS,), jnp.bool_)
 
     for i in range(iterations):
@@ -141,7 +147,7 @@ def drive(agent, iterations: int, key, obs=None, drift: float = 0.0) -> int:
         # normal, which is what every other caller gets.
         scale = 1.0 + drift * i
         timestep = Timestep(
-            obs=jax.random.normal(obs_key, (ENVS, OBS), dtype=jnp.float32) * scale
+            obs=jax.random.normal(obs_key, (ENVS, width), dtype=jnp.float32) * scale
             + (scale - 1.0),
             reward=jax.random.normal(reward_key, (ENVS,), dtype=jnp.float32),
             terminated=false,

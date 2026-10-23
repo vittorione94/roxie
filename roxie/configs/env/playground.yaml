@@ -42,6 +42,12 @@ njmax: null
 # OOM-kills a long run. Set it only to test that claim: `WARP` reproduces the
 # leak, `JAX`/`NONE` avoid it eagerly and are much slower.
 graph_mode: null
+
+# Render pixel observations instead of the state vector. Only tasks
+# mujoco_playground implements a vision mode for accept it (CartpoleBalance and
+# CartpoleSwingup today), and only on `impl: warp`, which renders through
+# mujoco_warp. Pair it with the `vision` config group so the networks read them.
+vision: false
 max_episode_steps: null
 seed: 0
 parallel_envs: 256
