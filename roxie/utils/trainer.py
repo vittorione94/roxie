@@ -64,6 +64,15 @@ class Trainer:
         self.environment = environment
         self.test_environment = test_environment
 
+    @staticmethod
+    def _memory_warmup(agent):
+        """The random-action env steps to fill before learning; 0 if none.
+
+        Read off `hp`, where the field lives. A baseline has no `hp` and PPO's
+        has no such field, and both answer 0.
+        """
+        return int(getattr(getattr(agent, "hp", None), "memory_warmup", 0) or 0)
+
     def _warmup_iters(self, memory_warmup, num_envs):
         """Zero when a resume restored a populated buffer — refilling would add
         random-action transitions to a trained policy's data."""
@@ -195,7 +204,7 @@ class Trainer:
         self.num_envs = num_envs
         agent_key = rngs.agent()
 
-        memory_warmup = getattr(agent, "memory_warmup", 0)
+        memory_warmup = self._memory_warmup(agent)
         warmup_iters = self._warmup_iters(memory_warmup, num_envs)
         epochs, episodes, tot_gradient_steps = self._init_counters()
 

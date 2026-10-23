@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from gymnasium import spaces
 
-from roxie.agents.hyperparams import AgentHyperparams
+from roxie.agents.hyperparams import AgentHyperparams, OffPolicyHyperparams
 from roxie.utils.rollout import (
     ChunkSums,
     EnvPoolRollout,
@@ -75,6 +75,25 @@ def test_the_epoch_cadence_cannot_drift_off_the_grid():
         assert 0 <= at - n * epoch < chunk, (
             f"epoch {n} fired at {at}, off the {n * epoch} grid point"
         )
+
+
+class _HyperparamsOnly:
+    def __init__(self, hp):
+        self.hp = hp
+
+
+def test_the_warmup_fill_is_read_off_the_hyperparams():
+    """The field lives on `hp`; read off the agent itself, it was always 0 and
+    every off-policy run silently skipped its random-action fill."""
+    off_policy = _HyperparamsOnly(OffPolicyHyperparams(memory_warmup=3_000))
+    assert Trainer._memory_warmup(off_policy) == 3_000
+    assert _trainer()._warmup_iters(Trainer._memory_warmup(off_policy), 100) == 30
+
+
+def test_agents_without_a_warmup_field_fill_nothing():
+    assert Trainer._memory_warmup(_HyperparamsOnly(AgentHyperparams())) == 0
+    assert Trainer._memory_warmup(_HyperparamsOnly(None)) == 0
+    assert Trainer._memory_warmup(object()) == 0
 
 
 class _FakeAgent:
