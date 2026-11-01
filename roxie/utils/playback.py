@@ -73,7 +73,13 @@ def load_config(checkpoint_path: str, overrides: tuple[str, ...] = ()) -> Any:
 
 def resolve_single_world(cfg: Any, *, verbose: bool = True) -> Any:
     """Rewrites a trained config onto a backend that can step one world."""
-    if cfg.env.get("impl", None) == "warp":
+    if cfg.get("vision"):
+        # The policy reads pixels only warp's CUDA renderer draws, so it replays
+        # where it trained. JAX's default 75% preallocation leaves warp too
+        # little to allocate the world in.
+        os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
+        jax.config.update("jax_platforms", "cuda")
+    elif cfg.env.get("impl", None) == "warp":
         cfg.env.impl = "jax"
 
     if uses_envpool(cfg.env):
@@ -172,10 +178,18 @@ def make_stepper(cfg: Any, func_env: Any, *, verbose: bool = True):
             print("Playback stepper: native MuJoCo (CPU)", flush=True)
         return player.reset, player.step
 
-    transition = jax.jit(func_env.transition)
-    reset = jax.jit(func_env.initial)
+    key = jax.random.PRNGKey(0)
 
+    # The env state keeps a dict observation's groups apart; `obs` is swapped
+    # for the flat vector the policy was trained on.
+    @jax.jit
+    def reset(reset_key):
+        state = func_env.initial(reset_key)
+        return state.replace(obs=func_env.observation(state, key))
+
+    @jax.jit
     def step(state, action):
-        return transition(state, action, jax.random.PRNGKey(0))
+        state = func_env.transition(state, action, key)
+        return state.replace(obs=func_env.observation(state, key))
 
     return reset, step

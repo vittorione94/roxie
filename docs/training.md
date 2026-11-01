@@ -61,7 +61,9 @@ uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
 
 Playback drives a single world into the interactive MuJoCo viewer, always on CPU/MJX even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override the saved run config.
 
-Both entry points restore the checkpoint through `roxie.utils.playback.load_policy`, which reads the run's saved Hydra config and rewrites the two backends that cannot replay themselves: Warp falls back to MJX on the same model, and an EnvPool run moves to the `mujoco_playground` twin of the same task, since a C++ pool exposes no `mjModel`/`mjData` to step or draw one world of.
+`--vision`, for a run whose policy reads pixels, opens a second window showing the image at the front of each observation — colour and depth side by side, before the agent's observation normalization — and has the viewer draw every camera, with a frustum for any camera that declares a `resolution`. [`examples/vision/humanoid_rgbd.py`](../examples/vision/humanoid_rgbd.py) declares its camera's, out to `depth_scale`, the range the depth channel covers.
+
+Both entry points restore the checkpoint through `roxie.utils.playback.load_policy`, which reads the run's saved Hydra config and rewrites the two backends that cannot replay themselves: Warp falls back to MJX on the same model, and an EnvPool run moves to the `mujoco_playground` twin of the same task, since a C++ pool exposes no `mjModel`/`mjData` to step or draw one world of. A run with a `vision` group is the exception: its policy reads images only warp's CUDA renderer draws, so it replays on warp and the GPU where it trained (`uv run --group cuda`).
 
 ### Rendering without a display
 

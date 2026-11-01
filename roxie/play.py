@@ -46,13 +46,16 @@ if (
 ):
     _exec_under_mjpython()
 
+import math
 import time
 
 import click
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import mujoco
 import mujoco.viewer
+import numpy as np
 
 from hydra.utils import get_method
 
@@ -68,6 +71,13 @@ _CONTROLS_HELP = """Viewer controls:
   double-click     select a body
   ctrl + drag      running: push selected body (right: translate, left: rotate)
                    paused: drag body pose directly"""
+
+# mujoco_warp renders colour, depth, or both stacked colour-first.
+_PIXEL_PANELS = {
+    1: (("depth", 0),),
+    3: (("RGB", slice(0, 3)),),
+    4: (("RGB", slice(0, 3)), ("depth", 3)),
+}
 
 
 class _ViewerControls:
@@ -86,6 +96,59 @@ class _ViewerControls:
             self.reset_requested = True
 
 
+class _PixelWindow:
+    """A window showing the image at the front of each observation."""
+
+    def __init__(self, pixel_shape: tuple[int, ...]):
+        self._shape = tuple(pixel_shape)
+        self._size = math.prod(self._shape)
+        self._panels = _PIXEL_PANELS.get(self._shape[-1])
+        if self._panels is None:
+            raise click.UsageError(
+                f"--vision shows RGB and depth images; this run's pixels have "
+                f"{self._shape[-1]} channels"
+            )
+        plt.ion()
+        self._fig, axes = plt.subplots(
+            1, len(self._panels), figsize=(4 * len(self._panels), 4.2),
+            squeeze=False,
+        )
+        self._fig.canvas.manager.set_window_title("What the policy sees")
+        self._images = []
+        for ax, (name, channels) in zip(axes[0], self._panels):
+            rgb = isinstance(channels, slice)
+            blank = np.zeros(self._shape[:2] + ((3,) if rgb else ()))
+            image = ax.imshow(
+                blank, vmin=0.0, vmax=1.0, interpolation="nearest",
+                cmap=None if rgb else "gray_r",
+            )
+            if name == "depth":
+                self._fig.colorbar(image, ax=ax, fraction=0.046, label="near → far")
+            ax.set_title(name)
+            ax.axis("off")
+            self._images.append(image)
+        self._fig.tight_layout()
+        plt.show(block=False)
+
+    def show(self, obs) -> None:
+        """Draws the image part of a flat observation."""
+        if not plt.fignum_exists(self._fig.number):
+            return
+        pixels = np.asarray(obs[: self._size]).reshape(self._shape)
+        for image, (_name, channels) in zip(self._images, self._panels):
+            image.set_data(np.clip(pixels[..., channels], 0.0, 1.0))
+        self._fig.canvas.draw_idle()
+        self.poll()
+
+    def poll(self) -> None:
+        """Keeps the window responsive between draws."""
+        if plt.fignum_exists(self._fig.number):
+            self._fig.canvas.flush_events()
+
+    def close(self) -> None:
+        plt.close(self._fig)
+
+
 def _write_state_data(state, **fields):
     """Updates physics buffers on native MjData or MJX Data state instances."""
     data = state.data
@@ -100,11 +163,21 @@ def _write_state_data(state, **fields):
 
 @click.command(context_settings=dict(ignore_unknown_options=True))
 @click.option("--checkpoint-path", type=str, help="Path to the checkpoint directory.")
+@click.option(
+    "--vision", is_flag=True,
+    help="Show the policy's camera images and the camera's frustum.",
+)
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
-def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
+def main(checkpoint_path: str, vision: bool, overrides: tuple[str, ...]) -> None:
     """Replays a trained agent checkpoint in an interactive MuJoCo viewer."""
     play = playback.load_policy(checkpoint_path, overrides)
     cfg, func_env, agent = play.cfg, play.func_env, play.agent
+
+    pixel_window = None
+    if vision:
+        if func_env.pixel_shape is None:
+            raise click.UsageError("--vision needs a run whose policy reads pixels")
+        pixel_window = _PixelWindow(func_env.pixel_shape)
 
     key = jax.random.PRNGKey(seed=0)
 
@@ -126,6 +199,16 @@ def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
     with mujoco.viewer.launch_passive(
         model, data, key_callback=controls.key_callback
     ) as viewer:
+        if vision:
+            if not (model.cam_resolution > 1).any():
+                print(
+                    "--vision: no camera declares a resolution, so MuJoCo has "
+                    "no frustum to draw",
+                    flush=True,
+                )
+            with viewer.lock():
+                viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CAMERA] = 1
+
         key, reset_key = jax.random.split(key)
         state = jit_reset(reset_key)
 
@@ -142,6 +225,8 @@ def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
                 data.qpos = state.data.qpos
                 data.qvel = state.data.qvel
             mujoco.mj_forward(model, data)
+            if pixel_window is not None:
+                pixel_window.show(state.obs)
 
         show(state)
 
@@ -172,6 +257,8 @@ def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
                     mujoco.mj_forward(model, data)
                     state = _write_state_data(state, qpos=data.qpos[:env_nq])
                 viewer.sync()
+                if pixel_window is not None:
+                    pixel_window.poll()
                 time.sleep(max(0.0, step_dt - (time.time() - step_start)))
                 continue
 
@@ -222,6 +309,9 @@ def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
             time_until_next_step = step_dt - (time.time() - step_start)
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
+
+    if pixel_window is not None:
+        pixel_window.close()
 
 
 if __name__ == "__main__":
