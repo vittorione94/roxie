@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import nnx
+from flax import nnx, struct
 from omegaconf import OmegaConf
 
 from roxie.environment import functional
@@ -355,6 +355,32 @@ def test_a_dict_observation_flattens_with_the_image_first():
     np.testing.assert_array_equal(obs[32:], [-1.0, -2.0, -3.0])
 
     assert JaxVectorEnv(func_env, 2).pixel_shape == (4, 4, 2)
+
+
+class _RenderingEnv(_DictObsEnv):
+    """A warp render context renders all its worlds on every call, so the
+    unbatched trace behind `observation_size` sees every world's image at
+    once; a reset vmapped over the worlds gives one each."""
+
+    observation_size = {"state": (3,), "pixels/view_0": (3, 4, 4, 2)}
+
+    @struct.dataclass
+    class State:
+        obs: dict
+
+    def reset(self, rng):
+        return self.State(obs={
+            "state": jnp.zeros(3, jnp.float32),
+            "pixels/view_0": jnp.zeros((4, 4, 2), jnp.float32),
+        })
+
+
+def test_a_rendering_env_is_sized_per_world():
+    """Read off `observation_size`, the image would carry the world axis and
+    the encoder would refuse its 4-D `pixel_shape`."""
+    func_env = PlaygroundFuncEnv(_RenderingEnv(), nworld=3)
+    assert func_env.pixel_shape == (4, 4, 2)
+    assert func_env.observation_space.shape == (4 * 4 * 2 + 3,)
 
 
 def test_a_second_camera_is_refused():

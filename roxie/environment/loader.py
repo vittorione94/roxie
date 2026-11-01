@@ -36,11 +36,20 @@ class MuJoCoFuncEnv(FuncEnv):
 
 
 class PlaygroundFuncEnv(MuJoCoFuncEnv):
-    """Functional environment wrapper for `mujoco_playground` environments."""
+    """Functional environment wrapper for `mujoco_playground` environments.
 
-    def __init__(self, env: Any, impl: str | None = None):
+    `nworld` is the world count of the warp render context the env carries, and
+    `None` for an env that renders nothing.
+    """
+
+    def __init__(
+        self, env: Any, impl: str | None = None, nworld: int | None = None,
+    ):
         self.env = env
-        obs_size = env.observation_size
+        obs_size = (
+            env.observation_size if nworld is None
+            else _rendered_obs_size(env, nworld)
+        )
         if isinstance(obs_size, Mapping):
             self._obs_keys, self.pixel_shape = _obs_layout(obs_size)
             obs_size = sum(math.prod(obs_size[k]) for k in self._obs_keys)
@@ -69,6 +78,17 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
         if name.startswith("__") or "env" not in self.__dict__:
             raise AttributeError(name)
         return getattr(self.env, name)
+
+
+def _rendered_obs_size(env: Any, nworld: int) -> Mapping:
+    """Per-world observation shapes of an env carrying a warp render context."""
+    # The context renders all `nworld` worlds on every call, so the unbatched
+    # trace behind `env.observation_size` reports an image as `(nworld, H, W,
+    # C)`. Vmapped at exactly `nworld` the batch axis IS the world axis and
+    # comes off cleanly; a batch of any other size does not trace at all.
+    keys = jax.random.split(jax.random.PRNGKey(0), int(nworld))
+    obs = jax.eval_shape(jax.vmap(env.reset), keys).obs
+    return {key: tuple(x.shape[1:]) for key, x in obs.items()}
 
 
 def _obs_layout(sizes: Mapping) -> tuple[tuple[str, ...], tuple[int, ...] | None]:
@@ -215,7 +235,7 @@ def load_playground_env(
     env = registry.load(env_name, config=env_cfg)
     if str(env_cfg.get("impl", "")) == "warp":
         _set_graph_mode(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
-    return PlaygroundFuncEnv(env), env_cfg
+    return PlaygroundFuncEnv(env, nworld=nworld if vision else None), env_cfg
 
 
 class EnvBundle(NamedTuple):
