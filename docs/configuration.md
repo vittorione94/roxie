@@ -98,7 +98,9 @@ The architecture comes from [`vision/cnn.yaml`](../roxie/configs/vision/cnn.yaml
 
 **Each network owns its encoder.** The actor, the critic and each twin head train their own from their own loss, and target networks copy them like any other layer. That is a conv stack per network rather than one shared trunk, in exchange for working unchanged under all seven agents' targets, optimizers and checkpoints.
 
-**Where pixels come from.** On mujoco_playground, `env.vision: true` renders through mujoco_warp — so `impl: warp`, a CUDA GPU, and a task that implements a vision mode (today the dense Cartpole tasks). A `FuncEnv` of your own opts in by setting `pixel_shape` and returning the flat layout above. EnvPool's dm_control tasks render nothing.
+**Where pixels come from.** On mujoco_playground, `env.vision: true` renders through mujoco_warp — so `impl: warp`, a CUDA GPU, and a task that implements a vision mode (today the dense Cartpole tasks). A `FuncEnv` of your own opts in by setting `pixel_shape` and returning the flat layout above. EnvPool's dm_control tasks render nothing. Warp needs the `cuda` dependency group (`uv run --group cuda ...`); without it JAX falls back to the CPU and the renderer cannot find its context.
+
+[`examples/vision/humanoid_rgbd.py`](../examples/vision/humanoid_rgbd.py) renders a task playground has no vision mode for: the humanoid's head-mounted `egocentric` camera, colour and depth stacked into one 64×64×4 image ahead of its proprioception, from a builder outside `roxie/`. [`experiments/vision/humanoid_rgbd_sac.yaml`](../experiments/vision/humanoid_rgbd_sac.yaml) trains it. A rendering env has to start each world from its own `rng`: a warp render context renders all its worlds at once, so a reset that ignores its key leaves the vmapped data unbatched and every world receives every world's image.
 
 **Replay memory.** Pixels are stored as float32: a 64×64×3 frame is 48 KB, so size `agent.memory_config.max_length` for it.
 
