@@ -129,7 +129,51 @@ def _ddpg_grad_steps(
     )
 
 
-class DDPG(Agent):
+class NoiseModuleActing:
+    """Acting through a deterministic actor plus an exploration noise module.
+
+    The half of DDPG a model-based learner with a deterministic policy shares:
+    it needs `self.hp`, `self.state`, `self.noise_module` and the action bounds,
+    and nothing about how the actor is trained.
+    """
+
+    def _checkpoint_modules(self) -> dict:
+        """Returns extra stateful modules outside `TrainState` to checkpoint."""
+        return {"noise_module": self.noise_module}
+
+    def select_action(
+        self,
+        observation: jnp.ndarray,
+        key: jax.Array = None,
+        evaluate: bool = False,
+        *,
+        actor: nnx.Module = None,
+        obs_stats: Any = None,
+        noise_module: nnx.Module = None,
+        critic: nnx.Module = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, dict]:
+        """Selects an action given an observation and applies exploration noise."""
+        del critic
+        if self.hp.normalize_observations:
+            stats = self.state.obs_stats if obs_stats is None else obs_stats
+            mean, std = obs_mean_std(stats, self.hp.obs_norm_eps)
+            observation = normalize_obs(observation, mean, std, self.hp.obs_norm_clip)
+
+        action, noise = deterministic_step_fn(
+            self.state.actor if actor is None else actor,
+            observation,
+            key,
+            self.noise_module if noise_module is None else noise_module,
+            evaluate,
+        )
+        return (
+            scale_to_env(action, self.action_low, self.action_high),
+            noise,
+            {},
+        )
+
+
+class DDPG(NoiseModuleActing, Agent):
     """Deep Deterministic Policy Gradient agent.
 
     Reference:
@@ -186,41 +230,6 @@ class DDPG(Agent):
         print(f"{type(self).__name__} agent initialized.")
         print("Noise module hyperparameters:", self.noise_module.hyperparameters())
         print("Hyper Params:", self._export_hyperparams())
-
-    def _checkpoint_modules(self) -> dict:
-        """Returns extra stateful modules outside `TrainState` to checkpoint."""
-        return {"noise_module": self.noise_module}
-
-    def select_action(
-        self,
-        observation: jnp.ndarray,
-        key: jax.Array = None,
-        evaluate: bool = False,
-        *,
-        actor: nnx.Module = None,
-        obs_stats: Any = None,
-        noise_module: nnx.Module = None,
-        critic: nnx.Module = None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, dict]:
-        """Selects an action given an observation and applies exploration noise."""
-        del critic
-        if self.hp.normalize_observations:
-            stats = self.state.obs_stats if obs_stats is None else obs_stats
-            mean, std = obs_mean_std(stats, self.hp.obs_norm_eps)
-            observation = normalize_obs(observation, mean, std, self.hp.obs_norm_clip)
-
-        action, noise = deterministic_step_fn(
-            self.state.actor if actor is None else actor,
-            observation,
-            key,
-            self.noise_module if noise_module is None else noise_module,
-            evaluate,
-        )
-        return (
-            scale_to_env(action, self.action_low, self.action_high),
-            noise,
-            {},
-        )
 
     def _compile_and_run(self, agent_rng: jax.Array, target_steps: int):
         """Runs one fused learning pass to update the agent."""

@@ -99,6 +99,7 @@ what keeps a thousand environments fed — see
 - **[Backends](docs/backends.md)** — the three physics backends, the two rollouts, memory, contact budgets, device placement, determinism.
 - **[Environments](docs/environments.md)** — the two ways to attach an env, the `FuncEnv` interface, builders, `terminal` vs `truncal`.
 - **[Agents](docs/agents.md)** — the shared base, the hyperparameter dataclass, the fused window, the contract a new agent honours, buffers, checkpoints.
+- **[World models](docs/worlds.md)** — model-based training: the world as the agent's peer and owner of the real data, the k-step fit, SHAC.
 - **[Configuration](docs/configuration.md)** — the Hydra convention, the config groups, an annotated experiment.
 - **[Training](docs/training.md)** — overrides, `device=`, resuming, playback.
 - **[Release benchmark](docs/benchmark.md)** — the 3 × 7 × 2 grid, the figures, and the weights export.
@@ -114,8 +115,9 @@ what keeps a thousand environments fed — see
 | **SAC** | Off-policy | Stochastic (squashed Gaussian) | Twin Q(s,a) | n-step | Entropy, auto α |
 | **MPO** | Off-policy | Stochastic (Gaussian) | Q(s,a) | **1-step only** | Policy sampling + KL duals |
 | **PPO** | On-policy | Stochastic (Gaussian) | V(s) | GAE | Policy entropy |
+| **SHAC** | Model-based | Deterministic, BPTT through a learned model | V(s) | Imagined λ-returns | Noise module |
 
-All share one `Agent` base and pick their replay structure from `n_step`.
+All share one `Agent` base. The model-free ones pick their replay structure from `n_step`; SHAC trains through a learned world model, which owns the replay buffer instead ([world models](docs/worlds.md)).
 
 ## Configuration
 

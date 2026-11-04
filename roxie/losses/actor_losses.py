@@ -309,3 +309,78 @@ def sac_alpha_loss_fn(log_alpha_module, log_probs, target_entropy):
     """Computes the loss for tuning the Soft Actor-Critic entropy temperature alpha."""
     alpha = jnp.exp(log_alpha_module.log_alpha[...])
     return -jnp.mean(alpha * (jax.lax.stop_gradient(log_probs) + target_entropy))
+
+def bptt_actor_loss_fn(
+    actor_model,
+    critic_model,
+    dynamics,
+    starts,
+    *,
+    policy_fn,
+    model_fn,
+    value_fn,
+    gamma,
+    horizon,
+):
+    """The short-horizon imagined return, differentiated through the model.
+
+    Rolls `horizon` steps from `starts` with the actor in the graph, and
+    bootstraps the tail with the critic:
+
+        J = sum_t gamma^t c_t r_{t+1} + gamma^H c_H V(s_H),
+        c_0 = 1,  c_{t+1} = c_t (1 - d_{t+1}).
+
+    The survival weight `c` multiplies the model's termination PROBABILITY in
+    rather than cutting the rollout at a hard done, so it stays differentiable.
+    Only `actor_model` is differentiated: the model and critic are arguments so
+    that their parameters are inputs to the gradient, not targets of it.
+
+    Args:
+        actor_model: the policy, the only module gradients are taken for.
+        critic_model: the state-value critic bootstrapping past the horizon.
+        dynamics: the world's dynamics network, held fixed.
+        starts: `(B, D)` real observations the rollouts start from.
+        policy_fn: `(actor, obs) -> env action`, the acting path minus noise.
+        model_fn: `(dynamics, obs, action) -> (next_obs, reward, term_prob)`.
+        value_fn: `(critic, obs) -> (B,)` value.
+        gamma: discount.
+        horizon: static; the scan length.
+
+    Returns:
+        `(loss, aux)`. `aux["trajectory"]` is the rollout with its gradients
+        stopped, `(states, rewards, term_probs)` each time-major over the
+        horizon, for the critic to fit to.
+    """
+    batch = starts.shape[0]
+    ones = jnp.ones((batch,), dtype=starts.dtype)
+
+    def body(carry, _):
+        obs, survival, discount = carry
+        action = policy_fn(actor_model, obs)
+        next_obs, reward, term_prob = model_fn(dynamics, obs, action)
+        step_return = discount * survival * reward
+        return (next_obs, survival * (1.0 - term_prob), discount * gamma), (
+            obs, action, reward, term_prob, step_return,
+        )
+
+    (last_obs, survival, discount), (states, actions, rewards, term_probs,
+                                     step_returns) = jax.lax.scan(
+        body, (starts, ones, ones), None, length=horizon,
+    )
+    tail = value_fn(critic_model, last_obs)
+    imagined = jnp.sum(step_returns, axis=0) + discount * survival * tail
+    # Per step, so the scale of the actor's gradient does not grow with H.
+    loss = -jnp.mean(imagined) / horizon
+
+    all_states = jnp.concatenate([states, last_obs[None]], axis=0)
+    aux = {
+        "imagined_return": jnp.mean(imagined),
+        "imagined_reward": jnp.mean(rewards),
+        "survival_H": jnp.mean(survival),
+        "value_H": jnp.mean(tail),
+        "action_abs": jnp.mean(jnp.abs(actions)),
+        "trajectory": jax.lax.stop_gradient(
+            (all_states, rewards, term_probs)
+        ),
+    }
+    return loss, aux

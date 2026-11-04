@@ -19,28 +19,6 @@ Fetch these on demand when working on related code — don't assume their conten
 - **Acme** — https://github.com/google-deepmind/acme — not a dependency here; useful as a reference RL agent architecture (DeepMind) when comparing agent/loop design.
 - **Google Python Style Guide** — https://google.github.io/styleguide/pyguide.html — section 3.8 is the docstring and comment contract this repo follows (see Docstrings and Comments below). Check it rather than guessing at section spelling or indentation.
 
-## No Legacy
-
-**roxie is unreleased. Nothing in it is legacy, and nothing needs backward
-compatibility.** There are no users on an older version, no checkpoints or run
-logs in the wild, and no config spellings to keep honouring.
-
-So when something is renamed, moved or collapsed into another knob, the old form
-goes — no alias, no fallback branch, no "still stripped so an old config
-replays", no shim that rewrites yesterday's column names. Update the code, the
-yamls, the docs and the tests together, and delete the old path in the same
-change.
-
-The word "legacy" should not appear in this repo. If it turns up in a comment,
-it is either dead code to delete or a live feature described badly: the flat
-pair vs trajectory replay layouts, for instance, are both current — `n_step=1`
-uses one and `n_step>1` the other.
-
-Compatibility that is NOT legacy, and stays: handling a real difference between
-agents or backends (an agent without `obs_stats`, a pool that exposes no
-`mjModel`), and refusing a mismatch loudly (`checkpoint.py`'s observation-width
-and buffer-geometry checks). That is present-tense variation, not history.
-
 ## Docstrings and Comments
 
 **Docstrings are Google-style**, per section 3.8 of the style guide linked
@@ -117,12 +95,12 @@ paragraphs, and lead with a one-line summary like any other docstring.
 
 ## JAX Conventions
 
-This is a JAX-based RL codebase (`roxie/agents/`: PPO, SAC, MPO, TD3, DDPG, D4PG, TD4; losses in `roxie/losses/`; shared JAX utilities in `roxie/utils/`). These are the project's own conventions on top of JAX — follow them rather than reaching for raw JAX primitives.
+This is a JAX-based RL codebase (`roxie/agents/`: PPO, SAC, MPO, TD3, DDPG, D4PG, TD4, and the model-based SHAC; learned world models in `roxie/worlds/`, which own the replay buffer when a run composes one; losses in `roxie/losses/`; shared JAX utilities in `roxie/utils/`). These are the project's own conventions on top of JAX — follow them rather than reaching for raw JAX primitives.
 
 ### PRNG keys
 - Variable name is always `key` (or a descriptive suffix like `agent_rng`, `step_key`, `sample_key`, `noise_key`, `perm_key`) — never `rng` or `seed` at call sites.
 - `flax.nnx.Rngs` is the general-purpose key-splitting utility across the codebase, not just for module init. `Trainer` holds separate `envs` and `agent` streams (`roxie/utils/trainer.py`), seeded so that resuming a run offsets the `envs` stream but keeps `agent` fixed (see `roxie/train.py`).
-- Network param-init keys go through `network_rngs(seed, offset)` in `roxie/agents/utils.py`, with the `offset` convention: actor=0, critic=2, second critic=4 (so twin critics never init identically).
+- Network param-init keys go through `network_rngs(seed, offset)` in `roxie/agents/utils.py`, with the `offset` convention: actor=0, critic=2, second critic=4 (so twin critics never init identically), world dynamics=6.
 - Bulk key-splitting for scanned learning passes goes through `fused_grad_steps` (`roxie/agents/utils.py`) — it splits once via `jax.random.split(key, n_steps)` and scans. Off-policy agents' `_<agent>_grad_steps` should call this rather than splitting manually per step.
 - Within a single step, split with an explicit count and destructure immediately, e.g. `key, sample_key, actor_key, critic_key = jax.random.split(key, 4)`.
 - Eval/test rollouts intentionally use a **fixed, non-threaded** key (`jax.random.PRNGKey(0)`, or `PRNGKey(_EVAL_SEED=12345)` for eval env resets in `roxie/utils/rollout.py`) so consecutive evals of the same weights are comparable. Don't thread a fresh key through eval paths.

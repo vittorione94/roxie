@@ -1,6 +1,6 @@
 # Agents
 
-What the seven agents share, how an update is dispatched, and the contract a new agent has to honour.
+What the eight agents share, how an update is dispatched, and the contract a new agent has to honour.
 
 *Back to the [README](../README.md).*
 
@@ -26,14 +26,16 @@ AgentHyperparams           seed, gamma, both learning rates, max_grad_norm,
 │  │  └─ TD3Hyperparams    policy_delay, twin_q_weight                     (TD3, TD4)
 │  ├─ SACHyperparams       alpha_learning_rate, the temperature dual, policy_delay, twin_q_weight
 │  └─ MPOHyperparams       n_step, dual_learning_rate, the KL bounds, the dual inits
-└─ PPOHyperparams          gae_lambda, clip_eps, entropy_coef, target_kl, num_minibatches
+├─ PPOHyperparams          gae_lambda, clip_eps, entropy_coef, target_kl, num_minibatches
+└─ SHACHyperparams         memory_warmup, horizon, gae_lambda, imagined_batch_size,
+                           critic epochs/minibatches, actor_clip_value          (SHAC)
 ```
 
 Three things follow from it being a dataclass:
 
 * **The checkpoint round-trips by construction.** `_export_hyperparams` is `dataclasses.asdict(self.hp)` and `Agent.load` rebuilds `hyperparams_cls` by field name. The on-disk layout is flat, one key per knob.
 * **A learning pass takes the whole set as ONE static argument.** `frozen=True` makes it hashable, so each `_<agent>_grad_steps` declares `static_argnames=("hp", ...)` instead of listing a dozen scalars.
-* **The type answers capability questions.** `isinstance(agent.hp, OffPolicyHyperparams)` is how the trainer asks whether there is a replay to warm up.
+* **The fields answer capability questions.** `memory_warmup` on `hp` is how the trainer asks whether there is a replay to warm up; PPO's dataclass has no such field, and a baseline has no `hp` at all.
 
 Derived quantities stay attributes instead: SAC's resolved `target_entropy`, PPO's `minibatch_size`, the buffer geometry. The exception is PPO's `steps_between_updates`, which the trainer reads for every agent the same way — PPO computes it from its queue width and writes it back onto `hp`, declaring it in `derived_hyperparams` so the config test knows the yaml must not set it.
 
@@ -74,7 +76,7 @@ Each of these is a constraint the fused window imposes on the base class.
 
 ### Acting: the agent keeps no acting state
 
-`select_action` has one signature for all seven agents, in two halves. Called bare — `select_action(obs, key)` — it acts off `self.state`, which is what `play.py` and the per-step rollouts use. The keyword-only half (`actor`, `obs_stats`, `noise_module`, `critic`) overrides each piece of that state instead.
+`select_action` has one signature for all eight agents, in two halves. Called bare — `select_action(obs, key)` — it acts off `self.state`, which is what `play.py` and the per-step rollouts use. The keyword-only half (`actor`, `obs_stats`, `noise_module`, `critic`) overrides each piece of that state instead.
 
 That second half is what lets a fused acting chunk run against a `lax.scan` carry: inside a trace the actor, the statistics and the noise counter are *carried values*, and reading them off `self` would bake the first chunk's weights into every chunk. Every keyword is part of the shared signature whether or not a given agent has the thing — DDPG ignores `critic`, PPO ignores `noise_module` — so one caller drives all of them. The play-only baselines take the positional half only.
 
@@ -127,6 +129,8 @@ The off-policy agents pick their buffer from `n_step`: a flashbax **flat buffer*
 
 Both structures have standalone walkthroughs under [`examples/flashbax/`](../examples/flashbax/).
 
+An agent that trains through a world model (SHAC) holds **no** buffer: the world owns the real data, and the rollout writes it there through the same `buffer_transitions` spelling. The agent folds only its acting statistics. See [worlds.md](worlds.md).
+
 ### Writing into one
 
 `buffer_transitions` writes one env-step batch **in place**, handing the transition to the store exactly as the caller assembled it: the time axis, the pruning to the fields this buffer allocated, and the NaN scrub all belong to `ReplayManager` ([`roxie/utils/memory.py`](../roxie/utils/memory.py)). Its optional `state` argument is the traced train state a fused chunk carries as a `lax.scan` carry; omit it and the agent's own state is used with the jitted, donating add. The two always go together, since a caller that has its own state is inside a trace, where the jitted wrapper would only nest a `pjit`.
@@ -142,5 +146,7 @@ Three blocks, plus the modules that live outside the train state:
 * **`_export_hyperparams`** — flat, one key per knob; `Agent.load` rebuilds `hyperparams_cls` from it by field name. Abstract, because a non-learning baseline has no `hp`.
 * **`_replay_hyperparams`** — the *derived* block every replay-driven agent carries. None of these is a constructor keyword: the buffer's geometry comes from `memory_config`, and the env sizes are read back off the buffer, because the shape it was **allocated** with is what a checkpoint is rebuilt against.
 * **`_checkpoint_modules`** — agent-owned `nnx` modules kept next to `self.state`: DDPG's exploration noise, SAC's temperature, MPO's duals, plus their optimizers. `save`/`restore` serialize `self.state` wholesale, so dropping these would restart exploration and the duals at their init values on resume. Keys are attribute names, restored with `setattr`.
+
+A world model's state rides in the same payload under its own `world` key ([worlds.md](worlds.md#checkpoints-and-resume)).
 
 The on-disk format lives in [`roxie/utils/checkpoint.py`](../roxie/utils/checkpoint.py); `checkpoint_payload` / `load` / `restore` on the agent are its agent-facing spelling.

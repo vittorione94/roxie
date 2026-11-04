@@ -23,6 +23,7 @@ from omegaconf import OmegaConf
 import roxie.agents  # noqa: F401  (avoid circular import)
 from roxie.agents.utils import Transition, build_agent
 from roxie.environment.vector import Timestep
+from roxie.worlds import build_world
 
 REPO = Path(__file__).resolve().parent.parent
 CONFIGS = REPO / "roxie" / "configs"
@@ -33,6 +34,9 @@ AGENTS = ("ddpg", "d4pg", "td3", "td4", "sac", "mpo", "ppo")
 # The deterministic arms: they explore through a noise module rather than
 # through their own policy, and carry the pre-activation penalty.
 DETERMINISTIC = ("ddpg", "d4pg", "td3", "td4")
+# Agents that learn through a world model. Kept out of `AGENTS`: they hold no
+# buffer, so the shared drive-and-learn suite cannot exercise them alone.
+MODEL_BASED = ("shac",)
 
 OBS, ACT, ENVS = 8, 3, 8
 
@@ -62,18 +66,7 @@ def agent_config(name: str, **hyperparams):
     for critic in _critic_blocks(cfg.critic_config):
         critic.features = [16, 16]
 
-    for key, value in (
-        ("max_length", 64 * ENVS),
-        ("min_length", 4 * ENVS),
-        ("sample_batch_size", 16),
-        ("max_length_time_axis", 16),
-        ("sample_sequence_length", 4),
-        # PPO's queue hardcodes the env count rather than reading
-        # `${env.parallel_envs}`.
-        ("add_batch_size", ENVS),
-    ):
-        if key in cfg.memory_config:
-            cfg.memory_config[key] = value
+    _shrink_memory(cfg.get("memory_config"))
 
     # Learn as soon as the buffer is legitimately full, then every iteration:
     # what these exercise is the learning pass, not the schedule
@@ -84,11 +77,61 @@ def agent_config(name: str, **hyperparams):
         "learning_steps": 2,
         "num_minibatches": 2,
         "num_action_samples": 4,
+        "imagined_batch_size": 16,
+        "horizon": 4,
     }
     for key, value in {**defaults, **hyperparams}.items():
         if key in cfg.hyperparams:
             cfg.hyperparams[key] = value
     return cfg
+
+
+def _shrink_memory(memory_config) -> None:
+    """Buffer sizes a CPU test fills in `WARMUP_ITERS` iterations; a no-op on
+    an agent that holds no buffer."""
+    if memory_config is None:
+        return
+    for key, value in (
+        ("max_length", 64 * ENVS),
+        ("min_length", 4 * ENVS),
+        ("sample_batch_size", 16),
+        ("max_length_time_axis", 16),
+        ("sample_sequence_length", 4),
+        # PPO's queue hardcodes the env count rather than reading
+        # `${env.parallel_envs}`.
+        ("add_batch_size", ENVS),
+    ):
+        if key in memory_config:
+            memory_config[key] = value
+
+
+def world_config(name: str = "deterministic", **hyperparams):
+    """The shipped world config for `name`, shrunk like `agent_config`."""
+    cfg = OmegaConf.create(
+        {
+            "env": {
+                "parallel_envs": ENVS,
+                "obs_size": OBS,
+                "action_size": ACT,
+            },
+            "world": OmegaConf.load(CONFIGS / "world" / f"{name}.yaml"),
+        }
+    ).world
+    cfg.dynamics_config.features = [16, 16]
+    _shrink_memory(cfg.memory_config)
+    # A window that fits the shrunk buffer several times over.
+    for key, value in {"learning_steps": 2, "window": 3, **hyperparams}.items():
+        cfg.hyperparams[key] = value
+    return cfg
+
+
+def build_world_model(name: str = "deterministic", **hyperparams):
+    """Construct the world `name` the way `train.py` does."""
+    return build_world(
+        world_config(name, **hyperparams),
+        env_obs_size=OBS,
+        env_action_size=ACT,
+    )
 
 
 def build(name: str, **hyperparams):
@@ -100,7 +143,7 @@ def build(name: str, **hyperparams):
         action_low=-jnp.ones(ACT, dtype=jnp.float32),
         action_high=jnp.ones(ACT, dtype=jnp.float32),
     )
-    if name in DETERMINISTIC:
+    if name in DETERMINISTIC + MODEL_BASED:
         kwargs["noise_config"] = OmegaConf.load(CONFIGS / "noise" / "gaussian.yaml")
     return build_agent(cfg, **kwargs)
 
@@ -113,7 +156,8 @@ def _critic_blocks(critic_config):
     return [critic_config]
 
 
-def drive(agent, iterations: int, key, obs=None, drift: float = 0.0) -> int:
+def drive(agent, iterations: int, key, obs=None, drift: float = 0.0,
+          world=None, terminated=None) -> int:
     """Act and buffer for `iterations` env steps; returns the env-step count.
 
     Deliberately the agent's public path rather than a direct buffer poke: it is
@@ -125,6 +169,10 @@ def drive(agent, iterations: int, key, obs=None, drift: float = 0.0) -> int:
     moves the running statistics far enough during one rollout for PPO's
     normalizer freeze to be observable (`test_ppo.py`). The default, 0, keeps
     the distribution stationary.
+
+    With a `world`, the world owns the buffer, as it does in training: the
+    transitions go to it and the agent folds only its acting statistics.
+    `terminated(i)` gives step `i`'s per-env termination flags; none by default.
     """
     if obs is None:
         obs = jax.random.normal(
@@ -144,24 +192,26 @@ def drive(agent, iterations: int, key, obs=None, drift: float = 0.0) -> int:
             obs=jax.random.normal(obs_key, (ENVS, OBS), dtype=jnp.float32) * scale
             + (scale - 1.0),
             reward=jax.random.normal(reward_key, (ENVS,), dtype=jnp.float32),
-            terminated=false,
+            terminated=false if terminated is None else terminated(i),
             truncated=false,
             info={},
         )
         # What `Learner.buffer` does: the action and the behaviour extras come
         # from the `select_action` that chose them, since the agent keeps no
         # acting state of its own.
-        agent.buffer_transitions(
-            Transition(
-                observation=obs,
-                action=action,
-                reward=timestep.reward,
-                terminal=timestep.terminated,
-                truncation=timestep.truncated,
-                **(extras or {}),
-            ),
-            timestep.obs,
+        transition = Transition(
+            observation=obs,
+            action=action,
+            reward=timestep.reward,
+            terminal=timestep.terminated,
+            truncation=timestep.truncated,
+            **(extras or {}),
         )
+        if world is None:
+            agent.buffer_transitions(transition, timestep.obs)
+        else:
+            world.buffer_transitions(transition, timestep.obs)
+            agent.absorb_obs_stats(obs[None], timestep.obs[None])
         obs = timestep.obs
 
     return iterations * ENVS
@@ -178,6 +228,19 @@ def warmed(name: str, key=None, **hyperparams):
         key = jax.random.PRNGKey(0)
     steps = drive(agent, WARMUP_ITERS, key)
     return agent, steps
+
+
+def warmed_with_world(name: str = "shac", key=None, **hyperparams):
+    """A model-based agent and its world, the world's buffer full.
+
+    Returns `(agent, world, env_steps)`.
+    """
+    agent = build(name, **hyperparams)
+    world = build_world_model()
+    if key is None:
+        key = jax.random.PRNGKey(0)
+    steps = drive(agent, WARMUP_ITERS, key, world=world)
+    return agent, world, steps
 
 
 def snapshot(module) -> list:

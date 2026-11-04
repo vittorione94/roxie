@@ -1,0 +1,43 @@
+_target_: roxie.worlds.DeterministicWorld
+
+hyperparams:
+  _target_: roxie.worlds.WorldHyperparams
+
+  seed: 0
+  learning_rate: 2e-4             # paper: 2e-4 on one GPU
+  max_grad_norm: 1.0
+  learning_steps: 10              # paper: 10 batches of 2048 windows per update
+  window: 8                       # k: steps of the autoregressive fit
+  reward_coef: 1.0
+  termination_coef: 1.0
+  normalize_observations: true
+  obs_norm_eps: 1e-06
+
+dynamics_config:
+  _target_: roxie.models.dynamics.DynamicsModel
+  obs_size: ${env.obs_size}
+  action_size: ${env.action_size}
+  features: [512, 512, 512]       # paper: [2048, 2048, 2048] for a 29-DoF humanoid
+  use_layer_norm: true
+  output_init_scale: 0.01
+  termination_bias_init: -5.0    # sigmoid(-5) ~ 0.7% per step until fit
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${world.hyperparams.seed}
+    offset: 6                     # after actor=0, critic=2, second critic=4
+
+# The REAL replay buffer: the world owns it. `build_replay` turns these sizes
+# and `hyperparams.window` into a `(window + 1)`-long trajectory buffer, so the
+# `_target_` only names the buffer family.
+memory_config:
+  _target_: flashbax.make_trajectory_buffer
+  max_length: 1_000_000           # paper: 1000 steps per env, FIFO
+  min_length: 10_000
+  sample_batch_size: 256
+  add_batch_size: ${env.parallel_envs}
+
+optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

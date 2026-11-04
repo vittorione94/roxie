@@ -110,15 +110,18 @@ class ChunkSums:
         return jax.tree.map(jnp.add, self, other)
 
 
-def chunk_step(carry, _, *, agent, advance, observe_params, acting_stats,
-               metric_keys):
+def chunk_step(carry, _, *, agent, world, advance, observe_params,
+               acting_stats, metric_keys):
     """Runs one environment step of the fused chunk: act, advance, buffer, tally.
 
     Args:
-        carry: `(train_state, noise_module, state, rng, params, scores,
-            lengths)` — only what a step must read back from the one before it.
+        carry: `(train_state, noise_module, world_state, state, rng, params,
+            scores, lengths)` — only what a step must read back from the one
+            before it. `world_state` is `None` without a world model.
         _: The scan's unused `xs` slot.
         agent: The static agent instance.
+        world: The static world model that owns the replay buffer, or None
+            when the agent owns it.
         advance: The backend's step, with the env and reset pool bound.
         observe_params: The backend's `params` update, likewise bound.
         acting_stats: The normalizer, constant for the chunk.
@@ -127,7 +130,8 @@ def chunk_step(carry, _, *, agent, advance, observe_params, acting_stats,
     Returns:
         The scan pair `(carry, stacked)`.
     """
-    train_state, noise_module, state, rng, params, scores, lengths = carry
+    (train_state, noise_module, world_state, state, rng, params, scores,
+     lengths) = carry
 
     rng, act_key, step_key = jax.random.split(rng, 3)
     prev_obs = state.obs
@@ -139,7 +143,12 @@ def chunk_step(carry, _, *, agent, advance, observe_params, acting_stats,
     state, timestep = advance(state, action, step_key, params)
     params = observe_params(params, timestep)
 
-    agent.buffer_transitions(
+    # The real data goes to whoever owns the buffer: the world when there is
+    # one, which the agent then never sees except through imagination.
+    owner, owner_state = (
+        (agent, train_state) if world is None else (world, world_state)
+    )
+    owner.buffer_transitions(
         Transition(
             observation=prev_obs,
             action=action,
@@ -149,7 +158,7 @@ def chunk_step(carry, _, *, agent, advance, observe_params, acting_stats,
             **(extras or {}),
         ),
         timestep.obs,
-        state=train_state,
+        state=owner_state,
         update_stats=False,
     )
 
@@ -162,7 +171,8 @@ def chunk_step(carry, _, *, agent, advance, observe_params, acting_stats,
 
     step_metrics = timestep.info.get("metrics", {})
     return (
-        train_state, noise_module, state, rng, params, scores, lengths,
+        train_state, noise_module, world_state, state, rng, params, scores,
+        lengths,
     ), (
         prev_obs, timestep.obs, ep_ret, ep_len, done_f, applied_noise,
         {key: step_metrics[key] for key in metric_keys},
@@ -264,12 +274,15 @@ def step_envs(rstate, actions, key, *, environment, advance, observe_params):
 @functools.partial(
     jax.jit,
     static_argnames=("environment", "advance", "observe_params", "agent",
-                     "n_steps", "metric_keys", "unroll"),
-    donate_argnums=(0, 1),
+                     "world", "n_steps", "metric_keys", "unroll"),
+    # The replay buffer rides in whichever state owns it, and is the run's
+    # largest array: donating both avoids a transient second copy of it every
+    # chunk. A `None` world state donates nothing.
+    donate_argnums=(0, 1, 2),
 )
-def collect_chunk(train_state, noise_module, rstate, frozen_stats, *,
-                  environment, advance, observe_params, agent, n_steps,
-                  metric_keys, unroll):
+def collect_chunk(train_state, noise_module, world_state, rstate, frozen_stats,
+                  *, environment, advance, observe_params, agent, world,
+                  n_steps, metric_keys, unroll):
     """Fuses acting, physics, buffering and scoring into a single JAX scan.
 
     `chunk_step` holds the per-step work and the carry; this holds what the
@@ -279,6 +292,8 @@ def collect_chunk(train_state, noise_module, rstate, frozen_stats, *,
         train_state: The agent's weights, optimizer state and replay buffer.
             Donated.
         noise_module: The exploration noise module, or None. Donated.
+        world_state: The world model's state, buffer included, or None.
+            Donated.
         rstate: The environment-side state carry (`RolloutState`).
         frozen_stats: Pinned normalizer statistics for on-policy rollouts, or
             None to pin to the statistics as they stood when the chunk opened.
@@ -286,12 +301,14 @@ def collect_chunk(train_state, noise_module, rstate, frozen_stats, *,
         advance: The backend-specific step function.
         observe_params: The backend-specific parameter update function.
         agent: The static agent instance; only its code may be used in a trace.
+        world: The static world model, or None; likewise code only.
         n_steps: The number of environment steps to collect.
         metric_keys: Tuple of metric keys reported by the environment.
         unroll: Loop unroll count for XLA optimization.
 
     Returns:
-        A tuple of `(train_state, noise_module, rstate, chunk_sums)`.
+        A tuple of `(train_state, noise_module, world_state, rstate,
+        chunk_sums)`.
     """
     reset_pool = rstate.reset_pool
 
@@ -304,22 +321,25 @@ def collect_chunk(train_state, noise_module, rstate, frozen_stats, *,
     acting_stats = (train_state.obs_stats if frozen_stats is None
                     else frozen_stats)
     body = functools.partial(
-        chunk_step, agent=agent, advance=advance_step, observe_params=observe,
-        acting_stats=acting_stats, metric_keys=metric_keys,
+        chunk_step, agent=agent, world=world, advance=advance_step,
+        observe_params=observe, acting_stats=acting_stats,
+        metric_keys=metric_keys,
     )
 
     init = (
-        train_state, noise_module, rstate.env, rstate.rng, rstate.params,
-        rstate.scores, rstate.lengths,
+        train_state, noise_module, world_state, rstate.env, rstate.rng,
+        rstate.params, rstate.scores, rstate.lengths,
     )
-    (train_state, noise_module, state, rng, params, scores,
+    (train_state, noise_module, world_state, state, rng, params, scores,
      lengths), stacked = jax.lax.scan(
         body, init, None, length=n_steps, unroll=unroll,
     )
     prev_obs, next_obs, ep_ret, ep_len, done_f, noise, metrics = stacked
 
     agent.absorb_obs_stats(prev_obs, next_obs, state=train_state)
-    return train_state, noise_module, rstate.replace(
+    if world is not None:
+        world.absorb_obs_stats(prev_obs, next_obs, state=world_state)
+    return train_state, noise_module, world_state, rstate.replace(
         env=state, rng=rng, params=params, scores=scores, lengths=lengths,
     ), ChunkSums.from_chunk(ep_ret, ep_len, done_f, noise, metrics, n_steps)
 
@@ -530,13 +550,14 @@ class Rollout:
             advance=self.advance, observe_params=self.observe_params,
         )
 
-    def collect(self, train_state, noise_module, rstate, frozen_stats, *,
-                agent, n_steps):
+    def collect(self, train_state, noise_module, world_state, rstate,
+                frozen_stats, *, agent, world, n_steps):
         """Collects one chunk. See `collect_chunk`, which this only binds."""
         return collect_chunk(
-            train_state, noise_module, rstate, frozen_stats,
+            train_state, noise_module, world_state, rstate, frozen_stats,
             environment=self.environment, advance=self.advance,
-            observe_params=self.observe_params, agent=agent, n_steps=n_steps,
+            observe_params=self.observe_params, agent=agent, world=world,
+            n_steps=n_steps,
             metric_keys=self.metric_keys,
             # A chunk shorter than the unroll would otherwise be traced as a
             # peeled remainder with no scan left around it.
@@ -558,8 +579,12 @@ class Rollout:
             max_steps=int(self.test_environment.max_episode_steps or 1000),
         )
 
-    def warmup(self, agent, rstate, iters):
-        """Rolls `iters` random-action steps into the agent's replay buffer."""
+    def warmup(self, agent, rstate, iters, *, world=None):
+        """Rolls `iters` random-action steps into the replay buffer.
+
+        The buffer is the world's when there is one; the agent then folds only
+        the block's statistics, which its acting normalizer still needs.
+        """
         print(f"Rolling {iters} warmup iters (compiles on the first)...",
               flush=True)
         t0 = time.time()
@@ -569,8 +594,11 @@ class Rollout:
 
         print("Filling the replay buffer...", flush=True)
         t0 = time.time()
+        if world is not None:
+            world.fill_buffer(transitions, next_obs)
         agent.fill_buffer(transitions, next_obs)
-        jax.block_until_ready(jax.tree.leaves(agent.state.buffer_state))
+        owner = agent if world is None else world
+        jax.block_until_ready(jax.tree.leaves(owner.state.buffer_state))
         print(f"  {time.time() - t0:.1f}s", flush=True)
 
         return rstate, int(jnp.sum(transitions.terminal | transitions.truncation))

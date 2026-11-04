@@ -402,3 +402,23 @@ def sac_critic_loss_fn(
         ),
     )
     return critic_loss, aux
+
+def lambda_return_targets(rewards, term_probs, next_values, gamma, lambda_):
+    """The critic's targets on an imagined rollout, `(B, H)` batch-major.
+
+    `G_t = r_{t+1} + gamma (1 - d_{t+1}) ((1 - lambda) V_{t+1} + lambda G_{t+1})`,
+    started from `G_H = V_H`: exactly `rlax.lambda_returns` with the model's
+    termination probability folded into the discount.
+    """
+    # `rlax.lambda_returns` is defined over ONE sequence, so it is vmapped
+    # over the batch axis.
+    return jax.vmap(
+        rlax.lambda_returns, in_axes=(0, 0, 0, None),
+    )(rewards, gamma * (1.0 - term_probs), next_values, lambda_)
+
+
+def shac_critic_loss_fn(critic_model, observations, targets):
+    """State-value MSE against targets fixed for the whole fit."""
+    v_t = critic_model(observations)[..., 0]
+    loss = jnp.mean(jnp.square(v_t - targets))
+    return loss, {"value": jnp.mean(v_t), "value_target": jnp.mean(targets)}

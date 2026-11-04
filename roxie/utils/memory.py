@@ -3,6 +3,7 @@
 import dataclasses
 import functools
 
+import flashbax
 import jax
 
 from roxie.utils.math import finite_or_zero
@@ -37,6 +38,32 @@ class ReplayManager:
         self.sample = buffer.sample
         self.can_sample = buffer.can_sample
         self._add_jit = None
+        self._samplers = {}
+
+    def sampler(self, batch_size: int, sequence_length: int = 1):
+        """A sample fn over this buffer's state at another batch and length.
+
+        Flashbax's trajectory sampling is a pure function of the state and its
+        own sizes, so one store can serve two consumers that draw differently —
+        a world model's k-step windows and the single real observations its
+        imagined rollouts start from. Cached per geometry: the callable is a
+        static jit argument, and a fresh one each call would recompile.
+
+        Raises:
+            ValueError: on a flat pair buffer, whose sampling is fixed at build.
+        """
+        if not self.time_axis:
+            raise ValueError(
+                "`sampler` reads a trajectory buffer; this one is a flat pair "
+                "buffer, whose sample geometry is fixed at build."
+            )
+        geometry = (int(batch_size), int(sequence_length))
+        if geometry not in self._samplers:
+            self._samplers[geometry] = functools.partial(
+                flashbax.buffers.trajectory_buffer.sample,
+                batch_size=geometry[0], sequence_length=geometry[1], period=1,
+            )
+        return self._samplers[geometry]
 
     def init(self):
         """Initializes an empty buffer state matching the prototype schema."""

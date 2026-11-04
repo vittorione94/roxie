@@ -9,6 +9,19 @@ from omegaconf import OmegaConf
 _COERCIBLE = (bool, int, float)
 
 
+def coerce_fields(hp) -> None:
+    """Casts a frozen dataclass's primitive fields to their declared hints.
+
+    A yaml `3e-4` arrives as a string, and a `1` as an int where a float is
+    declared; both would otherwise hash differently as a static jit argument.
+    """
+    hints = typing.get_type_hints(type(hp))
+    for field in dataclasses.fields(hp):
+        hint = hints.get(field.name)
+        if hint in _COERCIBLE:
+            object.__setattr__(hp, field.name, hint(getattr(hp, field.name)))
+
+
 @dataclasses.dataclass(frozen=True)
 class AgentHyperparams:
     """Base hyperparameters shared across all learning agents.
@@ -40,11 +53,7 @@ class AgentHyperparams:
 
     def __post_init__(self):
         """Coerces primitive fields to their declared type hints."""
-        hints = typing.get_type_hints(type(self))
-        for field in dataclasses.fields(self):
-            hint = hints.get(field.name)
-            if hint in _COERCIBLE:
-                object.__setattr__(self, field.name, hint(getattr(self, field.name)))
+        coerce_fields(self)
         if self.obs_norm_clip is not None:
             object.__setattr__(self, "obs_norm_clip", float(self.obs_norm_clip))
             if self.obs_norm_clip <= 0:
@@ -176,6 +185,44 @@ class PPOHyperparams(AgentHyperparams):
             object.__setattr__(self, "target_kl", float(self.target_kl))
             if self.target_kl < 0:
                 object.__setattr__(self, "target_kl", None)
+
+
+@dataclasses.dataclass(frozen=True)
+class SHACHyperparams(AgentHyperparams):
+    """Hyperparameters for SHAC, trained through a learned world model.
+
+    Attributes:
+        memory_warmup: Environment steps before learning begins. The warmup
+            fills the WORLD's buffer, whose `min_length` must not exceed it.
+        horizon: Imagined steps the actor's return is backpropagated through.
+        gae_lambda: Lambda of the critic's imagined lambda-returns.
+        imagined_batch_size: Imagined rollouts per gradient step, each started
+            from a real observation sampled out of the world's buffer.
+        critic_epochs: Passes over one imagined rollout's critic targets.
+        critic_minibatches: Minibatches each critic epoch is split into.
+        actor_clip_value: Element-wise actor gradient clip applied after the
+            global-norm one; None or non-positive disables it.
+    """
+
+    memory_warmup: int = 10_000
+    horizon: int = 32
+    gae_lambda: float = 0.95
+    imagined_batch_size: int = 1024
+    critic_epochs: int = 5
+    critic_minibatches: int = 4
+    actor_clip_value: Optional[float] = 0.1
+
+    def __post_init__(self):
+        """Coerces actor_clip_value to float or None for non-positive values."""
+        super().__post_init__()
+        if self.actor_clip_value is not None:
+            object.__setattr__(
+                self, "actor_clip_value", float(self.actor_clip_value)
+            )
+            if self.actor_clip_value <= 0:
+                object.__setattr__(self, "actor_clip_value", None)
+        if self.horizon < 1:
+            raise ValueError(f"horizon must be >= 1, got {self.horizon}")
 
 
 def build_hyperparams(cls, config):

@@ -18,11 +18,12 @@ A few keys under `env:` are *not* builder arguments, because roxie consumes them
 
 ## Layout
 
-- [`roxie/configs/agent/`](../roxie/configs/agent/) — one file per algorithm (`ddpg`, `td3`, `td4`, `d4pg`, `sac`, `mpo`, `ppo`, plus the play-only baselines in [`roxie/agents/basic.py`](../roxie/agents/basic.py), which `Trainer.run` refuses to train).
+- [`roxie/configs/agent/`](../roxie/configs/agent/) — one file per algorithm (`ddpg`, `td3`, `td4`, `d4pg`, `sac`, `mpo`, `ppo`, `shac`, plus the play-only baselines in [`roxie/agents/basic.py`](../roxie/agents/basic.py), which `Trainer.run` refuses to train).
 - [`roxie/configs/env/`](../roxie/configs/env/) — one file per env builder (`playground`, `envpool`): a complete `env:` block, pulled into a launchable's `defaults:` as `- /env: playground`. The leading `/` is required from a launchable in a subdirectory of `experiments/`, exactly as for `/agent:`.
+- [`roxie/configs/world/`](../roxie/configs/world/) — learned world models (`deterministic`), held to the same constructor-call convention and built with the same two injected env sizes. A launchable that composes a `world:` group is model-based: the world owns the replay buffer, and the agent must be one that trains through it (SHAC) — see [worlds.md](worlds.md).
 - [`roxie/configs/noise/`](../roxie/configs/noise/) — exploration noise modules (`ou`, `gaussian`, `adaptive`). Agents that explore from their own policy (SAC, MPO, PPO) take **no** noise group; adding one is a launch-time error.
 - [`experiments/<env>/`](../experiments/) — launchable experiments. `--config-name` includes the folder.
-- [`experiments/dmc/`](../experiments/dmc/) — the release benchmark, carrying its own groups: `agent/`, `backend/`, `bench/` and `noise/`.
+- [`experiments/dmc/`](../experiments/dmc/) — the release benchmark, carrying its own groups: `agent/`, `backend/`, `bench/`, `noise/` and `world/`.
 
 ## A launchable
 

@@ -1,4 +1,4 @@
-"""Checkpoint management utilities for locating, reading, and restoring agent states."""
+"""Locates, reads and restores the checkpointed state of agents and worlds."""
 
 import dataclasses
 import re
@@ -237,11 +237,7 @@ class AgentCheckpointer:
     @staticmethod
     def _restore_module(owner, name: str, source: Dict[str, Any]) -> None:
         """Merges a single checkpointed parameter subtree into a live NNX module."""
-        if name not in source:
-            print(f"Info: '{name}' not in checkpoint; keeping live {name}.")
-            return
-        gdef, _ = nnx.split(getattr(owner, name))
-        setattr(owner, name, nnx.merge(gdef, _to_jax(source[name])))
+        restore_module(owner, name, source)
 
     def _restore_obs_stats(self, ckpt_state: Dict[str, Any]) -> None:
         """Restores observation normalization statistics onto the agent's train state."""
@@ -252,55 +248,166 @@ class AgentCheckpointer:
             print("Info: checkpoint carries obs_stats but this agent has none; "
                   "leaving observation normalization at its init values.")
             return
-        obs = ckpt_state["obs_stats"]
-        self.agent.state.obs_stats = live.replace(
-            count=jnp.asarray(obs["count"], jnp.result_type(live.count)),
-            sum=jnp.asarray(obs["sum"], jnp.result_type(live.sum)),
-            sumsq=jnp.asarray(obs["sumsq"], jnp.result_type(live.sumsq)),
+        self.agent.state.obs_stats = restored_obs_stats(
+            live, ckpt_state["obs_stats"]
         )
 
     def _check_obs_width(self, loaded: Dict[str, Any], path: Path) -> None:
         """Validates that checkpoint observation dimensions match the active environment."""
-        ckpt_width = (loaded.get("hyperparams") or {}).get("env_obs_size", None)
-        experience = getattr(
-            getattr(self.agent.state, "buffer_state", None), "experience", None,
-        )
-        if ckpt_width is None or experience is None:
-            return
-        live_width = int(jnp.shape(experience.observation)[-1])
-        if int(ckpt_width) == live_width:
-            return
-        raise ValueError(
-            f"{path} was trained on a {int(ckpt_width)}-dimensional "
-            f"observation, but this env produces {live_width}."
+        check_obs_width(
+            loaded, getattr(self.agent.state, "buffer_state", None), path
         )
 
     def _restore_buffer(self, ckpt_buffer) -> bool:
         """Reconstructs Flashbax replay buffer state from host checkpoint arrays."""
-        live = getattr(self.agent.state, "buffer_state", None)
-        if live is None:
+        restored = restored_buffer(
+            getattr(self.agent.state, "buffer_state", None), ckpt_buffer
+        )
+        if restored is None:
             return False
-
-        def take(path, leaf):
-            node = ckpt_buffer
-            for key in path:
-                node = node[_path_key(key)]
-            value = jnp.asarray(node)
-            if value.shape != jnp.shape(leaf):
-                raise ValueError(
-                    f"buffer leaf {jax.tree_util.keystr(path)} has shape "
-                    f"{value.shape} in the checkpoint but {jnp.shape(leaf)} live"
-                )
-            return value.astype(jnp.result_type(leaf))
-
-        try:
-            self.agent.state.buffer_state = jax.tree_util.tree_map_with_path(
-                take, live
-            )
-        except (KeyError, TypeError, ValueError) as e:
-            print(
-                f"Warning: could not restore the replay buffer ({e}); "
-                "keeping the empty one — the trainer will refill it."
-            )
-            return False
+        self.agent.state.buffer_state = restored
         return True
+
+
+class WorldCheckpointer:
+    """Serializes and restores a world model, nested under its own key.
+
+    A world rides in the SAME checkpoint as the agent it trains, under
+    `PAYLOAD_KEY`, so one step directory is one resumable run. Playback reads
+    only the agent's half: acting needs no model.
+    """
+
+    PAYLOAD_KEY = "world"
+    MODULE_SLOTS = ("dynamics", "optimizer")
+
+    def __init__(self, world):
+        self.world = world
+
+    def payload(self, *, include_buffer: bool = False) -> Dict[str, Any]:
+        """The world's contents as host arrays; the buffer only on request."""
+        world = self.world
+        hyperparams = world._export_hyperparams()
+        saved_buffer = world.state.buffer_state
+        if not include_buffer:
+            world.state.buffer_state = None
+        try:
+            return {
+                "state": jax.device_get(nnx.split(world.state)[1]),
+                "hyperparams": hyperparams,
+            }
+        finally:
+            world.state.buffer_state = saved_buffer
+
+    def restore(
+        self,
+        path: str | Path,
+        *,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Loads a checkpoint's world half into this already-built world.
+
+        Returns:
+            Whether the replay buffer came back, which is what decides if the
+            trainer refills it.
+
+        Raises:
+            ValueError: if the checkpoint carries no world, or one trained on
+              another observation width.
+        """
+        path = Path(path).resolve()
+        loaded = read_checkpoint(path) if payload is None else payload
+        block = loaded.get(self.PAYLOAD_KEY)
+        if not block:
+            raise ValueError(
+                f"{path} carries no world model: it was not trained with one, "
+                f"so it cannot resume a run that learns through one."
+            )
+        state = self.world.state
+        check_obs_width(block, state.buffer_state, path)
+
+        ckpt_state = block.get("state") or {}
+        for name in self.MODULE_SLOTS:
+            restore_module(state, name, ckpt_state)
+        if "obs_stats" in ckpt_state:
+            state.obs_stats = restored_obs_stats(
+                state.obs_stats, ckpt_state["obs_stats"]
+            )
+
+        buffer_restored = False
+        if "buffer_state" in ckpt_state:
+            restored = restored_buffer(
+                state.buffer_state, ckpt_state["buffer_state"]
+            )
+            if restored is not None:
+                state.buffer_state = restored
+                buffer_restored = True
+        print(f"World model restored from {path}")
+        return buffer_restored
+
+
+def restore_module(owner, name: str, source: Dict[str, Any]) -> None:
+    """Merges a single checkpointed parameter subtree into a live NNX module."""
+    if name not in source:
+        print(f"Info: '{name}' not in checkpoint; keeping live {name}.")
+        return
+    gdef, _ = nnx.split(getattr(owner, name))
+    setattr(owner, name, nnx.merge(gdef, _to_jax(source[name])))
+
+
+def restored_obs_stats(live, ckpt_obs: Dict[str, Any]):
+    """`live` running moments with the checkpoint's values, at the live dtypes."""
+    return live.replace(
+        count=jnp.asarray(ckpt_obs["count"], jnp.result_type(live.count)),
+        sum=jnp.asarray(ckpt_obs["sum"], jnp.result_type(live.sum)),
+        sumsq=jnp.asarray(ckpt_obs["sumsq"], jnp.result_type(live.sumsq)),
+    )
+
+
+def check_obs_width(loaded: Dict[str, Any], buffer_state, path: Path) -> None:
+    """Refuses a checkpoint trained on another observation width than `buffer_state`'s.
+
+    Raises:
+        ValueError: on a mismatch. Nothing to compare is not one.
+    """
+    ckpt_width = (loaded.get("hyperparams") or {}).get("env_obs_size", None)
+    experience = getattr(buffer_state, "experience", None)
+    if ckpt_width is None or experience is None:
+        return
+    live_width = int(jnp.shape(experience.observation)[-1])
+    if int(ckpt_width) == live_width:
+        return
+    raise ValueError(
+        f"{path} was trained on a {int(ckpt_width)}-dimensional "
+        f"observation, but this env produces {live_width}."
+    )
+
+
+def restored_buffer(live, ckpt_buffer):
+    """`live`'s buffer refilled from host checkpoint arrays; None if it cannot be.
+
+    A mismatch is a warning rather than an error: the buffer is an accelerant,
+    and an empty one is simply refilled by the trainer's warmup.
+    """
+    if live is None:
+        return None
+
+    def take(path, leaf):
+        node = ckpt_buffer
+        for key in path:
+            node = node[_path_key(key)]
+        value = jnp.asarray(node)
+        if value.shape != jnp.shape(leaf):
+            raise ValueError(
+                f"buffer leaf {jax.tree_util.keystr(path)} has shape "
+                f"{value.shape} in the checkpoint but {jnp.shape(leaf)} live"
+            )
+        return value.astype(jnp.result_type(leaf))
+
+    try:
+        return jax.tree_util.tree_map_with_path(take, live)
+    except (KeyError, TypeError, ValueError) as e:
+        print(
+            f"Warning: could not restore the replay buffer ({e}); "
+            "keeping the empty one — the trainer will refill it."
+        )
+        return None

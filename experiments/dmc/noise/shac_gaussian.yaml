@@ -1,0 +1,5 @@
+# The paper's collection noise: a fixed N(0, 0.1^2) per action dimension. It
+# only widens the actions the world model is fit on — the actor never trains
+# on noisy actions — so it does not decay.
+_target_: roxie.exploration.noisy.GaussianNoise
+initial_noise_scale: 0.1

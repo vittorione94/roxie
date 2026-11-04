@@ -32,7 +32,7 @@ class PlayOnlyAgent(Agent):
     user who points `train.py` at a baseline sees is written once.
     """
 
-    def learn(self, agent_rng, n_steps=None):
+    def learn(self, agent_rng, n_steps=None, *, world=None):
         raise NotImplementedError(
             f"{type(self).__name__} is a non-learning baseline and cannot be "
             f"trained — it has nothing to learn, and its acting cannot be "

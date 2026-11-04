@@ -38,13 +38,21 @@ def build_agent(config, **kwargs):
     return hydra.utils.instantiate(config, _recursive_=False, **kwargs)
 
 
-def build_optimizer(config, *, learning_rate: float, max_grad_norm: float = None):
+def build_optimizer(
+    config,
+    *,
+    learning_rate: float,
+    max_grad_norm: float = None,
+    clip_value: float = None,
+):
     """Builds an Optax gradient transformation from a configuration dictionary.
 
     Args:
         config: Hydra config naming the optimizer family and parameters, or None for Adam.
         learning_rate: Base learning rate override.
         max_grad_norm: Optional threshold for global gradient norm clipping.
+        clip_value: Optional element-wise clip, applied after the global-norm
+            one so that it bounds what the norm clip leaves.
 
     Returns:
         An Optax `GradientTransformation`.
@@ -55,13 +63,20 @@ def build_optimizer(config, *, learning_rate: float, max_grad_norm: float = None
         overrides = {} if "learning_rate" in config else {"learning_rate": learning_rate}
         tx = hydra.utils.instantiate(config, **overrides)
 
+    if clip_value:
+        tx = optax.chain(optax.clip(clip_value), tx)
     if max_grad_norm:
         tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), tx)
     return tx
 
 
 def make_optimizer(
-    module: nnx.Module, config, *, learning_rate: float, max_grad_norm: float = None
+    module: nnx.Module,
+    config,
+    *,
+    learning_rate: float,
+    max_grad_norm: float = None,
+    clip_value: float = None,
 ) -> nnx.Optimizer:
     """Binds a Flax NNX module to an Optax optimizer over its parameters.
 
@@ -70,6 +85,7 @@ def make_optimizer(
         config: Optimizer configuration block.
         learning_rate: Base learning rate.
         max_grad_norm: Optional threshold for global gradient norm clipping.
+        clip_value: Optional element-wise clip; see `build_optimizer`.
 
     Returns:
         An `nnx.Optimizer` bound to `nnx.Param`.
@@ -77,7 +93,10 @@ def make_optimizer(
     return nnx.Optimizer(
         module,
         build_optimizer(
-            config, learning_rate=learning_rate, max_grad_norm=max_grad_norm
+            config,
+            learning_rate=learning_rate,
+            max_grad_norm=max_grad_norm,
+            clip_value=clip_value,
         ),
         wrt=nnx.Param,
     )

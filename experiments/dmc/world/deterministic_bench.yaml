@@ -1,0 +1,41 @@
+_target_: roxie.worlds.DeterministicWorld
+
+
+hyperparams:
+  _target_: roxie.worlds.WorldHyperparams
+
+  seed: 0
+  learning_rate: 2e-4
+  max_grad_norm: 1.0
+  learning_steps: 20
+  window: 8
+  reward_coef: 1.0
+  termination_coef: 1.0
+  normalize_observations: true
+  obs_norm_eps: 1e-06
+
+dynamics_config:
+  _target_: roxie.models.dynamics.DynamicsModel
+  obs_size: ${env.obs_size}
+  action_size: ${env.action_size}
+  features: [512, 512, 512]
+  use_layer_norm: true
+  output_init_scale: 0.01
+  termination_bias_init: -5.0
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${world.hyperparams.seed}
+    offset: 6
+
+memory_config:
+  _target_: flashbax.make_trajectory_buffer
+  max_length: 1_024_000           # 1000 steps per env at 1024 envs, as the paper
+  min_length: 30_720
+  sample_batch_size: 512
+  add_batch_size: ${env.parallel_envs}
+
+optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

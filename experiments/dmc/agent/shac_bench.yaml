@@ -1,0 +1,57 @@
+_target_: roxie.agents.SHAC
+
+
+hyperparams:
+  _target_: roxie.agents.hyperparams.SHACHyperparams
+
+  gamma: 0.99
+  actor_learning_rate: 2e-4
+  critic_learning_rate: 2e-4
+  max_grad_norm: 1.0
+  actor_clip_value: 0.1
+  memory_warmup: 30_720           # fills the world's buffer; >= its min_length
+  steps_between_updates: 2_048
+  learning_steps: 5
+  horizon: 32
+  gae_lambda: 0.95
+  imagined_batch_size: 1024
+  critic_epochs: 5
+  critic_minibatches: 4
+  normalize_observations: true
+  obs_norm_clip: 5.0
+  obs_norm_eps: 1e-08
+  seed: 0
+
+actor_config:
+  _target_: roxie.models.actors.DeterministicActor
+  in_features: ${env.obs_size}
+  action_dim: ${env.action_size}
+  features: [256, 256]
+  use_layer_norm: true
+  dropout_rate: 0.
+  output_init_scale: 0.01
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${agent.hyperparams.seed}
+    offset: 0
+
+critic_config:
+  _target_: roxie.models.critics.VCritic
+  in_features: ${env.obs_size}
+  features: [256, 128]
+  use_layer_norm: true
+  rngs:
+    _target_: roxie.agents.utils.network_rngs
+    seed: ${agent.hyperparams.seed}
+    offset: 2
+
+actor_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.95
+  eps: 1e-8
+critic_optimizer_config:
+  _target_: optax.adam
+  b1: 0.9
+  b2: 0.999
+  eps: 1e-8

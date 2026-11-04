@@ -130,7 +130,7 @@ def _child(mode: str, envs: int, task: str, chunks: int) -> None:
         return wrapper
 
     Rollout.collect = timed(
-        "collect", Rollout.collect, lambda out: (out[0], out[2].obs),
+        "collect", Rollout.collect, lambda out: (out[0], out[3].obs),
     )
     TD3.learn = timed("learn", TD3.learn, lambda out: out)
 

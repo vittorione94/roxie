@@ -39,9 +39,13 @@ INJECTED = {
     "noise_config",
 }
 
+# World configs are held to the same contract: one `instantiate` that is the
+# constructor call, and a hyperparams block naming every dataclass field.
 CONFIG_FILES = sorted(
     list((REPO / "roxie" / "configs" / "agent").glob("*.yaml"))
     + list(REPO.glob("experiments/*/agent/*.yaml"))
+    + list((REPO / "roxie" / "configs" / "world").glob("*.yaml"))
+    + list(REPO.glob("experiments/*/world/*.yaml"))
 )
 
 

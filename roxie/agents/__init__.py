@@ -13,6 +13,7 @@ from .ddpg import DDPG
 from .mpo import MPO
 from .ppo import PPO
 from .sac import SAC
+from .shac import SHAC
 from .td3 import TD3
 from .td4 import TD4
 
@@ -26,6 +27,7 @@ __all__ = [
     "MPO",
     "PPO",
     "SAC",
+    "SHAC",
     "TD3",
     "TD4",
 ]

@@ -7,7 +7,7 @@ import jax
 import orbax.checkpoint as ocp
 from flax import nnx
 
-from roxie.agents.hyperparams import OffPolicyHyperparams
+from roxie.agents.agent import check_world_pairing
 from roxie.utils import logger
 from roxie.utils.checkpoint import CHECKPOINTS_DIRNAME
 from roxie.utils.rollout import ChunkSums, RolloutState, build_rollout
@@ -23,7 +23,7 @@ def _new_epoch_acc(metric_keys):
     """
     return dict(
         sums=ChunkSums.zeros(metric_keys),
-        steps=0, actor_losses=[], critic_losses=[],
+        steps=0, actor_losses=[], critic_losses=[], world_losses=[],
     )
 
 
@@ -58,11 +58,19 @@ class Trainer:
         )
         self.skip_warmup = bool(resume.get("buffer_restored", False))
         self._checkpoint_manager = None
+        self.world = None
 
-    def initialize(self, agent, environment, test_environment=None):
+    def initialize(self, agent, environment, test_environment=None, world=None):
+        """Binds the run's parts; `world` is the model a SHAC-style agent needs.
+
+        Raises:
+            ValueError: if the agent and the world do not belong together.
+        """
+        check_world_pairing(agent, world)
         self.agent = agent
         self.environment = environment
         self.test_environment = test_environment
+        self.world = world
 
     @staticmethod
     def _memory_warmup(agent):
@@ -99,7 +107,11 @@ class Trainer:
         return self._checkpoint_manager
 
     def _save(self, agent, epochs, episodes, gradient_steps):
-        """Write a checkpoint, tagged with the progress needed to resume it."""
+        """Write a checkpoint, tagged with the progress needed to resume it.
+
+        A world model rides in the same payload, under its own key, so one step
+        directory is one resumable run.
+        """
         payload = agent.checkpoint_payload(
             include_buffer=self.save_buffer,
             extra_metadata={
@@ -111,6 +123,10 @@ class Trainer:
         )
         if payload is None:  # a baseline with nothing to checkpoint
             return
+        if self.world is not None:
+            payload[self.world.checkpointer.PAYLOAD_KEY] = (
+                self.world.checkpoint_payload(include_buffer=self.save_buffer)
+            )
         self._checkpoints().save(
             int(self.steps), args=ocp.args.StandardSave(payload)
         )
@@ -140,16 +156,25 @@ class Trainer:
                 self.initial_gradient_steps)
 
     @staticmethod
-    def _precompile_update(agent, agent_key):
+    def _precompile_update(agent, agent_key, world=None):
         """Compile the gradient step once the buffer holds warmup data. Returns
-        the advanced key. No-op for agents without the update contract."""
+        the advanced key. No-op for agents without the update contract — those
+        that do not learn off a warmed-up buffer (PPO, the baselines).
 
-        if not isinstance(agent.hp, OffPolicyHyperparams):
+        With a world model the world's fitting pass compiles first, so the
+        agent's first pass imagines through a model that has seen the data.
+        """
+        if getattr(agent.hp, "memory_warmup", None) is None:
             return agent_key
         print("Compiling gradient step...", flush=True)
         t0 = time.time()
         agent_key, warm_key = jax.random.split(agent_key)
-        agent.learn(warm_key)
+        if world is not None:
+            warm_key, world_key = jax.random.split(warm_key)
+            world.learn(world_key)
+            jax.block_until_ready(jax.tree.leaves(nnx.state(world.state)))
+            print(f"  world model: {time.time() - t0:.1f}s", flush=True)
+        agent.learn(warm_key, world=world)
         jax.block_until_ready(jax.tree.leaves(nnx.state(agent.state)))
         print(f"  {time.time() - t0:.1f}s", flush=True)
         return agent_key
@@ -199,7 +224,7 @@ class Trainer:
 
     def _run(self, rollout, rstate: RolloutState, rngs):
         start_time = last_epoch_time = time.time()
-        agent = self.agent
+        agent, world = self.agent, self.world
         num_envs = rollout.num_envs
         self.num_envs = num_envs
         agent_key = rngs.agent()
@@ -212,7 +237,7 @@ class Trainer:
             print(f"Warmup: {warmup_iters} iters ({memory_warmup:,} steps)...",
                   flush=True)
             rstate, warmup_episodes = rollout.warmup(
-                agent, rstate, warmup_iters,
+                agent, rstate, warmup_iters, world=world,
             )
             # Warmup transitions are real env steps, so they count.
             self.steps = self.initial_steps + warmup_iters * num_envs
@@ -220,7 +245,7 @@ class Trainer:
             print(f"  Done: {self.steps:,} steps, {int(episodes)} episodes",
                   flush=True)
 
-        agent_key = self._precompile_update(agent, agent_key)
+        agent_key = self._precompile_update(agent, agent_key, world)
 
         print("Training...", flush=True)
         collect_steps = self._collect_steps(agent, num_envs)
@@ -231,13 +256,18 @@ class Trainer:
 
         while True:
             chunk_t0 = time.time()
-            agent.state, noise_module, rstate, sums = rollout.collect(
-                agent.state, getattr(agent, "noise_module", None), rstate,
-                agent.freeze_acting_norm(),
-                agent=agent, n_steps=collect_steps,
+            agent.state, noise_module, world_state, rstate, sums = (
+                rollout.collect(
+                    agent.state, getattr(agent, "noise_module", None),
+                    None if world is None else world.state, rstate,
+                    agent.freeze_acting_norm(),
+                    agent=agent, world=world, n_steps=collect_steps,
+                )
             )
             if noise_module is not None:
                 agent.noise_module = noise_module
+            if world is not None:
+                world.state = world_state
 
             prev_steps = self.steps
             self.steps += chunk_env_steps
@@ -248,7 +278,15 @@ class Trainer:
 
             agent_key, update_key = jax.random.split(agent_key)
             if agent.due_for_update(self.steps):
-                gradient_steps, actor_loss, critic_loss = agent.learn(update_key)
+                # The world refits on the newest data first, so the agent
+                # imagines through the model as it now stands.
+                if world is not None:
+                    update_key, world_key = jax.random.split(update_key)
+                    _, world_loss = world.learn(world_key)
+                    acc["world_losses"].append(world_loss)
+                gradient_steps, actor_loss, critic_loss = agent.learn(
+                    update_key, world=world,
+                )
                 grad_steps += gradient_steps
                 tot_gradient_steps = self.initial_gradient_steps + grad_steps
                 acc["actor_losses"].append(actor_loss)
@@ -371,7 +409,8 @@ class Trainer:
         logger.store("train/episodes/total", int(episodes))
         logger.store("train/gradient_steps", gradient_steps)
 
-        for name in ("actor", "critic"):
+        names = ("actor", "critic") + (() if self.world is None else ("world",))
+        for name in names:
             values = acc[f"{name}_losses"]
             logger.store(f"train/loss/{name}",
                          float(np.mean(values)) if values else None)
@@ -384,6 +423,8 @@ class Trainer:
             extra["noise/per_joint_abs"] = float(sums.noise / iters)
         # Every agent answers this; the ones with nothing to report answer {}.
         extra.update(agent.pop_diagnostics(self.steps))
+        if self.world is not None:
+            extra.update(self.world.pop_diagnostics(self.steps))
         for k, v in extra.items():
             logger.store(f"train/{k}", float(v))
 

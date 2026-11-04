@@ -22,9 +22,10 @@ from flax import nnx
 
 from roxie.agents.utils import Transition, build_agent
 from roxie.environment.functional import space_size
-from roxie.agents.hyperparams import OffPolicyHyperparams
 from roxie.environment.loader import build_env, publish_env_shapes
 from roxie.utils.rollout import ChunkSums, _EVAL_SEED, build_rollout
+from roxie.utils.trainer import Trainer
+from roxie.worlds import build_world
 
 CHUNK = 4
 NUM_ENVS = 4
@@ -42,6 +43,18 @@ _OFF_POLICY_OVERRIDES = (
 # comes from `sample_sequence_length`, which `steps_between_updates` derives
 # from. `num_minibatches` must divide `add_batch_size`.
 _OVERRIDES = {
+    # The world owns SHAC's buffer, so its sizes move to the `world` block.
+    "shac": (
+        "agent.hyperparams.memory_warmup=512",
+        f"agent.hyperparams.steps_between_updates={CHUNK * NUM_ENVS}",
+        "agent.hyperparams.imagined_batch_size=8",
+        "agent.hyperparams.horizon=4",
+        "world.memory_config.max_length=256",
+        "world.memory_config.min_length=8",
+        "world.memory_config.sample_batch_size=8",
+        "world.dynamics_config.features=[16,16]",
+        "world.hyperparams.learning_steps=1",
+    ),
     "ppo": (
         f"agent.memory_config.sample_sequence_length={CHUNK}",
         "agent.memory_config.max_length_time_axis=16",
@@ -58,6 +71,15 @@ BACKENDS = {"jax": "mjx_cpu", "envpool": "envpool_cpu"}
 
 
 def _build(agent_name, backend, extra=()):
+    """`(agent, rollout, rstate)` for a model-free agent, warmed up."""
+    agent, world, rollout, rstate = _build_run(agent_name, backend, extra)
+    assert world is None, f"{agent_name} needs `_build_run`, which keeps the world"
+    return agent, rollout, rstate
+
+
+def _build_run(agent_name, backend, extra=()):
+    """`(agent, world, rollout, rstate)`, warmed up; `world` is None unless the
+    launchable composes one."""
     from hydra import compose, initialize_config_dir
     from pathlib import Path
 
@@ -103,19 +125,22 @@ def _build(agent_name, backend, extra=()):
     if "noise" in cfg:
         kwargs["noise_config"] = cfg.noise
     agent = build_agent(cfg.agent, **kwargs)
+    world = None
+    if cfg.get("world") is not None:
+        world = build_world(
+            cfg.world,
+            env_obs_size=kwargs["env_obs_size"],
+            env_action_size=kwargs["env_action_size"],
+        )
     rollout, rstate = build_rollout(
         env, test_env, NUM_ENVS, nnx.Rngs(envs=0).envs(),
     )
-    # On-policy agents have no warmup to run (and no replay to fill) — the
-    # type is what says so, exactly as `Trainer._precompile_update` asks it.
-    warmup_steps = (
-        agent.hp.memory_warmup // NUM_ENVS
-        if isinstance(agent.hp, OffPolicyHyperparams)
-        else 0
-    )
+    # On-policy agents have no warmup to run (and no replay to fill); asked
+    # exactly as the trainer asks it.
+    warmup_steps = Trainer._memory_warmup(agent) // NUM_ENVS
     if warmup_steps > 0:
-        rstate, _ = rollout.warmup(agent, rstate, warmup_steps)
-    return agent, rollout, rstate
+        rstate, _ = rollout.warmup(agent, rstate, warmup_steps, world=world)
+    return agent, world, rollout, rstate
 
 
 def _as_numpy(leaf):
@@ -264,9 +289,9 @@ def _stepwise_collect(rollout, agent, rstate, n_steps):
 
 
 def _fused_run(agent, rollout, rstate):
-    agent.state, noise, rstate, sums = rollout.collect(
-        agent.state, getattr(agent, "noise_module", None), rstate,
-        agent.freeze_acting_norm(), agent=agent, n_steps=CHUNK,
+    agent.state, noise, _, rstate, sums = rollout.collect(
+        agent.state, getattr(agent, "noise_module", None), None, rstate,
+        agent.freeze_acting_norm(), agent=agent, world=None, n_steps=CHUNK,
     )
     if noise is not None:
         agent.noise_module = noise
@@ -333,9 +358,9 @@ def test_the_noise_schedule_advances_by_env_frames_inside_the_scan():
     """
     agent, rollout, rstate = _build("td3", "envpool")
     before = int(agent.noise_module.step_count.get_value())
-    agent.state, agent.noise_module, rstate, _ = rollout.collect(
-        agent.state, agent.noise_module, rstate, agent.freeze_acting_norm(),
-        agent=agent, n_steps=CHUNK,
+    agent.state, agent.noise_module, _, rstate, _ = rollout.collect(
+        agent.state, agent.noise_module, None, rstate,
+        agent.freeze_acting_norm(), agent=agent, world=None, n_steps=CHUNK,
     )
     assert (
         int(agent.noise_module.step_count.get_value()) - before
@@ -457,3 +482,38 @@ def test_eval_leaves_the_exploration_noise_alone():
         agent=agent,
     )
     assert int(agent.noise_module.step_count.get_value()) == before
+
+
+# --- with a world model ------------------------------------------------------
+
+
+def test_a_world_owns_every_real_transition_the_chunk_collects():
+    """With a world in the run, the chunk writes the world's buffer and the
+    world's statistics; the agent, which holds no buffer, folds only the
+    statistics it acts under. Both then learn off what was written."""
+    agent, world, rollout, rstate = _build_run("shac", "envpool")
+    assert agent.state.buffer_state is None
+
+    def experience():
+        return np.asarray(world.state.buffer_state.experience.observation)
+
+    before = experience()
+    world_count = float(world.state.obs_stats.count)
+    agent_count = float(agent.state.obs_stats.count)
+
+    agent.state, agent.noise_module, world.state, rstate, _ = rollout.collect(
+        agent.state, agent.noise_module, world.state, rstate,
+        agent.freeze_acting_norm(), agent=agent, world=world, n_steps=CHUNK,
+    )
+
+    assert agent.state.buffer_state is None
+    assert not np.array_equal(before, experience()), "the world's buffer did not move"
+    # One fold per landed observation for the world; the agent's own weighting
+    # (see `Agent.absorb_obs_stats`) counts each step three times.
+    assert float(world.state.obs_stats.count) - world_count == CHUNK * NUM_ENVS
+    assert float(agent.state.obs_stats.count) - agent_count == 3 * CHUNK * NUM_ENVS
+
+    _, world_loss = world.learn(jax.random.PRNGKey(0))
+    _, actor_loss, critic_loss = agent.learn(jax.random.PRNGKey(1), world=world)
+    for loss in (world_loss, actor_loss, critic_loss):
+        assert np.isfinite(float(loss))

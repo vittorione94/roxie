@@ -74,6 +74,28 @@ class LearningOutput:
     extra_state: Any = None
 
 
+def check_world_pairing(agent, world) -> None:
+    """Refuses an agent and a world model that do not belong together.
+
+    Raises:
+        ValueError: if `agent` trains through a world and `world` is `None`,
+          or `world` is given to an agent that has no use for one.
+    """
+    uses_world = bool(getattr(type(agent), "uses_world", False))
+    name = type(agent).__name__
+    if uses_world and world is None:
+        raise ValueError(
+            f"{name} learns through a world model; compose a `world:` block "
+            f"into the config."
+        )
+    if world is not None and not uses_world:
+        raise ValueError(
+            f"{name} is model-free and does not train through a world model; "
+            f"drop the `world:` block, or pair the world with an agent that "
+            f"uses one."
+        )
+
+
 class Agent(abc.ABC):
     """Abstract class used to build agents."""
 
@@ -82,6 +104,9 @@ class Agent(abc.ABC):
     derived_hyperparams = frozenset()
     freeze_obs_norm_per_chunk = False
     joint_grad_clip = False
+    # Whether `learn` trains through a `roxie.worlds.WorldModel`. Such an
+    # agent holds no replay buffer of its own: the world owns the real data.
+    uses_world = False
 
     # The slots below are declared here rather than left for a subclass's
     # `__init__` to inject, so a non-learning baseline — which gets none of
@@ -133,13 +158,14 @@ class Agent(abc.ABC):
         `self`.
         """
 
-    def learn(self, agent_rng, n_steps=None):
+    def learn(self, agent_rng, n_steps=None, *, world=None):
         """Runs one learning pass of gradient steps, IN PLACE on `self.state`.
 
         Unconditional — the caller gates it with `due_for_update` first.
-        `n_steps` sizes the pass; `None` means `hp.learning_steps`. The
-        algorithm's own work is `_compile_and_run`; everything around it is
-        here.
+        `n_steps` sizes the pass; `None` means `hp.learning_steps`. `world` is
+        the model a `uses_world` agent imagines through, read but never
+        written. The algorithm's own work is `_compile_and_run`; everything
+        around it is here.
 
         Returns:
             `(gradient_steps, actor_loss, critic_loss)` — the losses averaged
@@ -148,11 +174,17 @@ class Agent(abc.ABC):
 
         Raises:
             NotImplementedError: on a play-only baseline.
+            ValueError: if `world` is given to an agent that does not use one,
+              or withheld from one that does.
         """
+        check_world_pairing(self, world)
         target_steps = (
             self.hp.learning_steps if n_steps is None else int(n_steps)
         )
-        steps_taken, output = self._compile_and_run(agent_rng, target_steps)
+        extra = () if world is None else (world,)
+        steps_taken, output = self._compile_and_run(
+            agent_rng, target_steps, *extra
+        )
 
         self.state = output.state
         if output.extra_state is not None:
@@ -164,6 +196,8 @@ class Agent(abc.ABC):
     @abc.abstractmethod
     def _compile_and_run(self, agent_rng, target_steps: int):
         """Dispatches to this algorithm's jitted learning pass.
+
+        A `uses_world` agent takes the world as a third argument.
 
         Args:
             agent_rng: the pass's key; splitting it belongs to the pass.
@@ -273,11 +307,13 @@ class Agent(abc.ABC):
 
         The bulk sibling of `buffer_transitions`, for the warmup fill: the adds
         scan inside one dispatch and the statistics take a single pass over the
-        block.
+        block. An agent with no buffer of its own — one whose world owns the
+        data — folds only the statistics, which its acting still needs.
         """
-        self.state.buffer_state = self.replay.add_block(
-            self.state.buffer_state, transitions
-        )
+        if self.replay is not None:
+            self.state.buffer_state = self.replay.add_block(
+                self.state.buffer_state, transitions
+            )
         if self.hp.normalize_observations:
             width = transitions.observation.shape[-1]
             self.state.obs_stats = update_obs_stats(
@@ -296,6 +332,8 @@ class Agent(abc.ABC):
         critic_optimizer_config: dict = None,
         target_actor: bool = True,
         target_critic: bool = True,
+        obs_size: Optional[int] = None,
+        actor_clip_value: Optional[float] = None,
     ) -> None:
         """Assembles the shared actor-critic state, targets and optimizers.
 
@@ -307,6 +345,10 @@ class Agent(abc.ABC):
         The targets are deep copies, so a run starts with `target == online`.
         Passing `False` leaves the slot `None`, which is what `restore` keys off
         to skip it without warning.
+
+        `obs_size` is read only when `buffer_state` is `None`; otherwise the
+        buffer is the authority on it. `actor_clip_value` adds an element-wise
+        clip to the actor's optimizer, after its global-norm one.
         """
         self.diagnostics = DiagnosticsTracker(type(self).__name__.lower())
 
@@ -320,6 +362,7 @@ class Agent(abc.ABC):
                 actor_optimizer_config,
                 learning_rate=self.hp.actor_learning_rate,
                 max_grad_norm=self._optimizer_grad_clip(),
+                clip_value=actor_clip_value,
             ),
             critic_optimizer=make_optimizer(
                 critic,
@@ -331,7 +374,8 @@ class Agent(abc.ABC):
             # The buffer is the authority on observation width, so stats built
             # from it cannot disagree with `add`.
             obs_stats=init_obs_stats(
-                buffer_state.experience.observation.shape[-1]
+                obs_size if buffer_state is None
+                else buffer_state.experience.observation.shape[-1]
             ),
         )
 

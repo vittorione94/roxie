@@ -38,6 +38,7 @@ from roxie.environment.loader import (
 from roxie.utils import hydra_searchpath, logger, precision
 from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
 from roxie.utils.trainer import Trainer
+from roxie.worlds import build_world
 
 hydra_searchpath.register()
 suites.register_resolvers()
@@ -134,6 +135,16 @@ def main(cfg: DictConfig):
 
     agent = build_agent(cfg.agent, **agent_kwargs)
 
+    # A model-based run composes a `world:` group; the world, not the agent,
+    # then owns the replay buffer of real transitions.
+    world = None
+    if cfg.get("world") is not None:
+        world = build_world(
+            cfg.world,
+            env_obs_size=agent_kwargs["env_obs_size"],
+            env_action_size=agent_kwargs["env_action_size"],
+        )
+
     resume_cfg = cfg.get("resume") or {}
     if isinstance(resume_cfg, str):
         resume_cfg = {"path": resume_cfg}
@@ -142,6 +153,8 @@ def main(cfg: DictConfig):
     if resume_path:
         checkpoint = find_checkpoint(resume_path)
         resume_metadata = agent.restore(checkpoint)
+        if world is not None:
+            resume_metadata["buffer_restored"] = world.restore(checkpoint)
         if not resume_metadata.get("steps"):
             resume_metadata["steps"] = checkpoint_steps(checkpoint) or 0
         print(
@@ -166,7 +179,8 @@ def main(cfg: DictConfig):
     )
     test_environment = test_env if test_env is not None else env
     trainer.initialize(
-        agent=agent, environment=env, test_environment=test_environment
+        agent=agent, environment=env, test_environment=test_environment,
+        world=world,
     )
     try:
         trainer.run(cfg.env.parallel_envs, training_rngs)
