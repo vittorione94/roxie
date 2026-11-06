@@ -6,14 +6,7 @@ There are exactly two ways to attach an environment to roxie, both shaped like [
 
 ## The two ways in
 
-| | Write a `FuncEnv` | Bring a batched env |
-|---|---|---|
-| Defined in | [`roxie/environment/functional.py`](../roxie/environment/functional.py) | [`roxie/environment/vector.py`](../roxie/environment/vector.py) |
-| For | anything functional and JAX-traceable | anything already batched |
-| State | passed explicitly, one env at a time | carried by the caller, batched |
-| Examples | MuJoCo Playground, Waymax | EnvPool |
-
-Write a `FuncEnv` and `JaxVectorEnv` batches it. Bring something that already speaks Gymnasium's 5-tuple and `EnvPoolVectorEnv` fronts it directly.
+Write a [`FuncEnv`](../roxie/environment/functional.py) — anything functional and JAX-traceable, one env at a time, with the state passed explicitly — and [`JaxVectorEnv`](../roxie/environment/vector.py) batches it. `mujoco_playground` and Waymax both fit this shape.
 
 ## Writing a `FuncEnv`
 
@@ -95,12 +88,12 @@ The three injected arguments are supplied by [`loader.build_env`](../roxie/envir
 
 Everything else under `env:` is a keyword argument, so a stale key fails at launch. The exceptions are `loader.TRAINER_ENV_KEYS` — `parallel_envs`, `test_episodes`, `viewer`, `player`, and the `obs_size`/`action_size`/`obs_action_size` that `publish_env_shapes` writes back into the block for the agent yaml to interpolate — which roxie consumes itself and strips before instantiating. Which hardware the physics runs on is `runtime.device`, applied long before a builder exists ([backends.md](backends.md#where-the-run-runs)). [`tests/test_env_configs.py`](../tests/test_env_configs.py) pins a config against its builder's signature in both directions.
 
-The two shipped builders are `build_playground_env` and `build_envpool_env` in [`roxie/environment/loader.py`](../roxie/environment/loader.py), with a config-group file each in [`roxie/configs/env/`](../roxie/configs/env/) — a complete `env:` block an experiment pulls in and overrides:
+The shipped builder is `build_playground_env` in [`roxie/environment/loader.py`](../roxie/environment/loader.py), with a config-group file in [`roxie/configs/env/`](../roxie/configs/env/) — a complete `env:` block an experiment pulls in and overrides:
 
 ```yaml
 defaults:
   - /agent: sac
-  - /env: playground     # or /env: envpool
+  - /env: playground
   - _self_
 
 env:
