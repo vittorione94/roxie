@@ -280,3 +280,14 @@ def test_resolve_placement_rejects_a_device_it_cannot_mean():
     with pytest.raises(ValueError, match="runtime.device"):
         resolve_placement(cfg)
 
+
+
+def test_warp_silences_only_the_iteration_warnings():
+    from mujoco.mjx.third_party import mujoco_warp as mjw
+
+    from roxie.environment.loader import load_playground_env
+
+    func_env, _ = load_playground_env("CartpoleBalance", impl="warp", graph_mode="JAX")
+    flag = int(func_env.env.mjx_model.opt._impl.warn_overflow)
+    capped = mjw.OverflowType.ITERATIONS | mjw.OverflowType.LS_ITERATIONS
+    assert flag == int(mjw.OverflowType.ALL) & ~int(capped)

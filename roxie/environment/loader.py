@@ -134,9 +134,10 @@ def log_loaded_backend(
 DEFAULT_WARP_GRAPH_MODE = "WARP_STAGED_EX"
 
 
-def _set_graph_mode(env: Any, graph_mode: str) -> None:
-    """Re-puts a playground environment's MJX model using a specified CUDA graph mode."""
+def _put_warp_model(env: Any, graph_mode: str) -> None:
+    """Re-puts a playground environment's MJX model for a long Warp run."""
     from mujoco import mjx
+    from mujoco.mjx.third_party import mujoco_warp as mjw
     from mujoco.mjx.warp import types as mjxw_types
 
     if not hasattr(env, "_mjx_model"):
@@ -144,11 +145,18 @@ def _set_graph_mode(env: Any, graph_mode: str) -> None:
             f"{type(env).__name__} has no `_mjx_model` to re-put; mujoco_playground "
             "changed shape."
         )
-    env._mjx_model = mjx.put_model(
+    model = mjx.put_model(
         env.mj_model,
         impl="warp",
         graph_mode=getattr(mjxw_types.GraphMode, graph_mode),
     )
+    # Playground caps the solver low on purpose, so these two print per world per
+    # step: 40-50k lines a minute on the humanoids at 256 worlds (2026-11-06). The
+    # contact and constraint overflows stay on; those are a budget set too small.
+    capped = mjw.OverflowType.ITERATIONS | mjw.OverflowType.LS_ITERATIONS
+    impl = model.opt._impl
+    impl = impl.replace(warn_overflow=int(impl.warn_overflow) & ~int(capped))
+    env._mjx_model = model.replace(opt=model.opt.replace(_impl=impl))
 
 
 def load_playground_env(
@@ -170,7 +178,7 @@ def load_playground_env(
 
     env = registry.load(env_name, config=env_cfg)
     if env_cfg.impl == "warp":
-        _set_graph_mode(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
+        _put_warp_model(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
     loaded_impl = BATCH_IMPL if impl == BATCH_IMPL else env_cfg.impl
     return PlaygroundFuncEnv(env, loaded_impl), env_cfg
 
