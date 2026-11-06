@@ -37,6 +37,7 @@ dependencies = [
     # Imported directly by scripts/render_gif.py for GIF palette quantization;
     # it arrives under matplotlib anyway, but nothing should rely on that.
     "pillow>=10.0",
+    "glfw>=2.10",
 ]
 
 [project.urls]
