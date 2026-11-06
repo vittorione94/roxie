@@ -31,32 +31,40 @@ def test_one_step_matches_mjx(task):
         task, num_envs=NUM_ENVS, impl="batch", num_threads=1,
     ).env
     key = jax.random.PRNGKey(0)
-    state, _ = mjx.reset(key)
+    state, _ = jax.jit(mjx.reset)(key)
     actions = _actions(mjx)
 
-    _, want = mjx.step(state, actions, key)
+    _, want = jax.jit(mjx.step)(state, actions, key)
     _, got = native.step(state, actions, key)
 
     np.testing.assert_allclose(got.obs, want.obs, atol=1e-3, rtol=1e-3)
     np.testing.assert_allclose(got.reward, want.reward, atol=1e-3)
 
 
-def _stepped_walker():
+@pytest.fixture(scope="module")
+def walker_start():
+    """A freshly reset walker, shared because the reset is what costs."""
+    env = build_playground_env(
+        "WalkerWalk", num_envs=NUM_ENVS, impl="batch", num_threads=1,
+    ).env
+    state, _ = jax.jit(env.reset)(jax.random.PRNGKey(0))
+    return state
+
+
+def _stepped_walker(start):
     """A walker one step in, with the carry the next step would be handed."""
     env = build_playground_env(
         "WalkerWalk", num_envs=NUM_ENVS, impl="batch", num_threads=1,
     ).env
-    key = jax.random.PRNGKey(0)
-    state, _ = env.reset(key)
-    state, _ = env.step(state, _actions(env), key)
+    state, _ = env.step(start, _actions(env), jax.random.PRNGKey(0))
     carried = {name: getattr(state.env_state.data, name) for name in env._last}
     return env, carried
 
 
-def test_an_unchanged_world_keeps_its_float64_state():
+def test_an_unchanged_world_keeps_its_float64_state(walker_start):
     """Reloading the carried float32 every step would discard the low bits."""
-    env, carried = _stepped_walker()
-    reference, _ = _stepped_walker()
+    env, carried = _stepped_walker(walker_start)
+    reference, _ = _stepped_walker(walker_start)
     env._rows["qvel"][:] += 1e-12
 
     action = np.zeros((NUM_ENVS, 6))
@@ -66,10 +74,10 @@ def test_an_unchanged_world_keeps_its_float64_state():
     assert not np.array_equal(env._rows["qpos"], reference._rows["qpos"])
 
 
-def test_only_the_replaced_world_is_reloaded():
+def test_only_the_replaced_world_is_reloaded(walker_start):
     """An auto-reset edits one world of the carry; the others must keep running."""
-    env, carried = _stepped_walker()
-    reference, _ = _stepped_walker()
+    env, carried = _stepped_walker(walker_start)
+    reference, _ = _stepped_walker(walker_start)
     moved = {**carried, "qpos": carried["qpos"].at[1, 2].add(0.5)}
 
     action = np.zeros((NUM_ENVS, 6))
@@ -85,7 +93,7 @@ def test_a_task_outside_the_suite_is_refused():
         build_playground_env("Go1JoystickFlatTerrain", impl="batch")
 
 
-def test_a_task_that_transforms_its_action_is_refused():
+def test_a_task_that_transforms_its_action_is_refused(walker_start):
     """The batch steps before the task runs, so it would have applied the wrong
     controls without a word."""
     func_env, _ = load_playground_env("WalkerWalk", impl="batch")
@@ -100,10 +108,8 @@ def test_a_task_that_transforms_its_action_is_refused():
 
     func_env.env = Scaling()
     env = BatchVectorEnv(func_env, NUM_ENVS, num_threads=1)
-    key = jax.random.PRNGKey(0)
-    state, _ = env.reset(key)
     with pytest.raises(ValueError, match="unchanged"):
-        env.step(state, _actions(env), key)
+        env.step(walker_start, _actions(env), jax.random.PRNGKey(0))
 
 
 def test_a_batch_run_replays_on_mjx():

@@ -105,13 +105,21 @@ def test_params_stay_traced_and_reach_initial(vec_env, rng_key):
     """`params` must be an ARGUMENT, not a closure constant: an env that adapts
     its params refreshes them every epoch, and a recompile there would cost more
     than the adaptation buys."""
-    jitted = jax.jit(lambda k, p: vec_env.reset(k, params=p)[0].obs)
+    traces = []
+
+    def reset_obs(k, p):
+        traces.append(p)
+        return vec_env.reset(k, params=p)[0].obs
+
+    jitted = jax.jit(reset_obs)
     at_zero = np.asarray(jitted(rng_key, 0.0))
     at_two = np.asarray(jitted(rng_key, 2.0))
 
     assert np.allclose(at_two - at_zero, 2.0)
-    # One compile for both values is the property under test.
-    assert jitted._cache_size() == 1
+    # One compile for both values is the property under test. Counted by trace,
+    # not `_cache_size()`: on jax 0.10.2 (what Python 3.11 locks to), a new
+    # function reads 0 there once the suite has filled the global jit cache.
+    assert len(traces) == 1
 
 
 def test_failure_is_terminated_not_truncated(vec_env, rng_key):
