@@ -37,7 +37,7 @@ from roxie.environment.loader import (
     requested_impl,
     resolve_placement,
 )
-from roxie.utils import hydra_searchpath, logger, precision
+from roxie.utils import hydra_searchpath, logger, memory_guard, precision
 from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
 from roxie.utils.trainer import Trainer
 
@@ -50,13 +50,16 @@ def main(cfg: DictConfig):
     """Parses environment/agent configuration and runs the training pipeline."""
     print("Agent:", cfg.agent._target_)
 
+    runtime_cfg = cfg.get("runtime") or {}
+    # Before `pin_cpu_cores`, so the watcher does not compete for the run's cores.
+    memory_guard.start(runtime_cfg.get("memory_reserve_gb", None))
+
     # Read through a multi-task block's tasks: there the backend sits in
     # `task_defaults`, and missing it here would skip Warp's memory setup.
     impl = requested_impl(cfg.env)
     if impl == "warp":
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
 
-    runtime_cfg = cfg.get("runtime") or {}
     device, platform = resolve_placement(cfg)
     if platform and not _device:
         jax.config.update("jax_platforms", str(platform))
