@@ -117,7 +117,7 @@ GRID_RUNS = [
     ("CheetahRun", "warp_gpu", "td3", "2026-01-01", 50_000_000, True),
     ("CheetahRun", "warp_gpu", "sac", "2026-01-01", 20_000_000, False),
     ("CheetahRun", "warp_gpu", "ppo", "2026-01-01", 5_000_000, True),
-    ("CheetahRun", "envpool_cpu", "td3", "2026-01-01", 50_000_000, True),
+    ("CheetahRun", "batch_cpu", "td3", "2026-01-01", 50_000_000, True),
     ("WalkerWalk", "warp_gpu", "td3", "2026-01-01", 50_000_000, True),
 ]
 
