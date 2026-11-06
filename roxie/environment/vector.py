@@ -1,21 +1,24 @@
-"""Vectorized environment drivers for JAX and C++ pool backends.
+"""Vectorized environment drivers for the JIT-compiled training loop.
 
-Provides `JaxVectorEnv` (vmapped `FuncEnv`) and `EnvPoolVectorEnv` 
-(C++ thread pool), both presenting an identical batched interface for 
-JIT-compiled training loops.
+`JaxVectorEnv` vmaps a `FuncEnv`. `BatchVectorEnv` is the same driver with the
+physics swapped for a `mujoco.batch` thread pool behind a host callback.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import contextlib
+import os
 from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from jax.experimental import io_callback
+from mujoco import batch
+from mujoco_playground._src import mjx_env
 
-from roxie.environment import functional
+from roxie.utils.precision import FLOAT
 
 
 @struct.dataclass
@@ -23,9 +26,9 @@ class VecState:
     """The environment-side carry for the next step.
 
     Attributes:
-        env_state: The internal state of the environment. None for C++ pools.
-        obs: The current observation to act upon. 
-        steps: Step counters for truncation limits. None for C++ pools.
+        env_state: The internal state of the environment.
+        obs: The current observation to act upon.
+        steps: Step counters for truncation limits.
     """
     env_state: Any
     obs: jax.Array
@@ -163,149 +166,126 @@ class JaxVectorEnv:
         return jax.tree.map(_leaf, reset_pool, stepped)
 
 
-def _dict_obs_keys(space: Any) -> tuple[str, ...] | None:
-    """Extracts the observation groups declared by a pool `Dict` space."""
-    spaces = getattr(space, "spaces", None)
-    if not isinstance(spaces, dict):
-        return None
-    return tuple(spaces)
+# Every field the dm_control suite tasks read off `data`, and the state a world
+# needs to be rebuilt from. `suites.DMC_TASKS` is what this list is good for, and
+# `build_playground_env` refuses anything else.
+_BATCH_CARRIED = (
+    "qpos", "qvel", "act", "qacc_warmstart", "mocap_pos", "mocap_quat", "time",
+)
+_BATCH_DERIVED = (
+    "xpos", "xmat", "xipos", "xanchor", "geom_xpos", "geom_xmat", "site_xpos",
+    "subtree_com", "sensordata",
+)
 
 
-def _resolve_obs_keys(space: Any, keys: Any = None) -> tuple[str, ...] | None:
-    """Resolves which observation groups should be flattened."""
-    declared = _dict_obs_keys(space)
-    if keys is None:
-        return declared
-    keys = tuple(keys)
-    if declared is None:
-        raise ValueError(
-            f"observation groups {keys} were requested, but the pool declares "
-            f"one flat observation space ({space!r}), not named groups"
+@contextlib.contextmanager
+def _physics_already_stepped(action, fields, n_substeps):
+    """Makes a task's `mjx_env.step` return results the batch already computed."""
+    real = mjx_env.step
+
+    def step(model, data, task_action, task_substeps=1):
+        del model
+        if task_action is not action or task_substeps != n_substeps:
+            raise ValueError(
+                "impl=batch steps physics before the task runs, so the task must "
+                "hand mjx_env.step its action and n_substeps unchanged."
+            )
+        return data.replace(ctrl=action, **fields)
+
+    mjx_env.step = step
+    try:
+        yield
+    finally:
+        mjx_env.step = real
+
+
+def _available_cores() -> int:
+    """The cores this process may run on, which a pinned run narrows."""
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+class BatchVectorEnv(JaxVectorEnv):
+    """A playground task whose physics runs on a `mujoco.batch` thread pool.
+
+    Everything but the physics is `JaxVectorEnv`: resets, auto-reset and the
+    upstream task's observation and reward stay in the compiled program.
+    """
+
+    def __init__(self, func_env, num_envs: int, max_episode_steps: int = 0,
+                 num_threads: int | None = None):
+        super().__init__(func_env, num_envs, max_episode_steps)
+        nthread = int(num_threads or _available_cores())
+        self._batch = batch.Batch(
+            func_env.mj_model, nsim=self.num_envs,
+            nthread=min(nthread, self.num_envs),
         )
-    unknown = [key for key in keys if key not in declared]
-    if unknown:
-        raise ValueError(
-            f"the pool declares no observation group(s) {unknown}; it has "
-            f"{list(declared)}"
-        )
-    return keys
-
-
-def _as_box(space: Any, unbounded: bool = False, keys: Any = None) -> Any:
-    """Normalizes a pool's space object to a `gymnasium.spaces.Box`."""
-    keys = _resolve_obs_keys(space, keys)
-    if keys is not None:
-        size = sum(int(np.prod(space.spaces[k].shape)) for k in keys)
-        return functional.unbounded_box(size)
-    low, high = getattr(space, "low", None), getattr(space, "high", None)
-    if low is None or high is None:
-        if not unbounded:
-            raise ValueError(f"space {space!r} declares no low/high bounds")
-        return functional.unbounded_box(int(np.prod(space.shape)))
-    return functional.box(low, high, shape=tuple(space.shape))
-
-
-class EnvPoolVectorEnv:
-    """A C++ pool batched internally via EnvPool."""
-
-    metadata = {"jax": False, "impl": "envpool"}
-    _POOL_HOOKS = ("epoch_refresh",)
-
-    def __init__(
-        self, pool: Any, num_envs: int | None = None,
-        max_episode_steps: int = 1000, rebuild=None,
-        obs_keys: Any = None,
-    ):
-        self.max_episode_steps = int(max_episode_steps)
-        self._rebuild = rebuild
-        self._num_envs = num_envs
-        self._bind_pool(pool)
-
-        self._obs_keys = _resolve_obs_keys(pool.observation_space, obs_keys)
-        self.single_observation_space = _as_box(
-            pool.observation_space, unbounded=True, keys=self._obs_keys,
-        )
-        self.single_action_space = _as_box(pool.action_space)
-
-    def _bind_pool(self, pool: Any) -> None:
-        self._pool = pool
-        self.num_envs = int(
-            getattr(pool, "num_envs", None) or self._num_envs or 0
-        ) or None
-        for name in self._POOL_HOOKS:
-            attr = getattr(pool, name, None)
-            if attr is not None:
-                setattr(self, name, attr)
-
-    def reseed(self, seed: int) -> bool:
-        """Rebuilds the pool at `seed` to pin reset reproducibility."""
-        if self._rebuild is None:
-            return False
-        self._bind_pool(self._rebuild(seed))
-        return True
-
-    def _flat_obs(self, obs: Any) -> np.ndarray:
-        """Flattens the pool's observation into a single contiguous array."""
-        if self._obs_keys is None:
-            return np.asarray(obs, dtype=np.float32)
-        parts = []
-        for key in self._obs_keys:
-            leaf = obs[key] if isinstance(obs, Mapping) else getattr(obs, key)
-            leaf = np.asarray(leaf, dtype=np.float32)
-            parts.append(leaf.reshape(leaf.shape[0], -1))
-        return np.concatenate(parts, axis=1)
-
-    @property
-    def step_spec(self):
-        """Defines the shape/dtype signature expected by `io_callback`."""
-        n = int(self.num_envs)
-        obs_size = int(np.prod(self.single_observation_space.shape))
-        f32 = lambda shape: jax.ShapeDtypeStruct(shape, np.float32)  # noqa: E731
-        return (
-            f32((n, obs_size)),
-            f32((n,)),
-            jax.ShapeDtypeStruct((n,), np.bool_),
-            jax.ShapeDtypeStruct((n,), np.bool_),
-            {"nonfinite": f32((n,))},
-        )
-
-    def reset(self, key=None, params=None, num_envs: int | None = None):
-        """Resets the pool."""
-        del key, params, num_envs 
-        obs, info = self._pool.reset()
-        obs = self._flat_obs(obs)
-        n = obs.shape[0]
-        self.num_envs = n
-        false = np.zeros(n, dtype=bool)
-        return VecState(env_state=None, obs=obs), Timestep(
-            obs=obs, reward=np.zeros(n, dtype=np.float32),
-            terminated=false, truncated=false,
-            info=info if isinstance(info, dict) else {},
-        )
-
-    def step(self, state: VecState, action, key=None, reset_pool=None, params=None):
-        """Executes one step in the C++ pool."""
-        del state, key, reset_pool, params
-        obs, reward, terminated, truncated, info = self._pool.step(
-            np.asarray(action)
-        )
-        obs = self._flat_obs(obs)
-        reward = np.asarray(reward, dtype=np.float32)
-
-        diverged = nonfinite_worlds(obs, reward, np)
-        obs = zero_worlds(diverged, obs, np)
-        reward = zero_worlds(diverged, reward, np)
-
-        info = dict(info) if isinstance(info, dict) else {}
-        info["metrics"] = {
-            **info.get("metrics", {}),
-            "nonfinite": diverged.astype(np.float32),
+        self._n_substeps = int(func_env.n_substeps)
+        self._rows = {
+            name: self._batch.bind(name)
+            for name in (*_BATCH_CARRIED, *_BATCH_DERIVED, "ctrl")
         }
-        timestep = Timestep(
-            obs=obs,
-            reward=reward,
-            terminated=np.asarray(terminated, dtype=bool),
-            truncated=np.asarray(truncated, dtype=bool),
-            info=info,
+        self._spec = {
+            name: jax.ShapeDtypeStruct(self._field_shape(name), FLOAT)
+            for name in (*_BATCH_CARRIED, *_BATCH_DERIVED)
+        }
+        self._last = {
+            name: np.full(self._spec[name].shape, np.nan, FLOAT)
+            for name in _BATCH_CARRIED
+        }
+        self._v_transition = self._transition
+
+    def _field_shape(self, name: str) -> tuple[int, ...]:
+        """The shape MJX gives a field, where the batch's rows hold it flat."""
+        shape = self._rows[name].shape
+        if name == "time":
+            return (self.num_envs,)
+        return shape[:-1] + (3, 3) if name.endswith("xmat") else shape
+
+    def _step_physics(self, carried, action):
+        """Steps every world, reloading those the program moved since last time.
+
+        The rows stay authoritative at float64 between steps. A world's carried
+        float32 fields only differ from what was last returned when the program
+        replaced them: an auto-reset, a fresh reset, or a task editing `data`.
+        """
+        stale = np.zeros(self.num_envs, dtype=bool)
+        for name, value in carried.items():
+            stale |= (np.asarray(value) != self._last[name]).reshape(
+                self.num_envs, -1,
+            ).any(axis=1)
+        ids = np.flatnonzero(stale)
+        if ids.size:
+            for name, value in carried.items():
+                row = self._rows[name]
+                row[ids] = np.asarray(value)[ids].reshape(row[ids].shape)
+
+        self._rows["ctrl"][:] = np.asarray(action)
+        # mjSTAGE_NONE, the default: derived fields lag the state by a substep,
+        # exactly as they do after `mjx.step`, which is what the tasks were
+        # written against.
+        self._batch.step(nstep=self._n_substeps)
+
+        out = {
+            name: self._rows[name].reshape(self._spec[name].shape).astype(FLOAT)
+            for name in self._spec
+        }
+        self._last = {name: out[name] for name in _BATCH_CARRIED}
+        return out
+
+    def _transition(self, state, action, keys, params):
+        carried = {name: getattr(state.data, name) for name in _BATCH_CARRIED}
+        # Ordered: the rows are stateful, so steps must run in sequence with each
+        # other and with the loop feeding them.
+        fields = io_callback(
+            self._step_physics, self._spec, carried, action, ordered=True,
         )
-        return VecState(env_state=None, obs=obs), timestep
+
+        def one(world, world_action, key, world_fields):
+            with _physics_already_stepped(
+                world_action, world_fields, self._n_substeps,
+            ):
+                return self.func_env.transition(world, world_action, key, params)
+
+        return jax.vmap(one)(state, action, keys, fields)

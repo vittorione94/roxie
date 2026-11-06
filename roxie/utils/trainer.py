@@ -30,8 +30,7 @@ def _new_epoch_acc(metric_keys):
 class Trainer:
     """One training loop over every backend.
 
-    What varies between a vmapped JAX env and a C++ EnvPool pool is behind
-    `roxie.utils.rollout`, which fuses a whole update window of acting,
+    `roxie.utils.rollout` fuses a whole update window of acting,
     physics, buffering and scoring into one compiled chunk. What is left here is
     the step budget, the epoch and save cadences, the learning pass's own
     bookkeeping, episode statistics and metric namespacing.

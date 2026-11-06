@@ -7,7 +7,7 @@ cd "$REPO_ROOT" || exit 1
 # --- 1. Configuration (Idiomatic defaults) ---
 : "${TASKS:=HumanoidWalk HumanoidRun HumanoidStand}"
 : "${AGENTS:=ppo}"
-: "${CELLS:=envpool_cpu}"
+: "${CELLS:=batch_cpu}"
 : "${FORCE:=1}"
 # Sized so the CPU budget divides: this is a per-run count of LOGICAL cores and
 # the slot count is (ncores - GPU reserve) / it, so 12 on a 24-thread box floors
@@ -102,7 +102,7 @@ echo "== plan: $MAX_CPU_JOBS concurrent CPU runs (${ncores}c, ${avail_gb}GB avai
 
 # --- 3. Signal Handling ---
 # The trainers are not our direct children: each job is
-#   script -> subshell -> uv -> python (-> envpool/vector workers)
+#   script -> subshell -> uv -> python (-> physics workers)
 # so `pkill -P $$` only reaps the subshell and orphans the rest onto init,
 # where they keep holding cores and RAM. Walk the whole tree instead.
 descendants() {
@@ -163,10 +163,8 @@ run_job() {
     local cmd=(uv run python roxie/train.py --config-name "dmc/bench_$a" "release.task=$t" "dmc/backend@backend=$c")
     local where="GPU"
     if [[ -n "$cores" ]]; then
-        # EnvPool owns a second thread pool on top of XLA's — only this cell
-        # has the key, so mjx_cpu (build_playground_env, no num_threads
-        # argument) must not get it or Hydra's instantiate() errors.
-        [[ "$c" == "envpool_cpu" ]] && cmd+=("env.num_threads=$CORES_PER_RUN")
+        # mujoco.batch owns a second thread pool on top of XLA's.
+        [[ "$c" == "batch_cpu" ]] && cmd+=("env.num_threads=$CORES_PER_RUN")
         # Thread cap applies whether or not pinning is available, otherwise each
         # run's BLAS/OMP pools fan out across every core and oversubscribe.
         cmd=(env "OMP_NUM_THREADS=$CORES_PER_RUN" "${cmd[@]}")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import os
 import sys
 from typing import Any
@@ -12,26 +11,14 @@ import jax
 from hydra.utils import get_class, get_method
 from omegaconf import OmegaConf
 
-from roxie.environment import suites
 from roxie.environment.functional import space_size
 from roxie.environment.loader import (
-    DEFAULT_BUILDER,
-    TRAINER_ENV_KEYS,
+    BATCH_IMPL,
     build_env,
-    build_playground_env,
     log_loaded_backend,
     publish_env_shapes,
-    uses_envpool,
 )
 from roxie.utils import hydra_searchpath
-
-# Keys build_playground_env accepts, so the EnvPool rewrite below can drop the
-# EnvPool-only ones (task_id, pool sizing) instead of passing them through.
-_PLAYGROUND_ENV_KEYS = (
-    set(inspect.signature(build_playground_env).parameters)
-    | set(TRAINER_ENV_KEYS)
-    | {"_target_"}
-)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,10 +43,9 @@ class Playback:
 
 
 def register_search_paths() -> None:
-    """Puts the repo root and cwd on `sys.path` and registers config resolvers."""
+    """Puts the repo root and cwd on `sys.path`."""
     sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
     sys.path.insert(0, os.getcwd())
-    suites.register_resolvers()
 
 
 def load_config(checkpoint_path: str, overrides: tuple[str, ...] = ()) -> Any:
@@ -71,26 +57,11 @@ def load_config(checkpoint_path: str, overrides: tuple[str, ...] = ()) -> Any:
     return cfg
 
 
-def resolve_single_world(cfg: Any, *, verbose: bool = True) -> Any:
+def resolve_single_world(cfg: Any) -> Any:
     """Rewrites a trained config onto a backend that can step one world."""
-    if cfg.env.get("impl", None) == "warp":
+    if cfg.env.get("impl", None) in ("warp", BATCH_IMPL):
         cfg.env.impl = "jax"
-
-    if uses_envpool(cfg.env):
-        task = suites.playground_task(cfg.env.task_id)
-        if verbose:
-            print(
-                f"EnvPool has no single-world stepper; replaying "
-                f"{cfg.env.task_id} on playground twin {task!r}.",
-                flush=True,
-            )
-        cfg.env["_target_"] = DEFAULT_BUILDER
-        cfg.env.env_name = task
-        cfg.env.impl = "jax"
-        cfg.env.pop("task_id", None)
-        for key in list(cfg.env.keys()):
-            if key not in _PLAYGROUND_ENV_KEYS:
-                cfg.env.pop(key, None)
+    cfg.env.pop("num_threads", None)
 
     matmul_precision = (cfg.get("runtime") or {}).get("matmul_precision", None)
     if matmul_precision:
@@ -108,7 +79,7 @@ def load_policy(
     """Restores the agent and the single-world env its checkpoint was trained on."""
     register_search_paths()
     cfg = resolve_single_world(
-        load_config(checkpoint_path, overrides), verbose=verbose
+        load_config(checkpoint_path, overrides)
     )
 
     env, _, _env_cfg = build_env(cfg.env, mode="play", num_envs=1, test_episodes=1)

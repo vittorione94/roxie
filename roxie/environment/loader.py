@@ -1,17 +1,23 @@
 """Environment loading, MuJoCo adapters, and vector environment builders."""
 
+import functools
 import os
 from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from hydra.utils import get_method, instantiate
+import mujoco
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf, open_dict
 from mujoco_playground import registry
 
 from roxie.environment import functional, suites
 from roxie.environment.functional import FuncEnv
-from roxie.environment.vector import EnvPoolVectorEnv, JaxVectorEnv
+from roxie.environment.vector import BatchVectorEnv, JaxVectorEnv
+
+# playground 0.2.0's reacher.py still calls this; MuJoCo renamed it to `body`.
+if not hasattr(mujoco.MjSpec, "find_body"):
+    mujoco.MjSpec.find_body = mujoco.MjSpec.body
 
 
 class MuJoCoFuncEnv(FuncEnv):
@@ -55,6 +61,9 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
         return getattr(self.env, name)
 
 
+BATCH_IMPL = "batch"
+
+
 def _read_impl(env: Any) -> str:
     """Extracts the underlying physics implementation string from an environment."""
     impl = getattr(env, "_impl", None)
@@ -81,8 +90,8 @@ def resolve_agent_device() -> tuple[str, str]:
 def resolve_env_device(env: Any) -> tuple[str, str]:
     """Identifies the physics execution device and backend description."""
     impl = resolve_loaded_impl(env)
-    if impl == "envpool":
-        return "cpu", "native MuJoCo, C++ thread pool"
+    if impl == BATCH_IMPL:
+        return "cpu", "native MuJoCo, mujoco.batch thread pool"
     device, backend = resolve_agent_device()
     return device, f"{impl} kernels on the JAX device ({backend})"
 
@@ -154,8 +163,9 @@ def load_playground_env(
 ):
     """Loads a `mujoco_playground` environment with optional overrides."""
     env_cfg = registry.get_default_config(env_name)
+    # `batch` swaps only the step: resets and the task's model stay on MJX.
     if impl is not None and "impl" in env_cfg:
-        env_cfg.impl = impl
+        env_cfg.impl = "jax" if impl == BATCH_IMPL else impl
     if naconmax is not None and "naconmax" in env_cfg:
         env_cfg.naconmax = naconmax
     if njmax is not None and "njmax" in env_cfg:
@@ -164,7 +174,7 @@ def load_playground_env(
     env = registry.load(env_name, config=env_cfg)
     if str(env_cfg.get("impl", "")) == "warp":
         _set_graph_mode(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
-    return PlaygroundFuncEnv(env), env_cfg
+    return PlaygroundFuncEnv(env, impl=BATCH_IMPL if impl == BATCH_IMPL else None), env_cfg
 
 
 class EnvBundle(NamedTuple):
@@ -208,8 +218,13 @@ def build_playground_env(
     njmax: int | None = None,
     graph_mode: str | None = None,
     max_episode_steps: int | None = None,
+    num_threads: int | None = None,
 ) -> EnvBundle:
     """Instantiates vectorized training and test drivers for `mujoco_playground` tasks."""
+    if impl == BATCH_IMPL and env_name not in suites.DMC_TASKS:
+        raise ValueError(
+            f"impl=batch supports the dm_control suite tasks, not {env_name!r}."
+        )
     func_env, env_cfg = load_playground_env(
         env_name, impl=impl, naconmax=naconmax, njmax=njmax,
         graph_mode=graph_mode,
@@ -219,51 +234,15 @@ def build_playground_env(
         or env_cfg.get("episode_length", None)
         or DEFAULT_MAX_EPISODE_STEPS
     )
+    if impl == BATCH_IMPL:
+        driver = functools.partial(BatchVectorEnv, num_threads=num_threads)
+    else:
+        driver = JaxVectorEnv
     return EnvBundle(
-        env=JaxVectorEnv(func_env, num_envs, max_episode_steps=max_steps),
-        test_env=JaxVectorEnv(func_env, test_episodes, max_episode_steps=max_steps),
+        env=driver(func_env, num_envs, max_episode_steps=max_steps),
+        test_env=driver(func_env, test_episodes, max_episode_steps=max_steps),
         env_cfg=env_cfg,
     )
-
-
-def build_envpool_env(
-    task_id: str,
-    *,
-    mode: str = "train",
-    num_envs: int = 1,
-    test_episodes: int = 1,
-    seed: int = 0,
-    max_episode_steps: int | None = None,
-    **task_kwargs: Any,
-) -> EnvBundle:
-    """Instantiates vectorized training and test drivers for C++ EnvPool tasks."""
-    import envpool
-
-    max_steps = int(max_episode_steps or DEFAULT_MAX_EPISODE_STEPS)
-    seed = int(seed)
-    obs_keys = suites.envpool_obs_keys(task_id)
-
-    def make_pool(n: int, pool_seed: int):
-        return envpool.make(
-            task_id,
-            env_type="gymnasium",
-            num_envs=n,
-            seed=pool_seed,
-            max_episode_steps=max_steps,
-            **task_kwargs,
-        )
-
-    train_env = EnvPoolVectorEnv(
-        make_pool(num_envs, seed), num_envs=num_envs,
-        max_episode_steps=max_steps, obs_keys=obs_keys,
-    )
-    test_env = EnvPoolVectorEnv(
-        make_pool(test_episodes, seed + 1), num_envs=test_episodes,
-        max_episode_steps=max_steps, obs_keys=obs_keys,
-        rebuild=lambda s: make_pool(test_episodes, s),
-    )
-
-    return EnvBundle(env=train_env, test_env=test_env, env_cfg=None)
 
 
 DEFAULT_BUILDER = "roxie.environment.loader.build_playground_env"
@@ -274,12 +253,9 @@ def builder_target(cfg_env: Any) -> str:
     return cfg_env.get("_target_", None) or DEFAULT_BUILDER
 
 
-def uses_envpool(cfg_env: Any) -> bool:
-    """Determines whether the environment configuration target points to EnvPool."""
-    try:
-        return get_method(builder_target(cfg_env)) is build_envpool_env
-    except Exception:
-        return False
+def uses_batch(cfg_env: Any) -> bool:
+    """Determines whether the environment configuration steps on `mujoco.batch`."""
+    return cfg_env.get("impl", None) == BATCH_IMPL
 
 
 DEVICES = ("cpu", "gpu")
@@ -293,10 +269,11 @@ def resolve_placement(cfg: Any) -> tuple[str | None, str | None]:
             f"runtime.device={device!r} is not one of {DEVICES}."
         )
 
-    if uses_envpool(cfg.env):
+    if uses_batch(cfg.env):
         if device == "gpu":
             raise ValueError(
-                "runtime.device=gpu cannot be used with EnvPool environments."
+                "runtime.device=gpu cannot be used with impl=batch: its physics "
+                "runs on CPU threads."
             )
         device = "cpu"
 
