@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - /dmc/agent@agent: mpo_bench
+  - /env: multitask
+  - /curriculum: null
+  - _self_
+
+env:
+  task_defaults:
+    _target_: roxie.environment.loader.build_playground_env
+    impl: warp
+  tasks:
+    stand: {env_name: HumanoidStand}
+    walk: {env_name: HumanoidWalk}
+    run: {env_name: HumanoidRun}
+  weights: {stand: 1, walk: 1, run: 1}
+  seed: 0
+  parallel_envs: 256
+
+runtime:
+  device: gpu
+  matmul_precision: tensorfloat32
+
+trainer:
+  steps: 500_000_000
+  epoch_steps: 500_000
+  save_steps: 5_000_000
+  test_episodes: 10
+  show_progress: true
+  replace_checkpoint: false
+  save_buffer: false
+
+hydra:
+  run:
+    dir: outputs/humanoid/mpo/${now:%Y-%m-%d_%H-%M-%S}
