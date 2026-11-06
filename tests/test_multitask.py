@@ -248,6 +248,20 @@ def test_loader_reads_the_backend_through_the_tasks():
     assert requested_impl(OmegaConf.create({"impl": "jax"})) == "jax"
 
 
+def test_humanoid_launchable_composes_the_three_tasks_on_warp():
+    from hydra import compose, initialize_config_dir
+
+    from roxie.utils import hydra_searchpath
+
+    hydra_searchpath.register()
+    with initialize_config_dir(config_dir=str(REPO / "roxie" / "configs"),
+                               version_base=None):
+        cfg = compose(config_name="humanoid/sac")
+    assert list(cfg.env.tasks) == ["stand", "walk", "run"]
+    assert requested_impl(cfg.env) == "warp"
+    assert not uses_batch(cfg.env)
+
+
 # ---- per-task observation statistics ---------------------------------------
 
 

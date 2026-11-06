@@ -39,6 +39,13 @@ Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch 
 
 A multi-task launchable names its tasks in an env block ([environments.md](environments.md#several-tasks-at-once)). 
 
+[`experiments/humanoid/sac.yaml`](../experiments/humanoid/sac.yaml) trains one policy for mujoco_playground's humanoid stand, walk and run, on Warp:
+
+```bash
+uv run --group cuda python roxie/train.py --config-name humanoid/sac
+uv run --group cuda python roxie/train.py --config-name humanoid/sac curriculum=learning_progress
+```
+
 The env block's `weights` fix each task's share of the worlds for the run. A **curriculum** steers what the learner samples from them instead: at every epoch boundary it reads each task's training score and sets the replay's task weights for the passes that follow. [`roxie/configs/curriculum/`](../roxie/configs/curriculum/) holds `learning_progress`, which favours the tasks whose score is moving, and `weighted`, which pins fixed weights. A curriculum needs a multi-task env and an off-policy agent; `train.py` refuses anything else at launch.
 
 Each task logs under its own name:
