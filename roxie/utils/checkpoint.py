@@ -179,6 +179,10 @@ class AgentCheckpointer:
         for key in ("action_low", "action_high"):
             if key in hyper:
                 init_kwargs[key] = jnp.asarray(hyper[key], dtype=jnp.float32)
+        if hyper.get("task_counts"):
+            init_kwargs["env_task_counts"] = tuple(
+                int(c) for c in hyper["task_counts"]
+            )
 
         if agent_cls.hyperparams_cls is not None:
             fields = {f.name for f in dataclasses.fields(agent_cls.hyperparams_cls)}
@@ -253,6 +257,15 @@ class AgentCheckpointer:
                   "leaving observation normalization at its init values.")
             return
         obs = ckpt_state["obs_stats"]
+        for name in ("count", "sum", "sumsq"):
+            saved, current = np.shape(obs[name]), jnp.shape(getattr(live, name))
+            if saved != current:
+                # Rows are tasks and columns features: a mismatch is a
+                # different task set or layout, never something to broadcast.
+                raise ValueError(
+                    f"checkpoint obs_stats.{name} is {saved}, but this "
+                    f"agent's is {current}: the env's task layout differs."
+                )
         self.agent.state.obs_stats = live.replace(
             count=jnp.asarray(obs["count"], jnp.result_type(live.count)),
             sum=jnp.asarray(obs["sum"], jnp.result_type(live.sum)),

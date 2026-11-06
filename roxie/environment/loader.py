@@ -7,7 +7,7 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import mujoco
-from hydra.utils import instantiate
+from hydra.utils import get_method, instantiate
 from omegaconf import DictConfig, OmegaConf, open_dict
 from mujoco_playground import registry
 
@@ -253,9 +253,50 @@ def builder_target(cfg_env: Any) -> str:
     return cfg_env.get("_target_", None) or DEFAULT_BUILDER
 
 
+def _builds_with(cfg_env: Any, builder) -> bool:
+    try:
+        return get_method(builder_target(cfg_env)) is builder
+    except Exception:
+        return False
+
+
+def is_multitask(cfg_env: Any) -> bool:
+    """Whether the env block composes several tasks into one batch."""
+    from roxie.environment import multitask  # it builds through this module
+
+    return _builds_with(cfg_env, multitask.build_multitask_env)
+
+
+def task_blocks(cfg_env: Any) -> list:
+    """Each task's own env block, `task_defaults` merged in; `[cfg_env]` if single."""
+    if not is_multitask(cfg_env):
+        return [cfg_env]
+    def plain(node):
+        # Unresolved, and copied out of the composed config: Hydra locks it,
+        # so a task block's own keys could not be merged into the defaults.
+        if OmegaConf.is_config(node):
+            return OmegaConf.to_container(node, resolve=False)
+        return dict(node or {})
+
+    defaults = plain(cfg_env.get("task_defaults", None))
+    return [
+        {**defaults, **plain(block)}
+        for block in (cfg_env.get("tasks", None) or {}).values()
+    ]
+
+
 def uses_batch(cfg_env: Any) -> bool:
-    """Determines whether the environment configuration steps on `mujoco.batch`."""
-    return cfg_env.get("impl", None) == BATCH_IMPL
+    """Whether the block steps on `mujoco.batch`, read through a multi-task one."""
+    blocks = task_blocks(cfg_env)
+    return bool(blocks) and all(
+        block.get("impl", None) == BATCH_IMPL for block in blocks
+    )
+
+
+def requested_impl(cfg_env: Any) -> str | None:
+    """The physics `impl` the block asks for, read through a multi-task one's tasks."""
+    impls = {block.get("impl", None) for block in task_blocks(cfg_env)}
+    return impls.pop() if len(impls) == 1 else None
 
 
 DEVICES = ("cpu", "gpu")
@@ -347,6 +388,10 @@ def build_env(
         resolved = dict(cfg_env)
     node = {k: v for k, v in resolved.items() if k not in TRAINER_ENV_KEYS}
     node["_target_"] = builder_target(cfg_env)
+    # Not recursive, as `build_agent` is not: a builder receives its nested
+    # blocks as data and builds them itself, which is how the multi-task
+    # builder hands each task's block to that task's own builder.
     return instantiate(
-        node, mode=mode, num_envs=num_envs, test_episodes=test_episodes,
+        node, _recursive_=False, mode=mode, num_envs=num_envs,
+        test_episodes=test_episodes,
     )

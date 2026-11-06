@@ -23,8 +23,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from hydra.core.hydra_config import HydraConfig
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
+from roxie.agents.hyperparams import OffPolicyHyperparams
 from roxie.agents.utils import build_agent
 from roxie.environment.functional import space_size
 from roxie.environment.loader import (
@@ -32,6 +34,7 @@ from roxie.environment.loader import (
     log_loaded_backend,
     pin_cpu_cores,
     publish_env_shapes,
+    requested_impl,
     resolve_placement,
 )
 from roxie.utils import hydra_searchpath, logger, precision
@@ -47,7 +50,10 @@ def main(cfg: DictConfig):
     """Parses environment/agent configuration and runs the training pipeline."""
     print("Agent:", cfg.agent._target_)
 
-    if cfg.env.get("impl", None) == "warp":
+    # Read through a multi-task block's tasks: there the backend sits in
+    # `task_defaults`, and missing it here would skip Warp's memory setup.
+    impl = requested_impl(cfg.env)
+    if impl == "warp":
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
 
     runtime_cfg = cfg.get("runtime") or {}
@@ -80,7 +86,6 @@ def main(cfg: DictConfig):
     print("JAX devices:", jax.devices())
     print("JAX platform:", jax.default_backend())
 
-    impl = cfg.env.get("impl", None)
     env, test_env, env_cfg = build_env(
         cfg.env,
         mode="train",
@@ -129,8 +134,20 @@ def main(cfg: DictConfig):
     )
     if "noise" in cfg:
         agent_kwargs["noise_config"] = cfg.noise
+    task_counts = getattr(env, "task_counts", None)
+    if task_counts is not None:
+        agent_kwargs["env_task_counts"] = tuple(task_counts)
 
     agent = build_agent(cfg.agent, **agent_kwargs)
+
+    curriculum = None
+    if cfg.get("curriculum", None):
+        if task_counts is None or not isinstance(agent.hp, OffPolicyHyperparams):
+            raise ValueError(
+                "a curriculum weights a multi-task env's replay by task, so "
+                "it needs a multi-task env and an off-policy agent."
+            )
+        curriculum = instantiate(cfg.curriculum)
 
     resume_cfg = cfg.get("resume") or {}
     if isinstance(resume_cfg, str):
@@ -161,6 +178,7 @@ def main(cfg: DictConfig):
         replace_checkpoint=cfg.trainer.replace_checkpoint,
         save_buffer=bool(cfg.trainer.get("save_buffer", False)),
         resume=resume_metadata,
+        curriculum=curriculum,
     )
     test_environment = test_env if test_env is not None else env
     trainer.initialize(

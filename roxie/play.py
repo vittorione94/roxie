@@ -100,10 +100,16 @@ def _write_state_data(state, **fields):
 
 @click.command(context_settings=dict(ignore_unknown_options=True))
 @click.option("--checkpoint-path", type=str, help="Path to the checkpoint directory.")
+@click.option(
+    "--task-id", type=str, default=None,
+    help="For a multi-task run, the name of the task to replay.",
+)
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
-def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
+def main(
+    checkpoint_path: str, task_id: str | None, overrides: tuple[str, ...],
+) -> None:
     """Replays a trained agent checkpoint in an interactive MuJoCo viewer."""
-    play = playback.load_policy(checkpoint_path, overrides)
+    play = playback.load_policy(checkpoint_path, overrides, task_id=task_id)
     cfg, func_env, agent = play.cfg, play.func_env, play.agent
 
     key = jax.random.PRNGKey(seed=0)
@@ -184,7 +190,7 @@ def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
                 )
                 perturbing = pert_active
 
-            obs_b = jnp.expand_dims(state.obs, axis=0)
+            obs_b = jnp.expand_dims(play.observe(state.obs), axis=0)
             action, _noise, _extras = agent.select_action(
                 obs_b, key, evaluate=True,
             )

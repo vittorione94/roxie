@@ -137,7 +137,7 @@ class TestNonFiniteNeverPersists:
     """
 
     def test_obs_stats_survive_a_nan_observation(self):
-        stats = init_obs_stats((3,))
+        stats = init_obs_stats(3)
         obs = jnp.array([[1.0, 2.0, 3.0], [jnp.nan, jnp.inf, 1.0]])
 
         stats = update_obs_stats(stats, obs)
@@ -149,7 +149,7 @@ class TestNonFiniteNeverPersists:
     def test_a_later_clean_batch_still_normalizes(self):
         """The failure this prevents: once the sums are NaN, EVERY agent sees
         NaN for EVERY env forever, whether or not anything is still diverging."""
-        stats = init_obs_stats((3,))
+        stats = init_obs_stats(3)
         stats = update_obs_stats(stats, jnp.full((2, 3), jnp.nan))
         stats = update_obs_stats(stats, jnp.ones((2, 3), dtype=jnp.float32))
 
@@ -194,7 +194,8 @@ class TestObsStats:
         """Sums in, mean/std out. The variance is taken as E[x^2] - E[x]^2, so
         this pins the recovery rather than only the accumulation."""
         stats = init_obs_stats(2)
-        assert stats.sum.shape == stats.sumsq.shape == (2,)
+        # One row per task; a single-task env is the one-row case.
+        assert stats.sum.shape == stats.sumsq.shape == (1, 2)
         # Empty is mean 0 / std 1, so normalization before any data is inert.
         assert jnp.allclose(obs_mean_std(stats, eps=1e-8)[0], 0.0)
 
@@ -209,8 +210,8 @@ class TestObsStats:
         assert jnp.allclose(std, jnp.sqrt(expected_var + 1e-8), atol=1e-5)
 
     def test_normalize_obs_is_a_z_score_inside_the_clip(self):
-        mean = jnp.array([5.0, 10.0], dtype=jnp.float32)
-        std = jnp.array([5.0, 5.0], dtype=jnp.float32)
+        mean = jnp.array([[5.0, 10.0]], dtype=jnp.float32)
+        std = jnp.array([[5.0, 5.0]], dtype=jnp.float32)
         result = normalize_obs(
             jnp.array([10.0, 20.0], dtype=jnp.float32), mean, std, clip=5.0
         )
@@ -220,8 +221,8 @@ class TestObsStats:
         # as a hundred standard deviations.
         clipped = normalize_obs(
             jnp.array([100.0], dtype=jnp.float32),
-            jnp.zeros(1, dtype=jnp.float32),
-            jnp.ones(1, dtype=jnp.float32),
+            jnp.zeros((1, 1), dtype=jnp.float32),
+            jnp.ones((1, 1), dtype=jnp.float32),
             clip=3.0,
         )
         assert jnp.isclose(clipped, 3.0)
@@ -236,8 +237,8 @@ class TestObsStats:
         """
         far = normalize_obs(
             jnp.array([8.5, 6.5], dtype=jnp.float32),
-            jnp.zeros(2, dtype=jnp.float32),
-            jnp.ones(2, dtype=jnp.float32),
+            jnp.zeros((1, 2), dtype=jnp.float32),
+            jnp.ones((1, 2), dtype=jnp.float32),
             clip=None,
         )
         assert jnp.allclose(far, jnp.array([8.5, 6.5], dtype=jnp.float32))

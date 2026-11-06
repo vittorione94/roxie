@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import math
 
+from roxie.utils.precision import FLOAT
+
 
 @jax.jit
 def scale_to_env(x: jnp.ndarray, low: jnp.ndarray, high: jnp.ndarray) -> jnp.ndarray:
@@ -26,7 +28,12 @@ def finite_or_zero(x: jnp.ndarray) -> jnp.ndarray:
 def normalize_obs(
     x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, clip: float | None
 ) -> jnp.ndarray:
-    """Standardizes observations using running moments, clipping if asked.
+    """Standardizes observations by their own task's moments, clipping if asked.
+
+    `mean` and `std` are `(K, D)`, one row per task. An observation exactly `D`
+    wide is the single-task case and takes row 0. A wider one carries its task
+    as a trailing one-hot, which picks the row and passes through untouched, so
+    the network always sees an exact one-hot.
 
     `clip=None` leaves the z-score unbounded, which a task whose informative
     states are far in the tail of its own running distribution needs: on
@@ -34,25 +41,46 @@ def normalize_obs(
     sets the moments, so standing sits at z ~ 8.5 and a bound of 5 maps the
     whole upright-to-falling range onto one number (measured 2026-09-20).
     """
-    z = (x - mean) / std
-    return z if clip is None else jnp.clip(z, -clip, clip)
+    width = mean.shape[-1]
+    if x.shape[-1] == width:
+        z = (x - mean[0]) / std[0]
+        return z if clip is None else jnp.clip(z, -clip, clip)
+    hot = x[..., width:]
+    # Picked by argmax rather than read off `hot @ std`: a terminated n-step
+    # window bootstraps from an all-zero observation, one-hot included, and the
+    # product would divide by a std of zero there.
+    task = jnp.argmax(hot, axis=-1)
+    z = (x[..., :width] - mean[task]) / std[task]
+    z = z if clip is None else jnp.clip(z, -clip, clip)
+    return jnp.concatenate([z, hot], axis=-1)
 
 
 @struct.dataclass
 class ObsStats:
-    """Running moment accumulators for observation normalization."""
+    """Running moment accumulators for observation normalization, per task.
+
+    One row per task, and a single-task env is the one-row case. A multi-task
+    env zero-pads every task's observation to the widest one, so a column a
+    task does not fill only ever accumulates zeros: its mean stays 0 and it
+    normalizes to exactly 0. That is the whole observation mask.
+
+    Attributes:
+        count: `(K,)` observations folded in per task.
+        sum: `(K, D)` per-task column sums, over the features only.
+        sumsq: `(K, D)` per-task column sums of squares.
+    """
 
     count: jnp.ndarray
     sum: jnp.ndarray
     sumsq: jnp.ndarray
 
 
-def init_obs_stats(obs_shape) -> ObsStats:
-    """Initializes zero-filled observation statistics for a given shape."""
+def init_obs_stats(width: int, num_tasks: int = 1) -> ObsStats:
+    """Zeroed statistics over `width` feature columns for `num_tasks` tasks."""
     return ObsStats(
-        count=jnp.array(0.0, dtype=jnp.float32),
-        sum=jnp.zeros(obs_shape, dtype=jnp.float32),
-        sumsq=jnp.zeros(obs_shape, dtype=jnp.float32),
+        count=jnp.zeros((num_tasks,), dtype=FLOAT),
+        sum=jnp.zeros((num_tasks, width), dtype=FLOAT),
+        sumsq=jnp.zeros((num_tasks, width), dtype=FLOAT),
     )
 
 def inv_softplus(y: float) -> float:
@@ -61,24 +89,39 @@ def inv_softplus(y: float) -> float:
 
 @jax.jit
 def update_obs_stats(stats: ObsStats, batch_obs: jnp.ndarray) -> ObsStats:
-    """Updates running sum accumulators with a batch of observations."""
+    """Folds a `(B, D)` batch, or a `(B, D + K)` one with its one-hot, in."""
     batch_obs = finite_or_zero(batch_obs)
-    b = batch_obs.shape[0]
-    batch_sum = jnp.sum(batch_obs, axis=0)
-    batch_sumsq = jnp.sum(jnp.square(batch_obs), axis=0)
+    width = stats.sum.shape[-1]
+    if batch_obs.shape[-1] == width:
+        return stats.replace(
+            count=stats.count + batch_obs.shape[0],
+            sum=stats.sum + jnp.sum(batch_obs, axis=0),
+            sumsq=stats.sumsq + jnp.sum(jnp.square(batch_obs), axis=0),
+        )
+    features, hot = batch_obs[:, :width], batch_obs[:, width:]
+
+    def per_task(values):
+        # HIGHEST: these are running sums, and the GPU cells' tensorfloat32
+        # default would round every observation to a 10-bit mantissa on its
+        # way into them.
+        return jnp.einsum(
+            "bk,bd->kd", hot, values, precision=jax.lax.Precision.HIGHEST,
+        )
+
     return stats.replace(
-        count=stats.count + b,
-        sum=stats.sum + batch_sum,
-        sumsq=stats.sumsq + batch_sumsq,
+        count=stats.count + jnp.sum(hot, axis=0),
+        sum=stats.sum + per_task(features),
+        sumsq=stats.sumsq + per_task(jnp.square(features)),
     )
 
 
 def obs_mean_std(stats: ObsStats, eps: float) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Computes mean and standard deviation from running statistics."""
-    count = jnp.maximum(stats.count, 1.0)
-    mean = stats.sum / count
-    var = jnp.maximum(stats.sumsq / count - jnp.square(mean), 0.0)
-    std = jnp.where(stats.count > 1.0, jnp.sqrt(var + eps), 1.0)
+    """`(K, D)` means and standard deviations from the running sums."""
+    count = stats.count[:, None]
+    safe = jnp.maximum(count, 1.0)
+    mean = stats.sum / safe
+    var = jnp.maximum(stats.sumsq / safe - jnp.square(mean), 0.0)
+    std = jnp.where(count > 1.0, jnp.sqrt(var + eps), 1.0)
     return mean, std
 
 

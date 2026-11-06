@@ -33,7 +33,9 @@ def _d4pg_grad_step(
 ):
     """Executes a single D4PG gradient step updating actor and categorical critic networks."""
     key, noise_key = jax.random.split(key)
-    samples = replay_sample_fn(state.buffer_state, key)
+    samples = replay_sample_fn(
+        state.buffer_state, key, state.task_weights
+    )
     re_packed_samples = repack_samples(samples, hp.gamma, hp.n_step)
     re_packed_samples = normalize_samples(
         re_packed_samples,
@@ -133,7 +135,7 @@ class D4PG(DDPG):
             agent_rng,
             target_steps,
             self.hp,
-            self.replay.sample,
+            self.replay.draw,
             self.action_low,
             self.action_high,
         )

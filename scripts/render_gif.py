@@ -32,7 +32,7 @@ from PIL import Image
 from roxie.utils import playback
 
 
-def roll_episode(agent, reset, step, key, max_steps):
+def roll_episode(agent, reset, step, key, max_steps, observe):
     """Runs one episode, returning `(score, qpos frames, qvel frames)`."""
     state = reset(key)
     qpos, qvel = [np.array(state.data.qpos)], [np.array(state.data.qvel)]
@@ -40,7 +40,7 @@ def roll_episode(agent, reset, step, key, max_steps):
 
     for _ in range(max_steps):
         action, _noise, _extras = agent.select_action(
-            jnp.expand_dims(state.obs, axis=0), key, evaluate=True,
+            jnp.expand_dims(observe(state.obs), axis=0), key, evaluate=True,
         )
         state = step(state, action[0])
         qpos.append(np.array(state.data.qpos))
@@ -132,13 +132,18 @@ def write_gif(frames, path, fps, colors, dither):
 @click.option("--colors", default=128, help="GIF palette size.")
 @click.option("--dither/--no-dither", default=False, help="Dither the palette.")
 @click.option("--seed", default=0, help="Seed for the episode resets.")
+@click.option(
+    "--task-id", default=None,
+    help="For a multi-task run, the name of the task to render.",
+)
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
 def main(
     checkpoint_path, output, camera, distance, azimuth, elevation,
-    width, height, seconds, fps, episodes, skip, colors, dither, seed, overrides,
+    width, height, seconds, fps, episodes, skip, colors, dither, seed, task_id,
+    overrides,
 ):
     """Renders a checkpoint's policy to an animated GIF."""
-    play = playback.load_policy(checkpoint_path, overrides)
+    play = playback.load_policy(checkpoint_path, overrides, task_id=task_id)
     func_env = play.func_env
     model = func_env.mj_model
 
@@ -153,7 +158,9 @@ def main(
     best = None
     for episode in range(episodes):
         key, reset_key = jax.random.split(key)
-        score, qpos, qvel = roll_episode(play.agent, reset, step, reset_key, wanted)
+        score, qpos, qvel = roll_episode(
+            play.agent, reset, step, reset_key, wanted, play.observe,
+        )
         print(
             f"episode {episode}: score={score:.1f} steps={len(qpos) - 1}", flush=True
         )

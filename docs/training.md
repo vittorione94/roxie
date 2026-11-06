@@ -35,6 +35,29 @@ The env is a config group like the agent — [`roxie/configs/env/`](../roxie/con
 
 Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch metrics to console + CSV, checkpoints under `checkpoints/`, and optionally Weights & Biases (`logging.wandb.enabled: true`).
 
+## Several tasks
+
+A multi-task launchable names its tasks in an env block ([environments.md](environments.md#several-tasks-at-once)). 
+
+The env block's `weights` fix each task's share of the worlds for the run. A **curriculum** steers what the learner samples from them instead: at every epoch boundary it reads each task's training score and sets the replay's task weights for the passes that follow. [`roxie/configs/curriculum/`](../roxie/configs/curriculum/) holds `learning_progress`, which favours the tasks whose score is moving, and `weighted`, which pins fixed weights. A curriculum needs a multi-task env and an off-policy agent; `train.py` refuses anything else at launch.
+
+Each task logs under its own name:
+
+| Key | What |
+|---|---|
+| `train/task/<name>/score` | mean return of the task's episodes that finished this epoch; absent when none did |
+| `train/task/<name>/reward` | mean per-step reward over the task's worlds |
+| `train/task/<name>/weight` | the replay weight the curriculum chose for the next epoch |
+| `test/task/<name>/score` | the task's eval return, over its own eval worlds |
+
+A resume restarts the curriculum's averages.
+
+`play.py` and `scripts/render_gif.py` replay one task of a multi-task run at a time, named with `--task-id`. The world runs that task's own env, and the policy gets its observation padded to the trained width with the task's one-hot appended; the checkpoint records each task's width, so a replay env that disagrees is refused rather than misread:
+
+```bash
+uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000 --task-id walk
+```
+
 ## Resume
 
 ```bash

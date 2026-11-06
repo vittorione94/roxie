@@ -101,6 +101,32 @@ env:
   impl: warp
 ```
 
+## Several tasks at once
+
+[`roxie/environment/multitask.py`](../roxie/environment/multitask.py) trains one policy on several tasks by composing their envs into one batch. Each task is an ordinary env block, built by its own builder, with its own physics, observation and reward. Nothing is shared between tasks or detected about them; they only have to agree on an action space. `build_multitask_env` is the builder and [`roxie/configs/env/multitask.yaml`](../roxie/configs/env/multitask.yaml) its group file:
+
+```yaml
+env:
+  task_defaults:                     # what every task shares: builder, backend
+    _target_: roxie.environment.loader.build_playground_env
+    impl: warp
+  tasks:
+    stand: {env_name: HumanoidStand}
+    run: {env_name: HumanoidRun}
+  weights: {stand: 1, run: 3}        # each task's share of `parallel_envs`
+```
+
+The rollout, the agents and the replay see one env:
+
+- **Worlds.** Each task gets a fixed, contiguous block of worlds, in one-hot order, sized by `weights` at launch. A world never changes task: its physics belongs to its task's env, and moving it would mean recompiling.
+- **Observations.** Each task's own, zero-padded to the widest task, then the task's one-hot. The padding is the observation mask: the agent keeps its statistics per task, so a column a task does not fill only ever accumulates zeros and normalizes to exactly zero ([agents.md](agents.md#observation-normalization)).
+- **Rewards and done flags.** Each task's own, untouched.
+- **Eval.** Every task gets `trainer.test_episodes` worlds of its own, whatever the weights.
+
+`MultiTaskJaxEnv` steps the task envs side by side inside the trace, threading each task's own `params` through its own hooks. Every task must run on the same backend: mixing `impl: batch` with anything else is refused.
+
+The weights fix what the worlds *collect*. What the learner *trains on* is the replay's to steer, through a curriculum ([training.md](training.md#several-tasks)).
+
 ## Spaces
 
 Envs declare `gymnasium.spaces.Box` observation and action spaces; drivers expose them as `single_observation_space` / `single_action_space`. `train.py` derives `env_obs_size`, `env_action_size`, `action_low` and `action_high` from them — the four arguments it injects into every agent constructor ([configuration.md](configuration.md)). For a MuJoCo env the action bounds come from `mj_model.actuator_ctrlrange`.
