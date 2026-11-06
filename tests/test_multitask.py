@@ -497,10 +497,8 @@ def test_select_task_refuses_a_task_the_run_did_not_train():
         select_task(OmegaConf.create({"env": {"env_name": "WalkerWalk"}}), "walk")
 
 
-def test_one_task_of_a_multi_task_checkpoint_plays_back(tmp_path, rng_key):
-    """Saved through the trainer, replayed through the real loader."""
-    from roxie.utils.playback import load_policy
-
+def _saved_multi_task_run(tmp_path, cfg=None):
+    """Saves through the trainer; returns the checkpoint's step directory."""
     bundle = _toy()
     agent = _sac(bundle.env)
     trainer = Trainer(output_dir=str(tmp_path))
@@ -508,11 +506,65 @@ def test_one_task_of_a_multi_task_checkpoint_plays_back(tmp_path, rng_key):
     trainer._save(agent, epochs=1, episodes=0, gradient_steps=0)
     trainer._checkpoint_manager.close()
     (tmp_path / ".hydra").mkdir()
-    OmegaConf.save(_run_config(), tmp_path / ".hydra" / "config.yaml")
+    OmegaConf.save(cfg or _run_config(), tmp_path / ".hydra" / "config.yaml")
+    return str(tmp_path / "checkpoints" / "100")
 
+
+def test_every_task_of_a_run_replays_under_one_agent(tmp_path):
+    from roxie.utils.playback import load_tasks
+
+    plays = load_tasks(_saved_multi_task_run(tmp_path), verbose=False)
+    assert list(plays) == ["narrow", "wide"]
+    assert plays["narrow"].agent is plays["wide"].agent
+    assert plays["narrow"].func_env is not plays["wide"].func_env
+
+
+def test_the_backend_banner_prints_once_however_many_tasks(tmp_path, capsys):
+    from roxie.utils.playback import load_tasks
+
+    load_tasks(_saved_multi_task_run(tmp_path), verbose=True)
+    assert capsys.readouterr().out.count("PHYSICS BACKEND LOADED") == 1
+
+
+def test_a_task_that_cannot_replay_is_left_out(tmp_path, capsys):
+    from roxie.utils.playback import load_tasks
+
+    cfg = _run_config()
+    # The saved layout says this task trained on 4 columns.
+    cfg.env.tasks.wide.width = 3
+    plays = load_tasks(_saved_multi_task_run(tmp_path, cfg), verbose=False)
+    assert list(plays) == ["narrow"]
+    assert "Leaving out task 'wide'" in capsys.readouterr().out
+
+
+def test_a_run_with_no_task_that_replays_is_refused(tmp_path):
+    from roxie.utils.playback import load_tasks
+
+    cfg = _run_config()
+    cfg.env.tasks.narrow.width = 3
+    cfg.env.tasks.wide.width = 3
+    with pytest.raises(ValueError, match="none of this run's tasks"):
+        load_tasks(_saved_multi_task_run(tmp_path, cfg), verbose=False)
+
+
+def test_a_single_task_run_has_one_world_with_no_name(monkeypatch):
+    from roxie.utils import playback
+
+    monkeypatch.setattr(
+        playback, "load_config",
+        lambda *_: OmegaConf.create({"env": {"env_name": "WalkerWalk"}}),
+    )
+    monkeypatch.setattr(playback, "load_policy", lambda *_, **__: "the policy")
+    assert playback.load_tasks("checkpoint", verbose=False) == {None: "the policy"}
+
+
+def test_one_task_of_a_multi_task_checkpoint_plays_back(tmp_path, rng_key):
+    """Saved through the trainer, replayed through the real loader."""
+    from roxie.utils.playback import load_policy
+
+    checkpoint = _saved_multi_task_run(tmp_path)
     for name, k, width in (("narrow", 0, 2), ("wide", 1, 4)):
-        play = load_policy(str(tmp_path / "checkpoints" / "100"),
-                           task_id=name, verbose=False)
+        play = load_policy(checkpoint, task_id=name, verbose=False)
         assert play.obs_size == 4 + 2
         obs = play.observe(np.arange(width, dtype=np.float32) + 1.0)
         np.testing.assert_array_equal(obs[width:4], 0.0)

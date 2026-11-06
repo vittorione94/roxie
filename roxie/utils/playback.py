@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 import sys
 from pathlib import Path
@@ -105,16 +106,24 @@ def select_task(cfg: Any, task_id: str | None) -> tuple[Any, int | None]:
     return cfg, task
 
 
-def _task_input(checkpoint_path: str, task: int, width: int):
-    """`(observe, obs_size)` feeding one task's world to a multi-task policy.
+@functools.lru_cache(maxsize=1)
+def _task_layout(checkpoint_path: str) -> tuple[int, int, tuple[int, ...]]:
+    """`(num_tasks, padded_width, task_widths)` a multi-task policy trained on.
 
-    The trained layout is read off the checkpoint rather than the config: the
-    statistics give the task count and the padded width, and the trainer
-    records each task's own width beside its progress.
+    The layout is read off the checkpoint rather than the config: the statistics
+    give the task count and the padded width, and the trainer records each
+    task's own width beside its progress.
     """
     loaded = read_checkpoint(Path(checkpoint_path).resolve())
     num_tasks, padded = np.shape(loaded["trainstate_state"]["obs_stats"]["sum"])
-    trained = int(loaded["metadata"]["task_obs_widths"][task])
+    widths = loaded["metadata"]["task_obs_widths"]
+    return int(num_tasks), int(padded), tuple(int(width) for width in widths)
+
+
+def _task_input(checkpoint_path: str, task: int, width: int):
+    """`(observe, obs_size)` feeding one task's world to a multi-task policy."""
+    num_tasks, padded, widths = _task_layout(checkpoint_path)
+    trained = widths[task]
     if width != trained:
         raise ValueError(
             f"the replay env gives this task {width} observation columns, but "
@@ -126,7 +135,7 @@ def _task_input(checkpoint_path: str, task: int, width: int):
     def observe(obs):
         return np.concatenate([np.asarray(obs, dtype=np.float32), pad, hot])
 
-    return observe, int(padded + num_tasks)
+    return observe, padded + num_tasks
 
 
 def _single_task(obs):
@@ -151,6 +160,55 @@ def resolve_single_world(cfg: Any) -> Any:
     return cfg
 
 
+def _load_world(
+    checkpoint_path: str,
+    overrides: tuple[str, ...],
+    task_id: str | None,
+    verbose: bool,
+    *,
+    banner: bool = True,
+) -> dict[str, Any]:
+    """Builds the `Playback` fields of one task's world, all but the agent."""
+    cfg, task = select_task(load_config(checkpoint_path, overrides), task_id)
+    cfg = resolve_single_world(cfg)
+
+    env, _, _env_cfg = build_env(cfg.env, mode="play", num_envs=1, test_episodes=1)
+    if verbose and banner:
+        log_loaded_backend(env)
+
+    func_env = env.func_env
+    obs_size = space_size(func_env.observation_space)
+    action_size = space_size(func_env.action_space)
+    observe = _single_task
+    if task is not None:
+        observe, obs_size = _task_input(checkpoint_path, task, obs_size)
+    publish_env_shapes(cfg.env, obs_size, action_size)
+
+    return {
+        "cfg": cfg,
+        "env": env,
+        "func_env": func_env,
+        "obs_size": obs_size,
+        "action_size": action_size,
+        "observe": observe,
+    }
+
+
+def _load_agent(checkpoint_path: str, world: dict[str, Any]) -> Any:
+    """Restores the checkpoint's agent for a world's observation and action sizes."""
+    cfg = world["cfg"]
+    agent_args = {k: v for k, v in cfg.agent.items() if k.endswith("_config")}
+    if "noise" in cfg:
+        agent_args["noise_config"] = cfg.noise
+
+    return get_class(cfg.agent._target_).load(
+        path=checkpoint_path,
+        env_obs_size=world["obs_size"],
+        env_act_size=world["action_size"],
+        **agent_args,
+    )
+
+
 def load_policy(
     checkpoint_path: str,
     overrides: tuple[str, ...] = (),
@@ -164,41 +222,52 @@ def load_policy(
     env.
     """
     register_search_paths()
-    cfg, task = select_task(load_config(checkpoint_path, overrides), task_id)
-    cfg = resolve_single_world(cfg)
+    world = _load_world(checkpoint_path, overrides, task_id, verbose)
+    return Playback(agent=_load_agent(checkpoint_path, world), **world)
 
-    env, _, _env_cfg = build_env(cfg.env, mode="play", num_envs=1, test_episodes=1)
-    if verbose:
-        log_loaded_backend(env, requested_impl=cfg.env.get("impl", "jax"))
 
-    func_env = env.func_env
-    obs_size = space_size(func_env.observation_space)
-    action_size = space_size(func_env.action_space)
-    observe = _single_task
-    if task is not None:
-        observe, obs_size = _task_input(checkpoint_path, task, obs_size)
-    publish_env_shapes(cfg.env, obs_size, action_size)
+def load_tasks(
+    checkpoint_path: str,
+    overrides: tuple[str, ...] = (),
+    *,
+    verbose: bool = True,
+) -> dict[str | None, Playback]:
+    """Restores one agent and the world of every task the run can replay.
 
-    agent_args = {k: v for k, v in cfg.agent.items() if k.endswith("_config")}
-    if "noise" in cfg:
-        agent_args["noise_config"] = cfg.noise
+    Args:
+        checkpoint_path: the checkpoint's step directory.
+        overrides: dotlist overrides of the run's saved config.
+        verbose: print what each world resolved to.
 
-    agent = get_class(cfg.agent._target_).load(
-        path=checkpoint_path,
-        env_obs_size=obs_size,
-        env_act_size=action_size,
-        **agent_args,
-    )
+    Returns:
+        `{task: Playback}` in the run's order, all holding the same agent. A
+        task that cannot replay is left out, with its reason printed. A
+        single-task run's only key is None.
 
-    return Playback(
-        cfg=cfg,
-        env=env,
-        func_env=func_env,
-        agent=agent,
-        obs_size=obs_size,
-        action_size=action_size,
-        observe=observe,
-    )
+    Raises:
+        ValueError: if no task of the run can replay.
+    """
+    register_search_paths()
+    cfg = load_config(checkpoint_path, overrides)
+    if not is_multitask(cfg.env):
+        return {None: load_policy(checkpoint_path, overrides, verbose=verbose)}
+
+    names = list(cfg.env.tasks)
+    worlds = {}
+    for name in names:
+        try:
+            worlds[name] = _load_world(
+                checkpoint_path, overrides, name, verbose, banner=not worlds,
+            )
+        except ValueError as error:
+            print(f"Leaving out task {name!r}: {error}", flush=True)
+    if not worlds:
+        raise ValueError(f"none of this run's tasks can replay: {names}.")
+
+    agent = _load_agent(checkpoint_path, next(iter(worlds.values())))
+    return {
+        name: Playback(agent=agent, **world) for name, world in worlds.items()
+    }
 
 
 def frame_dt(func_env: Any, model: Any) -> float:

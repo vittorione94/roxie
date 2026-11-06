@@ -52,10 +52,10 @@ Each task logs under its own name:
 
 A resume restarts the curriculum's averages.
 
-`play.py` and `scripts/render_gif.py` replay one task of a multi-task run at a time, named with `--task-id`. The world runs that task's own env, and the policy gets its observation padded to the trained width with the task's one-hot appended; the checkpoint records each task's width, so a replay env that disagrees is refused rather than misread:
+`play.py` opens a multi-task run with a Tasks section in its window's panel, one entry per task the run can replay; a click resets the world and plays that task under the same policy. It starts on the first. `scripts/render_gif.py` has no window to click in, so it takes the task as `--task-id`. Either way the world runs that task's own env, and the policy gets its observation padded to the trained width with the task's one-hot appended; the checkpoint records each task's width, so a replay env that disagrees is refused rather than misread, and `play.py` leaves that task out of its menu:
 
 ```bash
-uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000 --task-id walk
+uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
 ```
 
 A replay always runs its physics in C MuJoCo, whatever the run trained on. A run keeps `mujoco_playground`'s task code for its reset, observations and reward, with only the physics calls leaving for C.
@@ -84,7 +84,9 @@ Resume into a *different* run dir than the dead leg: the CSV backend opens `log.
 uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
 ```
 
-Playback drives a single world into the interactive MuJoCo viewer, always on CPU/MJX even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override the saved run config.
+Playback drives a single world into an interactive window, always with C MuJoCo on the CPU, even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override the saved run config.
+
+The window is roxie's own ([`roxie/utils/viewer.py`](../roxie/utils/viewer.py)), not `mujoco.viewer`, whose panels cannot be given another control from Python. It draws MuJoCo's own widgets through `ctypes` ([`roxie/utils/mjui.py`](../roxie/utils/mjui.py)), which pins the struct layouts to the exact `mjui.h` they were written from and refuses a MuJoCo whose header differs. The panel holds Tasks, Simulation, Rendering and Visualization. The camera follows the root body until `esc` frees it; `play.py` prints the mouse and keyboard controls when it starts.
 
 Both entry points restore the checkpoint through `roxie.utils.playback`, which reads the run's saved Hydra config and rewrites it onto the C physics above. C and the engine a run trained on are not numerically identical, so a replay's score can differ a little from the run's own eval.
 
