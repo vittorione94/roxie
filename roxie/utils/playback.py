@@ -203,28 +203,21 @@ def load_policy(
 
 def frame_dt(func_env: Any, model: Any) -> float:
     """Seconds of simulated time per environment step, for real-time playback."""
-    substeps = int(
-        getattr(func_env, "n_substeps", None)
-        or getattr(func_env, "native_n_substeps", None)
-        or 1
-    )
+    substeps = int(getattr(func_env, "n_substeps", None) or 1)
     return float(
         getattr(func_env, "dt", None) or model.opt.timestep * substeps
     )
 
 
 def make_stepper(cfg: Any, func_env: Any, *, verbose: bool = True):
-    """Returns `(reset, step)` for one world, native MuJoCo if the env offers it.
+    """Returns `(reset, step)` for one world, with its physics in C MuJoCo.
 
-    A native stepper runs the C++ physics directly and needs no compile; the
-    fallback jits the functional env. The step key is fixed rather than
-    threaded because playback is evaluation: consecutive replays of the same
-    weights should be comparable.
+    A functional env with no MuJoCo task behind it has no physics to move, and
+    is jitted whole. The step key is fixed rather than threaded because playback
+    is evaluation: consecutive replays of the same weights should be comparable.
     """
-    player_path = cfg.env.get(
-        "player", "roxie.utils.native_player.make_native_player"
-    )
-    player = get_method(player_path)(func_env) if player_path else None
+    player_path = cfg.env.get("player", "roxie.utils.native_player.make_native_player")
+    player = get_method(player_path)(func_env)
     if player is not None:
         if verbose:
             print("Playback stepper: native MuJoCo (CPU)", flush=True)

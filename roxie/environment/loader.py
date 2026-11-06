@@ -92,6 +92,8 @@ def resolve_env_device(env: Any) -> tuple[str, str]:
     impl = resolve_loaded_impl(env)
     if impl == BATCH_IMPL:
         return "cpu", "native MuJoCo, mujoco.batch thread pool"
+    if impl == "native":
+        return "cpu", "native MuJoCo, one world"
     device, backend = resolve_agent_device()
     return device, f"{impl} kernels on the JAX device ({backend})"
 
@@ -229,6 +231,8 @@ def build_playground_env(
         env_name, impl=impl, naconmax=naconmax, njmax=njmax,
         graph_mode=graph_mode,
     )
+    if mode == "play":
+        func_env.metadata["impl"] = "native"
     max_steps = int(
         max_episode_steps
         or env_cfg.get("episode_length", None)

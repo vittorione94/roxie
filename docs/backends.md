@@ -118,9 +118,9 @@ The CPU pin is not just a default. The batch never touches the GPU, but the agen
 
 ## Determinism and reproducibility
 
-Warp's atomic contact reductions are **not bit-reproducible**: two identical rollouts diverge by ~1e-6 per step, which chaotic contact dynamics amplify. CPU/MJX playback is exact. Hence:
+Warp's atomic contact reductions are **not bit-reproducible**: two identical rollouts diverge by ~1e-6 per step, which chaotic contact dynamics amplify. C MuJoCo playback is exact. Hence:
 
-- `play.py` unconditionally forces `JAX_PLATFORMS=cpu` and coerces `impl: warp` → `impl: jax`. Checkpoints are agent-side, so the policy replays identically on either backend, and Warp-only knobs are ignored by the MJX builder.
+- `play.py` unconditionally forces `JAX_PLATFORMS=cpu` and runs the physics in C MuJoCo, coercing `impl: warp` → `impl: jax` only so the task can be built without Warp. Checkpoints are agent-side, so the same weights load on any backend, but C is not numerically identical to the engine a run trained on, so a replay's score can differ a little from its eval. Warp-only knobs are ignored.
 - Evaluation uses `test_episodes: 10` rather than 1, so Warp's non-reproducibility shows up as visible spread rather than a silently shifting single number.
 
 Evaluation itself is pinned: fixed reset keys held constant across epochs *and* across runs, so a change in `test/score` is a change in the policy. `test/distinct_starts` is logged because `test/length/std == 0` is ambiguous — it means either a degenerate eval or a policy saturating the episode cap.

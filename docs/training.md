@@ -58,6 +58,8 @@ A resume restarts the curriculum's averages.
 uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000 --task-id walk
 ```
 
+A replay always runs its physics in C MuJoCo, whatever the run trained on. A run keeps `mujoco_playground`'s task code for its reset, observations and reward, with only the physics calls leaving for C.
+
 ## Resume
 
 ```bash
@@ -84,7 +86,7 @@ uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
 
 Playback drives a single world into the interactive MuJoCo viewer, always on CPU/MJX even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override the saved run config.
 
-Both entry points restore the checkpoint through `roxie.utils.playback.load_policy`, which reads the run's saved Hydra config and moves Warp and `mujoco.batch` runs onto MJX, which steps one world of the same task and model.
+Both entry points restore the checkpoint through `roxie.utils.playback`, which reads the run's saved Hydra config and rewrites it onto the C physics above. C and the engine a run trained on are not numerically identical, so a replay's score can differ a little from the run's own eval.
 
 ### Rendering without a display
 
