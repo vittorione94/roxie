@@ -19,7 +19,6 @@ from roxie.environment.loader import (
     BATCH_IMPL,
     build_env,
     TRAINER_ENV_KEYS,
-    is_multitask,
     log_loaded_backend,
     publish_env_shapes,
     task_blocks,
@@ -85,7 +84,7 @@ def select_task(cfg: Any, task_id: str | None) -> tuple[Any, int | None]:
         ValueError: on a missing or unknown task, or one passed to a
           single-task run.
     """
-    if not is_multitask(cfg.env):
+    if "tasks" not in cfg.env:
         if task_id is not None:
             raise ValueError(
                 f"task_id={task_id!r} selects a task of a multi-task run, and "
@@ -144,7 +143,7 @@ def _single_task(obs):
 
 def resolve_single_world(cfg: Any) -> Any:
     """Rewrites a trained config onto a backend that can step one world."""
-    if is_multitask(cfg.env):
+    if "tasks" in cfg.env:
         raise ValueError(
             "a multi-task config replays one task at a time; narrow it with "
             "`select_task` first."
@@ -249,7 +248,7 @@ def load_tasks(
     """
     register_search_paths()
     cfg = load_config(checkpoint_path, overrides)
-    if not is_multitask(cfg.env):
+    if "tasks" not in cfg.env:
         return {None: load_policy(checkpoint_path, overrides, verbose=verbose)}
 
     names = list(cfg.env.tasks)

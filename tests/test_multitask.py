@@ -26,7 +26,6 @@ from roxie.environment import functional
 from roxie.environment.loader import (
     EnvBundle,
     build_playground_env,
-    is_multitask,
     requested_impl,
     uses_batch,
 )
@@ -237,7 +236,7 @@ def test_loader_reads_the_backend_through_the_tasks():
         "task_defaults": BATCH_DEFAULTS,
         "tasks": BATCH_TASKS,
     })
-    assert is_multitask(block) and uses_batch(block)
+    assert uses_batch(block)
     warp = OmegaConf.create({
         "_target_": "roxie.environment.multitask.build_multitask_env",
         "task_defaults": {"impl": "warp"},
