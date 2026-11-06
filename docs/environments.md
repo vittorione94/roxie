@@ -6,7 +6,7 @@ There are exactly two ways to attach an environment to roxie, both shaped like [
 
 ## The two ways in
 
-Write a [`FuncEnv`](../roxie/environment/functional.py) — anything functional and JAX-traceable, one env at a time, with the state passed explicitly — and [`JaxVectorEnv`](../roxie/environment/vector.py) batches it. `mujoco_playground` and Waymax both fit this shape.
+Write a [`FuncEnv`](../roxie/environment/functional.py) — anything functional and JAX-traceable, one env at a time, with the state passed explicitly — and [`JaxVectorEnv`](../roxie/environment/vector.py) batches it. `mujoco_playground` is the one family roxie ships, wrapped in this shape; an env from another repo attaches the same way.
 
 ## Writing a `FuncEnv`
 
@@ -42,15 +42,7 @@ The driver only carries the value: it takes one from `init_params`, passes it to
 
 ### Adapting a monolithic-step env
 
-Playground, Brax and Waymax compute physics, observation, reward and termination in a single `step` call, so the accessors cannot recompute them independently without paying for the physics twice. The recipe is [`MuJoCoFuncEnv`](../roxie/environment/loader.py), which splits `FuncEnv`'s eight methods into the two that *make physics happen* (`initial`, `transition`) and the six that *answer questions about a state*: every MuJoCo env answers the six identically by reading the field off an `mjx_env.State`.
-
-```
-FuncEnv                    the interface; knows nothing about MuJoCo
-└── MuJoCoFuncEnv          + "my state is an mjx_env.State" -> the 6 accessors
-    └── PlaygroundFuncEnv  + initial/transition by WRAPPING a playground env
-```
-
-An env in another repo that subclasses `MuJoCoFuncEnv` inherits the same accessors, so two backends cannot drift on what a termination means.
+Playground tasks compute physics, observation, reward and termination in a single `step` call, so the accessors cannot recompute them independently without paying for the physics twice. [`PlaygroundFuncEnv`](../roxie/environment/loader.py) splits `FuncEnv`'s methods into the two that *make physics happen* (`initial`, `transition`), which call the wrapped env's `reset` and `step`, and the accessors that *answer questions about a state* by reading the field off an `mjx_env.State`.
 
 ## Bringing an already-batched env
 
@@ -100,6 +92,8 @@ env:
   env_name: CheetahRun
   impl: warp
 ```
+
+Observations must be flat arrays. The 16 registered tasks whose observation is a dictionary, such as `Go1JoystickFlatTerrain` and `LeapCubeReorient`, do not load.
 
 ## Several tasks at once
 

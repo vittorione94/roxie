@@ -20,8 +20,21 @@ if not hasattr(mujoco.MjSpec, "find_body"):
     mujoco.MjSpec.find_body = mujoco.MjSpec.body
 
 
-class MuJoCoFuncEnv(FuncEnv):
-    """Abstract functional environment adapter for MuJoCo physics state."""
+class PlaygroundFuncEnv(FuncEnv):
+    """Functional environment wrapper for `mujoco_playground` environments."""
+
+    def __init__(self, env: Any, impl: str):
+        self.env = env
+        self.observation_space = functional.unbounded_box(env.observation_size)
+        ctrl_range = env.mj_model.actuator_ctrlrange
+        self.action_space = functional.box(ctrl_range[:, 0], ctrl_range[:, 1])
+        self.metadata = {"jax": True, "impl": impl}
+
+    def initial(self, rng, params=None):
+        return self.env.reset(rng)
+
+    def transition(self, state, action, rng, params=None):
+        return self.env.step(state, action)
 
     def observation(self, state, rng, params=None):
         return state.obs
@@ -37,23 +50,6 @@ class MuJoCoFuncEnv(FuncEnv):
 
     def transition_info(self, state, action, next_state, params=None):
         return {"metrics": next_state.metrics}
-
-
-class PlaygroundFuncEnv(MuJoCoFuncEnv):
-    """Functional environment wrapper for `mujoco_playground` environments."""
-
-    def __init__(self, env: Any, impl: str | None = None):
-        self.env = env
-        self.observation_space = functional.unbounded_box(env.observation_size)
-        ctrl_range = env.mj_model.actuator_ctrlrange
-        self.action_space = functional.box(ctrl_range[:, 0], ctrl_range[:, 1])
-        self.metadata = {"jax": True, "impl": impl or _read_impl(env)}
-
-    def initial(self, rng, params=None):
-        return self.env.reset(rng)
-
-    def transition(self, state, action, rng, params=None):
-        return self.env.step(state, action)
 
     def __getattr__(self, name):
         if name.startswith("__") or "env" not in self.__dict__:
@@ -166,17 +162,18 @@ def load_playground_env(
     """Loads a `mujoco_playground` environment with optional overrides."""
     env_cfg = registry.get_default_config(env_name)
     # `batch` swaps only the step: resets and the task's model stay on MJX.
-    if impl is not None and "impl" in env_cfg:
+    if impl is not None:
         env_cfg.impl = "jax" if impl == BATCH_IMPL else impl
-    if naconmax is not None and "naconmax" in env_cfg:
+    if naconmax is not None:
         env_cfg.naconmax = naconmax
-    if njmax is not None and "njmax" in env_cfg:
+    if njmax is not None:
         env_cfg.njmax = njmax
 
     env = registry.load(env_name, config=env_cfg)
-    if str(env_cfg.get("impl", "")) == "warp":
+    if env_cfg.impl == "warp":
         _set_graph_mode(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
-    return PlaygroundFuncEnv(env, impl=BATCH_IMPL if impl == BATCH_IMPL else None), env_cfg
+    loaded_impl = BATCH_IMPL if impl == BATCH_IMPL else env_cfg.impl
+    return PlaygroundFuncEnv(env, loaded_impl), env_cfg
 
 
 class EnvBundle(NamedTuple):
@@ -186,8 +183,6 @@ class EnvBundle(NamedTuple):
     test_env: Any
     env_cfg: Any
 
-
-DEFAULT_MAX_EPISODE_STEPS = 1000
 
 TRAINER_ENV_KEYS = frozenset({
     "parallel_envs",
@@ -233,11 +228,7 @@ def build_playground_env(
     )
     if mode == "play":
         func_env.metadata["impl"] = "native"
-    max_steps = int(
-        max_episode_steps
-        or env_cfg.get("episode_length", None)
-        or DEFAULT_MAX_EPISODE_STEPS
-    )
+    max_steps = int(max_episode_steps or env_cfg.episode_length)
     if impl == BATCH_IMPL:
         driver = functools.partial(BatchVectorEnv, num_threads=num_threads)
     else:
