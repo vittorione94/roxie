@@ -31,7 +31,7 @@ from roxie.environment.loader import (
     uses_batch,
 )
 from roxie.environment.multitask import (
-    MultiTaskJaxEnv,
+    MultiTaskEnv,
     TaskLayout,
     allocate_worlds,
     build_multitask_env,
@@ -122,7 +122,7 @@ def test_layout_pads_to_the_widest_task_and_appends_the_one_hot():
 def test_jax_composite_steps_each_task_as_its_own_env(rng_key):
     """Every block of worlds is exactly its own task's driver, padded."""
     env = _toy().env
-    assert isinstance(env, MultiTaskJaxEnv)
+    assert isinstance(env, MultiTaskEnv)
     assert env.single_observation_space.shape == (4 + 2,)
     state, _ = env.reset(rng_key)
     pool, _ = env.reset(jax.random.fold_in(rng_key, 1))
@@ -185,7 +185,7 @@ def test_batch_composite_matches_standalone_tasks(rng_key):
     """Same starts, same actions: each block is exactly its own task, padded."""
     env = build_multitask_env(BATCH_TASKS, task_defaults=BATCH_DEFAULTS,
                               num_envs=4).env
-    assert isinstance(env, MultiTaskJaxEnv)
+    assert isinstance(env, MultiTaskEnv)
     alone = [build_playground_env(block["env_name"], impl="batch", num_envs=2,
                                   num_threads=1).env
              for block in BATCH_TASKS.values()]

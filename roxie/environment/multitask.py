@@ -12,7 +12,7 @@ run: its physics belongs to its task's env, and moving it would mean recompiling
 Steering what the learner trains on is the replay's job instead
 (`ReplayManager.draw`).
 
-`MultiTaskJaxEnv` steps the task envs side by side inside the trace, and looks
+`MultiTaskEnv` steps the task envs side by side inside the trace, and looks
 like any other env to the rollout, the agents and the replay.
 """
 
@@ -125,37 +125,6 @@ def _task_metrics(names, steps, xp):
     return metrics
 
 
-class _Composite:
-    """What both composites share: the layout and the spaces it implies.
-
-    Attributes:
-        envs: Each task's own vector env, in one-hot order.
-        layout: Where each task sits in the batch.
-        task_names: The tasks, in one-hot order.
-        task_counts: Each task's number of worlds.
-        task_ids: Each world's task.
-        num_envs: The batch width, every task's worlds together.
-    """
-
-    def __init__(self, envs: dict):
-        self.envs = tuple(envs.values())
-        self.layout = TaskLayout(
-            envs, [env.num_envs for env in self.envs],
-            [functional.space_size(env.single_observation_space)
-             for env in self.envs],
-        )
-        self.task_names = self.layout.names
-        self.task_counts = self.layout.counts
-        self.task_ids = self.layout.task_ids
-        self.num_envs = int(sum(self.task_counts))
-        self.single_action_space = _shared_action_space(self.envs)
-        self.single_observation_space = functional.unbounded_box(
-            self.layout.width + len(self.task_names)
-        )
-        # The eval loop's cap: no task's episode may be cut short by another's.
-        self.max_episode_steps = max(env.max_episode_steps for env in self.envs)
-
-
 class _TaskParams:
     """The per-task `params` hooks, over a tuple of each task's own params."""
 
@@ -184,11 +153,40 @@ class _TaskParams:
         return tuple(p for p, _ in out), any(inv for _, inv in out)
 
 
-class MultiTaskJaxEnv(_Composite):
-    """Vmapped task envs, stepped side by side inside the trace."""
+class MultiTaskEnv:
+    """A driver running each task's own driver on its block of the batch.
+
+    It sits beside `JaxVectorEnv` rather than on `FuncEnv`, which is one world:
+    a world that could be any task would carry every task's state and, under
+    `vmap`, run every task's physics. Whatever the backend, it only calls each
+    task driver's `reset` and `step`.
+
+    Attributes:
+        envs: Each task's own vector env, in one-hot order.
+        layout: Where each task sits in the batch.
+        task_names: The tasks, in one-hot order.
+        task_counts: Each task's number of worlds.
+        task_ids: Each world's task.
+        num_envs: The batch width, every task's worlds together.
+    """
 
     def __init__(self, envs: dict):
-        super().__init__(envs)
+        self.envs = tuple(envs.values())
+        self.layout = TaskLayout(
+            envs, [env.num_envs for env in self.envs],
+            [functional.space_size(env.single_observation_space)
+             for env in self.envs],
+        )
+        self.task_names = self.layout.names
+        self.task_counts = self.layout.counts
+        self.task_ids = self.layout.task_ids
+        self.num_envs = int(sum(self.task_counts))
+        self.single_action_space = _shared_action_space(self.envs)
+        self.single_observation_space = functional.unbounded_box(
+            self.layout.width + len(self.task_names)
+        )
+        # The eval loop's cap: no task's episode may be cut short by another's.
+        self.max_episode_steps = max(env.max_episode_steps for env in self.envs)
         self.metadata = dict(self.envs[0].metadata)
         self.func_env = _TaskParams(self.envs, self.layout)
 
@@ -301,5 +299,5 @@ def build_multitask_env(
     if any(batched) and not all(batched):
         raise ValueError("every task must run on the same backend")
     return EnvBundle(
-        env=MultiTaskJaxEnv(train), test_env=MultiTaskJaxEnv(test), env_cfg=None,
+        env=MultiTaskEnv(train), test_env=MultiTaskEnv(test), env_cfg=None,
     )

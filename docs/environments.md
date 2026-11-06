@@ -123,7 +123,7 @@ The rollout, the agents and the replay see one env:
 - **Rewards and done flags.** Each task's own, untouched.
 - **Eval.** Every task gets `trainer.test_episodes` worlds of its own, whatever the weights.
 
-`MultiTaskJaxEnv` steps the task envs side by side inside the trace, threading each task's own `params` through its own hooks. Every task must run on the same backend: mixing `impl: batch` with anything else is refused.
+`MultiTaskEnv` steps the task envs side by side inside the trace, threading each task's own `params` through its own hooks. Every task must run on the same backend: mixing `impl: batch` with anything else is refused.
 
 The weights fix what the worlds *collect*. What the learner *trains on* is the replay's to steer, through a curriculum ([training.md](training.md#several-tasks)).
 
