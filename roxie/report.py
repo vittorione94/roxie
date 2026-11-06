@@ -51,11 +51,13 @@ CELL_INFO = {
 }
 
 HOW_TO_READ = (
-    "One section per dm_control task, and inside it every agent at matched "
-    "hyperparameters and a matched step budget, on both physics "
-    "implementations. Score is the dm_control episode return, so 1000 is the "
-    "ceiling on every task here and the sections are directly comparable to "
-    "each other. Three caveats belong in any ranking: PPO is on-policy and "
+    "One section per task of mujoco_playground's port of the dm_control suite, "
+    "and inside it every agent at matched hyperparameters and a matched step "
+    "budget, on both physics implementations. Score is the episode return, so "
+    "1000 is the ceiling on every task here and the sections are directly "
+    "comparable to each other, but not to published dm_control results: the "
+    "port changes timesteps, solver settings and contacts. Three caveats "
+    "belong in any ranking: PPO is on-policy and "
     "therefore not replay-ratio comparable (judge it on score-vs-steps and "
     "score-vs-wall-clock, never on gradient steps); MPO pays ~20x per gradient "
     "step for its 20 action samples; and ranks should come from the back-half "
@@ -228,7 +230,8 @@ def main():
     parser.add_argument(
         "--description",
         default=(
-            "Every agent in roxie on the whole dm_control suite, run twice: "
+            "Every agent in roxie on mujoco_playground's port of the dm_control "
+            "suite, run twice: "
             "once on GPU through mujoco_warp, once fully GPU-free through "
             "mujoco.batch."
         ),

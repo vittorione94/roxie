@@ -101,6 +101,8 @@ experiments/dmc/
   noise/bench_gaussian.yaml  exploration noise for the deterministic arms
 ```
 
+**The tasks are `mujoco_playground`'s port of the dm_control suite, not dm_control itself.** The port changes timesteps, solver settings and contacts to run well on a GPU (the package lists them in `mujoco_playground/_src/dm_control_suite/xmls/README.md`), so scores here are not directly comparable to published dm_control results.
+
 **The task is an override, not a file.** `release.task` is a playground registry name.
 
 ```bash
