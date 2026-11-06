@@ -78,6 +78,9 @@ FORCE=0 scripts/run_release_benchmark.sh                      # skip finished le
 resumable at run granularity. `CORES_PER_RUN`, `GB_PER_RUN` and the `GPU_RESERVE_*` pair
 size the slots; `CORES_PER_RUN` is **logical** cores, and `batch_cpu` also gets it as
 `env.num_threads` so the batch's own pool matches the pinning.
+Slots are planned to stay inside one L3 domain whenever they all still fit, because a slot
+crossing two domains runs far slower: TD3 measured about 15k steps/s across a domain
+boundary against about 19k inside one, on a 2-die Ryzen.
 
 Then:
 

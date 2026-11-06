@@ -70,10 +70,37 @@ physical_core_groups() {
 mapfile -t PHYS_GROUPS < <(physical_core_groups)
 GROUP_SIZE=$(( $(grep -o ',' <<< "${PHYS_GROUPS[0]:-0}" | wc -l) + 1 ))
 
+# The L3 domain of each physical-core group, in PHYS_GROUPS order.
+l3_domains() {
+    local group first path
+    for group in "${PHYS_GROUPS[@]}"; do
+        first=${group%%[,-]*}
+        path="/sys/devices/system/cpu/cpu$first/cache/index3/shared_cpu_list"
+        if [[ -r "$path" ]]; then cat "$path"; else echo all; fi
+    done
+}
+
+# Where each job slot starts, in physical-core groups. A slot spanning two L3
+# domains runs far slower than one inside a domain, so a slot that would straddle
+# a boundary moves past it whenever every remaining slot still fits.
+plan_slot_starts() {
+    local i=$(( reserve_cores / GROUP_SIZE )) n=${#PHYS_GROUPS[@]} slot end next
+    for (( slot = 0; slot < MAX_CPU_JOBS; slot++ )); do
+        end=$(( i + groups_per_run - 1 ))
+        if (( end < n )) && [[ "${L3_DOMAINS[i]}" != "${L3_DOMAINS[end]}" ]]; then
+            next=$i
+            while [[ "${L3_DOMAINS[next]}" == "${L3_DOMAINS[i]}" ]]; do next=$(( next + 1 )); done
+            if (( next + (MAX_CPU_JOBS - slot) * groups_per_run <= n )); then i=$next; fi
+        fi
+        echo "$i"
+        i=$(( i + groups_per_run ))
+    done
+}
+
 # The core string for job slot $2, given $1 physical-core groups per job.
 job_core_string() {
     local groups_per_run=$1 slot=$2 start i ids=()
-    start=$(( reserve_cores / GROUP_SIZE + slot * groups_per_run ))
+    start=${SLOT_STARTS[slot]}
     for (( i = start; i < start + groups_per_run; i++ )); do
         ids+=("${PHYS_GROUPS[i]}")
     done
@@ -93,6 +120,9 @@ by_ram=$(( (avail_gb - reserve_gb) / GB_PER_RUN ))
 
 groups_per_run=$(( CORES_PER_RUN / GROUP_SIZE ))
 (( groups_per_run < 1 )) && groups_per_run=1
+
+mapfile -t L3_DOMAINS < <(l3_domains)
+mapfile -t SLOT_STARTS < <(plan_slot_starts)
 
 PIN=1
 command -v taskset >/dev/null || { PIN=0; echo "! taskset missing — CPU runs will not be pinned"; }
