@@ -32,12 +32,11 @@ from roxie.environment.functional import space_size
 from roxie.environment.loader import (
     build_env,
     log_loaded_backend,
-    pin_cpu_cores,
     publish_env_shapes,
     requested_impl,
     resolve_placement,
 )
-from roxie.utils import hydra_searchpath, logger, memory_guard, precision
+from roxie.utils import hydra_searchpath, logger, precision, system
 from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
 from roxie.utils.trainer import Trainer
 
@@ -52,7 +51,7 @@ def main(cfg: DictConfig):
 
     runtime_cfg = cfg.get("runtime") or {}
     # Before `pin_cpu_cores`, so the watcher does not compete for the run's cores.
-    memory_guard.start(runtime_cfg.get("memory_reserve_gb", None))
+    system.start_memory_guard(runtime_cfg.get("memory_reserve_gb", None))
 
     # Read through a multi-task block's tasks: there the backend sits in
     # `task_defaults`, and missing it here would skip Warp's memory setup.
@@ -64,7 +63,7 @@ def main(cfg: DictConfig):
     if platform and not _device:
         jax.config.update("jax_platforms", str(platform))
 
-    pinned = pin_cpu_cores(runtime_cfg.get("cpu_cores", None), _device or platform)
+    pinned = system.pin_cpu_cores(runtime_cfg.get("cpu_cores", None), _device or platform)
     if pinned:
         print(f"CPU affinity: {pinned} cores ({sorted(os.sched_getaffinity(0))})")
 

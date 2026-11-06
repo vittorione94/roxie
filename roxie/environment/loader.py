@@ -1,7 +1,6 @@
 """Environment loading, MuJoCo adapters, and vector environment builders."""
 
 import functools
-import os
 from typing import Any, NamedTuple
 
 import jax
@@ -315,56 +314,6 @@ def resolve_placement(cfg: Any) -> tuple[str | None, str | None]:
 
     platform = None if device in (None, "gpu") else device
     return device, platform
-
-
-def _parse_cpu_list(text: str) -> list[int]:
-    """Parses a CPU range string into individual core indices."""
-    out: list[int] = []
-    for part in text.strip().split(","):
-        if not part:
-            continue
-        if "-" in part:
-            lo, hi = part.split("-", 1)
-            out.extend(range(int(lo), int(hi) + 1))
-        else:
-            out.append(int(part))
-    return out
-
-
-def _l3_domains(available: list[int]) -> list[list[int]]:
-    """Groups available CPUs by their shared L3 cache domain."""
-    groups: dict[tuple[int, ...], list[int]] = {}
-    for cpu in available:
-        path = f"/sys/devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list"
-        try:
-            with open(path) as fh:
-                key = tuple(sorted(_parse_cpu_list(fh.read())))
-        except (OSError, ValueError):
-            return [list(available)]
-        groups.setdefault(key, []).append(cpu)
-    return sorted(groups.values(), key=lambda g: (-len(g), g[0]))
-
-
-def select_cpu_cores(available: list[int], cores: int) -> list[int]:
-    """Selects core indices packed to minimize L3 cache domain boundaries."""
-    picked: list[int] = []
-    for group in _l3_domains(available):
-        if len(picked) >= cores:
-            break
-        picked.extend(group[: cores - len(picked)])
-    return sorted(picked)
-
-
-def pin_cpu_cores(cores: Any, platform: str | None) -> int | None:
-    """Pins CPU affinity for the current process to a subset of available cores."""
-    if not cores or str(platform) != "cpu" or not hasattr(os, "sched_setaffinity"):
-        return None
-    available = sorted(os.sched_getaffinity(0))
-    cores = int(cores)
-    if cores >= len(available):
-        return None
-    os.sched_setaffinity(0, set(select_cpu_cores(available, cores)))
-    return cores
 
 
 def build_env(
