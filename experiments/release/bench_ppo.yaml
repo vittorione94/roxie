@@ -2,7 +2,7 @@
 
 defaults:
   - agent: ppo_bench
-  - bench: dmc
+  - bench: release
   - backend: batch_cpu
   - _self_
 

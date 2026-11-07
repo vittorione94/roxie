@@ -79,7 +79,7 @@ def agent_config(name: str, **hyperparams):
     # what these exercise is the learning pass, not the schedule
     # (`test_update_schedule.py` covers that).
     defaults = {
-        "memory_warmup": 4 * ENVS,
+        "memory_warmup": 8 * ENVS,
         "steps_between_updates": ENVS,
         "learning_steps": 2,
         "num_minibatches": 2,

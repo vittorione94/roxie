@@ -1,11 +1,11 @@
 # @package _global_
 
 defaults:
-  - agent: td4_bench
+  - agent: ddpg_bench
   - noise: bench_gaussian
-  - bench: dmc
+  - bench: release
   - backend: batch_cpu
   - _self_
 
 release:
-  agent: td4
+  agent: ddpg

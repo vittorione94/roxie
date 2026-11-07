@@ -17,9 +17,11 @@ from flax import struct
 
 from roxie.environment import functional
 from roxie.environment.vector import (
+    DIVERGED_OBS_LIMIT,
     JaxVectorEnv,
     Timestep,
     VecState,
+    nonfinite_worlds,
 )
 
 
@@ -272,11 +274,19 @@ def test_transition_info_metrics_are_batched(vec_env, rng_key):
 class DivergingEnv(CounterEnv):
     """A `CounterEnv` whose physics blows up past x >= 2, exactly as a MuJoCo
     world does: the state goes non-finite and every predicate written about it
-    silently answers False from then on."""
+    silently answers False from then on.
+
+    `blown` is what the state blows up to: NaN, or a huge finite value, which is
+    what a MuJoCo world emits on its way to NaN.
+    """
+
+    def __init__(self, blown: float = float("nan")):
+        super().__init__()
+        self.blown = blown
 
     def transition(self, state, action, rng, params=None):
         x = state.x + jnp.squeeze(action)
-        return state.replace(x=jnp.where(x >= 2.0, jnp.nan, x))
+        return state.replace(x=jnp.where(x >= 2.0, self.blown, x))
 
     def reward(self, state, action, next_state, rng, params=None):
         return next_state.x - state.x
@@ -291,8 +301,12 @@ class TestNonFiniteWorlds:
     buffer and into the observation statistics, neither of which recovers.
     """
 
+    blown = float("nan")
+
     def _diverged(self, rng_key, reset_pool=True):
-        env = JaxVectorEnv(DivergingEnv(), num_envs=4, max_episode_steps=0)
+        env = JaxVectorEnv(
+            DivergingEnv(self.blown), num_envs=4, max_episode_steps=0,
+        )
         state = _pool(env, rng_key)
         pool = _pool(env, rng_key) if reset_pool else None
         # Two steps of +1: the second crosses the threshold into NaN.
@@ -361,6 +375,31 @@ class TestNonFiniteWorlds:
         assert np.allclose(np.asarray(ts.reward), 0.5)
         assert not np.any(np.asarray(ts.terminated))
         assert np.all(np.asarray(ts.info["metrics"]["nonfinite"]) == 0.0)
+
+
+class TestFiniteBlowUps(TestNonFiniteWorlds):
+    """The same contract for a world that blows up without reaching NaN.
+
+    `mujoco.batch` resets such a world itself at its QACC check, so its
+    observations stay finite throughout; one of them in the all-time
+    observation statistics is as permanent as a NaN in them.
+    """
+
+    blown = 1e7
+
+
+def test_the_limit_is_on_magnitude_per_world():
+    obs = jnp.asarray([
+        [DIVERGED_OBS_LIMIT, 0.0],
+        [-DIVERGED_OBS_LIMIT, 0.0],
+        [2.0 * DIVERGED_OBS_LIMIT, 0.0],
+        [0.0, -2.0 * DIVERGED_OBS_LIMIT],
+        [jnp.inf, 0.0],
+    ], dtype=jnp.float32)
+    reward = jnp.zeros((5,), dtype=jnp.float32)
+    assert nonfinite_worlds(obs, reward).tolist() == [
+        False, False, True, True, True,
+    ]
 
 
 def test_timestep_unpacks_as_the_gymnasium_five_tuple(vec_env, rng_key):

@@ -2,8 +2,7 @@
 
 defaults:
   - agent: mpo_bench
-  - bench: dmc
-  - backend: batch_cpu
+  - bench: multitask
   - _self_
 
 release:

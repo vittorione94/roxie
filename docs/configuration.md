@@ -12,17 +12,18 @@ Only four arguments are injected by `train.py` rather than coming from YAML — 
 
 Hardware placement is not an agent key: `runtime.device` (`cpu`/`gpu`/null) places the whole run, and a JAX platform has to be chosen before the first `jax.*` call — long before an agent exists. See [backends.md](backends.md#where-the-run-runs).
 
-The env block follows the same convention: `env._target_` names a **builder**, instantiated by [`loader.build_env`](../roxie/environment/loader.py). So the core training loop never branches on an env-type string and never names a specific task — the builder can live in another repo. Same for the viewer hook (`env.viewer`).
+The env block follows the same convention: `env._target_` names a **builder**, which [`loader.build_env`](../roxie/environment/loader.py) calls with the block's other keys. So the core training loop never branches on an env-type string and never names a specific task — the builder can live in another repo. Same for the viewer hook (`env.viewer`).
 
-A few keys under `env:` are *not* builder arguments, because roxie consumes them itself: `parallel_envs` and `test_episodes` reach the builder as the injected `num_envs`/`test_episodes`, `viewer`/`player` are `play.py`'s hooks, and `obs_size`/`action_size`/`obs_action_size` are written *back* into the block by `publish_env_shapes` once the env exists, so an agent yaml can interpolate `${env.obs_size}`. They are listed as `loader.TRAINER_ENV_KEYS` and stripped before instantiation. Everything else in the block is a builder keyword: a stale key is a `TypeError` at launch.
+A few keys under `env:` are *not* builder arguments, because roxie consumes them itself: `parallel_envs` and `test_episodes` reach the builder as the injected `num_envs`/`test_episodes`, `viewer`/`player` are `play.py`'s hooks, and `obs_size`/`action_size`/`obs_action_size` are written *back* into the block by `publish_env_shapes` once the env exists, so an agent yaml can interpolate `${env.obs_size}`. They are listed as `loader.TRAINER_ENV_KEYS` and stripped before the call. Everything else in the block is a builder keyword: a stale key is a `TypeError` at launch.
 
 ## Layout
 
 - [`roxie/configs/agent/`](../roxie/configs/agent/) — one file per algorithm (`ddpg`, `td3`, `td4`, `d4pg`, `sac`, `mpo`, `ppo`, plus the play-only baselines in [`roxie/agents/basic.py`](../roxie/agents/basic.py), which `Trainer.run` refuses to train).
-- [`roxie/configs/env/`](../roxie/configs/env/) — one file per env builder: a complete `env:` block, pulled into a launchable's `defaults:` as `- /env: playground`. The leading `/` is required from a launchable in a subdirectory of `experiments/`, exactly as for `/agent:`.
+- [`roxie/configs/env/`](../roxie/configs/env/) — one file per env builder (`playground`, and `multitask`, which composes several tasks): a complete `env:` block, pulled into a launchable's `defaults:` as `- /env: playground`. The leading `/` is required from a launchable in a subdirectory of `experiments/`, exactly as for `/agent:`.
+- [`roxie/configs/curriculum/`](../roxie/configs/curriculum/) — task curricula for a multi-task env (`learning_progress`, `weighted`), pulled in as `curriculum=` ([training.md](training.md#several-tasks)).
 - [`roxie/configs/noise/`](../roxie/configs/noise/) — exploration noise modules (`ou`, `gaussian`, `adaptive`). Agents that explore from their own policy (SAC, MPO, PPO) take **no** noise group; adding one is a launch-time error.
 - [`experiments/<env>/`](../experiments/) — launchable experiments. `--config-name` includes the folder.
-- [`experiments/dmc/`](../experiments/dmc/) — the release benchmark, carrying its own groups: `agent/`, `backend/`, `bench/` and `noise/`.
+- [`experiments/release/`](../experiments/release/) — the release benchmark, single-task and multi-task, carrying its own groups: `agent/`, `backend/`, `bench/` and `noise/`.
 
 ## A launchable
 

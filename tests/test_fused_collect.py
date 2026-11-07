@@ -65,9 +65,9 @@ def _build(agent_name, backend, extra=()):
     configs = Path(__file__).resolve().parents[1] / "roxie" / "configs"
     with initialize_config_dir(config_dir=str(configs), version_base=None):
         cfg = compose(
-            config_name=f"dmc/bench_{agent_name}",
+            config_name=f"release/bench_{agent_name}",
             overrides=[
-                f"dmc/backend@backend={BACKENDS[backend]}",
+                f"release/backend@backend={BACKENDS[backend]}",
                 "release.task=CartpoleBalance",
                 f"env.parallel_envs={NUM_ENVS}",
                 # Enough to condition the observation statistics first:
@@ -346,7 +346,7 @@ def test_the_noise_schedule_advances_by_env_frames_inside_the_scan():
 # replaced did. Its episodes are capped hard here — the comparison is per-step,
 # so 25 of them catch what 1000 would.
 
-_SHORT_EPISODES = ("env.max_episode_steps=25",)
+_SHORT_EPISODES = ("+env.max_episode_steps=25",)
 
 
 def _eval_stats(agent):

@@ -1,17 +1,17 @@
 # The release benchmark
 
 Every launchable config in this repo belongs to one grid: seven agents (DDPG, TD3, TD4,
-D4PG, SAC, MPO, PPO) on three tasks, at matched hyperparameters and a matched step
-budget, on two implementations of the physics.
+D4PG, SAC, MPO, PPO) on `HumanoidStand`, `HumanoidWalk` and `HumanoidRun`, at matched
+hyperparameters and a matched step budget. They are the hardest three tasks of the suite,
+and the only ones where the agents actually separate. The grid runs them two ways:
 
-**3 tasks × 7 agents × 2 cells = 42 runs**, each 500M env steps at 1024 parallel envs,
-one seed.
-
-The tasks are `HumanoidStand`, `HumanoidWalk` and `HumanoidRun` — the hardest three of
-the suite, and the only ones where the agents actually separate. The other 22 in
-`roxie.environment.suites.DMC_TASKS` are one `release.task=` override away and carry the
-same tests; they are not in the grid because a 25-task sweep
-of curves nobody reads costs a fortnight of the box.
+- **Single-task** (`bench_<agent>.yaml`): each task trained on its own, on two
+  implementations of the physics. **3 tasks × 7 agents × 2 cells = 42 runs**, each 500M
+  env steps at 1024 parallel envs, one seed. The results below are these runs.
+- **Multi-task** (`multitask_<agent>.yaml`): one policy for all three tasks in one run, on
+  Warp at 256 parallel envs. It is recorded as the task `Multitask`, so it shares the
+  output tree, the W&B grouping, the plots and the export with the single-task runs. No
+  released result comes from it yet.
 
 ## Results
 
@@ -68,6 +68,7 @@ core slots while the GPU queue drains alongside them:
 
 ```bash
 scripts/run_release_benchmark.sh                              # defaults: 3 tasks, ppo, batch_cpu
+TASKS=Multitask CELLS=warp_gpu scripts/run_release_benchmark.sh  # the multi-task run
 AGENTS="ddpg td3 td4 d4pg sac mpo ppo" \
 CELLS="batch_cpu warp_gpu" scripts/run_release_benchmark.sh # the whole grid
 CELLS=warp_gpu AGENTS=ppo TASKS=HumanoidRun scripts/run_release_benchmark.sh   # one leg
@@ -93,33 +94,38 @@ uv run python scripts/export_release_weights.py      # publish the policies
 ## Layout
 
 ```
-experiments/dmc/
-  bench_<agent>.yaml         launchable, one per agent — this is what you run
+experiments/release/
+  bench_<agent>.yaml         single-task launchable, one per agent
+  multitask_<agent>.yaml     multi-task launchable, one per agent
   agent/<agent>_bench.yaml   matched hyperparameters, one per agent
-  backend/<cell>.yaml        the four device cells
-  bench/dmc.yaml             shared env + trainer + logging block
+  backend/<cell>.yaml        the four device cells (single-task only)
+  bench/release.yaml         shared env + trainer + logging block
+  bench/multitask.yaml       release.yaml plus the three-task env, on Warp
   noise/bench_gaussian.yaml  exploration noise for the deterministic arms
 ```
 
-**The task is an override, not a file.** `release.task` is a playground registry name.
+**The tasks are `mujoco_playground`'s port of the dm_control suite, not dm_control itself.** The port changes timesteps, solver settings and contacts to run well on a GPU (the package lists them in `mujoco_playground/_src/dm_control_suite/xmls/README.md`), so scores here are not directly comparable to published dm_control results.
+
+**The single-task run's task is an override, not a file.** `release.task` is a playground registry name.
 
 ```bash
-uv run python roxie/train.py --config-name dmc/bench_td3                     # WalkerWalk, warp_gpu
-uv run python roxie/train.py --config-name dmc/bench_td3 release.task=HumanoidRun
-uv run python roxie/train.py --config-name dmc/bench_ppo release.task=HumanoidRun \
-    dmc/backend@backend=batch_cpu
+uv run python roxie/train.py --config-name release/bench_td3                 # HumanoidWalk, batch_cpu
+uv run python roxie/train.py --config-name release/bench_td3 release.task=HumanoidRun
+uv run python roxie/train.py --config-name release/bench_ppo release.task=HumanoidRun \
+    release/backend@backend=warp_gpu
+uv run python roxie/train.py --config-name release/multitask_td3             # all three, warp_gpu
 ```
 
 The backend group lives in a subdirectory of the search path, so `backend=batch_cpu` is
 rejected (`Key 'backend' is not in struct`) and `+backend=envpool_cpu` appends a second
-entry instead of replacing the default. `dmc/backend@backend=` is the form that works.
+entry instead of replacing the default. `release/backend@backend=` is the form that works.
 
 ## Held identical across every arm
 
 | Held fixed | Where |
 |---|---|
-| step budget, epoch size, eval protocol | `bench/dmc.yaml` |
-| `parallel_envs` (1024), seed | `bench/dmc.yaml` |
+| step budget, epoch size, eval protocol | `bench/release.yaml` |
+| `parallel_envs` (1024; 256 multi-task), seed | `bench/release.yaml`, `bench/multitask.yaml` |
 | actor + critic MLP `[256, 256]` | every `agent/*_bench.yaml` |
 | layer norm (the six off-policy arms; PPO runs without) | every `agent/*_bench.yaml` |
 | batch size, replay ratio, buffer capacity, warmup | every off-policy `agent/*_bench.yaml` |
