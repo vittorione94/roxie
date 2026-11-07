@@ -221,7 +221,7 @@ class Agent(abc.ABC):
 
         Args:
             weights: one non-negative weight per task, in one-hot order; it
-              need not sum to 1.
+              need not sum to 1, and is stored normalised.
 
         Raises:
             ValueError: on a single-task env or an on-policy agent, which have
@@ -245,7 +245,9 @@ class Agent(abc.ABC):
                 f"task weights {host.tolist()} must be finite and non-negative, "
                 f"with a positive total"
             )
-        self.state.task_weights = jnp.asarray(host, dtype=FLOAT)
+        # Normalised before the float32 cast, which would turn 1e40 into inf.
+        host = host / host.max()
+        self.state.task_weights = jnp.asarray(host / host.sum(), dtype=FLOAT)
 
     def freeze_acting_norm(self):
         """The `ObsStats` acting uses for this chunk, or `None` for `state`'s.
