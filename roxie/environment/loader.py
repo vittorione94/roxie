@@ -5,7 +5,6 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
-import mujoco
 from hydra.utils import get_method
 from omegaconf import DictConfig, OmegaConf, open_dict
 from mujoco_playground import registry
@@ -13,10 +12,6 @@ from mujoco_playground import registry
 from roxie.environment import functional
 from roxie.environment.functional import FuncEnv
 from roxie.environment.vector import BatchVectorEnv, JaxVectorEnv
-
-# playground 0.2.0's reacher.py still calls this; MuJoCo renamed it to `body`.
-if not hasattr(mujoco.MjSpec, "find_body"):
-    mujoco.MjSpec.find_body = mujoco.MjSpec.body
 
 
 class PlaygroundFuncEnv(FuncEnv):
