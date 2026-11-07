@@ -64,6 +64,17 @@ def test_c_tracks_mjx_on_the_first_steps():
     np.testing.assert_allclose(mjx_state.obs, c_state.obs, atol=1e-3)
 
 
+def test_a_player_never_reuses_a_program_traced_on_mjx(c_calls):
+    func_env = _func_env("CartpoleBalance")
+    env = func_env.env
+    action = jnp.zeros(env.action_size, dtype=jnp.float32)
+    jax.jit(env.step)(jax.jit(env.reset)(KEY), action)
+
+    player = CPhysicsPlayer(func_env)
+    jax.block_until_ready(player.step(player.reset(KEY), action).obs)
+    assert c_calls
+
+
 def test_a_model_nothing_registered_stays_on_mjx(c_calls):
     registered = _func_env("CartpoleBalance")
     CPhysicsPlayer(registered)
