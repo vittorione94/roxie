@@ -184,11 +184,10 @@ def main(cfg: DictConfig):
         curriculum=curriculum,
     )
     test_environment = test_env if test_env is not None else env
-    trainer.initialize(
-        agent=agent, environment=env, test_environment=test_environment
-    )
     try:
-        trainer.run(cfg.env.parallel_envs, training_rngs)
+        trainer.run(
+            agent, env, test_environment, cfg.env.parallel_envs, training_rngs,
+        )
     finally:
         logger.close()
 

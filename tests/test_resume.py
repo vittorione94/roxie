@@ -469,8 +469,7 @@ def test_trainer_resumes_the_run_end_to_end(tmp_path, logging_to):
             save_steps=first, test_episodes=2, show_progress=False,
             save_buffer=True, resume=resume,
         )
-        trainer.initialize(agent=agent, environment=env, test_environment=test_env)
-        trainer.run(ENVS, nnx.Rngs(envs=0, agent=3))
+        trainer.run(agent, env, test_env, ENVS, nnx.Rngs(envs=0, agent=3))
         return trainer
 
     run(first, harness.build("td3"))
@@ -510,8 +509,7 @@ def test_a_fresh_run_fills_the_replay_before_its_first_pass(tmp_path, logging_to
         output_dir=str(tmp_path), steps=16 * ENVS, epoch_steps=8 * ENVS,
         save_steps=16 * ENVS, test_episodes=2, show_progress=False,
     )
-    trainer.initialize(agent=agent, environment=env, test_environment=test_env)
-    trainer.run(ENVS, nnx.Rngs(envs=0, agent=3))
+    trainer.run(agent, env, test_env, ENVS, nnx.Rngs(envs=0, agent=3))
 
     can_sample, observations = seen[0]
     assert can_sample
@@ -527,7 +525,7 @@ def test_a_resume_without_a_saved_buffer_refills_it(tmp_path, logging_to):
     """Without `save_buffer`, a resumed off-policy run must re-run warmup —
     otherwise its first gradient steps sample an all-zero buffer.
 
-    Stops at `initialize`: running the second leg would only re-time the loop
+    Stops before the second leg: running it would only re-time the loop
     the test above already drives, and what the refill costs is the arithmetic
     `_warmup_iters` reports.
     """
@@ -538,10 +536,7 @@ def test_a_resume_without_a_saved_buffer_refills_it(tmp_path, logging_to):
         output_dir=str(tmp_path), steps=steps, epoch_steps=8 * ENVS,
         save_steps=steps, test_episodes=2, show_progress=False,
     )
-    trainer.initialize(
-        agent=harness.build("td3"), environment=env, test_environment=env
-    )
-    trainer.run(ENVS, nnx.Rngs(envs=0, agent=3))
+    trainer.run(harness.build("td3"), env, env, ENVS, nnx.Rngs(envs=0, agent=3))
 
     resumed_agent = harness.build("td3")
     metadata = resumed_agent.restore(find_checkpoint(tmp_path))
@@ -550,9 +545,6 @@ def test_a_resume_without_a_saved_buffer_refills_it(tmp_path, logging_to):
     resumed = Trainer(
         output_dir=str(tmp_path), steps=steps + 8 * ENVS, epoch_steps=8 * ENVS,
         save_steps=steps, test_episodes=2, show_progress=False, resume=metadata,
-    )
-    resumed.initialize(
-        agent=resumed_agent, environment=env, test_environment=env
     )
     assert resumed._warmup_iters(resumed_agent.hp.memory_warmup, ENVS) == (
         resumed_agent.hp.memory_warmup // ENVS

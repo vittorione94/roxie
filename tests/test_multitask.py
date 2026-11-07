@@ -561,11 +561,10 @@ def test_the_first_learning_pass_draws_by_the_curriculum(tmp_path):
         output_dir=str(tmp_path), steps=64, epoch_steps=1_000, save_steps=1_000,
         show_progress=False, curriculum=WeightedTasks({"wide": 3}),
     )
-    trainer.initialize(agent=agent, environment=bundle.env,
-                       test_environment=bundle.test_env)
     logger.initialize(path=str(tmp_path / "logs"), backends=[])
     try:
-        trainer.run(4, nnx.Rngs(envs=0, agent=3))
+        trainer.run(agent, bundle.env, bundle.test_env, 4,
+                    nnx.Rngs(envs=0, agent=3))
     finally:
         logger.close()
     np.testing.assert_allclose(seen[0], [0.25, 0.75])
@@ -621,8 +620,9 @@ def _saved_multi_task_run(tmp_path, cfg=None):
     bundle = _toy()
     agent = _sac(bundle.env)
     trainer = Trainer(output_dir=str(tmp_path))
-    trainer.environment, trainer.steps = bundle.env, 100
-    trainer._save(agent, epochs=1, episodes=0, gradient_steps=0)
+    trainer.steps = 100
+    trainer._save(agent, epochs=1, episodes=0, gradient_steps=0,
+                  layout=bundle.env.layout)
     trainer._checkpoint_manager.close()
     (tmp_path / ".hydra").mkdir()
     OmegaConf.save(cfg or _run_config(), tmp_path / ".hydra" / "config.yaml")
@@ -666,8 +666,9 @@ def test_a_task_whose_replay_width_changed_is_refused(tmp_path):
 
 def test_a_replay_whose_worlds_changed_task_is_not_restored(tmp_path):
     trainer = Trainer(output_dir=str(tmp_path), save_buffer=True)
-    trainer.environment, trainer.steps = _toy().env, 100
-    trainer._save(_sac(_toy().env), epochs=1, episodes=0, gradient_steps=0)
+    trainer.steps = 100
+    trainer._save(_sac(_toy().env), epochs=1, episodes=0, gradient_steps=0,
+                  layout=_toy().env.layout)
     trainer._checkpoint_manager.close()
     checkpoint = tmp_path / "checkpoints" / "100"
 

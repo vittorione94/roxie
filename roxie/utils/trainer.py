@@ -84,11 +84,6 @@ class Trainer:
         self.curriculum = curriculum
         self._checkpoint_manager = None
 
-    def initialize(self, agent, environment, test_environment=None):
-        self.agent = agent
-        self.environment = environment
-        self.test_environment = test_environment
-
     def _warmup_iters(self, memory_warmup, num_envs):
         """Zero when a resume restored a populated buffer — refilling would add
         random-action transitions to a trained policy's data."""
@@ -114,15 +109,17 @@ class Trainer:
             )
         return self._checkpoint_manager
 
-    def _save(self, agent, epochs, episodes, gradient_steps):
-        """Write a checkpoint, tagged with the progress needed to resume it."""
+    def _save(self, agent, epochs, episodes, gradient_steps, layout=None):
+        """Write a checkpoint, tagged with the progress needed to resume it.
+
+        `layout` is a multi-task env's `TaskLayout`, or None for a single task.
+        """
         metadata = {
             "steps": int(self.steps),
             "epochs": int(epochs),
             "episodes": int(episodes),
             "gradient_steps": int(gradient_steps),
         }
-        layout = getattr(getattr(self, "environment", None), "layout", None)
         if layout is not None:
             # What playback needs to rebuild one task's input: how many of the
             # padded observation's columns that task really fills.
@@ -210,25 +207,32 @@ class Trainer:
             flush=True,
         )
 
-    def run(self, NUM_ENVS, rngs):
-        """Build the backend rollout, then train.
+    def run(self, agent, environment, test_environment, num_envs, rngs):
+        """Builds the backend rollout, then trains `agent` on it.
 
         A play-only baseline from `agents.basic` does not belong here and says
         so itself: its `learn` raises, and its acting cannot be compiled against
         a handed-in actor because the policy IS its own Python state.
+
+        Args:
+            agent: what is trained.
+            environment: the training env.
+            test_environment: the env the epoch-end eval runs on; None skips it.
+            num_envs: the configured number of training worlds.
+            rngs: the run's `envs` and `agent` key streams.
         """
         rollout, rstate = build_rollout(
-            self.environment, self.test_environment, NUM_ENVS, rngs.envs(),
+            environment, test_environment, num_envs, rngs.envs(),
         )
         try:
-            self._run(rollout, rstate, rngs)
+            self._run(agent, rollout, rstate, rngs)
         finally:
             if self._checkpoint_manager is not None:
                 self._checkpoint_manager.close()
 
-    def _run(self, rollout, rstate: RolloutState, rngs):
+    def _run(self, agent, rollout, rstate: RolloutState, rngs):
         start_time = last_epoch_time = time.time()
-        agent = self.agent
+        layout = getattr(rollout.environment, "layout", None)
         num_envs = rollout.num_envs
         self.num_envs = num_envs
         agent_key = rngs.agent()
@@ -313,6 +317,7 @@ class Trainer:
             stop_training = self._checkpoint_if_due(
                 agent, epochs=epochs, episodes=episodes,
                 gradient_steps=tot_gradient_steps, prev_steps=prev_steps,
+                layout=layout,
             )
             if stop_training:
                 break
@@ -329,9 +334,9 @@ class Trainer:
         if hasattr(agent, "noise_module"):
             agent.noise_module.reset_noise()
 
-        if self.test_environment and hasattr(agent, "state"):
+        test_env = rollout.test_environment
+        if test_env and hasattr(agent, "state"):
             pin = agent.freeze_acting_norm()
-            test_env = rollout.test_environment
             self._store_test_metrics(*rollout.evaluate(
                 agent.state.actor,
                 agent.state.obs_stats if pin is None else pin,
@@ -363,7 +368,7 @@ class Trainer:
         return epochs, _new_epoch_acc(rollout.metric_keys, len(rollout.task_names))
 
     def _checkpoint_if_due(self, agent, *, epochs, episodes,
-                           gradient_steps, prev_steps):
+                           gradient_steps, prev_steps, layout=None):
         """Saves on the save cadence and at the step budget.
 
         Returns:
@@ -372,7 +377,7 @@ class Trainer:
         stop_training = self.steps >= self.max_steps
         if stop_training or self._crossed(prev_steps, self.steps,
                                           self.save_steps):
-            self._save(agent, epochs, episodes, gradient_steps)
+            self._save(agent, epochs, episodes, gradient_steps, layout)
         return stop_training
 
     @staticmethod
