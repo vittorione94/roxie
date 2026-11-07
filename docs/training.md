@@ -57,7 +57,7 @@ Each task logs under its own name:
 | `train/task/<name>/weight` | the replay weight the curriculum chose for the next epoch |
 | `test/task/<name>/score` | the task's eval return, over its own eval worlds |
 
-A resume restarts the curriculum's averages.
+A resume restarts the curriculum's averages. It has to keep the run's tasks, in the same order and at the same observation widths, or it is refused: equal-width tasks in another order would each get another task's one-hot. Splitting the worlds differently between them is allowed, but leaves a saved replay out, since its rows would belong to other tasks; warmup refills it.
 
 `play.py` loads every task of a multi-task run and starts on `--task-id`, or on the first without it; the up and down arrows switch to the previous or next task under the same policy, reopening the window on that task's model. `scripts/render_gif.py` renders the one task `--task-id` names. Either way the world runs that task's own env, and the policy gets its observation padded to the trained width with the task's one-hot appended; the checkpoint records each task's width, so a replay env that disagrees is refused rather than misread:
 

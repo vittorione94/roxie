@@ -10,7 +10,30 @@ from flax import nnx
 from roxie.agents.hyperparams import OffPolicyHyperparams
 from roxie.utils import logger
 from roxie.utils.checkpoint import CHECKPOINTS_DIRNAME
+from roxie.utils.playback import load_config
 from roxie.utils.rollout import ChunkSums, RolloutState, build_rollout
+
+
+def check_resumed_tasks(checkpoint, environment, metadata) -> None:
+    """Refuses to resume a multi-task run into an env that lays its tasks out anew.
+
+    Equal-width tasks in another order pass every shape check, and would each
+    get another task's one-hot and statistics row. The order a run trained in
+    is its saved config's, and the widths are what `Trainer` records.
+
+    Raises:
+        ValueError: if the tasks or their observation widths differ.
+    """
+    layout = getattr(environment, "layout", None)
+    if layout is None:
+        return
+    trained = tuple(load_config(str(checkpoint)).env.tasks)
+    widths = tuple(int(w) for w in metadata.get("task_obs_widths") or ())
+    if (trained, widths) != (layout.names, layout.widths):
+        raise ValueError(
+            f"{checkpoint} trained tasks {trained} with observation widths "
+            f"{widths}, but this env has {layout.names} with {layout.widths}."
+        )
 
 
 def _new_epoch_acc(metric_keys, num_tasks=0):

@@ -562,6 +562,23 @@ def test_a_replay_whose_worlds_changed_task_is_not_restored(tmp_path):
     assert moved.restore(checkpoint)["buffer_restored"] is False
 
 
+def test_a_resume_that_reorders_or_rewidens_the_tasks_is_refused(tmp_path):
+    from roxie.utils.trainer import check_resumed_tasks
+
+    checkpoint = _saved_multi_task_run(tmp_path)
+    metadata = {"task_obs_widths": [2, 4]}
+    check_resumed_tasks(checkpoint, _toy().env, metadata)
+
+    reordered = build_multitask_env(
+        {"wide": TOY_TASKS["wide"], "narrow": TOY_TASKS["narrow"]},
+        task_defaults={"_target_": COUNTER}, num_envs=4,
+    )
+    with pytest.raises(ValueError, match="trained tasks"):
+        check_resumed_tasks(checkpoint, reordered.env, metadata)
+    with pytest.raises(ValueError, match="trained tasks"):
+        check_resumed_tasks(checkpoint, _toy().env, {"task_obs_widths": [2, 3]})
+
+
 def test_a_single_task_run_has_one_world_with_no_name(monkeypatch):
     from roxie.utils import playback
 

@@ -38,7 +38,7 @@ from roxie.environment.loader import (
 )
 from roxie.utils import hydra_searchpath, logger, precision, system
 from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
-from roxie.utils.trainer import Trainer
+from roxie.utils.trainer import Trainer, check_resumed_tasks
 
 hydra_searchpath.register()
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
@@ -159,6 +159,7 @@ def main(cfg: DictConfig):
     if resume_path:
         checkpoint = find_checkpoint(resume_path)
         resume_metadata = agent.restore(checkpoint)
+        check_resumed_tasks(checkpoint, env, resume_metadata)
         if not resume_metadata.get("steps"):
             resume_metadata["steps"] = checkpoint_steps(checkpoint) or 0
         print(
