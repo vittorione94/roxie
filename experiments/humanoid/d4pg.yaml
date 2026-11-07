@@ -3,8 +3,7 @@
 defaults:
   - /dmc/agent@agent: d4pg_bench
   - /dmc/noise@noise: bench_gaussian
-  - /env: multitask
-  - /curriculum: null
+  - bench: humanoid
   - _self_
 
 # Sized for 4,096 worlds. `max_length` is shared by all worlds, which reset in
@@ -20,29 +19,10 @@ agent:
     max_length: 8_388_608       # 2,048 steps per world, about 3.1 GB
 
 env:
-  task_defaults:
-    _target_: roxie.environment.loader.build_playground_env
-    impl: warp
-  tasks:
-    stand: {env_name: HumanoidStand}
-    walk: {env_name: HumanoidWalk}
-    run: {env_name: HumanoidRun}
-  weights: {stand: 1, walk: 1, run: 1}
-  seed: 0
   parallel_envs: 4096
-
-runtime:
-  device: gpu
-  matmul_precision: tensorfloat32
 
 trainer:
   steps: 1_000_000_000
-  epoch_steps: 500_000
-  save_steps: 5_000_000
-  test_episodes: 10
-  show_progress: true
-  replace_checkpoint: false
-  save_buffer: false
 
 hydra:
   run:
