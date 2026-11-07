@@ -16,7 +16,7 @@ uv run python roxie/train.py --config-name dmc/bench_sac release.task=CheetahRun
 Move a run between devices by switching its `backend` group; the physics and the learner move together and nothing else changes:
 
 ```bash
-uv run python roxie/train.py --config-name dmc/bench_sac dmc/backend@backend=envpool_cpu  # GPU-free
+uv run python roxie/train.py --config-name dmc/bench_sac dmc/backend@backend=batch_cpu  # GPU-free
 uv run python roxie/train.py --config-name dmc/bench_sac dmc/backend@backend=mjx_cpu
 ```
 
@@ -61,7 +61,7 @@ uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
 
 Playback drives a single world into the interactive MuJoCo viewer, always on CPU/MJX even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override the saved run config.
 
-Both entry points restore the checkpoint through `roxie.utils.playback.load_policy`, which reads the run's saved Hydra config and rewrites the two backends that cannot replay themselves: Warp falls back to MJX on the same model, and an EnvPool run moves to the `mujoco_playground` twin of the same task, since a C++ pool exposes no `mjModel`/`mjData` to step or draw one world of.
+Both entry points restore the checkpoint through `roxie.utils.playback.load_policy`, which reads the run's saved Hydra config and moves Warp and `mujoco.batch` runs onto MJX, which steps one world of the same task and model.
 
 ### Rendering without a display
 

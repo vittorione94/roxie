@@ -44,7 +44,7 @@ Two knobs whose spelling is not self-evident:
 
 ## The fused window
 
-The trainer's unit of work is a **window**: `steps_between_updates` env steps, then a pass of `learning_steps` gradient steps. Both halves are single compiled programs — [`Rollout.collect`](../roxie/utils/rollout.py) scans the whole acting chunk, `fused_grad_steps` scans the gradient steps — so a window costs **two host dispatches rather than a handful per step**, on every agent and both backends. A C++ pool cannot be traced but can be *called* from inside a trace, so `EnvPoolRollout` steps its pool through an ordered `io_callback` and compiles the same chunk ([backends.md](backends.md#why-there-are-two-rollouts)).
+The trainer's unit of work is a **window**: `steps_between_updates` env steps, then a pass of `learning_steps` gradient steps. Both halves are single compiled programs — [`Rollout.collect`](../roxie/utils/rollout.py) scans the whole acting chunk, `fused_grad_steps` scans the gradient steps — so a window costs **two host dispatches rather than a handful per step**, on every agent and both backends. `mujoco.batch` cannot be traced but can be *called* from inside a trace, so it is stepped through an ordered `io_callback` in the same chunk ([backends.md](backends.md#one-rollout)).
 
 That makes the *boundary* the cost, which is why `nnx.jit` is nowhere near the hot loop: it re-walks the module graph in Python on every call. So `TrainState` is declared a **pytree** rather than an opaque nnx graph node, and a learning pass hands it straight to `jax.jit` and `lax.scan` with no `nnx.split`/`merge`. (`buffer_state` and `obs_stats` are annotated `nnx.data()` because they are raw arrays rather than `nnx.Variable`s, and the two target slots because a slot born `None` — SAC's and PPO's — would otherwise be classified static and refuse a later assignment.)
 
@@ -92,7 +92,7 @@ Acting is normalized against the statistics as they stood when the chunk opened,
 
 PPO's `freeze_obs_norm_per_chunk` is a stronger pin: its snapshot is the same `ObsStats` object acting and the *update* both run under, and it survives the chunk until `learn` clears it, because its ratio is only meaningful against the observations the behaviour policy saw. `_prepare_rollout` re-normalizes the stored observations to recompute that ratio, so drift between acting and updating would make the clip and the KL early stop fire on normalization noise.
 
-`freeze_acting_norm` is the host-side half: the rollout calls it at every chunk boundary and gets back the `ObsStats` acting must use, or `None` from agents with no update-time pin — which every caller reads as "use the ones off the train state". `EnvPoolRollout` needs it returned, its acting being one dispatch per step; `JaxRollout` hoists the same value off its traced pytree.
+`freeze_acting_norm` is the host-side half: the rollout calls it at every chunk boundary and gets back the `ObsStats` acting must use, or `None` from agents with no update-time pin — which every caller reads as "use the ones off the train state". The rollout hoists the same value off its traced pytree.
 
 `obs_norm_clip` bounds the z-score; `None` leaves it unbounded. It is a *static* argument to `normalize_obs`, and travels through a checkpoint as a number, non-positive meaning `None`.
 

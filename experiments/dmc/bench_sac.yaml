@@ -3,7 +3,7 @@
 defaults:
   - agent: sac_bench
   - bench: dmc
-  - backend: envpool_cpu
+  - backend: batch_cpu
   - _self_
 
 release:

@@ -17,7 +17,6 @@ from flax import struct
 
 from roxie.environment import functional
 from roxie.environment.vector import (
-    EnvPoolVectorEnv,
     JaxVectorEnv,
     Timestep,
     VecState,
@@ -106,13 +105,21 @@ def test_params_stay_traced_and_reach_initial(vec_env, rng_key):
     """`params` must be an ARGUMENT, not a closure constant: an env that adapts
     its params refreshes them every epoch, and a recompile there would cost more
     than the adaptation buys."""
-    jitted = jax.jit(lambda k, p: vec_env.reset(k, params=p)[0].obs)
+    traces = []
+
+    def reset_obs(k, p):
+        traces.append(p)
+        return vec_env.reset(k, params=p)[0].obs
+
+    jitted = jax.jit(reset_obs)
     at_zero = np.asarray(jitted(rng_key, 0.0))
     at_two = np.asarray(jitted(rng_key, 2.0))
 
     assert np.allclose(at_two - at_zero, 2.0)
-    # One compile for both values is the property under test.
-    assert jitted._cache_size() == 1
+    # One compile for both values is the property under test. Counted by trace,
+    # not `_cache_size()`: on jax 0.10.2 (what Python 3.11 locks to), a new
+    # function reads 0 there once the suite has filled the global jit cache.
+    assert len(traces) == 1
 
 
 def test_failure_is_terminated_not_truncated(vec_env, rng_key):
@@ -275,25 +282,6 @@ class DivergingEnv(CounterEnv):
         return next_state.x - state.x
 
 
-class _FakePool:
-    """The minimum surface `EnvPoolVectorEnv` needs from a C++ pool."""
-
-    num_envs = 4
-
-    def __init__(self):
-        self.observation_space = functional.unbounded_box(2)
-        self.action_space = functional.box(-1.0, 1.0, shape=(1,))
-        self.obs = np.zeros((4, 2), dtype=np.float32)
-        self.reward = np.zeros(4, dtype=np.float32)
-
-    def reset(self):
-        return self.obs, {}
-
-    def step(self, action):
-        false = np.zeros(4, dtype=bool)
-        return self.obs, self.reward, false, false, {}
-
-
 class TestNonFiniteWorlds:
     """A diverged world is caught by the DRIVER, because it cannot catch itself.
 
@@ -373,23 +361,6 @@ class TestNonFiniteWorlds:
         assert np.allclose(np.asarray(ts.reward), 0.5)
         assert not np.any(np.asarray(ts.terminated))
         assert np.all(np.asarray(ts.info["metrics"]["nonfinite"]) == 0.0)
-
-    def test_pool_backend_zeroes_without_forcing_a_reset(self):
-        """The pool owns its episode boundaries in C++, so the driver zeroes and
-        reports but does NOT invent a termination it cannot act on — that would
-        re-fire every step and count one dead world as thousands of episodes."""
-        pool = _FakePool()
-        env = EnvPoolVectorEnv(pool, max_episode_steps=0)
-        state, _ = env.reset()
-        pool.obs = np.full((4, 2), np.nan, dtype=np.float32)
-        pool.reward = np.full(4, np.nan, dtype=np.float32)
-
-        _, ts = env.step(state, np.zeros((4, 1), dtype=np.float32))
-
-        assert np.all(np.isfinite(ts.obs)) and ts.obs.dtype == np.float32
-        assert np.all(np.isfinite(ts.reward)) and ts.reward.dtype == np.float32
-        assert not np.any(ts.terminated)
-        assert np.all(ts.info["metrics"]["nonfinite"] == 1.0)
 
 
 def test_timestep_unpacks_as_the_gymnasium_five_tuple(vec_env, rng_key):
