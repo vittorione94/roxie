@@ -548,6 +548,20 @@ def test_a_task_whose_replay_width_changed_is_refused(tmp_path):
         load_tasks(_saved_multi_task_run(tmp_path, cfg), verbose=False)
 
 
+def test_a_replay_whose_worlds_changed_task_is_not_restored(tmp_path):
+    trainer = Trainer(output_dir=str(tmp_path), save_buffer=True)
+    trainer.environment, trainer.steps = _toy().env, 100
+    trainer._save(_sac(_toy().env), epochs=1, episodes=0, gradient_steps=0)
+    trainer._checkpoint_manager.close()
+    checkpoint = tmp_path / "checkpoints" / "100"
+
+    assert _sac(_toy().env).restore(checkpoint)["buffer_restored"] is True
+    # Same four worlds and the same buffer shapes, split (1, 3) instead.
+    moved = _sac(_toy(weights={"wide": 3}).env)
+    assert moved.task_counts == (1, 3)
+    assert moved.restore(checkpoint)["buffer_restored"] is False
+
+
 def test_a_single_task_run_has_one_world_with_no_name(monkeypatch):
     from roxie.utils import playback
 

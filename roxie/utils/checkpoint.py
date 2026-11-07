@@ -240,7 +240,7 @@ class AgentCheckpointer:
         self._restore_obs_stats(ckpt_state)
 
         buffer_restored = False
-        if "buffer_state" in ckpt_state:
+        if "buffer_state" in ckpt_state and self._same_task_blocks(loaded):
             buffer_restored = self._restore_buffer(ckpt_state["buffer_state"])
 
         boundary = loaded.get("last_update_boundary", None)
@@ -301,6 +301,26 @@ class AgentCheckpointer:
             f"{path} was trained on a {int(ckpt_width)}-dimensional "
             f"observation, but this env produces {live_width}."
         )
+
+    def _same_task_blocks(self, loaded: Dict[str, Any]) -> bool:
+        """Whether the saved replay's rows belong to the tasks they do live.
+
+        A replay row is one world's stream, and a multi-task env gives each task
+        a contiguous block of worlds, so moving worlds between tasks relabels
+        rows without changing a single shape.
+        """
+        saved = tuple(
+            int(c) for c in (loaded.get("hyperparams") or {}).get("task_counts") or ()
+        )
+        live = tuple(self.agent.task_counts or ())
+        if saved == live:
+            return True
+        print(
+            f"Warning: the checkpoint's replay holds task blocks of {saved} "
+            f"worlds, but this env has {live}; keeping the empty one — the "
+            "trainer will refill it."
+        )
+        return False
 
     def _restore_buffer(self, ckpt_buffer) -> bool:
         """Reconstructs Flashbax replay buffer state from host checkpoint arrays."""
