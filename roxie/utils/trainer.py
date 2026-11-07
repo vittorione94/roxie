@@ -144,6 +144,14 @@ class Trainer:
 
         if not isinstance(agent.hp, OffPolicyHyperparams):
             return agent_key
+        # This is a real learning pass. flashbax allocates with `jnp.empty_like`,
+        # so a buffer it cannot sample yields uninitialised memory on a GPU, and
+        # one pass on that can leave NaN weights for the rest of the run.
+        if not agent.replay.can_sample(agent.state.buffer_state):
+            raise ValueError(
+                f"memory_warmup={agent.hp.memory_warmup:,} leaves the replay too "
+                f"short to sample from; raise it."
+            )
         print("Compiling gradient step...", flush=True)
         t0 = time.time()
         agent_key, warm_key = jax.random.split(agent_key)
@@ -202,7 +210,7 @@ class Trainer:
         self.num_envs = num_envs
         agent_key = rngs.agent()
 
-        memory_warmup = getattr(agent, "memory_warmup", 0)
+        memory_warmup = getattr(agent.hp, "memory_warmup", 0)
         warmup_iters = self._warmup_iters(memory_warmup, num_envs)
         epochs, episodes, tot_gradient_steps = self._init_counters()
 

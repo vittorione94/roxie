@@ -492,6 +492,37 @@ def test_trainer_resumes_the_run_end_to_end(tmp_path, logging_to):
     assert (Path(tmp_path) / "checkpoints" / str(second)).is_dir()
 
 
+def test_a_fresh_run_fills_the_replay_before_its_first_pass(tmp_path, logging_to):
+    agent = harness.build("td3")
+    seen = []
+    learn = agent.learn
+
+    def spy(key, n_steps=None):
+        seen.append((
+            bool(agent.replay.can_sample(agent.state.buffer_state)),
+            float(jax.numpy.sum(agent.state.obs_stats.count)),
+        ))
+        return learn(key, n_steps)
+
+    agent.learn = spy
+    env, test_env = _fake_vector_env(), _fake_vector_env(num_envs=2)
+    trainer = Trainer(
+        output_dir=str(tmp_path), steps=16 * ENVS, epoch_steps=8 * ENVS,
+        save_steps=16 * ENVS, test_episodes=2, show_progress=False,
+    )
+    trainer.initialize(agent=agent, environment=env, test_environment=test_env)
+    trainer.run(ENVS, nnx.Rngs(envs=0, agent=3))
+
+    can_sample, observations = seen[0]
+    assert can_sample
+    assert observations > 0
+
+
+def test_learning_from_a_replay_it_cannot_sample_is_refused():
+    with pytest.raises(ValueError, match="memory_warmup"):
+        Trainer._precompile_update(harness.build("td3"), jax.random.PRNGKey(0))
+
+
 def test_a_resume_without_a_saved_buffer_refills_it(tmp_path, logging_to):
     """Without `save_buffer`, a resumed off-policy run must re-run warmup —
     otherwise its first gradient steps sample an all-zero buffer.
