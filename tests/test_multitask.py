@@ -218,6 +218,15 @@ def test_tasks_must_share_a_backend():
         )
 
 
+def test_tasks_must_share_a_physics_impl():
+    with pytest.raises(ValueError, match="same backend"):
+        build_multitask_env(
+            {"toy": {"_target_": COUNTER},
+             "mjx": {"env_name": "CartpoleBalance", "impl": "jax"}},
+            num_envs=2,
+        )
+
+
 def test_eval_waits_for_an_uncapped_task():
     bundle = build_multitask_env(
         {"capped": {"max_steps": 100}, "uncapped": {"max_steps": 0}},

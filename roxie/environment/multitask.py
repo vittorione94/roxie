@@ -21,7 +21,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from roxie.environment import functional
-from roxie.environment.loader import EnvBundle, build_env, plain
+from roxie.environment.loader import (
+    EnvBundle,
+    build_env,
+    plain,
+    resolve_loaded_impl,
+)
 from roxie.environment.vector import (
     UNCAPPED_EVAL_STEPS,
     BatchVectorEnv,
@@ -290,9 +295,14 @@ def build_multitask_env(
         )
         train[name], test[name] = bundle.env, bundle.test_env
 
-    batched = [isinstance(env, BatchVectorEnv) for env in train.values()]
-    if any(batched) and not all(batched):
-        raise ValueError("every task must run on the same backend")
+    backends = {
+        (isinstance(env, BatchVectorEnv), resolve_loaded_impl(env))
+        for env in train.values()
+    }
+    if len(backends) > 1:
+        raise ValueError(
+            f"every task must run on the same backend; got {sorted(backends)}"
+        )
     return EnvBundle(
         env=MultiTaskEnv(train), test_env=MultiTaskEnv(test), env_cfg=None,
     )
