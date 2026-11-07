@@ -360,8 +360,10 @@ class PPO(Agent):
         hyperparams: PPOHyperparams = None,
         actor_optimizer_config: dict = None,
         critic_optimizer_config: dict = None,
+        env_task_counts=None,
     ):
         self.hp = build_hyperparams(type(self).hyperparams_cls, hyperparams)
+        self._bind_tasks(env_task_counts)
 
         actor = hydra.utils.instantiate(actor_config)
         critic = hydra.utils.instantiate(critic_config)

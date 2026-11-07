@@ -1,0 +1,29 @@
+# @package _global_
+
+defaults:
+  - /dmc/agent@agent: d4pg_bench
+  - /dmc/noise@noise: bench_gaussian
+  - bench: humanoid
+  - _self_
+
+# Sized for 4,096 worlds. `max_length` is shared by all worlds, which reset in
+# lockstep here, so a window under one episode (500k would be 122 steps) only ever
+# holds one slice of the episode. 2,048 steps per world is close to the 1,953 that
+# 256 worlds get from the bench's 500k.
+agent:
+  hyperparams:
+    memory_warmup: 491_520      # 120 control steps per world
+    steps_between_updates: 4_096
+    learning_steps: 40          # with the line above, the bench's updates per env step
+  memory_config:
+    max_length: 8_388_608       # 2,048 steps per world, about 3.1 GB
+
+env:
+  parallel_envs: 4096
+
+trainer:
+  steps: 1_000_000_000
+
+hydra:
+  run:
+    dir: outputs/humanoid/d4pg/${now:%Y-%m-%d_%H-%M-%S}

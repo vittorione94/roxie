@@ -43,7 +43,7 @@ pipeline_tag: reinforcement-learning
 tags:
   - reinforcement-learning
   - deep-reinforcement-learning
-  - dm-control
+  - mujoco-playground
   - mujoco
   - jax
 ---
@@ -336,8 +336,10 @@ def write_index(dest_root: Path, exported: list[dict], *, cells: list[str],
         f"agent(s) — each selected by best `{metric}` among its run's "
         "checkpoints, not by taking the final checkpoint.",
         "",
-        "Scores are dm_control episode returns, so 1000 is the ceiling on every "
-        "task and the table is comparable down its rows as well as across them. "
+        "Scores are episode returns on mujoco_playground's port of the dm_control "
+        "suite, not comparable to published dm_control results. 1000 is the "
+        "ceiling on every task and the table is comparable down its rows as well "
+        "as across them. "
         "Each entry gives the published checkpoint's own score, then in "
         f"parentheses the mean of its run's last {FINAL_EVALS} evaluations — "
         "where the run ENDED, which is what the release figures plot. The two "

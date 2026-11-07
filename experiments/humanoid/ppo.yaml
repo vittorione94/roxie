@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - /dmc/agent@agent: ppo_bench
+  - bench: humanoid
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/humanoid/ppo/${now:%Y-%m-%d_%H-%M-%S}

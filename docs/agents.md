@@ -94,6 +94,8 @@ PPO's `freeze_obs_norm_per_chunk` is a stronger pin: its snapshot is the same `O
 
 `freeze_acting_norm` is the host-side half: the rollout calls it at every chunk boundary and gets back the `ObsStats` acting must use, or `None` from agents with no update-time pin — which every caller reads as "use the ones off the train state". The rollout hoists the same value off its traced pytree.
 
+On a multi-task env the statistics keep one row per task, and a single-task env is the one-row case. The observation ends in its task's one-hot, which picks the row and reaches the network untouched; the padded columns a task does not fill only ever accumulate zeros, so they normalize to exactly zero. The agent learns the layout from `env_task_counts`, each task's number of worlds, which `train.py` passes only for a multi-task env.
+
 `obs_norm_clip` bounds the z-score; `None` leaves it unbounded. It is a *static* argument to `normalize_obs`, and travels through a checkpoint as a number, non-positive meaning `None`.
 
 ### `learn` is unconditional; `due_for_update` consumes its boundary
@@ -126,6 +128,10 @@ The env-step count is passed *in* by the trainer, so both rates are against the 
 The off-policy agents pick their buffer from `n_step`: a flashbax **flat buffer** at `n_step: 1`, switching to a **trajectory buffer** (`sample_sequence_length = n_step + 1`, `period=1`) when `n_step > 1`, since n-step targets need consecutive items. The YAML keeps the flat-buffer schema either way — `max_length`/`min_length` are *total* transitions, converted internally to flashbax's per-row time-axis lengths. PPO instead uses a trajectory **queue**, drained every update.
 
 Both structures have standalone walkthroughs under [`examples/flashbax/`](../examples/flashbax/).
+
+### Weighting it by task
+
+On a multi-task env a world keeps its task for the whole run, so each replay row holds one task's stream, and weighting tasks is weighting rows. Every off-policy gradient step draws through `ReplayManager.draw` with the train state's `task_weights`, which start at the collection shares, so an untouched run samples exactly as uniform sampling would. `set_task_weights` moves them; they are a traced array, so the next learning pass picks them up without recompiling. It raises for PPO, whose on-policy queue has nothing to reweight, and on a single-task env, where `task_weights` is `None` and the draw is flashbax's own.
 
 ### Writing into one
 

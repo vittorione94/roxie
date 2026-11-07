@@ -1,0 +1,13 @@
+# Samples the replay by how fast each task's training score is moving: the gap
+# between a fast and a slow moving average of its normalized score. Only for a
+# multi-task env and an off-policy agent; train.py refuses anything else.
+#
+#   defaults:
+#     - /curriculum: learning_progress
+_target_: roxie.utils.curriculum.LearningProgressTasks
+# A dm_control episode pays at most 1 per step: 1000 over its 1000 steps.
+score_scale: 1000.0
+# The share of every draw spread uniformly, so no task starves.
+floor: 0.2
+fast_rate: 0.5
+slow_rate: 0.1

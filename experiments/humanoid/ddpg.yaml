@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - /dmc/agent@agent: ddpg_bench
+  - /dmc/noise@noise: bench_gaussian
+  - bench: humanoid
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/humanoid/ddpg/${now:%Y-%m-%d_%H-%M-%S}

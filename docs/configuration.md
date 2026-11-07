@@ -19,7 +19,8 @@ A few keys under `env:` are *not* builder arguments, because roxie consumes them
 ## Layout
 
 - [`roxie/configs/agent/`](../roxie/configs/agent/) — one file per algorithm (`ddpg`, `td3`, `td4`, `d4pg`, `sac`, `mpo`, `ppo`, plus the play-only baselines in [`roxie/agents/basic.py`](../roxie/agents/basic.py), which `Trainer.run` refuses to train).
-- [`roxie/configs/env/`](../roxie/configs/env/) — one file per env builder: a complete `env:` block, pulled into a launchable's `defaults:` as `- /env: playground`. The leading `/` is required from a launchable in a subdirectory of `experiments/`, exactly as for `/agent:`.
+- [`roxie/configs/env/`](../roxie/configs/env/) — one file per env builder (`playground`, and `multitask`, which composes several tasks): a complete `env:` block, pulled into a launchable's `defaults:` as `- /env: playground`. The leading `/` is required from a launchable in a subdirectory of `experiments/`, exactly as for `/agent:`.
+- [`roxie/configs/curriculum/`](../roxie/configs/curriculum/) — task curricula for a multi-task env (`learning_progress`, `weighted`), pulled in as `curriculum=` ([training.md](training.md#several-tasks)).
 - [`roxie/configs/noise/`](../roxie/configs/noise/) — exploration noise modules (`ou`, `gaussian`, `adaptive`). Agents that explore from their own policy (SAC, MPO, PPO) take **no** noise group; adding one is a launch-time error.
 - [`experiments/<env>/`](../experiments/) — launchable experiments. `--config-name` includes the folder.
 - [`experiments/dmc/`](../experiments/dmc/) — the release benchmark, carrying its own groups: `agent/`, `backend/`, `bench/` and `noise/`.

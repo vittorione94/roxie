@@ -45,11 +45,30 @@ class Timestep(NamedTuple):
     info: dict
 
 
+# Past this, a finite observation is a diverged world all the same. MuJoCo passes
+# through finite values on the way to NaN: Warp emitted ~1e11 the step before its
+# NaN, and the C engine behind `mujoco.batch` emits ~1e7 velocities until its own
+# QACC check resets the world, which never reaches NaN at all. One such step,
+# folded into the all-time `ObsStats`, scales that task's normalized inputs to ~0
+# for the rest of the run: humanoid `stand` went 985 -> 34 at 436M on Warp, and a
+# batch run never learned `run` in 500M (2026-11-07). Healthy humanoid columns
+# kept an RMS under 26 over 1B steps, and under random actions no loadable
+# playground task passed 78 in a 1,000-step episode.
+DIVERGED_OBS_LIMIT = 1e3
+
+# How long an eval runs an episode on a driver with `max_episode_steps=0`,
+# which puts no cutoff of its own on it.
+UNCAPPED_EVAL_STEPS = 1000
+
+
 def nonfinite_worlds(obs, reward, xp=jnp):
-    """Identifies worlds that produced non-finite observations or rewards."""
+    """Identifies worlds whose step diverged: non-finite, or past the limit."""
     n = obs.shape[0]
-    finite_obs = xp.all(xp.isfinite(obs).reshape(n, -1), axis=1)
-    return ~(finite_obs & xp.isfinite(reward))
+    # `<=` is False on NaN and on Inf, so this also catches non-finite values.
+    sane_obs = xp.all(
+        (xp.abs(obs) <= DIVERGED_OBS_LIMIT).reshape(n, -1), axis=1
+    )
+    return ~(sane_obs & xp.isfinite(reward))
 
 
 def zero_worlds(mask, x, xp=jnp):
@@ -128,7 +147,11 @@ class JaxVectorEnv:
         terminated = jnp.logical_or(
             jnp.logical_and(terminal, jnp.logical_not(truncal)), diverged
         )
-        truncated = jnp.logical_or(truncal, step_truncated)
+        # A blown-up world still runs its predicates, and a large finite state
+        # can trip `truncal`; a truncation would bootstrap off that state.
+        truncated = jnp.logical_and(
+            jnp.logical_or(truncal, step_truncated), jnp.logical_not(diverged)
+        )
         done = jnp.logical_or(jnp.logical_or(terminated, truncal), step_truncated)
 
         info = {

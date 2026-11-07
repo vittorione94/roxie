@@ -98,7 +98,7 @@ what keeps a thousand environments fed — see
 ## Documentation
 
 - **[Backends](docs/backends.md)** — the three physics backends, the rollout, memory, contact budgets, device placement, determinism.
-- **[Environments](docs/environments.md)** — the two ways to attach an env, the `FuncEnv` interface, builders, `terminal` vs `truncal`.
+- **[Environments](docs/environments.md)** — the two ways to attach an env, the `FuncEnv` interface, builders, `terminal` vs `truncal`, several tasks in one policy.
 - **[Agents](docs/agents.md)** — the shared base, the hyperparameter dataclass, the fused window, the contract a new agent honours, buffers, checkpoints.
 - **[Configuration](docs/configuration.md)** — the Hydra convention, the config groups, an annotated experiment.
 - **[Training](docs/training.md)** — overrides, `device=`, resuming, playback.

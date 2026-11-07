@@ -6,11 +6,13 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import struct
 
 from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
 from roxie.environment.functional import space_size
+from roxie.environment.vector import UNCAPPED_EVAL_STEPS
 from roxie.utils.precision import FLOAT
 
 _EVAL_SEED = 12345
@@ -59,7 +61,13 @@ def finished_episodes(scores, lengths, done):
 
 @struct.dataclass
 class ChunkSums:
-    """One chunk's scalars: the episode accumulators and the per-step means."""
+    """One chunk's scalars: the episode accumulators and the per-step means.
+
+    Attributes:
+        task_ret: `(K,)` finished-episode returns summed per task; None for a
+            single-task env.
+        task_count: `(K,)` finished episodes per task; None likewise.
+    """
 
     ret: Any
     ret_sq: Any
@@ -68,27 +76,41 @@ class ChunkSums:
     count: Any
     noise: Any
     metrics: dict
+    task_ret: Any = None
+    task_count: Any = None
 
     @classmethod
-    def zeros(cls, metric_keys):
+    def zeros(cls, metric_keys, num_tasks=0):
         """An empty accumulator, keyed for the metrics this env reports."""
         zero = jnp.zeros((), FLOAT)
+        per_task = jnp.zeros((num_tasks,), FLOAT) if num_tasks else None
         return cls(
             ret=zero, ret_sq=zero, length=zero, length_sq=zero, count=zero,
             noise=zero, metrics={key: zero for key in metric_keys},
+            task_ret=per_task, task_count=per_task,
         )
 
     @classmethod
-    def from_chunk(cls, ep_ret, ep_len, done_f, noise, metrics, n_steps):
+    def from_chunk(cls, ep_ret, ep_len, done_f, noise, metrics, n_steps,
+                   task_hot=None):
         """Reduces one chunk, in a single pass per key.
 
-        Every argument arrives stacked over the chunk's time axis, `(T, ...)`.
+        Every argument arrives stacked over the chunk's time axis, `(T, ...)`,
+        but `task_hot`: the static `(N, K)` world-to-task one-hot of a
+        multi-task env, or None.
 
         Returns:
             The chunk's `ChunkSums`.
         """
         def per_step_mean(x):
             return jnp.mean(x.reshape(n_steps, -1), axis=1)
+
+        def per_task(x):
+            # HIGHEST: a sum of returns, not an activation.
+            return jnp.einsum(
+                "n,nk->k", jnp.sum(x, axis=0), task_hot,
+                precision=jax.lax.Precision.HIGHEST,
+            )
 
         return cls(
             ret=jnp.sum(ep_ret),
@@ -99,12 +121,22 @@ class ChunkSums:
             noise=jnp.sum(per_step_mean(jnp.abs(noise))),
             metrics={key: jnp.sum(per_step_mean(value))
                      for key, value in metrics.items()},
+            task_ret=None if task_hot is None else per_task(ep_ret),
+            task_count=None if task_hot is None else per_task(done_f),
         )
 
     def __add__(self, other):
         """Fold another chunk in, leaf by leaf. Both carry the same metric keys
         — `zeros` is built from the same `metric_keys` the chunk reports."""
         return jax.tree.map(jnp.add, self, other)
+
+
+def task_one_hot(environment):
+    """The static `(N, K)` world-to-task one-hot of a multi-task env, or None."""
+    task_ids = getattr(environment, "task_ids", None)
+    if task_ids is None:
+        return None
+    return np.eye(len(environment.task_names), dtype=np.float32)[task_ids]
 
 
 def chunk_step(carry, _, *, agent, advance, observe_params, acting_stats,
@@ -272,7 +304,10 @@ def collect_chunk(train_state, noise_module, rstate, frozen_stats, *,
     agent.absorb_obs_stats(prev_obs, next_obs, state=train_state)
     return train_state, noise_module, rstate.replace(
         env=state, rng=rng, params=params, scores=scores, lengths=lengths,
-    ), ChunkSums.from_chunk(ep_ret, ep_len, done_f, noise, metrics, n_steps)
+    ), ChunkSums.from_chunk(
+        ep_ret, ep_len, done_f, noise, metrics, n_steps,
+        task_hot=task_one_hot(environment),
+    )
 
 
 @functools.partial(
@@ -406,6 +441,7 @@ class Rollout:
             at the price of a proportionally larger graph to compile.
         num_envs: The env width.
         metric_keys: What the env reports under `info["metrics"]`.
+        task_names: A multi-task env's tasks, in one-hot order; empty if single.
     """
 
     advance = staticmethod(jax_advance)
@@ -428,6 +464,7 @@ class Rollout:
         self.num_envs = int(num_envs)
         self.action_size = space_size(environment.single_action_space)
         self.metric_keys = tuple(metric_keys)
+        self.task_names = tuple(getattr(environment, "task_names", ()))
         self._frozen = True
 
     def __setattr__(self, name, value):
@@ -551,7 +588,9 @@ class Rollout:
         return evaluate_policy(
             actor, obs_stats, state, environment=self.test_environment,
             advance=self.advance, agent=agent,
-            max_steps=int(self.test_environment.max_episode_steps or 1000),
+            max_steps=int(
+                self.test_environment.max_episode_steps or UNCAPPED_EVAL_STEPS
+            ),
         )
 
     def warmup(self, agent, rstate, iters):

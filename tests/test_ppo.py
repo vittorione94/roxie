@@ -105,7 +105,7 @@ class TestObsNormFreeze:
         """
         agent = _agent(normalize_observations=False)
         diag = _collect_and_update(agent, jax.random.PRNGKey(0))
-        assert float(agent.state.obs_stats.count) == 0.0
+        assert float(jnp.sum(agent.state.obs_stats.count)) == 0.0
         assert diag["ppo/approx_kl"] == pytest.approx(0.0, abs=1e-5)
 
 

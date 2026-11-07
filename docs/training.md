@@ -35,6 +35,38 @@ The env is a config group like the agent — [`roxie/configs/env/`](../roxie/con
 
 Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch metrics to console + CSV, checkpoints under `checkpoints/`, and optionally Weights & Biases (`logging.wandb.enabled: true`).
 
+## Several tasks
+
+A multi-task launchable names its tasks in an env block ([environments.md](environments.md#several-tasks-at-once)). 
+
+[`experiments/humanoid/sac.yaml`](../experiments/humanoid/sac.yaml) trains one policy for mujoco_playground's humanoid stand, walk and run, on Warp:
+
+```bash
+uv run --group cuda python roxie/train.py --config-name humanoid/sac
+uv run --group cuda python roxie/train.py --config-name humanoid/sac curriculum=learning_progress
+```
+
+The env block's `weights` fix each task's share of the worlds for the run. A **curriculum** steers what the learner samples from them instead: it sets the replay's task weights before the first learning pass, then at every epoch boundary reads each task's training score and sets them for the passes that follow. [`roxie/configs/curriculum/`](../roxie/configs/curriculum/) holds `learning_progress`, which favours the tasks whose score is moving, and `weighted`, which pins fixed weights. A curriculum needs a multi-task env and an off-policy agent; `train.py` refuses anything else at launch.
+
+Each task logs under its own name:
+
+| Key | What |
+|---|---|
+| `train/task/<name>/score` | mean return of the task's episodes that finished this epoch; absent when none did |
+| `train/task/<name>/reward` | mean per-step reward over the task's worlds |
+| `train/task/<name>/weight` | the replay weight the curriculum chose for the next epoch |
+| `test/task/<name>/score` | the task's eval return, over its own eval worlds |
+
+A resume restarts the curriculum's averages. It has to keep the run's tasks, in the same order and at the same observation widths, or it is refused: equal-width tasks in another order would each get another task's one-hot. Splitting the worlds differently between them is allowed, but leaves a saved replay out, since its rows would belong to other tasks; warmup refills it.
+
+`play.py` loads every task of a multi-task run and starts on `--task-id`, or on the first without it; the up and down arrows switch to the previous or next task under the same policy, reopening the window on that task's model. `scripts/render_gif.py` renders the one task `--task-id` names. Either way the world runs that task's own env, and the policy gets its observation padded to the trained width with the task's one-hot appended; the checkpoint records each task's width, so a replay env that disagrees is refused rather than misread:
+
+```bash
+uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
+```
+
+A replay always runs its physics in C MuJoCo, whatever the run trained on. A run keeps `mujoco_playground`'s task code for its reset, observations and reward, with only the physics calls leaving for C.
+
 ## Resume
 
 ```bash
@@ -59,9 +91,9 @@ Resume into a *different* run dir than the dead leg: the CSV backend opens `log.
 uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
 ```
 
-Playback drives a single world into the interactive MuJoCo viewer, always on CPU/MJX even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override the saved run config.
+Playback drives a single world into an interactive window, always with C MuJoCo on the CPU, even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override thThe window is `mujoco.viewer.launch_passive`, so the camera, picking, pushing and panels are MuJoCo's own `simulate`. The camera follows the root body until `esc` frees it; `play.py` prints the keyboard and mouse controls it adds when it starts. On macOS it re-executes itself under mujoco's `mjpython`, which the passive viewer needs.trols when it starts.
 
-Both entry points restore the checkpoint through `roxie.utils.playback.load_policy`, which reads the run's saved Hydra config and moves Warp and `mujoco.batch` runs onto MJX, which steps one world of the same task and model.
+Both entry points restore the checkpoint through `roxie.utils.playback`, which reads the run's saved Hydra config and rewrites it onto the C physics above. C and the engine a run trained on are not numerically identical, so a replay's score can differ a little from the run's own eval.
 
 ### Rendering without a display
 

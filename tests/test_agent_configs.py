@@ -37,6 +37,8 @@ INJECTED = {
     "action_low",
     "action_high",
     "noise_config",
+    # A multi-task env's world split, passed only when the env has tasks.
+    "env_task_counts",
 }
 
 CONFIG_FILES = sorted(
