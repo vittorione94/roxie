@@ -16,15 +16,12 @@ Steering what the learner trains on is the replay's job instead
 like any other env to the rollout, the agents and the replay.
 """
 
-from typing import Any
-
 import jax
 import jax.numpy as jnp
 import numpy as np
-from omegaconf import OmegaConf
 
 from roxie.environment import functional
-from roxie.environment.loader import EnvBundle, build_env
+from roxie.environment.loader import EnvBundle, build_env, plain
 from roxie.environment.vector import BatchVectorEnv, Timestep, VecState
 
 
@@ -238,12 +235,6 @@ class MultiTaskEnv:
         return VecState(env_state=states, obs=obs), timestep
 
 
-def _plain(cfg) -> Any:
-    if OmegaConf.is_config(cfg):
-        return OmegaConf.to_container(cfg, resolve=True)
-    return cfg
-
-
 def build_multitask_env(
     tasks,
     *,
@@ -274,9 +265,9 @@ def build_multitask_env(
         ValueError: on weights for an unknown task, tasks on different
           backends, or tasks that disagree on the action space.
     """
-    tasks = _plain(tasks)
-    defaults = _plain(task_defaults) or {}
-    weights = _plain(weights) or {}
+    tasks = plain(tasks)
+    defaults = plain(task_defaults) or {}
+    weights = plain(weights) or {}
     unknown = sorted(set(weights) - set(tasks))
     if unknown:
         raise ValueError(f"weights for unknown task(s) {unknown}")

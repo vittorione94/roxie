@@ -27,6 +27,7 @@ from roxie.environment.loader import (
     EnvBundle,
     build_playground_env,
     requested_impl,
+    task_blocks,
     uses_batch,
 )
 from roxie.environment.multitask import (
@@ -236,6 +237,17 @@ def test_loader_reads_the_backend_through_the_tasks():
     })
     assert requested_impl(warp) == "warp" and not uses_batch(warp)
     assert requested_impl(OmegaConf.create({"impl": "jax"})) == "jax"
+
+
+def test_the_backend_resolves_through_the_composed_config():
+    cfg = OmegaConf.create({
+        "physics": "batch",
+        "env": {"task_defaults": {"impl": "${physics}"},
+                "tasks": {"walk": {"env_name": "WalkerWalk"},
+                          "run": {"env_name": "${env.tasks.walk.env_name}"}}},
+    })
+    assert uses_batch(cfg.env) and requested_impl(cfg.env) == "batch"
+    assert task_blocks(cfg.env)[1]["env_name"] == "WalkerWalk"
 
 
 def test_humanoid_launchable_composes_the_three_tasks_on_warp():

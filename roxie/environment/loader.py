@@ -250,16 +250,24 @@ def build_playground_env(
 DEFAULT_BUILDER = "roxie.environment.loader.build_playground_env"
 
 
+def plain(cfg: Any) -> Any:
+    """A config node as plain containers, its interpolations resolved."""
+    if OmegaConf.is_config(cfg):
+        return OmegaConf.to_container(cfg, resolve=True)
+    return cfg
+
+
 def task_blocks(cfg_env: Any) -> list:
     """Each task's own env block, `task_defaults` merged in; `[cfg_env]` if single."""
     # Left a config, so `get` on a single block still resolves its interpolations.
     if "tasks" not in cfg_env:
         return [cfg_env]
-    # Unresolved, and copied out of the composed config: Hydra locks it, so a
+    # Resolved while they are still part of the composed config their
+    # interpolations point into, and copied out of it: Hydra locks it, so a
     # task block's own keys could not be merged into the defaults.
-    env = OmegaConf.to_container(cfg_env, resolve=False)
-    defaults = env.get("task_defaults") or {}
-    return [{**defaults, **(block or {})} for block in env["tasks"].values()]
+    defaults = plain(cfg_env.get("task_defaults", None)) or {}
+    return [{**defaults, **(plain(block) or {})}
+            for block in cfg_env["tasks"].values()]
 
 
 def uses_batch(cfg_env: Any) -> bool:
