@@ -143,11 +143,6 @@ def _single_task(obs):
 
 def resolve_single_world(cfg: Any) -> Any:
     """Rewrites a trained config onto a backend that can step one world."""
-    if "tasks" in cfg.env:
-        raise ValueError(
-            "a multi-task config replays one task at a time; narrow it with "
-            "`select_task` first."
-        )
     if cfg.env.get("impl", None) in ("warp", BATCH_IMPL):
         cfg.env.impl = "jax"
     cfg.env.pop("num_threads", None)
@@ -164,15 +159,13 @@ def _load_world(
     overrides: tuple[str, ...],
     task_id: str | None,
     verbose: bool,
-    *,
-    banner: bool = True,
 ) -> dict[str, Any]:
     """Builds the `Playback` fields of one task's world, all but the agent."""
     cfg, task = select_task(load_config(checkpoint_path, overrides), task_id)
     cfg = resolve_single_world(cfg)
 
     env, _, _env_cfg = build_env(cfg.env, mode="play", num_envs=1, test_episodes=1)
-    if verbose and banner:
+    if verbose:
         log_loaded_backend(env)
 
     func_env = env.func_env
@@ -236,33 +229,25 @@ def load_tasks(
     Args:
         checkpoint_path: the checkpoint's step directory.
         overrides: dotlist overrides of the run's saved config.
-        verbose: print what each world resolved to.
+        verbose: print the backend the first world resolved to.
 
     Returns:
         `{task: Playback}` in the run's order, all holding the same agent. A
-        task that cannot replay is left out, with its reason printed. A
         single-task run's only key is None.
 
     Raises:
-        ValueError: if no task of the run can replay.
+        ValueError: if a task's replay env does not give the observation width
+          it trained on.
     """
     register_search_paths()
     cfg = load_config(checkpoint_path, overrides)
     if "tasks" not in cfg.env:
         return {None: load_policy(checkpoint_path, overrides, verbose=verbose)}
 
-    names = list(cfg.env.tasks)
-    worlds = {}
-    for name in names:
-        try:
-            worlds[name] = _load_world(
-                checkpoint_path, overrides, name, verbose, banner=not worlds,
-            )
-        except ValueError as error:
-            print(f"Leaving out task {name!r}: {error}", flush=True)
-    if not worlds:
-        raise ValueError(f"none of this run's tasks can replay: {names}.")
-
+    worlds = {
+        name: _load_world(checkpoint_path, overrides, name, verbose and not index)
+        for index, name in enumerate(cfg.env.tasks)
+    }
     agent = _load_agent(checkpoint_path, next(iter(worlds.values())))
     return {
         name: Playback(agent=agent, **world) for name, world in worlds.items()

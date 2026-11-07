@@ -43,7 +43,7 @@ from roxie.utils.math import (
     obs_mean_std,
     update_obs_stats,
 )
-from roxie.utils.rollout import ChunkSums, Rollout, build_rollout
+from roxie.utils.rollout import ChunkSums, build_rollout
 from roxie.utils.trainer import Trainer
 from tests.test_env_protocol import CounterEnv
 
@@ -108,7 +108,7 @@ def test_world_split_refuses_what_it_cannot_honour():
 def test_layout_pads_to_the_widest_task_and_appends_the_one_hot():
     layout = TaskLayout(("a", "b"), (1, 2), (2, 3))
     obs = layout.compose([np.ones((1, 2), np.float32),
-                          np.full((2, 3), 2.0, np.float32)], np)
+                          np.full((2, 3), 2.0, np.float32)])
     assert obs.shape == (3, 3 + 2)
     np.testing.assert_array_equal(obs[0], [1, 1, 0, 1, 0])
     np.testing.assert_array_equal(obs[1:], [[2, 2, 2, 0, 1]] * 2)
@@ -161,15 +161,6 @@ def test_eval_gets_the_same_worlds_per_task_whatever_the_weights():
     bundle = _toy(num_envs=8, weights={"narrow": 1, "wide": 3}, test_episodes=3)
     assert bundle.env.task_counts == (2, 6)
     assert bundle.test_env.task_counts == (3, 3)
-
-
-def test_jax_composite_runs_through_the_jax_rollout(rng_key):
-    bundle = _toy()
-    rollout, rstate = build_rollout(bundle.env, bundle.test_env, 4, rng_key)
-    assert isinstance(rollout, Rollout)
-    assert rollout.task_names == ("narrow", "wide")
-    rstate, _, ts = rollout.step(rstate, jnp.zeros((4, 1), jnp.float32), rng_key)
-    assert ts.obs.shape == (4, 6)
 
 
 # ---- tasks on mujoco.batch --------------------------------------------------
@@ -269,8 +260,7 @@ def _two_task_batch():
     layout = TaskLayout(("a", "b"), (300, 300), (3, 5))
     parts = [rng.normal(5.0, 3.0, size=(300, 3)),
              rng.normal(-2.0, 0.5, size=(300, 5))]
-    return jnp.asarray(layout.compose(
-        [p.astype(np.float32) for p in parts], np))
+    return layout.compose([p.astype(np.float32) for p in parts])
 
 
 def test_each_task_normalizes_by_its_own_moments():
@@ -328,8 +318,7 @@ def _filled_replay(n_step, counts=(2, 2, 4, 8), steps=50):
     for _ in range(steps):
         x = rng.normal(size=(n, 3)).astype(np.float32)
         state = replay.add(state, Transition(
-            observation=jnp.asarray(layout.compose(
-                [x[sl] for sl in layout.slices], np)),
+            observation=layout.compose([x[sl] for sl in layout.slices]),
             action=jnp.zeros((n, 1)), reward=jnp.zeros(n),
             terminal=jnp.zeros(n, bool), truncation=jnp.zeros(n, bool),
         ))
@@ -397,6 +386,7 @@ def test_off_policy_agent_trains_on_the_composite_and_reweights_freely(rng_key):
     np.testing.assert_allclose(agent.state.task_weights, [0.5, 0.5])
 
     rollout, rstate = build_rollout(bundle.env, bundle.test_env, 4, rng_key)
+    assert rollout.task_names == ("narrow", "wide")
     rstate, _ = rollout.warmup(agent, rstate, 8)
     agent.state, _, rstate, sums = rollout.collect(
         agent.state, None, rstate, None, agent=agent, n_steps=6,
@@ -539,24 +529,13 @@ def test_the_backend_banner_prints_once_however_many_tasks(tmp_path, capsys):
     assert capsys.readouterr().out.count("PHYSICS BACKEND LOADED") == 1
 
 
-def test_a_task_that_cannot_replay_is_left_out(tmp_path, capsys):
+def test_a_task_whose_replay_width_changed_is_refused(tmp_path):
     from roxie.utils.playback import load_tasks
 
     cfg = _run_config()
     # The saved layout says this task trained on 4 columns.
     cfg.env.tasks.wide.width = 3
-    plays = load_tasks(_saved_multi_task_run(tmp_path, cfg), verbose=False)
-    assert list(plays) == ["narrow"]
-    assert "Leaving out task 'wide'" in capsys.readouterr().out
-
-
-def test_a_run_with_no_task_that_replays_is_refused(tmp_path):
-    from roxie.utils.playback import load_tasks
-
-    cfg = _run_config()
-    cfg.env.tasks.narrow.width = 3
-    cfg.env.tasks.wide.width = 3
-    with pytest.raises(ValueError, match="none of this run's tasks"):
+    with pytest.raises(ValueError, match="trained on 4"):
         load_tasks(_saved_multi_task_run(tmp_path, cfg), verbose=False)
 
 

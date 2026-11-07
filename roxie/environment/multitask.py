@@ -75,20 +75,17 @@ class TaskLayout:
         self.task_ids = np.repeat(np.arange(len(self.names)), self.counts)
         self._eye = np.eye(len(self.names), dtype=np.float32)
 
-    def compose(self, parts, xp):
-        """Pads each task's `(n_k, D_k)` observations and appends the one-hot.
-
-        `xp` is `jnp` or `np`.
-        """
+    def compose(self, parts):
+        """Pads each task's `(n_k, D_k)` observations and appends the one-hot."""
         rows = []
         for k, obs in enumerate(parts):
             n = obs.shape[0]
-            pad = xp.zeros((n, self.width - obs.shape[1]), dtype=obs.dtype)
-            hot = xp.broadcast_to(
-                xp.asarray(self._eye[k], dtype=obs.dtype), (n, len(self.names))
+            pad = jnp.zeros((n, self.width - obs.shape[1]), dtype=obs.dtype)
+            hot = jnp.broadcast_to(
+                jnp.asarray(self._eye[k], dtype=obs.dtype), (n, len(self.names))
             )
-            rows.append(xp.concatenate([obs, pad, hot], axis=1))
-        return xp.concatenate(rows, axis=0)
+            rows.append(jnp.concatenate([obs, pad, hot], axis=1))
+        return jnp.concatenate(rows, axis=0)
 
 
 def _shared_action_space(envs):
@@ -105,7 +102,7 @@ def _shared_action_space(envs):
     return first
 
 
-def _task_metrics(names, steps, xp):
+def _task_metrics(names, steps):
     """One value per task per step: its worlds' mean reward and own metrics.
 
     Shaped `(1,)` rather than per world, since a task's metric means nothing
@@ -114,13 +111,13 @@ def _task_metrics(names, steps, xp):
     """
     metrics = {}
     for name, step in zip(names, steps):
-        metrics[f"task/{name}/reward"] = xp.mean(
-            xp.asarray(step.reward, dtype=np.float32), keepdims=True
+        metrics[f"task/{name}/reward"] = jnp.mean(
+            jnp.asarray(step.reward, dtype=jnp.float32), keepdims=True
         )
         for key, value in step.info.get("metrics", {}).items():
             if key != "nonfinite":
-                metrics[f"task/{name}/{key}"] = xp.mean(
-                    xp.asarray(value, dtype=np.float32), keepdims=True
+                metrics[f"task/{name}/{key}"] = jnp.mean(
+                    jnp.asarray(value, dtype=jnp.float32), keepdims=True
                 )
     return metrics
 
@@ -204,7 +201,7 @@ class MultiTaskEnv:
             env.reset(k, p)[0]
             for env, k, p in zip(self.envs, keys, self._params(params))
         )
-        obs = self.layout.compose([state.obs for state in states], jnp)
+        obs = self.layout.compose([state.obs for state in states])
         zeros = jnp.zeros(self.num_envs, dtype=jnp.float32)
         false = jnp.zeros(self.num_envs, dtype=jnp.bool_)
         return VecState(env_state=states, obs=obs), Timestep(
@@ -226,18 +223,18 @@ class MultiTaskEnv:
         steps = [step for _, step in out]
         metrics = {"nonfinite": jnp.concatenate(
             [step.info["metrics"]["nonfinite"] for step in steps])}
-        metrics.update(_task_metrics(self.task_names, steps, jnp))
+        metrics.update(_task_metrics(self.task_names, steps))
         timestep = Timestep(
             # Each task's driver already split pre- from post-auto-reset; the
             # buffer gets the former, acting the latter.
-            obs=self.layout.compose([step.obs for step in steps], jnp),
+            obs=self.layout.compose([step.obs for step in steps]),
             reward=jnp.concatenate([step.reward for step in steps]),
             terminated=jnp.concatenate([step.terminated for step in steps]),
             truncated=jnp.concatenate([step.truncated for step in steps]),
             info={"metrics": metrics,
                   "tasks": tuple(step.info for step in steps)},
         )
-        obs = self.layout.compose([sub.obs for sub in states], jnp)
+        obs = self.layout.compose([sub.obs for sub in states])
         return VecState(env_state=states, obs=obs), timestep
 
 

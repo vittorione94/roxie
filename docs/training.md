@@ -59,7 +59,7 @@ Each task logs under its own name:
 
 A resume restarts the curriculum's averages.
 
-`play.py` loads every task a multi-task run can replay and starts on `--task-id`, or on the first without it; the up and down arrows switch to the previous or next task under the same policy, reopening the window on that task's model. `scripts/render_gif.py` renders the one task `--task-id` names. Either way the world runs that task's own env, and the policy gets its observation padded to the trained width with the task's one-hot appended; the checkpoint records each task's width, so a replay env that disagrees is refused rather than misread, and `play.py` leaves that task out of the ones it cycles through:
+`play.py` loads every task of a multi-task run and starts on `--task-id`, or on the first without it; the up and down arrows switch to the previous or next task under the same policy, reopening the window on that task's model. `scripts/render_gif.py` renders the one task `--task-id` names. Either way the world runs that task's own env, and the policy gets its observation padded to the trained width with the task's one-hot appended; the checkpoint records each task's width, so a replay env that disagrees is refused rather than misread:
 
 ```bash
 uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
