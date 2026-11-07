@@ -36,7 +36,7 @@ from roxie.environment.multitask import (
     allocate_worlds,
     build_multitask_env,
 )
-from roxie.environment.vector import JaxVectorEnv
+from roxie.environment.vector import UNCAPPED_EVAL_STEPS, JaxVectorEnv
 from roxie.utils.curriculum import LearningProgressTasks, WeightedTasks
 from roxie.utils.math import (
     init_obs_stats,
@@ -66,14 +66,14 @@ class WideCounter(CounterEnv):
         )
 
 
-def build_counter_env(*, width=2, start=0.0, actions=1, mode="train",
-                      num_envs=1, test_episodes=1, seed=0):
+def build_counter_env(*, width=2, start=0.0, actions=1, max_steps=3,
+                      mode="train", num_envs=1, test_episodes=1, seed=0):
     """A toy builder with the injected keywords every builder takes."""
     env = WideCounter(width, start)
     env.action_space = functional.box(-1.0, 1.0, shape=(actions,))
     return EnvBundle(
-        env=JaxVectorEnv(env, num_envs, max_episode_steps=3),
-        test_env=JaxVectorEnv(env, test_episodes, max_episode_steps=3),
+        env=JaxVectorEnv(env, num_envs, max_episode_steps=max_steps),
+        test_env=JaxVectorEnv(env, test_episodes, max_episode_steps=max_steps),
         env_cfg=None,
     )
 
@@ -216,6 +216,14 @@ def test_tasks_must_share_a_backend():
              "native": {**BATCH_DEFAULTS, "env_name": "CartpoleBalance"}},
             num_envs=2,
         )
+
+
+def test_eval_waits_for_an_uncapped_task():
+    bundle = build_multitask_env(
+        {"capped": {"max_steps": 100}, "uncapped": {"max_steps": 0}},
+        task_defaults={"_target_": COUNTER}, num_envs=2,
+    )
+    assert bundle.test_env.max_episode_steps == UNCAPPED_EVAL_STEPS
 
 
 # ---- the config surface ----------------------------------------------------

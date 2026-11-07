@@ -12,6 +12,7 @@ from flax import struct
 from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
 from roxie.environment.functional import space_size
+from roxie.environment.vector import UNCAPPED_EVAL_STEPS
 from roxie.utils.precision import FLOAT
 
 _EVAL_SEED = 12345
@@ -587,7 +588,9 @@ class Rollout:
         return evaluate_policy(
             actor, obs_stats, state, environment=self.test_environment,
             advance=self.advance, agent=agent,
-            max_steps=int(self.test_environment.max_episode_steps or 1000),
+            max_steps=int(
+                self.test_environment.max_episode_steps or UNCAPPED_EVAL_STEPS
+            ),
         )
 
     def warmup(self, agent, rstate, iters):

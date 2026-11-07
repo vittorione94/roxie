@@ -22,7 +22,12 @@ import numpy as np
 
 from roxie.environment import functional
 from roxie.environment.loader import EnvBundle, build_env, plain
-from roxie.environment.vector import BatchVectorEnv, Timestep, VecState
+from roxie.environment.vector import (
+    UNCAPPED_EVAL_STEPS,
+    BatchVectorEnv,
+    Timestep,
+    VecState,
+)
 
 
 def allocate_worlds(weights, total: int) -> tuple[int, ...]:
@@ -180,7 +185,9 @@ class MultiTaskEnv:
             self.layout.width + len(self.task_names)
         )
         # The eval loop's cap: no task's episode may be cut short by another's.
-        self.max_episode_steps = max(env.max_episode_steps for env in self.envs)
+        self.max_episode_steps = max(
+            env.max_episode_steps or UNCAPPED_EVAL_STEPS for env in self.envs
+        )
         self.metadata = dict(self.envs[0].metadata)
         self.func_env = _TaskParams(self.envs, self.layout)
 

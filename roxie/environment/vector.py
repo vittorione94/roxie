@@ -56,6 +56,10 @@ class Timestep(NamedTuple):
 # playground task passed 78 in a 1,000-step episode.
 DIVERGED_OBS_LIMIT = 1e3
 
+# How long an eval runs an episode on a driver with `max_episode_steps=0`,
+# which puts no cutoff of its own on it.
+UNCAPPED_EVAL_STEPS = 1000
+
 
 def nonfinite_worlds(obs, reward, xp=jnp):
     """Identifies worlds whose step diverged: non-finite, or past the limit."""
