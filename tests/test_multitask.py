@@ -339,6 +339,14 @@ def test_replay_draws_tasks_by_weight_not_by_world_count(n_step):
                                target, atol=0.03)
 
 
+def test_a_task_weighted_zero_is_never_drawn():
+    replay, state, k = _filled_replay(1)
+    target = jnp.asarray([0.0, 0.5, 0.0, 0.5], jnp.float32)
+    batch = jax.jit(replay.draw)(state, jax.random.PRNGKey(0), target)
+    tasks = np.asarray(batch.experience.first.observation[..., -k:]).argmax(-1)
+    assert set(np.unique(tasks)) == {1, 3}
+
+
 def test_unweighted_draw_is_flashbax_itself():
     replay, state, _ = _filled_replay(1)
     key = jax.random.PRNGKey(3)

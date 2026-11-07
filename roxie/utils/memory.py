@@ -14,8 +14,8 @@ from roxie.utils.math import finite_or_zero
 SCRUBBED_FIELDS = frozenset({"observation", "reward"})
 
 
-def _rows(state, key, logits, batch_size, sequence_length):
-    """flashbax's trajectory sample, with the row drawn from `logits`.
+def _rows(state, key, row_weights, batch_size, sequence_length):
+    """flashbax's trajectory sample, with the row drawn by `row_weights`.
 
     Everything but the row draw is `flashbax.buffers.trajectory_buffer.sample`
     at `period=1`, which every buffer here uses; a flat buffer is that with a
@@ -29,7 +29,14 @@ def _rows(state, key, logits, batch_size, sequence_length):
     item_key, row_key = jax.random.split(key)
     start = (head + jax.random.randint(
         item_key, (batch_size,), 0, num_valid)) % max_length
-    rows = jax.random.categorical(row_key, logits, shape=(batch_size,))
+    # Inverse CDF rather than `categorical`, which draws a Gumbel per row per
+    # sample; unrolled, as the default search is a loop of kernels on a GPU.
+    cdf = jnp.cumsum(row_weights)
+    u = jax.random.uniform(row_key, (batch_size,), dtype=cdf.dtype) * cdf[-1]
+    rows = jnp.minimum(
+        jnp.searchsorted(cdf, u, side="right", method="scan_unrolled"),
+        cdf.shape[0] - 1,
+    )
     times = (start[:, None] + jnp.arange(sequence_length)) % max_length
     return jax.tree.map(lambda x: x[rows[:, None], times], state.experience)
 
@@ -88,7 +95,7 @@ class ReplayManager:
         per_row = (task_weights[self.task_ids]
                    / jnp.asarray(counts[self.task_ids], dtype=task_weights.dtype))
         sequence = _rows(
-            buffer_state, key, jnp.log(per_row / jnp.sum(per_row)),
+            buffer_state, key, per_row,
             self._sample_batch_size, self._sample_sequence_length,
         )
         if self.time_axis:
