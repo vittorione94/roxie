@@ -26,7 +26,6 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from roxie.agents.utils import build_agent
-from roxie.environment import suites
 from roxie.environment.functional import space_size
 from roxie.environment.loader import (
     build_env,
@@ -40,7 +39,6 @@ from roxie.utils.checkpoint import checkpoint_steps, find_checkpoint
 from roxie.utils.trainer import Trainer
 
 hydra_searchpath.register()
-suites.register_resolvers()
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 

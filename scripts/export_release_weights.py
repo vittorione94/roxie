@@ -24,12 +24,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_ROOT = REPO_ROOT / "outputs" / "release_v1"
 DEFAULT_DONE_DIR = REPO_ROOT / "logs" / ".done"
 
-# Both release cells. envpool_cpu is dm_control's XMLs through EnvPool and
-# warp_gpu is mujoco_playground: different physics behind an observation of the
-# same 67 dimensions and an action of the same 21, so `_check_obs_width` cannot
-# refuse a swap and the cell in the bundle name is the only thing separating
-# them.
-DEFAULT_CELLS = ("envpool_cpu", "warp_gpu")
+# Both release cells: the same mujoco_playground tasks on two physics engines,
+# so `_check_obs_width` cannot refuse a swap and the cell in the bundle name is
+# the only thing separating them.
+DEFAULT_CELLS = ("batch_cpu", "warp_gpu")
 
 # Where --push-to-hub publishes. The version is in the repo id so a later grid
 # gets its own repo instead of overwriting this one's history.
@@ -357,11 +355,10 @@ def write_index(dest_root: Path, exported: list[dict], *, cells: list[str],
             lines.append("| " + " | ".join(row) + " |")
     lines += [
         "",
-        "The two cells are two different environments, not one environment on "
-        "two machines: `envpool_cpu` is dm_control's XMLs through EnvPool and "
-        "`warp_gpu` is `mujoco_playground`. Their observations are the same "
-        "width, so loading one against the other raises nothing — go by the "
-        "cell in the bundle name.",
+        "The two cells run the same `mujoco_playground` tasks on different "
+        "physics: `batch_cpu` on `mujoco.batch` and `warp_gpu` on mujoco_warp. "
+        "Their observations are the same width, so loading one against the "
+        "other raises nothing — go by the cell in the bundle name.",
         "",
         "The full record — per-bundle steps, budget, `test/score_per_step`, "
         "`test/length`, size and the commit each was cut from — is in "

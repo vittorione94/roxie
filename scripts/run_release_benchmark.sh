@@ -7,7 +7,7 @@ cd "$REPO_ROOT" || exit 1
 # --- 1. Configuration (Idiomatic defaults) ---
 : "${TASKS:=HumanoidWalk HumanoidRun HumanoidStand}"
 : "${AGENTS:=ppo}"
-: "${CELLS:=envpool_cpu}"
+: "${CELLS:=batch_cpu}"
 : "${FORCE:=1}"
 # Sized so the CPU budget divides: this is a per-run count of LOGICAL cores and
 # the slot count is (ncores - GPU reserve) / it, so 12 on a 24-thread box floors
@@ -70,10 +70,37 @@ physical_core_groups() {
 mapfile -t PHYS_GROUPS < <(physical_core_groups)
 GROUP_SIZE=$(( $(grep -o ',' <<< "${PHYS_GROUPS[0]:-0}" | wc -l) + 1 ))
 
+# The L3 domain of each physical-core group, in PHYS_GROUPS order.
+l3_domains() {
+    local group first path
+    for group in "${PHYS_GROUPS[@]}"; do
+        first=${group%%[,-]*}
+        path="/sys/devices/system/cpu/cpu$first/cache/index3/shared_cpu_list"
+        if [[ -r "$path" ]]; then cat "$path"; else echo all; fi
+    done
+}
+
+# Where each job slot starts, in physical-core groups. A slot spanning two L3
+# domains runs far slower than one inside a domain, so a slot that would straddle
+# a boundary moves past it whenever every remaining slot still fits.
+plan_slot_starts() {
+    local i=$(( reserve_cores / GROUP_SIZE )) n=${#PHYS_GROUPS[@]} slot end next
+    for (( slot = 0; slot < MAX_CPU_JOBS; slot++ )); do
+        end=$(( i + groups_per_run - 1 ))
+        if (( end < n )) && [[ "${L3_DOMAINS[i]}" != "${L3_DOMAINS[end]}" ]]; then
+            next=$i
+            while [[ "${L3_DOMAINS[next]}" == "${L3_DOMAINS[i]}" ]]; do next=$(( next + 1 )); done
+            if (( next + (MAX_CPU_JOBS - slot) * groups_per_run <= n )); then i=$next; fi
+        fi
+        echo "$i"
+        i=$(( i + groups_per_run ))
+    done
+}
+
 # The core string for job slot $2, given $1 physical-core groups per job.
 job_core_string() {
     local groups_per_run=$1 slot=$2 start i ids=()
-    start=$(( reserve_cores / GROUP_SIZE + slot * groups_per_run ))
+    start=${SLOT_STARTS[slot]}
     for (( i = start; i < start + groups_per_run; i++ )); do
         ids+=("${PHYS_GROUPS[i]}")
     done
@@ -94,6 +121,9 @@ by_ram=$(( (avail_gb - reserve_gb) / GB_PER_RUN ))
 groups_per_run=$(( CORES_PER_RUN / GROUP_SIZE ))
 (( groups_per_run < 1 )) && groups_per_run=1
 
+mapfile -t L3_DOMAINS < <(l3_domains)
+mapfile -t SLOT_STARTS < <(plan_slot_starts)
+
 PIN=1
 command -v taskset >/dev/null || { PIN=0; echo "! taskset missing — CPU runs will not be pinned"; }
 
@@ -102,7 +132,7 @@ echo "== plan: $MAX_CPU_JOBS concurrent CPU runs (${ncores}c, ${avail_gb}GB avai
 
 # --- 3. Signal Handling ---
 # The trainers are not our direct children: each job is
-#   script -> subshell -> uv -> python (-> envpool/vector workers)
+#   script -> subshell -> uv -> python (-> physics workers)
 # so `pkill -P $$` only reaps the subshell and orphans the rest onto init,
 # where they keep holding cores and RAM. Walk the whole tree instead.
 descendants() {
@@ -163,10 +193,8 @@ run_job() {
     local cmd=(uv run python roxie/train.py --config-name "dmc/bench_$a" "release.task=$t" "dmc/backend@backend=$c")
     local where="GPU"
     if [[ -n "$cores" ]]; then
-        # EnvPool owns a second thread pool on top of XLA's — only this cell
-        # has the key, so mjx_cpu (build_playground_env, no num_threads
-        # argument) must not get it or Hydra's instantiate() errors.
-        [[ "$c" == "envpool_cpu" ]] && cmd+=("env.num_threads=$CORES_PER_RUN")
+        # mujoco.batch owns a second thread pool on top of XLA's.
+        [[ "$c" == "batch_cpu" ]] && cmd+=("env.num_threads=$CORES_PER_RUN")
         # Thread cap applies whether or not pinning is available, otherwise each
         # run's BLAS/OMP pools fan out across every core and oversubscribe.
         cmd=(env "OMP_NUM_THREADS=$CORES_PER_RUN" "${cmd[@]}")

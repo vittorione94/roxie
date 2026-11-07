@@ -1,8 +1,8 @@
 _target_: roxie.environment.loader.build_playground_env
 
-# mujoco_playground envs — the default env family, and the one the release
-# benchmark's GPU cells run. Physics is JAX all the way down, so the whole
-# rollout stays on device and the trainer scans over it.
+# mujoco_playground envs — the env family every release benchmark cell runs.
+# `impl` picks the physics: MJX, mujoco_warp, or `batch` for native MuJoCo on a
+# CPU thread pool.
 #
 # A launchable picks it up in its defaults list, then overrides what it needs:
 #
@@ -43,5 +43,8 @@ njmax: null
 # leak, `JAX`/`NONE` avoid it eagerly and are much slower.
 graph_mode: null
 max_episode_steps: null
+# impl: batch only. The size of mujoco.batch's thread pool; null takes every core
+# this process may run on.
+num_threads: null
 seed: 0
 parallel_envs: 256

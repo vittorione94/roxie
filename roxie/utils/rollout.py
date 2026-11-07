@@ -4,16 +4,13 @@ import functools
 import time
 from typing import Any
 
-import numpy as np
 import jax
 import jax.numpy as jnp
 from flax import struct
-from jax.experimental import io_callback
 
 from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
 from roxie.environment.functional import space_size
-from roxie.environment.vector import EnvPoolVectorEnv, Timestep, VecState
 from roxie.utils.precision import FLOAT
 
 _EVAL_SEED = 12345
@@ -197,52 +194,6 @@ def jax_observe_params(environment, params, timestep):
     return environment.func_env.observe_params(
         params, timestep.info, timestep.terminated,
     )
-
-
-def _pool_stepper(environment):
-    """The host callable the fused chunk steps a C++ pool through.
-
-    Returns exactly `environment.step_spec` — the driver's own contract — so the
-    callback's structure is known before the pool has ever been stepped. A
-    pool's other `info` keys are dropped here; nothing above the rollout reads
-    them.
-    """
-    metric_keys = tuple(environment.step_spec[-1])
-
-    def step(action):
-        # `state` is unused: a pool keeps everything in C++.
-        _state, timestep = environment.step(None, np.asarray(action))
-        metrics = timestep.info.get("metrics", {})
-        return (timestep.obs, timestep.reward, timestep.terminated,
-                timestep.truncated, {k: metrics[k] for k in metric_keys})
-
-    return step
-
-
-def pool_advance(environment, state, action, key, reset_pool, params):
-    """Advances a C++ pool by one step, through an ordered host callback.
-
-    A pool cannot be traced, but it can be CALLED from inside one. Ordered is
-    what makes it sound: the pool is stateful, so its steps must run in sequence
-    with each other and with the loop that feeds them.
-    """
-    del state, key, reset_pool, params  # the pool owns all of it, in C++
-    obs, reward, terminated, truncated, metrics = io_callback(
-        _pool_stepper(environment), environment.step_spec, action,
-        ordered=True,
-    )
-    # The pool auto-resets in C++ and hands back only the post-reset
-    # observation, so the timestep's obs and the next state's are one array.
-    return VecState(env_state=None, obs=obs), Timestep(
-        obs=obs, reward=reward, terminated=terminated, truncated=truncated,
-        info={"metrics": metrics},
-    )
-
-
-def keep_params(environment, params, timestep):
-    """Returns `params` untouched: a C++ pool owns such state natively."""
-    del environment, timestep
-    return params
 
 
 @functools.partial(
@@ -442,34 +393,36 @@ def evaluate_policy(actor, obs_stats, state, *, environment, advance, agent,
 class Rollout:
     """The training loop's env half: a dispatcher onto the functions above.
 
-    Subclasses supply only what a backend cannot share — its `advance` and
-    `observe_params` pair, how a batch of envs is reset, and what the epoch
-    boundary does to the env. The fused chunk, the warmup roll, the eval loop
-    and the episode bookkeeping are all module-level and identical for both.
-
     Instances are frozen at construction: everything below feeds a static jit
     argument, so `_probe` settles it all before `__init__` runs and `build_rollout`
     is the only way to get one.
 
     Attributes:
-        advance: The backend's step function, `self`-free so it can be a static
+        advance: The env's step function, `self`-free so it can be a static
             argument without dragging the instance into the cache key.
-        observe_params: The backend's `params` update, likewise.
+        observe_params: The env's `params` update, likewise.
         scan_unroll: How many chunk steps XLA sees as straight-line code per
             `lax.scan` trip. It buys fusion and register reuse ACROSS env steps
             at the price of a proportionally larger graph to compile.
-        num_envs: The backend's authoritative env width — a C++ pool's own
-            count, which need not be the one that was asked for.
+        num_envs: The env width.
         metric_keys: What the env reports under `info["metrics"]`.
     """
 
-    advance = None
-    observe_params = staticmethod(keep_params)
+    advance = staticmethod(jax_advance)
+    observe_params = staticmethod(jax_observe_params)
     scan_unroll = 2
 
     _frozen = False
 
     def __init__(self, environment, test_environment, num_envs, metric_keys):
+        # `FuncEnv` declares `init_params`/`observe_params`/`epoch_refresh` as
+        # no-ops, so an env that does not adapt needs no branch here — and the
+        # driver vmaps `truncal` unconditionally, so an env missing roxie's
+        # method set could not reach a rollout in the first place.
+        self.func_env = environment.func_env
+        # Gathered from, so it need not match num_envs; equal means one reset
+        # program serves both.
+        self.pool_size = int(num_envs)
         self.environment = environment
         self.test_environment = test_environment
         self.num_envs = int(num_envs)
@@ -488,112 +441,6 @@ class Rollout:
                 f"Anything that varies belongs in `RolloutState`."
             )
         object.__setattr__(self, name, value)
-
-    # --- what a backend supplies -------------------------------------------
-
-    @classmethod
-    def _probe(cls, environment, num_envs, rng):
-        """Resets the envs and settles what the compiled programs need static.
-
-        A classmethod, so it runs before `__init__` and cannot mutate a
-        rollout: the backend's authoritative env width and metric keys are
-        construction arguments, not something `prepare` writes back.
-
-        Returns:
-            A tuple of `(rstate, num_envs, metric_keys)`.
-        """
-        raise NotImplementedError
-
-    def reset_test(self):
-        """The eval envs, reset to a pinned start.
-
-        Consecutive evals of one policy must face the same draw, or a change in
-        `test/score` could be the draw rather than the policy.
-        """
-        raise NotImplementedError
-
-    def epoch_refresh(self, rstate):
-        """`(rstate, invalidated)` — see each backend's own docstring."""
-        raise NotImplementedError
-
-    # --- the loop, shared --------------------------------------------------
-
-    def reset_tally(self, rstate):
-        """`rstate` with the in-flight per-env episode counters dropped."""
-        scores, lengths = fresh_tally(self.num_envs)
-        return rstate.replace(scores=scores, lengths=lengths)
-
-    def step(self, rstate, actions, key):
-        """Advances the envs one step. See `step_envs`."""
-        return step_envs(
-            rstate, actions, key, environment=self.environment,
-            advance=self.advance, observe_params=self.observe_params,
-        )
-
-    def collect(self, train_state, noise_module, rstate, frozen_stats, *,
-                agent, n_steps):
-        """Collects one chunk. See `collect_chunk`, which this only binds."""
-        return collect_chunk(
-            train_state, noise_module, rstate, frozen_stats,
-            environment=self.environment, advance=self.advance,
-            observe_params=self.observe_params, agent=agent, n_steps=n_steps,
-            metric_keys=self.metric_keys,
-            # A chunk shorter than the unroll would otherwise be traced as a
-            # peeled remainder with no scan left around it.
-            unroll=max(1, min(self.scan_unroll, n_steps)),
-        )
-
-    def roll_random(self, rstate, *, iters):
-        """Rolls `iters` random-action steps. See `roll_random_actions`."""
-        return roll_random_actions(
-            rstate, environment=self.environment, advance=self.advance,
-            num_envs=self.num_envs, action_size=self.action_size, iters=iters,
-        )
-
-    def evaluate(self, actor, obs_stats, state, *, agent):
-        """Runs the held-out eval. See `evaluate_policy`."""
-        return evaluate_policy(
-            actor, obs_stats, state, environment=self.test_environment,
-            advance=self.advance, agent=agent,
-            max_steps=int(self.test_environment.max_episode_steps or 1000),
-        )
-
-    def warmup(self, agent, rstate, iters):
-        """Rolls `iters` random-action steps into the agent's replay buffer."""
-        print(f"Rolling {iters} warmup iters (compiles on the first)...",
-              flush=True)
-        t0 = time.time()
-        rstate, transitions, next_obs = self.roll_random(rstate, iters=iters)
-        jax.block_until_ready(next_obs)
-        print(f"  {time.time() - t0:.1f}s", flush=True)
-
-        print("Filling the replay buffer...", flush=True)
-        t0 = time.time()
-        agent.fill_buffer(transitions, next_obs)
-        jax.block_until_ready(jax.tree.leaves(agent.state.buffer_state))
-        print(f"  {time.time() - t0:.1f}s", flush=True)
-
-        return rstate, int(jnp.sum(transitions.terminal | transitions.truncation))
-
-
-class JaxRollout(Rollout):
-    """Vmapped JAX environments: physics and auto-reset all on device."""
-
-    advance = staticmethod(jax_advance)
-    observe_params = staticmethod(jax_observe_params)
-
-    def __init__(self, environment, test_environment, num_envs, metric_keys):
-        # Before `super().__init__`, which freezes the instance.
-        #
-        # `FuncEnv` declares `init_params`/`observe_params`/`epoch_refresh` as
-        # no-ops, so an env that does not adapt needs no branch here — and the
-        # driver vmaps `truncal` unconditionally, so an env missing roxie's
-        # method set could not reach a rollout in the first place.
-        self.func_env = environment.func_env
-        # Gathered from, so it need not match num_envs; equal means one reset
-        # program serves both.
-        self.pool_size = int(num_envs)
-        super().__init__(environment, test_environment, num_envs, metric_keys)
 
     def _reset(self, n, key, params):
         return reset_envs(key, params, environment=self.environment, num_envs=n)
@@ -667,70 +514,74 @@ class JaxRollout(Rollout):
             )
         return rstate, invalidated
 
+    def reset_tally(self, rstate):
+        """`rstate` with the in-flight per-env episode counters dropped."""
+        scores, lengths = fresh_tally(self.num_envs)
+        return rstate.replace(scores=scores, lengths=lengths)
 
-class EnvPoolRollout(Rollout):
-    """C++ pools: native physics, auto-reset and adaptive state owned by the pool.
+    def step(self, rstate, actions, key):
+        """Advances the envs one step. See `step_envs`."""
+        return step_envs(
+            rstate, actions, key, environment=self.environment,
+            advance=self.advance, observe_params=self.observe_params,
+        )
 
-    `pool_advance` bridges the pool into the shared chunk through an ordered
-    host callback, so that chunk compiles for this backend too: one dispatch
-    per chunk, with acting, buffering and the episode bookkeeping staying on
-    device between pool steps instead of round-tripping through Python ten
-    times a step. `observe_params` stays the inherited no-op — a pool owns its
-    adaptive state in C++.
-    """
+    def collect(self, train_state, noise_module, rstate, frozen_stats, *,
+                agent, n_steps):
+        """Collects one chunk. See `collect_chunk`, which this only binds."""
+        return collect_chunk(
+            train_state, noise_module, rstate, frozen_stats,
+            environment=self.environment, advance=self.advance,
+            observe_params=self.observe_params, agent=agent, n_steps=n_steps,
+            metric_keys=self.metric_keys,
+            # A chunk shorter than the unroll would otherwise be traced as a
+            # peeled remainder with no scan left around it.
+            unroll=max(1, min(self.scan_unroll, n_steps)),
+        )
 
-    advance = staticmethod(pool_advance)
+    def roll_random(self, rstate, *, iters):
+        """Rolls `iters` random-action steps. See `roll_random_actions`."""
+        return roll_random_actions(
+            rstate, environment=self.environment, advance=self.advance,
+            num_envs=self.num_envs, action_size=self.action_size, iters=iters,
+        )
 
-    @classmethod
-    def _probe(cls, environment, num_envs, rng):
-        """Resets the pool and reads its declared width and metric keys."""
-        del num_envs  # the pool is authoritative about its own width
-        print("Resetting environment...", flush=True)
+    def evaluate(self, actor, obs_stats, state, *, agent):
+        """Runs the held-out eval. See `evaluate_policy`."""
+        return evaluate_policy(
+            actor, obs_stats, state, environment=self.test_environment,
+            advance=self.advance, agent=agent,
+            max_steps=int(self.test_environment.max_episode_steps or 1000),
+        )
+
+    def warmup(self, agent, rstate, iters):
+        """Rolls `iters` random-action steps into the agent's replay buffer."""
+        print(f"Rolling {iters} warmup iters (compiles on the first)...",
+              flush=True)
         t0 = time.time()
-        state, _ = environment.reset()
+        rstate, transitions, next_obs = self.roll_random(rstate, iters=iters)
+        jax.block_until_ready(next_obs)
         print(f"  {time.time() - t0:.1f}s", flush=True)
 
-        num_envs = int(state.obs.shape[0])
-        # Declared by the driver rather than discovered by a probe step: a pool
-        # step cannot be taken back, and `step_spec` is what the fused chunk's
-        # callback is traced against anyway.
-        metric_keys = tuple(environment.step_spec[-1])
-        scores, lengths = fresh_tally(num_envs)
-        return RolloutState(
-            env=VecState(env_state=None, obs=jnp.asarray(state.obs, FLOAT)),
-            rng=rng, scores=scores, lengths=lengths,
-        ), num_envs, metric_keys
+        print("Filling the replay buffer...", flush=True)
+        t0 = time.time()
+        agent.fill_buffer(transitions, next_obs)
+        jax.block_until_ready(jax.tree.leaves(agent.state.buffer_state))
+        print(f"  {time.time() - t0:.1f}s", flush=True)
 
-    def reset_test(self):
-        test_env = self.test_environment
-        # `reset()` advances the pool's RNG, so consecutive evals would start
-        # from different states; `reseed` rebuilds the pool at a fixed seed.
-        reseed = getattr(test_env, "reseed", None)
-        if reseed is not None:
-            reseed(_EVAL_SEED)
-        state, _ = test_env.reset()
-        return VecState(env_state=None, obs=jnp.asarray(state.obs, FLOAT))
-
-    def epoch_refresh(self, rstate):
-        refresh = getattr(self.environment, "epoch_refresh", None)
-        return rstate, (bool(refresh()) if refresh is not None else False)
+        return rstate, int(jnp.sum(transitions.terminal | transitions.truncation))
 
 
 def build_rollout(environment, test_environment, num_envs, rng):
     """Probes the environment, then builds the rollout for it.
 
-    The only place a backend is named. The probe runs first and its results are
-    construction arguments, so the rollout is frozen from the moment it exists
-    and `num_envs` in the returned instance is the backend's authoritative
-    width — a C++ pool's own count, not the one that was asked for. Callers
-    should do their step accounting off `rollout.num_envs` for that reason.
+    The probe runs first and its results are construction arguments, so the
+    rollout is frozen from the moment it exists.
 
     Returns:
         A tuple of `(rollout, rstate)` — the frozen rollout, and the run's
         first `RolloutState` with every env program already compiled.
     """
-    cls = (EnvPoolRollout if isinstance(environment, EnvPoolVectorEnv)
-           else JaxRollout)
-    rstate, num_envs, metric_keys = cls._probe(environment, num_envs, rng)
-    rollout = cls(environment, test_environment, num_envs, metric_keys)
+    rstate, num_envs, metric_keys = Rollout._probe(environment, num_envs, rng)
+    rollout = Rollout(environment, test_environment, num_envs, metric_keys)
     return rollout, rstate

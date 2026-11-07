@@ -12,8 +12,7 @@ from gymnasium import spaces
 from roxie.agents.hyperparams import AgentHyperparams
 from roxie.utils.rollout import (
     ChunkSums,
-    EnvPoolRollout,
-    JaxRollout,
+    Rollout,
     finished_episodes,
 )
 from roxie.utils.trainer import Trainer, _new_epoch_acc
@@ -229,32 +228,6 @@ def test_a_window_narrower_than_one_iteration_still_collects_a_step():
     assert Trainer._collect_steps(_CadencedAgent(64), 256) == 1
 
 
-def test_the_two_rollouts_declare_matching_surfaces():
-    """One loop drives both, so anything it calls must exist on each."""
-    surface = ("_probe", "warmup", "step", "collect", "roll_random",
-               "reset_tally", "epoch_refresh", "reset_test", "evaluate")
-    for name in surface:
-        assert hasattr(JaxRollout, name), f"JaxRollout is missing {name}"
-        assert hasattr(EnvPoolRollout, name), f"EnvPoolRollout is missing {name}"
-
-
-def test_each_backend_supplies_only_its_own_hooks():
-    """The loop is shared; what a backend may differ in is not.
-
-    `advance` (traced physics or a host callback), `observe_params`, `prepare`,
-    `reset_test` and `epoch_refresh` are the seams — `collect`, `roll_random`
-    and `evaluate` must be the SAME functions for both, or the two paths can
-    drift apart again.
-    """
-    for name in ("collect", "roll_random", "evaluate", "step", "reset_tally"):
-        assert JaxRollout.__dict__.get(name) is None, (
-            f"JaxRollout overrides the shared {name}"
-        )
-        assert EnvPoolRollout.__dict__.get(name) is None, (
-            f"EnvPoolRollout overrides the shared {name}"
-        )
-
-
 def test_a_rollout_is_frozen_once_built():
     """What a stale static argument would cost.
 
@@ -263,7 +236,7 @@ def test_a_rollout_is_frozen_once_built():
     would keep running against the geometry it was compiled for, silently. So
     `_probe` settles both before `__init__` and nothing may move them after.
     """
-    rollout = JaxRollout(_FakeEnv(), _FakeEnv(), 4, ("height",))
+    rollout = Rollout(_FakeEnv(), _FakeEnv(), 4, ("height",))
     assert rollout.num_envs == 4 and rollout.metric_keys == ("height",)
 
     for name, value in (("metric_keys", ()), ("num_envs", 8),
@@ -274,19 +247,16 @@ def test_a_rollout_is_frozen_once_built():
     assert rollout.num_envs == 4 and rollout.metric_keys == ("height",)
 
 
-def test_the_backend_step_functions_carry_no_instance():
+def test_the_step_functions_carry_no_instance():
     """What lets the compiled programs take `advance` as a static argument.
 
     A bound method would hold its rollout in `__self__`, putting the instance
     back in the jit cache key and retracing the whole chunk once per rollout —
     which is exactly what a static `self` used to do.
     """
-    for cls in (JaxRollout, EnvPoolRollout):
-        for name in ("advance", "observe_params"):
-            fn = getattr(cls, name)
-            assert fn is not None, f"{cls.__name__} declares no {name}"
-            assert not hasattr(fn, "__self__"), (
-                f"{cls.__name__}.{name} is bound and would key the cache on "
-                f"its instance"
-            )
-            assert hash(fn) is not None
+    for name in ("advance", "observe_params"):
+        fn = getattr(Rollout, name)
+        assert not hasattr(fn, "__self__"), (
+            f"Rollout.{name} is bound and would key the cache on its instance"
+        )
+        assert hash(fn) is not None

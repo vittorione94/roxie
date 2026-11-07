@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# The envpool_cpu cell only: CPU physics (native MuJoCo pool) + CPU learner,
+# The batch_cpu cell only: CPU physics (mujoco.batch) + CPU learner,
 # fully GPU-free. Thin wrapper around run_release_benchmark.sh — see its header
 # for the full grid, usage and resumability.
 #
@@ -13,4 +13,4 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CELLS=envpool_cpu exec "$SCRIPT_DIR/run_release_benchmark.sh" "$@"
+CELLS=batch_cpu exec "$SCRIPT_DIR/run_release_benchmark.sh" "$@"

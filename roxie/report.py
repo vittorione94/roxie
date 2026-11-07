@@ -45,7 +45,7 @@ DEFAULT_GRID = "release-v1"
 # Backend cells in display order, keyed by job_type.
 CELL_INFO = {
     "warp_gpu": "GPU physics (mujoco_warp) + GPU learner",
-    "envpool_cpu": "CPU physics (native MuJoCo pool) + CPU learner — fully GPU-free",
+    "batch_cpu": "CPU physics (mujoco.batch) + CPU learner — fully GPU-free",
     "mjx_gpu": "GPU physics (MJX) + GPU learner",
     "mjx_cpu": "CPU physics (MJX) + CPU learner — fully GPU-free",
 }
@@ -229,8 +229,8 @@ def main():
         "--description",
         default=(
             "Every agent in roxie on the whole dm_control suite, run twice: "
-            "once on GPU through mujoco_playground, once fully GPU-free through "
-            "EnvPool's native-MuJoCo pool."
+            "once on GPU through mujoco_warp, once fully GPU-free through "
+            "mujoco.batch."
         ),
     )
     parser.add_argument("--dry-run", action="store_true",

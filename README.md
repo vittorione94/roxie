@@ -19,19 +19,19 @@ Replayed from the released checkpoint with <a href="scripts/render_gif.py"><code
 Requires Python ≥ 3.11.
 
 ```bash
-uv sync                 # CPU-only: MJX on CPU + the EnvPool/native-MuJoCo path
+uv sync                 # CPU-only: MJX and mujoco.batch on CPU
 uv sync --group cuda    # Linux + NVIDIA: adds jax[cuda12] and warp-lang
 uv run python scripts/check_warp.py     # exit 0 = warp usable
 ```
 
-or, with plain pip: `pip install -e .`. The `cuda` group pins `warp-lang>=1.11,<1.13` ([why](docs/backends.md#the-warp-version-pin)).
+or, with plain pip: `pip install -e .`. The `cuda` group pins `warp-lang==1.18.0` ([why](docs/backends.md#the-warp-version-pin)).
 
 ## Quick start
 
 ```bash
 uv run python roxie/train.py --config-name dmc/bench_sac                          # WalkerWalk, GPU
 uv run python roxie/train.py --config-name dmc/bench_sac release.task=CheetahRun  # any of the 25
-uv run python roxie/train.py --config-name dmc/bench_sac dmc/backend@backend=envpool_cpu  # GPU-free
+uv run python roxie/train.py --config-name dmc/bench_sac dmc/backend@backend=batch_cpu  # GPU-free
 uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/step_5000000
 ```
 
@@ -51,9 +51,9 @@ wandb login
 uv run python roxie/train.py --config-name dmc/bench_sac release.task=HumanoidWalk \
     logging.wandb.project=my-roxie          # or logging.wandb.enabled=false
 
-uv run python roxie/plot.py --path outputs/release_v1/HumanoidWalk/envpool_cpu/sac \
+uv run python roxie/plot.py --path outputs/release_v1/HumanoidWalk/batch_cpu/sac \
     --output sac.pdf                        # one run: score, losses, throughput, wall-clock
-uv run python roxie/plot.py --path outputs/release_v1/HumanoidWalk/envpool_cpu \
+uv run python roxie/plot.py --path outputs/release_v1/HumanoidWalk/batch_cpu \
     --output walk-cpu.pdf                   # a directory: every run under it, overlaid
 ```
 
@@ -71,7 +71,8 @@ the physics — **3 tasks × 7 agents × 2 cells**.
   <img src="https://github.com/vittorione94/roxie/blob/main/images/release-dm_control-cpu.png?raw=true" alt="Episode return for seven agents on three dm_control humanoid tasks, against environment steps and against wall-clock time, on CPU">
 </picture>
 
-That is the **GPU-free** cell: EnvPool over dm_control's own C++ MuJoCo. The GPU figure,
+That is the **GPU-free** cell as measured at v0.1.0, on EnvPool over dm_control's XMLs. The
+cell now runs `mujoco.batch` over the `mujoco_playground` XMLs and has not been re-run. The GPU figure,
 the per-backend cost of an environment step, the final-score table and the method — what
 is held identical, what necessarily differs, how to run the grid — are in
 **[the release benchmark](docs/benchmark.md)**.
@@ -96,7 +97,7 @@ what keeps a thousand environments fed — see
 
 ## Documentation
 
-- **[Backends](docs/backends.md)** — the three physics backends, the two rollouts, memory, contact budgets, device placement, determinism.
+- **[Backends](docs/backends.md)** — the three physics backends, the rollout, memory, contact budgets, device placement, determinism.
 - **[Environments](docs/environments.md)** — the two ways to attach an env, the `FuncEnv` interface, builders, `terminal` vs `truncal`.
 - **[Agents](docs/agents.md)** — the shared base, the hyperparameter dataclass, the fused window, the contract a new agent honours, buffers, checkpoints.
 - **[Configuration](docs/configuration.md)** — the Hydra convention, the config groups, an annotated experiment.
@@ -133,7 +134,7 @@ A task can live outside this repo and still be launched through `roxie.train` �
 uv run pytest tests/
 ```
 
-Covers models, losses, exploration noise, n-step returns, agent utilities, per-agent behaviour, and that every agent config constructs with no `__init__` keyword missing from its YAML. CI ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) runs the same suite on Python 3.11 and 3.12; the runners are CPU-only, so it exercises the MJX-on-CPU and EnvPool paths and never the `cuda` group.
+Covers models, losses, exploration noise, n-step returns, agent utilities, per-agent behaviour, and that every agent config constructs with no `__init__` keyword missing from its YAML. CI ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) runs the same suite on Python 3.11 and 3.12; the runners are CPU-only, so it exercises the MJX-on-CPU and `mujoco.batch` paths and never the `cuda` group.
 
 ## Citation
 
