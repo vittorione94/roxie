@@ -341,13 +341,14 @@ def test_single_task_statistics_are_the_one_row_case():
 # ---- the task-weighted replay ----------------------------------------------
 
 
-def _filled_replay(n_step, counts=(2, 2, 4, 8), steps=50):
+def _filled_replay(n_step, counts=(2, 2, 4, 8), steps=50, slots=512):
+    """A replay of `slots` steps per world, `steps` added; column 0 is the step."""
     layout = TaskLayout("abcd", counts, (3,) * len(counts))
     n, k = sum(counts), len(counts)
     memory = OmegaConf.create({
         "_target_": "flashbax.buffers.make_flat_buffer",
         # Room for a 4096-sample draw, which flashbax checks against capacity.
-        "max_length": n * 512, "min_length": n, "sample_batch_size": 4096,
+        "max_length": n * slots, "min_length": n, "sample_batch_size": 4096,
         "add_sequences": False, "add_batch_size": n,
     })
     prototype = Transition(
@@ -358,8 +359,9 @@ def _filled_replay(n_step, counts=(2, 2, 4, 8), steps=50):
     replay = build_replay(memory, n_step, prototype, task_ids=layout.task_ids)
     state = replay.init()
     rng = np.random.default_rng(0)
-    for _ in range(steps):
+    for t in range(steps):
         x = rng.normal(size=(n, 3)).astype(np.float32)
+        x[:, 0] = t
         state = replay.add(state, Transition(
             observation=layout.compose([x[sl] for sl in layout.slices]),
             action=jnp.zeros((n, 1), FLOAT), reward=jnp.zeros(n, FLOAT),
@@ -378,6 +380,26 @@ def test_replay_draws_tasks_by_weight_not_by_world_count(n_step):
     if tasks.ndim == 2:
         assert np.all(tasks == tasks[:, :1]), "a window crossed rows"
         tasks = tasks[:, 0]
+    np.testing.assert_allclose(np.bincount(tasks, minlength=k) / tasks.size,
+                               target, atol=0.03)
+
+
+@pytest.mark.parametrize("n_step", [1, 5], ids=["flat", "trajectory"])
+def test_weighted_draws_after_the_replay_wraps_are_retained_runs(n_step):
+    slots, steps = 256, 300
+    replay, state, k = _filled_replay(n_step, steps=steps, slots=slots)
+    assert bool(state.is_full)
+    target = jnp.asarray([0.1, 0.2, 0.3, 0.4], jnp.float32)
+    batch = jax.jit(replay.draw)(state, jax.random.PRNGKey(0), target)
+    if n_step == 1:
+        windows = np.stack([batch.experience.first.observation,
+                            batch.experience.second.observation], axis=1)
+    else:
+        windows = np.asarray(batch.experience.observation)
+    times = windows[..., 0]
+    np.testing.assert_array_equal(np.diff(times, axis=1), 1.0)
+    assert times.min() >= steps - slots, "a window reached an overwritten step"
+    tasks = windows[:, 0, -k:].argmax(-1)
     np.testing.assert_allclose(np.bincount(tasks, minlength=k) / tasks.size,
                                target, atol=0.03)
 
