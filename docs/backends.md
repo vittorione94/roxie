@@ -20,7 +20,7 @@ Selection is a Hydra config group: [`experiments/dmc/backend/`](../experiments/d
 
 `impl` picks which physics steps the *same* task: the XML, the reset, the observation and the reward are upstream `mujoco_playground` code on all three. `loader.uses_batch` asks the config wherever roxie needs to know (pinning the run to the CPU in `train.py`).
 
-`impl: batch` covers the 25 dm_control suite tasks in `suites.DMC_TASKS` and refuses anything else, because `BatchVectorEnv` copies back only the `mjData` fields those tasks read. Resets still run on MJX; only the step moves to native MuJoCo.
+`BatchVectorEnv` copies back only the `mjData` fields in `vector.py`'s `_BATCH_CARRIED` and `_BATCH_DERIVED`; every other field the task sees keeps its reset value. So at build time it traces the task's step and refuses one that reads any other field, naming it; adding a field `mj_step` always computes to `_BATCH_DERIVED` is how such a task is let in. Resets still run on MJX; only the step moves to native MuJoCo.
 
 `train.py` prints a banner at startup reporting the backend that *actually* loaded (read off the constructed env, not echoed from config) and flags a mismatch against what was requested.
 

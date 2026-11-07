@@ -14,6 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+# `dce_jaxpr` has no public alias (JAX 0.11).
+from jax._src.interpreters import partial_eval as pe
 from jax.experimental import io_callback
 from mujoco import batch
 from mujoco_playground._src import mjx_env
@@ -189,9 +191,11 @@ class JaxVectorEnv:
         return jax.tree.map(_leaf, reset_pool, stepped)
 
 
-# Every field the dm_control suite tasks read off `data`, and the state a world
-# needs to be rebuilt from. `suites.DMC_TASKS` is what this list is good for, and
-# `build_playground_env` refuses anything else.
+# The state a world is rebuilt from, and the derived fields the batch copies back.
+# A task may read only these off `data`: every other field keeps its reset value
+# (`fields_the_task_reads_that_batch_never_updates` finds such a task). Add only
+# fields `mj_step` always computes: the batch shares an MjData across worlds, so
+# any other holds another world's value (the `mujoco.batch` docstring).
 _BATCH_CARRIED = (
     "qpos", "qvel", "act", "qacc_warmstart", "mocap_pos", "mocap_quat", "time",
 )
@@ -222,6 +226,33 @@ def _physics_already_stepped(action, fields, n_substeps):
         mjx_env.step = real
 
 
+def fields_the_task_reads_that_batch_never_updates(
+    func_env, n_substeps: int,
+) -> list[str]:
+    """The `data` fields the task's step reads that the batch does not return."""
+    key = jax.random.PRNGKey(0)
+    state = jax.eval_shape(func_env.initial, key)
+    returned = {"ctrl", *_BATCH_CARRIED, *_BATCH_DERIVED}
+    fields = {name: getattr(state.data, name) for name in returned - {"ctrl"}}
+    action = jax.ShapeDtypeStruct(func_env.action_space.shape, FLOAT)
+
+    def outputs(state, fields, action):
+        with _physics_already_stepped(action, fields, n_substeps):
+            next_state = func_env.transition(state, action, key)
+        # The next `data` passes every field through, read or not.
+        return next_state.replace(data=None)
+
+    jaxpr = jax.make_jaxpr(outputs)(state, fields, action).jaxpr
+    _, used = pe.dce_jaxpr(jaxpr, [True] * len(jaxpr.outvars))
+    paths = jax.tree_util.tree_flatten_with_path(state)[0]
+    read = {
+        path[1].name
+        for (path, _), is_used in zip(paths, used)
+        if is_used and path[0].name == "data"
+    }
+    return sorted(read - returned)
+
+
 def _available_cores() -> int:
     """The cores this process may run on, which a pinned run narrows."""
     if hasattr(os, "sched_getaffinity"):
@@ -245,6 +276,14 @@ class BatchVectorEnv(JaxVectorEnv):
             nthread=min(nthread, self.num_envs),
         )
         self._n_substeps = int(func_env.n_substeps)
+        stale_fields = fields_the_task_reads_that_batch_never_updates(
+            func_env, self._n_substeps,
+        )
+        if stale_fields:
+            raise ValueError(
+                f"impl=batch cannot run {type(func_env.env).__name__}: it reads "
+                f"data.{stale_fields}, which mujoco.batch never updates."
+            )
         self._rows = {
             name: self._batch.bind(name)
             for name in (*_BATCH_CARRIED, *_BATCH_DERIVED, "ctrl")

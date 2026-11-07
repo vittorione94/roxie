@@ -10,7 +10,7 @@ from hydra.utils import get_method
 from omegaconf import DictConfig, OmegaConf, open_dict
 from mujoco_playground import registry
 
-from roxie.environment import functional, suites
+from roxie.environment import functional
 from roxie.environment.functional import FuncEnv
 from roxie.environment.vector import BatchVectorEnv, JaxVectorEnv
 
@@ -225,10 +225,6 @@ def build_playground_env(
     num_threads: int | None = None,
 ) -> EnvBundle:
     """Instantiates vectorized training and test drivers for `mujoco_playground` tasks."""
-    if impl == BATCH_IMPL and env_name not in suites.DMC_TASKS:
-        raise ValueError(
-            f"impl=batch supports the dm_control suite tasks, not {env_name!r}."
-        )
     func_env, env_cfg = load_playground_env(
         env_name, impl=impl, naconmax=naconmax, njmax=njmax,
         graph_mode=graph_mode,
