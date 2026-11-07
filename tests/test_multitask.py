@@ -439,7 +439,7 @@ def test_a_task_with_nothing_finished_scores_nan_not_zero():
 
 def test_weighted_curriculum_orders_weights_by_task():
     curriculum = WeightedTasks({"run": 3})
-    curriculum.start(("stand", "run"))
+    np.testing.assert_allclose(curriculum.start(("stand", "run")), [0.25, 0.75])
     np.testing.assert_allclose(curriculum.update([np.nan, np.nan]), [0.25, 0.75])
     with pytest.raises(ValueError, match="unknown"):
         WeightedTasks({"fly": 1}).start(("stand", "run"))
@@ -453,6 +453,40 @@ def test_learning_progress_favours_the_task_that_is_moving():
     assert np.argmax(weights) == 2
     np.testing.assert_allclose(weights.sum(), 1.0)
     assert weights.min() >= 0.2 / 3 - 1e-9, "the floor starves nothing"
+
+
+def test_learning_progress_starts_uniform():
+    curriculum = LearningProgressTasks(score_scale=1.0)
+    np.testing.assert_allclose(curriculum.start(("a", "b", "c", "d")), [0.25] * 4)
+
+
+def test_the_first_learning_pass_draws_by_the_curriculum(tmp_path):
+    from flax import nnx
+
+    from roxie.utils import logger
+
+    bundle = _toy()
+    agent = _sac(bundle.env)
+    seen = []
+    learn = agent.learn
+
+    def spy(key, n_steps=None):
+        seen.append(np.asarray(agent.state.task_weights))
+        return learn(key, n_steps)
+
+    agent.learn = spy
+    trainer = Trainer(
+        output_dir=str(tmp_path), steps=64, epoch_steps=1_000, save_steps=1_000,
+        show_progress=False, curriculum=WeightedTasks({"wide": 3}),
+    )
+    trainer.initialize(agent=agent, environment=bundle.env,
+                       test_environment=bundle.test_env)
+    logger.initialize(path=str(tmp_path / "logs"), backends=[])
+    try:
+        trainer.run(4, nnx.Rngs(envs=0, agent=3))
+    finally:
+        logger.close()
+    np.testing.assert_allclose(seen[0], [0.25, 0.75])
 
 
 def test_learning_progress_holds_a_task_that_finished_nothing():

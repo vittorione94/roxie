@@ -249,14 +249,14 @@ class Trainer:
             print(f"  Done: {self.steps:,} steps, {int(episodes)} episodes",
                   flush=True)
 
+        if self.curriculum is not None:
+            agent.set_task_weights(self.curriculum.start(rollout.task_names))
         agent_key = self._precompile_update(agent, agent_key)
 
         print("Training...", flush=True)
         collect_steps = self._collect_steps(agent, num_envs)
         chunk_env_steps = collect_steps * num_envs
         acc = _new_epoch_acc(rollout.metric_keys, len(rollout.task_names))
-        if self.curriculum is not None:
-            self.curriculum.start(rollout.task_names)
         grad_steps = 0
         first_chunk, bench_t0, bench_steps = True, None, 0
 

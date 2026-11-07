@@ -9,8 +9,9 @@ What it does not move is which tasks the envs collect: each task's share of
 worlds is fixed at launch by the env block's `weights`. A curriculum decides
 what the learner trains on, from whatever the worlds collected.
 
-The trainer drives it: `start` once with the task names, then `update` at every
-epoch boundary.
+The trainer drives it: `start` once with the task names, which returns the
+weights the first learning pass draws by, then `update` at every epoch
+boundary.
 """
 
 import numpy as np
@@ -28,7 +29,7 @@ class WeightedTasks:
         self._weights = None
 
     def start(self, task_names):
-        """Orders the weights by the env's tasks."""
+        """Orders the weights by the env's tasks and returns them."""
         unknown = sorted(set(self.weights) - set(task_names))
         if unknown:
             raise ValueError(f"weights for unknown task(s) {unknown}")
@@ -36,6 +37,7 @@ class WeightedTasks:
         if np.any(w <= 0):
             raise ValueError(f"task weights {self.weights} must be positive")
         self._weights = w / w.sum()
+        return self._weights
 
     def update(self, scores):
         """Returns the fixed weights, whatever `scores` says."""
@@ -66,9 +68,11 @@ class LearningProgressTasks:
         self._fast = self._slow = None
 
     def start(self, task_names):
-        """Sizes the averages for the env's tasks."""
-        self._fast = np.full(len(task_names), np.nan)
-        self._slow = np.full(len(task_names), np.nan)
+        """Sizes the averages for the env's tasks; returns uniform weights."""
+        k = len(task_names)
+        self._fast = np.full(k, np.nan)
+        self._slow = np.full(k, np.nan)
+        return np.full(k, 1.0 / k)
 
     def update(self, scores):
         """Folds an epoch's per-task scores in and returns the new weights.
