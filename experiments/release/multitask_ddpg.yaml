@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - agent: ddpg_bench
+  - noise: bench_gaussian
+  - bench: multitask
+  - _self_
+
+release:
+  agent: ddpg

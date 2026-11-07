@@ -32,7 +32,6 @@ from roxie.utils.math import (
     obs_mean_std,
     scale_to_env,
 )
-from roxie.utils.memory import ReplayManager
 
 
 class LogAlpha(nnx.Module):
@@ -59,7 +58,9 @@ def _sac_grad_step(
     state, log_alpha_module, alpha_optimizer = nodes
 
     key, sample_key, actor_key, critic_key = jax.random.split(key, 4)
-    samples = replay_sample_fn(state.buffer_state, sample_key)
+    samples = replay_sample_fn(
+        state.buffer_state, sample_key, state.task_weights
+    )
     re_packed_samples = repack_samples(samples, hp.gamma, hp.n_step)
     re_packed_samples = normalize_samples(
         re_packed_samples,
@@ -214,16 +215,18 @@ class SAC(Agent):
         actor_optimizer_config: dict = None,
         critic_optimizer_config: dict = None,
         alpha_optimizer_config: dict = None,
+        env_task_counts=None,
     ):
         self.hp = build_hyperparams(type(self).hyperparams_cls, hyperparams)
+        self._bind_tasks(env_task_counts)
 
         actor = hydra.utils.instantiate(actor_config)
         twin_critic = hydra.utils.instantiate(critic_config)
 
-        self.replay = ReplayManager(
-            build_replay(memory_config, self.hp.n_step),
+        self.replay = build_replay(
+            memory_config, self.hp.n_step,
             transition_prototype(env_obs_size, env_action_size),
-            time_axis=self.hp.n_step > 1,
+            task_ids=self.task_ids,
         )
         self.batch_size = memory_config.sample_batch_size
         self.buffer_size = memory_config.max_length
@@ -306,7 +309,7 @@ class SAC(Agent):
             agent_rng,
             target_steps,
             self.hp,
-            self.replay.sample,
+            self.replay.draw,
             self.target_entropy,
             self.action_low,
             self.action_high,

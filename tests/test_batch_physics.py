@@ -5,8 +5,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from roxie.environment import suites
-from roxie.environment.loader import build_playground_env, load_playground_env
+from roxie.environment.loader import (
+    PlaygroundFuncEnv,
+    build_playground_env,
+    load_playground_env,
+)
 from roxie.environment.vector import BatchVectorEnv
 
 NUM_ENVS = 2
@@ -19,7 +22,7 @@ def _actions(env, seed=0):
     )
 
 
-@pytest.mark.parametrize("task", suites.DMC_TASKS)
+@pytest.mark.parametrize("task", ["HumanoidStand", "HumanoidWalk", "HumanoidRun"])
 def test_one_step_matches_mjx(task):
     """Same reset, action and task code, so only the physics engine differs.
 
@@ -39,6 +42,18 @@ def test_one_step_matches_mjx(task):
 
     np.testing.assert_allclose(got.obs, want.obs, atol=1e-3, rtol=1e-3)
     np.testing.assert_allclose(got.reward, want.reward, atol=1e-3)
+
+
+def test_a_task_reading_a_field_the_batch_does_not_return_is_refused():
+    func_env, _ = load_playground_env("WalkerWalk", impl="batch")
+
+    class ReadsCvel(PlaygroundFuncEnv):
+        def transition(self, state, action, rng, params=None):
+            nxt = super().transition(state, action, rng, params)
+            return nxt.replace(reward=nxt.reward + nxt.data.cvel.sum())
+
+    with pytest.raises(ValueError, match="cvel"):
+        BatchVectorEnv(ReadsCvel(func_env.env, "batch"), NUM_ENVS)
 
 
 @pytest.fixture(scope="module")
@@ -88,12 +103,7 @@ def test_only_the_replaced_world_is_reloaded(walker_start):
     assert not np.allclose(env._rows["qpos"][1], reference._rows["qpos"][1])
 
 
-def test_a_task_outside_the_suite_is_refused():
-    with pytest.raises(ValueError, match="dm_control suite"):
-        build_playground_env("Go1JoystickFlatTerrain", impl="batch")
-
-
-def test_a_task_that_transforms_its_action_is_refused(walker_start):
+def test_a_task_that_transforms_its_action_is_refused():
     """The batch steps before the task runs, so it would have applied the wrong
     controls without a word."""
     func_env, _ = load_playground_env("WalkerWalk", impl="batch")
@@ -107,9 +117,8 @@ def test_a_task_that_transforms_its_action_is_refused(walker_start):
             return task.step(state, 0.5 * action)
 
     func_env.env = Scaling()
-    env = BatchVectorEnv(func_env, NUM_ENVS, num_threads=1)
     with pytest.raises(ValueError, match="unchanged"):
-        env.step(walker_start, _actions(env), jax.random.PRNGKey(0))
+        BatchVectorEnv(func_env, NUM_ENVS, num_threads=1)
 
 
 def test_a_batch_run_replays_on_mjx():

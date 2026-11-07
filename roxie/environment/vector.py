@@ -14,6 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+# `dce_jaxpr` has no public alias (JAX 0.11).
+from jax._src.interpreters import partial_eval as pe
 from jax.experimental import io_callback
 from mujoco import batch
 from mujoco_playground._src import mjx_env
@@ -45,11 +47,30 @@ class Timestep(NamedTuple):
     info: dict
 
 
+# Past this, a finite observation is a diverged world all the same. MuJoCo passes
+# through finite values on the way to NaN: Warp emitted ~1e11 the step before its
+# NaN, and the C engine behind `mujoco.batch` emits ~1e7 velocities until its own
+# QACC check resets the world, which never reaches NaN at all. One such step,
+# folded into the all-time `ObsStats`, scales that task's normalized inputs to ~0
+# for the rest of the run: humanoid `stand` went 985 -> 34 at 436M on Warp, and a
+# batch run never learned `run` in 500M (2026-11-07). Healthy humanoid columns
+# kept an RMS under 26 over 1B steps, and under random actions no loadable
+# playground task passed 78 in a 1,000-step episode.
+DIVERGED_OBS_LIMIT = 1e3
+
+# How long an eval runs an episode on a driver with `max_episode_steps=0`,
+# which puts no cutoff of its own on it.
+UNCAPPED_EVAL_STEPS = 1000
+
+
 def nonfinite_worlds(obs, reward, xp=jnp):
-    """Identifies worlds that produced non-finite observations or rewards."""
+    """Identifies worlds whose step diverged: non-finite, or past the limit."""
     n = obs.shape[0]
-    finite_obs = xp.all(xp.isfinite(obs).reshape(n, -1), axis=1)
-    return ~(finite_obs & xp.isfinite(reward))
+    # `<=` is False on NaN and on Inf, so this also catches non-finite values.
+    sane_obs = xp.all(
+        (xp.abs(obs) <= DIVERGED_OBS_LIMIT).reshape(n, -1), axis=1
+    )
+    return ~(sane_obs & xp.isfinite(reward))
 
 
 def zero_worlds(mask, x, xp=jnp):
@@ -128,7 +149,11 @@ class JaxVectorEnv:
         terminated = jnp.logical_or(
             jnp.logical_and(terminal, jnp.logical_not(truncal)), diverged
         )
-        truncated = jnp.logical_or(truncal, step_truncated)
+        # A blown-up world still runs its predicates, and a large finite state
+        # can trip `truncal`; a truncation would bootstrap off that state.
+        truncated = jnp.logical_and(
+            jnp.logical_or(truncal, step_truncated), jnp.logical_not(diverged)
+        )
         done = jnp.logical_or(jnp.logical_or(terminated, truncal), step_truncated)
 
         info = {
@@ -166,9 +191,11 @@ class JaxVectorEnv:
         return jax.tree.map(_leaf, reset_pool, stepped)
 
 
-# Every field the dm_control suite tasks read off `data`, and the state a world
-# needs to be rebuilt from. `suites.DMC_TASKS` is what this list is good for, and
-# `build_playground_env` refuses anything else.
+# The state a world is rebuilt from, and the derived fields the batch copies back.
+# A task may read only these off `data`: every other field keeps its reset value
+# (`fields_the_task_reads_that_batch_never_updates` finds such a task). Add only
+# fields `mj_step` always computes: the batch shares an MjData across worlds, so
+# any other holds another world's value (the `mujoco.batch` docstring).
 _BATCH_CARRIED = (
     "qpos", "qvel", "act", "qacc_warmstart", "mocap_pos", "mocap_quat", "time",
 )
@@ -199,6 +226,33 @@ def _physics_already_stepped(action, fields, n_substeps):
         mjx_env.step = real
 
 
+def fields_the_task_reads_that_batch_never_updates(
+    func_env, n_substeps: int,
+) -> list[str]:
+    """The `data` fields the task's step reads that the batch does not return."""
+    key = jax.random.PRNGKey(0)
+    state = jax.eval_shape(func_env.initial, key)
+    returned = {"ctrl", *_BATCH_CARRIED, *_BATCH_DERIVED}
+    fields = {name: getattr(state.data, name) for name in returned - {"ctrl"}}
+    action = jax.ShapeDtypeStruct(func_env.action_space.shape, FLOAT)
+
+    def outputs(state, fields, action):
+        with _physics_already_stepped(action, fields, n_substeps):
+            next_state = func_env.transition(state, action, key)
+        # The next `data` passes every field through, read or not.
+        return next_state.replace(data=None)
+
+    jaxpr = jax.make_jaxpr(outputs)(state, fields, action).jaxpr
+    _, used = pe.dce_jaxpr(jaxpr, [True] * len(jaxpr.outvars))
+    paths = jax.tree_util.tree_flatten_with_path(state)[0]
+    read = {
+        path[1].name
+        for (path, _), is_used in zip(paths, used)
+        if is_used and path[0].name == "data"
+    }
+    return sorted(read - returned)
+
+
 def _available_cores() -> int:
     """The cores this process may run on, which a pinned run narrows."""
     if hasattr(os, "sched_getaffinity"):
@@ -222,6 +276,14 @@ class BatchVectorEnv(JaxVectorEnv):
             nthread=min(nthread, self.num_envs),
         )
         self._n_substeps = int(func_env.n_substeps)
+        stale_fields = fields_the_task_reads_that_batch_never_updates(
+            func_env, self._n_substeps,
+        )
+        if stale_fields:
+            raise ValueError(
+                f"impl=batch cannot run {type(func_env.env).__name__}: it reads "
+                f"data.{stale_fields}, which mujoco.batch never updates."
+            )
         self._rows = {
             name: self._batch.bind(name)
             for name in (*_BATCH_CARRIED, *_BATCH_DERIVED, "ctrl")
