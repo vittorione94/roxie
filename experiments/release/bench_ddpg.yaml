@@ -3,8 +3,8 @@
 defaults:
   - agent: ddpg_bench
   - noise: bench_gaussian
-  - bench: dmc
-  - backend: envpool_cpu
+  - bench: release
+  - backend: batch_cpu
   - _self_
 
 release:

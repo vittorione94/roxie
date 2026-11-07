@@ -38,7 +38,6 @@ from mujoco_playground._src.dm_control_suite import humanoid
 from scipy import ndimage
 
 from roxie.environment.loader import (
-    DEFAULT_MAX_EPISODE_STEPS,
     DEFAULT_WARP_GRAPH_MODE,
     EnvBundle,
     PlaygroundFuncEnv,
@@ -326,7 +325,7 @@ class HumanoidRGBD(humanoid.Humanoid):
     def _render(self, data: mjx.Data) -> jnp.ndarray:
         data = self._pose_lights(data)
         render_data = mjx.refit_bvh(self.mjx_model, data, self._rc_pytree)
-        rgb, depth = mjx.render(self.mjx_model, render_data, self._rc_pytree)
+        rgb, depth, _ = mjx.render(self.mjx_model, render_data, self._rc_pytree)
         # Camera index 0 counts ACTIVE cameras, and only one is active.
         rgb = mjx.get_rgb(self._rc_pytree, 0, rgb)
         depth = mjx.get_depth(
@@ -435,11 +434,7 @@ def build_humanoid_rgbd_env(
         env = HumanoidRGBD(MOVE_SPEEDS[task], world_config, terrain)
         return PlaygroundFuncEnv(env, impl="warp", nworld=nworld)
 
-    max_steps = int(
-        max_episode_steps
-        or config.get("episode_length", None)
-        or DEFAULT_MAX_EPISODE_STEPS
-    )
+    max_steps = int(max_episode_steps or config.episode_length)
     # A render context is allocated for a fixed `nworld` that JAX cannot see, so
     # the eval batch needs its own env rather than sharing the training one.
     return EnvBundle(

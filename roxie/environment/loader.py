@@ -1,50 +1,29 @@
 """Environment loading, MuJoCo adapters, and vector environment builders."""
 
+import functools
 import math
-import os
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from hydra.utils import get_method, instantiate
+from hydra.utils import get_method
 from omegaconf import DictConfig, OmegaConf, open_dict
 from mujoco_playground import registry
 
-from roxie.environment import functional, suites
+from roxie.environment import functional
 from roxie.environment.functional import FuncEnv
-from roxie.environment.vector import EnvPoolVectorEnv, JaxVectorEnv
+from roxie.environment.vector import BatchVectorEnv, JaxVectorEnv
 
 
-class MuJoCoFuncEnv(FuncEnv):
-    """Abstract functional environment adapter for MuJoCo physics state."""
-
-    def observation(self, state, rng, params=None):
-        return state.obs
-
-    def reward(self, state, action, next_state, rng, params=None):
-        return next_state.reward
-
-    def terminal(self, state, rng, params=None):
-        return state.done.astype(jnp.bool_)
-
-    def truncal(self, state, rng, params=None):
-        return jnp.asarray(state.info.get("truncation", False), dtype=jnp.bool_)
-
-    def transition_info(self, state, action, next_state, params=None):
-        return {"metrics": next_state.metrics}
-
-
-class PlaygroundFuncEnv(MuJoCoFuncEnv):
+class PlaygroundFuncEnv(FuncEnv):
     """Functional environment wrapper for `mujoco_playground` environments.
 
     `nworld` is the world count of the warp render context the env carries, and
     `None` for an env that renders nothing.
     """
 
-    def __init__(
-        self, env: Any, impl: str | None = None, nworld: int | None = None,
-    ):
+    def __init__(self, env: Any, impl: str, nworld: int | None = None):
         self.env = env
         obs_size = (
             env.observation_size if nworld is None
@@ -58,7 +37,13 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
         self.observation_space = functional.unbounded_box(obs_size)
         ctrl_range = env.mj_model.actuator_ctrlrange
         self.action_space = functional.box(ctrl_range[:, 0], ctrl_range[:, 1])
-        self.metadata = {"jax": True, "impl": impl or _read_impl(env)}
+        self.metadata = {"jax": True, "impl": impl}
+
+    def initial(self, rng, params=None):
+        return self.env.reset(rng)
+
+    def transition(self, state, action, rng, params=None):
+        return self.env.step(state, action)
 
     def observation(self, state, rng, params=None):
         if self._obs_keys is None:
@@ -68,11 +53,17 @@ class PlaygroundFuncEnv(MuJoCoFuncEnv):
             for key in self._obs_keys
         ])
 
-    def initial(self, rng, params=None):
-        return self.env.reset(rng)
+    def reward(self, state, action, next_state, rng, params=None):
+        return next_state.reward
 
-    def transition(self, state, action, rng, params=None):
-        return self.env.step(state, action)
+    def terminal(self, state, rng, params=None):
+        return state.done.astype(jnp.bool_)
+
+    def truncal(self, state, rng, params=None):
+        return jnp.asarray(state.info.get("truncation", False), dtype=jnp.bool_)
+
+    def transition_info(self, state, action, next_state, params=None):
+        return {"metrics": next_state.metrics}
 
     def __getattr__(self, name):
         if name.startswith("__") or "env" not in self.__dict__:
@@ -109,6 +100,9 @@ def _obs_layout(sizes: Mapping) -> tuple[tuple[str, ...], tuple[int, ...] | None
     return tuple(pixels + rest), pixel_shape
 
 
+BATCH_IMPL = "batch"
+
+
 def _read_impl(env: Any) -> str:
     """Extracts the underlying physics implementation string from an environment."""
     impl = getattr(env, "_impl", None)
@@ -135,8 +129,10 @@ def resolve_agent_device() -> tuple[str, str]:
 def resolve_env_device(env: Any) -> tuple[str, str]:
     """Identifies the physics execution device and backend description."""
     impl = resolve_loaded_impl(env)
-    if impl == "envpool":
-        return "cpu", "native MuJoCo, C++ thread pool"
+    if impl == BATCH_IMPL:
+        return "cpu", "native MuJoCo, mujoco.batch thread pool"
+    if impl == "native":
+        return "cpu", "native MuJoCo, one world"
     device, backend = resolve_agent_device()
     return device, f"{impl} kernels on the JAX device ({backend})"
 
@@ -182,9 +178,10 @@ def log_loaded_backend(
 DEFAULT_WARP_GRAPH_MODE = "WARP_STAGED_EX"
 
 
-def _set_graph_mode(env: Any, graph_mode: str) -> None:
-    """Re-puts a playground environment's MJX model using a specified CUDA graph mode."""
+def _put_warp_model(env: Any, graph_mode: str) -> None:
+    """Re-puts a playground environment's MJX model for a long Warp run."""
     from mujoco import mjx
+    from mujoco.mjx.third_party import mujoco_warp as mjw
     from mujoco.mjx.warp import types as mjxw_types
 
     if not hasattr(env, "_mjx_model"):
@@ -192,11 +189,18 @@ def _set_graph_mode(env: Any, graph_mode: str) -> None:
             f"{type(env).__name__} has no `_mjx_model` to re-put; mujoco_playground "
             "changed shape."
         )
-    env._mjx_model = mjx.put_model(
+    model = mjx.put_model(
         env.mj_model,
         impl="warp",
         graph_mode=getattr(mjxw_types.GraphMode, graph_mode),
     )
+    # Playground caps the solver low on purpose, so these two print per world per
+    # step: 40-50k lines a minute on the humanoids at 256 worlds (2026-11-06). The
+    # contact and constraint overflows stay on; those are a budget set too small.
+    capped = mjw.OverflowType.ITERATIONS | mjw.OverflowType.LS_ITERATIONS
+    impl = model.opt._impl
+    impl = impl.replace(warn_overflow=int(impl.warn_overflow) & ~int(capped))
+    env._mjx_model = model.replace(opt=model.opt.replace(_impl=impl))
 
 
 def load_playground_env(
@@ -213,11 +217,12 @@ def load_playground_env(
     `nworld` sizes the render context under `vision`, and nothing otherwise.
     """
     env_cfg = registry.get_default_config(env_name)
-    if impl is not None and "impl" in env_cfg:
-        env_cfg.impl = impl
-    if naconmax is not None and "naconmax" in env_cfg:
+    # `batch` swaps only the step: resets and the task's model stay on MJX.
+    if impl is not None:
+        env_cfg.impl = "jax" if impl == BATCH_IMPL else impl
+    if naconmax is not None:
         env_cfg.naconmax = naconmax
-    if njmax is not None and "njmax" in env_cfg:
+    if njmax is not None:
         env_cfg.njmax = njmax
     if vision:
         if "vision" not in env_cfg:
@@ -233,9 +238,11 @@ def load_playground_env(
         env_cfg.vision_config.nworld = int(nworld)
 
     env = registry.load(env_name, config=env_cfg)
-    if str(env_cfg.get("impl", "")) == "warp":
-        _set_graph_mode(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
-    return PlaygroundFuncEnv(env, nworld=nworld if vision else None), env_cfg
+    if env_cfg.impl == "warp":
+        _put_warp_model(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
+    loaded_impl = BATCH_IMPL if impl == BATCH_IMPL else env_cfg.impl
+    func_env = PlaygroundFuncEnv(env, loaded_impl, nworld=nworld if vision else None)
+    return func_env, env_cfg
 
 
 class EnvBundle(NamedTuple):
@@ -245,8 +252,6 @@ class EnvBundle(NamedTuple):
     test_env: Any
     env_cfg: Any
 
-
-DEFAULT_MAX_EPISODE_STEPS = 1000
 
 TRAINER_ENV_KEYS = frozenset({
     "parallel_envs",
@@ -289,6 +294,7 @@ def build_playground_env(
     graph_mode: str | None = None,
     vision: bool = False,
     max_episode_steps: int | None = None,
+    num_threads: int | None = None,
 ) -> EnvBundle:
     """Instantiates vectorized training and test drivers for `mujoco_playground` tasks."""
     def load(nworld: int):
@@ -301,74 +307,54 @@ def build_playground_env(
     # A render context is allocated for a fixed `nworld` that JAX cannot see, so
     # the eval batch needs its own env rather than sharing the training one.
     test_func_env = load(test_episodes)[0] if vision else func_env
-    max_steps = int(
-        max_episode_steps
-        or env_cfg.get("episode_length", None)
-        or DEFAULT_MAX_EPISODE_STEPS
-    )
+    # Pixels are drawn by warp's renderer, so a vision replay keeps its physics
+    # on warp rather than C MuJoCo.
+    if mode == "play" and not vision:
+        func_env.metadata["impl"] = "native"
+    max_steps = int(max_episode_steps or env_cfg.episode_length)
+    if impl == BATCH_IMPL:
+        driver = functools.partial(BatchVectorEnv, num_threads=num_threads)
+    else:
+        driver = JaxVectorEnv
     return EnvBundle(
-        env=JaxVectorEnv(func_env, num_envs, max_episode_steps=max_steps),
-        test_env=JaxVectorEnv(
-            test_func_env, test_episodes, max_episode_steps=max_steps,
-        ),
+        env=driver(func_env, num_envs, max_episode_steps=max_steps),
+        test_env=driver(test_func_env, test_episodes, max_episode_steps=max_steps),
         env_cfg=env_cfg,
     )
 
 
-def build_envpool_env(
-    task_id: str,
-    *,
-    mode: str = "train",
-    num_envs: int = 1,
-    test_episodes: int = 1,
-    seed: int = 0,
-    max_episode_steps: int | None = None,
-    **task_kwargs: Any,
-) -> EnvBundle:
-    """Instantiates vectorized training and test drivers for C++ EnvPool tasks."""
-    import envpool
+def plain(cfg: Any) -> Any:
+    """A config node as plain containers, its interpolations resolved."""
+    if OmegaConf.is_config(cfg):
+        return OmegaConf.to_container(cfg, resolve=True)
+    return cfg
 
-    max_steps = int(max_episode_steps or DEFAULT_MAX_EPISODE_STEPS)
-    seed = int(seed)
-    obs_keys = suites.envpool_obs_keys(task_id)
 
-    def make_pool(n: int, pool_seed: int):
-        return envpool.make(
-            task_id,
-            env_type="gymnasium",
-            num_envs=n,
-            seed=pool_seed,
-            max_episode_steps=max_steps,
-            **task_kwargs,
-        )
+def task_blocks(cfg_env: Any) -> list:
+    """Each task's own env block, `task_defaults` merged in; `[cfg_env]` if single."""
+    # Left a config, so `get` on a single block still resolves its interpolations.
+    if "tasks" not in cfg_env:
+        return [cfg_env]
+    # Resolved while they are still part of the composed config their
+    # interpolations point into, and copied out of it: Hydra locks it, so a
+    # task block's own keys could not be merged into the defaults.
+    defaults = plain(cfg_env.get("task_defaults", None)) or {}
+    return [{**defaults, **(plain(block) or {})}
+            for block in cfg_env["tasks"].values()]
 
-    train_env = EnvPoolVectorEnv(
-        make_pool(num_envs, seed), num_envs=num_envs,
-        max_episode_steps=max_steps, obs_keys=obs_keys,
-    )
-    test_env = EnvPoolVectorEnv(
-        make_pool(test_episodes, seed + 1), num_envs=test_episodes,
-        max_episode_steps=max_steps, obs_keys=obs_keys,
-        rebuild=lambda s: make_pool(test_episodes, s),
+
+def uses_batch(cfg_env: Any) -> bool:
+    """Whether the block steps on `mujoco.batch`, read through a multi-task one."""
+    blocks = task_blocks(cfg_env)
+    return bool(blocks) and all(
+        block.get("impl", None) == BATCH_IMPL for block in blocks
     )
 
-    return EnvBundle(env=train_env, test_env=test_env, env_cfg=None)
 
-
-DEFAULT_BUILDER = "roxie.environment.loader.build_playground_env"
-
-
-def builder_target(cfg_env: Any) -> str:
-    """Returns the dotted import path of the target environment builder."""
-    return cfg_env.get("_target_", None) or DEFAULT_BUILDER
-
-
-def uses_envpool(cfg_env: Any) -> bool:
-    """Determines whether the environment configuration target points to EnvPool."""
-    try:
-        return get_method(builder_target(cfg_env)) is build_envpool_env
-    except Exception:
-        return False
+def requested_impl(cfg_env: Any) -> str | None:
+    """The physics `impl` the block asks for, read through a multi-task one's tasks."""
+    impls = {block.get("impl", None) for block in task_blocks(cfg_env)}
+    return impls.pop() if len(impls) == 1 else None
 
 
 DEVICES = ("cpu", "gpu")
@@ -382,10 +368,11 @@ def resolve_placement(cfg: Any) -> tuple[str | None, str | None]:
             f"runtime.device={device!r} is not one of {DEVICES}."
         )
 
-    if uses_envpool(cfg.env):
+    if uses_batch(cfg.env):
         if device == "gpu":
             raise ValueError(
-                "runtime.device=gpu cannot be used with EnvPool environments."
+                "runtime.device=gpu cannot be used with impl=batch: its physics "
+                "runs on CPU threads."
             )
         device = "cpu"
 
@@ -393,72 +380,27 @@ def resolve_placement(cfg: Any) -> tuple[str | None, str | None]:
     return device, platform
 
 
-def _parse_cpu_list(text: str) -> list[int]:
-    """Parses a CPU range string into individual core indices."""
-    out: list[int] = []
-    for part in text.strip().split(","):
-        if not part:
-            continue
-        if "-" in part:
-            lo, hi = part.split("-", 1)
-            out.extend(range(int(lo), int(hi) + 1))
-        else:
-            out.append(int(part))
-    return out
-
-
-def _l3_domains(available: list[int]) -> list[list[int]]:
-    """Groups available CPUs by their shared L3 cache domain."""
-    groups: dict[tuple[int, ...], list[int]] = {}
-    for cpu in available:
-        path = f"/sys/devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list"
-        try:
-            with open(path) as fh:
-                key = tuple(sorted(_parse_cpu_list(fh.read())))
-        except (OSError, ValueError):
-            return [list(available)]
-        groups.setdefault(key, []).append(cpu)
-    return sorted(groups.values(), key=lambda g: (-len(g), g[0]))
-
-
-def select_cpu_cores(available: list[int], cores: int) -> list[int]:
-    """Selects core indices packed to minimize L3 cache domain boundaries."""
-    picked: list[int] = []
-    for group in _l3_domains(available):
-        if len(picked) >= cores:
-            break
-        picked.extend(group[: cores - len(picked)])
-    return sorted(picked)
-
-
-def pin_cpu_cores(cores: Any, platform: str | None) -> int | None:
-    """Pins CPU affinity for the current process to a subset of available cores."""
-    if not cores or str(platform) != "cpu" or not hasattr(os, "sched_setaffinity"):
-        return None
-    available = sorted(os.sched_getaffinity(0))
-    cores = int(cores)
-    if cores >= len(available):
-        return None
-    os.sched_setaffinity(0, set(select_cpu_cores(available, cores)))
-    return cores
-
-
 def build_env(
-    cfg_env: Any,
+    cfg_env: DictConfig | dict[str, Any],
     *,
     mode: str = "train",
     num_envs: int = 1,
     test_episodes: int = 1,
 ) -> EnvBundle:
-    """Instantiates an environment bundle from a Hydra configuration block."""
-    if isinstance(cfg_env, DictConfig):
-        resolved = OmegaConf.to_container(
+    """Calls the builder an env block names, with the block's keys as kwargs.
+
+    `_target_` is the builder's dotted path, so a builder may live outside
+    roxie. Every other key is one of its keyword arguments, except the
+    trainer's own (`TRAINER_ENV_KEYS`), which are dropped.
+    """
+    if OmegaConf.is_config(cfg_env):
+        cfg_env = OmegaConf.to_container(
             cfg_env, resolve=True, throw_on_missing=True,
         )
-    else:
-        resolved = dict(cfg_env)
-    node = {k: v for k, v in resolved.items() if k not in TRAINER_ENV_KEYS}
-    node["_target_"] = builder_target(cfg_env)
-    return instantiate(
-        node, mode=mode, num_envs=num_envs, test_episodes=test_episodes,
+    kwargs = {k: v for k, v in cfg_env.items() if k not in TRAINER_ENV_KEYS}
+    if "_target_" not in kwargs:
+        raise ValueError(f"env block {sorted(kwargs)} names no `_target_` builder")
+    builder = get_method(kwargs.pop("_target_"))
+    return builder(
+        **kwargs, mode=mode, num_envs=num_envs, test_episodes=test_episodes,
     )

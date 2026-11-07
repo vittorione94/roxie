@@ -36,8 +36,8 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      # Default (CPU) resolution: MJX on CPU plus the EnvPool/native-MuJoCo
-      # path. The `cuda` group is deliberately left out -- no NVIDIA runner.
+      # Default (CPU) resolution: MJX on CPU plus the mujoco.batch path.
+      # The `cuda` group is deliberately left out -- no NVIDIA runner.
       # `--locked` fails the run if uv.lock is stale rather than silently
       # re-resolving.
       - name: Install dependencies

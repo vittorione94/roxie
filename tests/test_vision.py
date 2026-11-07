@@ -28,7 +28,7 @@ from roxie.environment.loader import (
     load_playground_env,
     publish_env_shapes,
 )
-from roxie.environment.vector import EnvPoolVectorEnv, JaxVectorEnv
+from roxie.environment.vector import JaxVectorEnv
 from roxie.models.actors import DeterministicActor, StochasticActor
 from roxie.models.critics import DistributionalQCritic, QCritic, VCritic
 from roxie.models.vision import PixelEncoder
@@ -308,11 +308,9 @@ def test_the_pixel_launchable_composes():
     the env has published its pixel shape, every network must resolve to it."""
     from hydra import compose, initialize_config_dir
 
-    from roxie.environment import suites
     from roxie.utils import hydra_searchpath
 
     hydra_searchpath.register()
-    suites.register_resolvers()
     with initialize_config_dir(
         config_dir=str(REPO / "roxie" / "configs"), version_base=None
     ):
@@ -339,11 +337,10 @@ class _DictObsEnv:
 
     observation_size = {"state": (3,), "pixels/view_0": (4, 4, 2)}
     mj_model = SimpleNamespace(actuator_ctrlrange=np.array([[-1.0, 1.0]]))
-    _impl = "warp"
 
 
 def test_a_dict_observation_flattens_with_the_image_first():
-    func_env = PlaygroundFuncEnv(_DictObsEnv())
+    func_env = PlaygroundFuncEnv(_DictObsEnv(), "warp")
     assert func_env.pixel_shape == (4, 4, 2)
     assert func_env.observation_space.shape == (4 * 4 * 2 + 3,)
 
@@ -378,7 +375,7 @@ class _RenderingEnv(_DictObsEnv):
 def test_a_rendering_env_is_sized_per_world():
     """Read off `observation_size`, the image would carry the world axis and
     the encoder would refuse its 4-D `pixel_shape`."""
-    func_env = PlaygroundFuncEnv(_RenderingEnv(), nworld=3)
+    func_env = PlaygroundFuncEnv(_RenderingEnv(), "warp", nworld=3)
     assert func_env.pixel_shape == (4, 4, 2)
     assert func_env.observation_space.shape == (4 * 4 * 2 + 3,)
 
@@ -387,11 +384,11 @@ def test_a_second_camera_is_refused():
     env = _DictObsEnv()
     env.observation_size = {**env.observation_size, "pixels/view_1": (4, 4, 2)}
     with pytest.raises(ValueError, match="exactly one"):
-        PlaygroundFuncEnv(env)
+        PlaygroundFuncEnv(env, "warp")
 
 
 def test_envs_without_pixels_publish_none():
-    assert EnvPoolVectorEnv.pixel_shape is None
+    assert functional.FuncEnv.pixel_shape is None
     cfg = OmegaConf.create({})
     publish_env_shapes(cfg, 8, 3)
     assert cfg.pixel_shape is None
@@ -472,9 +469,8 @@ def test_a_pixel_env_trains_saves_and_reloads(name, tmp_path):
         epoch_steps=10 * harness.ENVS, save_steps=20 * harness.ENVS,
         test_episodes=2, show_progress=False,
     )
-    trainer.initialize(agent=agent, environment=env, test_environment=test_env)
     try:
-        trainer.run(harness.ENVS, nnx.Rngs(envs=0, agent=3))
+        trainer.run(agent, env, test_env, harness.ENVS, nnx.Rngs(envs=0, agent=3))
     finally:
         logger.close()
 

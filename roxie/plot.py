@@ -121,32 +121,25 @@ def load_runs(paths):
 
 
 # Which task IMPLEMENTATION a cell steps — the axis the figure must not
-# collapse. The playground cells share one set of XMLs, so overlaying them IS a
-# parity check; EnvPool steps dm_control's own C++ physics off a different XML,
-# and the two disagree on integrator (9 of 25 tasks) and sim dt (8). So a
-# cross-suite score gap tangles physics with algorithm, and each suite gets its
-# own figure.
+# collapse. The playground cells share one set of XMLs and one set of task code,
+# so overlaying them IS a parity check.
 CELL_SUITE = {
     "warp_gpu": "playground",
     "mjx_gpu": "playground",
     "mjx_cpu": "playground",
-    "envpool_cpu": "dm_control",
-    "mjbatch_cpu": "mjbatch",
+    "batch_cpu": "playground",
 }
 
 # Named in each figure's subtitle.
 SUITE_PHYSICS = {
     "playground": "mujoco_playground XMLs, MJX-tuned solver settings",
-    "dm_control": "dm_control XMLs, native MuJoCo",
-    "mjbatch": "dm_control XMLs, native MuJoCo, batched rollout",
 }
 
 DEVICE_LABEL = {"cpu": "CPU", "gpu": "GPU"}
 
 # Named in the speed figure's legend, where the series is the backend cell.
 CELL_LABEL = {
-    "envpool_cpu": "EnvPool (CPU)",
-    "mjbatch_cpu": "mjbatch (CPU)",
+    "batch_cpu": "mujoco.batch (CPU)",
     "warp_gpu": "mujoco_warp (GPU)",
     "mjx_gpu": "MJX (GPU)",
     "mjx_cpu": "MJX (CPU)",
@@ -234,7 +227,7 @@ def discover_grid(root: Path):
     """Walk a release tree into {task: {(agent, cell): DataFrame}}.
 
     Expects ``<root>/<task>/<cell>/<agent>/<stamp>/log.csv``, which is the
-    layout `experiments/dmc/bench/dmc.yaml` gives `hydra.run.dir`. When an arm
+    layout `experiments/release/bench/release.yaml` gives `hydra.run.dir`. When an arm
     was run more than once (a resume, a re-run), the LAST timestamp wins — the
     tree is sorted, and a later stamp is the later attempt — and the dropped
     stamps are named on stdout, because a re-run at a changed config is exactly

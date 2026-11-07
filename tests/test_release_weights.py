@@ -117,7 +117,7 @@ GRID_RUNS = [
     ("CheetahRun", "warp_gpu", "td3", "2026-01-01", 50_000_000, True),
     ("CheetahRun", "warp_gpu", "sac", "2026-01-01", 20_000_000, False),
     ("CheetahRun", "warp_gpu", "ppo", "2026-01-01", 5_000_000, True),
-    ("CheetahRun", "envpool_cpu", "td3", "2026-01-01", 50_000_000, True),
+    ("CheetahRun", "batch_cpu", "td3", "2026-01-01", 50_000_000, True),
     ("WalkerWalk", "warp_gpu", "td3", "2026-01-01", 50_000_000, True),
 ]
 
@@ -221,13 +221,13 @@ def test_final_mean_reports_where_the_run_ended(tmp_path):
     assert export.final_mean(run, "test/score", n=2) == pytest.approx(10.0)
 
 
-BENCH = OmegaConf.load(REPO / "experiments" / "dmc" / "bench" / "dmc.yaml")
-NOISE = OmegaConf.load(REPO / "experiments" / "dmc" / "noise" / "bench_gaussian.yaml")
+BENCH = OmegaConf.load(REPO / "experiments" / "release" / "bench" / "release.yaml")
+NOISE = OmegaConf.load(REPO / "experiments" / "release" / "noise" / "bench_gaussian.yaml")
 
 
 def test_noise_anneal_tracks_the_step_budget():
     """`decay_steps` is 40% of `trainer.steps` by design (see the header of
-    experiments/dmc/noise/bench_gaussian.yaml). A decay measured in env steps
+    experiments/release/noise/bench_gaussian.yaml). A decay measured in env steps
     becomes "no anneal" at a shorter budget and "no exploration" at a longer
     one, and neither shows up as a failure — only as a worse curve."""
     budget = BENCH.trainer.steps

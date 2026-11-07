@@ -1,7 +1,7 @@
 [project]
 name = "roxie"
 version = "0.1.0"
-description = "Reinforcement learning in JAX for continuous control in MuJoCo, across MJX, mujoco_warp and native-CPU physics backends"
+description = "Reinforcement learning in JAX for continuous control in MuJoCo, across MJX, mujoco_warp and mujoco.batch physics backends"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -24,20 +24,20 @@ dependencies = [
     "hydra-core>=1.3.2",
     "numpy>=2.0.2",
     "optax>=0.2.4",
-    "playground>=0.2.0",
+    # 1.0 drops the dm_control suite, and with it the humanoid release tasks.
+    "playground>=0.2.0,<1.0",
     "rlax>=0.1.7",
     "termcolor>=3.1.0",
     "etils>=1.13.0",
-    "mujoco-mjx>=3.9.0",
+    "mujoco>=4.0.0",
+    "mujoco-mjx>=4.0.0",
+    "gymnasium>=1.0",
     "wandb>=0.18.0",
     "pandas>=3.0.3",
     "matplotlib>=3.8",
     # Imported directly by scripts/render_gif.py for GIF palette quantization;
     # it arrives under matplotlib anyway, but nothing should rely on that.
     "pillow>=10.0",
-    # The benchmark's second physics implementation: the same dm_control tasks
-    # through native MuJoCo on CPU threads. Not optional — it is half the grid.
-    "envpool>=1.2.5",
 ]
 
 [project.urls]
@@ -61,13 +61,11 @@ dev = [
 ]
 
 # Linux (NVIDIA): uv sync --group cuda
-# mujocos warp bridge imports warp._src.jax_experimental.ffi.GraphMode and
-# reads public warp.types.warp_type_to_np_dtype. Warp 1.13 dropped the latter
-# from the public API and 1.14 graduated jax_experimental (NVIDIA/warp#1370),
-# moving both out from under the bridge. 1.12.x is the newest that has both.
+# mujoco-mjx pins the warp its bridge is built against in its own `warp` extra;
+# mjx fails at import on an older warp.
 cuda = [
     "jax[cuda12]>=0.4.30",
-    "warp-lang>=1.11,<1.13",
+    "warp-lang==1.18.0",
 ]
 
 [tool.pytest.ini_options]

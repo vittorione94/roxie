@@ -84,7 +84,7 @@ def agent_config(name: str, *, vision=None, obs_size: int = OBS, **hyperparams):
     # what these exercise is the learning pass, not the schedule
     # (`test_update_schedule.py` covers that).
     defaults = {
-        "memory_warmup": 4 * ENVS,
+        "memory_warmup": 8 * ENVS,
         "steps_between_updates": ENVS,
         "learning_steps": 2,
         "num_minibatches": 2,

@@ -3,8 +3,7 @@
 defaults:
   - agent: td3_bench
   - noise: bench_gaussian
-  - bench: dmc
-  - backend: envpool_cpu
+  - bench: multitask
   - _self_
 
 release:

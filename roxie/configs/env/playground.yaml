@@ -1,8 +1,8 @@
 _target_: roxie.environment.loader.build_playground_env
 
-# mujoco_playground envs — the default env family, and the one the release
-# benchmark's GPU cells run. Physics is JAX all the way down, so the whole
-# rollout stays on device and the trainer scans over it.
+# mujoco_playground envs — the env family every release benchmark cell runs.
+# `impl` picks the physics: MJX, mujoco_warp, or `batch` for native MuJoCo on a
+# CPU thread pool.
 #
 # A launchable picks it up in its defaults list, then overrides what it needs:
 #
@@ -12,7 +12,7 @@ _target_: roxie.environment.loader.build_playground_env
 #     - _self_
 #
 #   env:
-#     env_name: CheetahRun
+#     env_name: HumanoidWalk
 #     impl: warp
 #
 #   uv run python roxie/train.py --config-name my/experiment env.env_name=WalkerWalk
@@ -20,15 +20,14 @@ _target_: roxie.environment.loader.build_playground_env
 # (The leading `/` is what reaches this group from a launchable that lives in a
 # subdirectory of `experiments/`; Hydra otherwise looks for `<dir>/env/`. The
 # release benchmark deliberately does NOT use this group — its env block comes
-# from `experiments/dmc/backend/`, which is the variable under test there.)
+# from `experiments/release/backend/`, which is the variable under test there.)
 #
 # Like an agent config, this file IS the builder call: every key below is one of
 # `build_playground_env`'s keyword arguments, so a knob missing here would be
 # invisible in the run's config and unsweepable.
 # `tests/test_env_configs.py` pins both directions.
 
-# The mujoco_playground registry name — see roxie.environment.suites.DMC_TASKS
-# for the 25 the benchmark uses.
+# The mujoco_playground registry name.
 env_name: ???
 
 impl: jax
@@ -49,5 +48,8 @@ graph_mode: null
 # mujoco_warp. Pair it with the `vision` config group so the networks read them.
 vision: false
 max_episode_steps: null
+# impl: batch only. The size of mujoco.batch's thread pool; null takes every core
+# this process may run on.
+num_threads: null
 seed: 0
 parallel_envs: 256

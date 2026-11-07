@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from roxie.environment.suites import DMC_TASKS  # noqa: E402
 from roxie.utils.checkpoint import (  # noqa: E402
     CHECKPOINTS_DIRNAME,
     checkpoint_steps,
@@ -24,12 +23,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_ROOT = REPO_ROOT / "outputs" / "release_v1"
 DEFAULT_DONE_DIR = REPO_ROOT / "logs" / ".done"
 
-# Both release cells. envpool_cpu is dm_control's XMLs through EnvPool and
-# warp_gpu is mujoco_playground: different physics behind an observation of the
-# same 67 dimensions and an action of the same 21, so `_check_obs_width` cannot
-# refuse a swap and the cell in the bundle name is the only thing separating
-# them.
-DEFAULT_CELLS = ("envpool_cpu", "warp_gpu")
+# Both release cells: the same mujoco_playground tasks on two physics engines,
+# so `_check_obs_width` cannot refuse a swap and the cell in the bundle name is
+# the only thing separating them.
+DEFAULT_CELLS = ("batch_cpu", "warp_gpu")
 
 # Where --push-to-hub publishes. The version is in the repo id so a later grid
 # gets its own repo instead of overwriting this one's history.
@@ -45,7 +42,7 @@ pipeline_tag: reinforcement-learning
 tags:
   - reinforcement-learning
   - deep-reinforcement-learning
-  - dm-control
+  - mujoco-playground
   - mujoco
   - jax
 ---
@@ -338,8 +335,10 @@ def write_index(dest_root: Path, exported: list[dict], *, cells: list[str],
         f"agent(s) — each selected by best `{metric}` among its run's "
         "checkpoints, not by taking the final checkpoint.",
         "",
-        "Scores are dm_control episode returns, so 1000 is the ceiling on every "
-        "task and the table is comparable down its rows as well as across them. "
+        "Scores are episode returns on mujoco_playground's port of the dm_control "
+        "suite, not comparable to published dm_control results. 1000 is the "
+        "ceiling on every task and the table is comparable down its rows as well "
+        "as across them. "
         "Each entry gives the published checkpoint's own score, then in "
         f"parentheses the mean of its run's last {FINAL_EVALS} evaluations — "
         "where the run ENDED, which is what the release figures plot. The two "
@@ -357,11 +356,10 @@ def write_index(dest_root: Path, exported: list[dict], *, cells: list[str],
             lines.append("| " + " | ".join(row) + " |")
     lines += [
         "",
-        "The two cells are two different environments, not one environment on "
-        "two machines: `envpool_cpu` is dm_control's XMLs through EnvPool and "
-        "`warp_gpu` is `mujoco_playground`. Their observations are the same "
-        "width, so loading one against the other raises nothing — go by the "
-        "cell in the bundle name.",
+        "The two cells run the same `mujoco_playground` tasks on different "
+        "physics: `batch_cpu` on `mujoco.batch` and `warp_gpu` on mujoco_warp. "
+        "Their observations are the same width, so loading one against the "
+        "other raises nothing — go by the cell in the bundle name.",
         "",
         "The full record — per-bundle steps, budget, `test/score_per_step`, "
         "`test/length`, size and the commit each was cut from — is in "
@@ -617,8 +615,7 @@ def main() -> int:
         return 1
 
     cells = [c.strip() for c in args.cells.split(",") if c.strip()]
-    # Read off the tree rather than DMC_TASKS, which is what makes a partial
-    # grid exportable.
+    # Read off the tree, which is what makes a partial grid exportable.
     available = {r["task"] for r in finished if r["cell"] in cells}
     if args.tasks:
         wanted_tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -627,8 +624,7 @@ def main() -> int:
             print(f"No finished runs for: {', '.join(missing)}", file=sys.stderr)
         tasks = [t for t in wanted_tasks if t in available]
     else:
-        tasks = [t for t in DMC_TASKS if t in available]
-        tasks += sorted(available - set(DMC_TASKS))
+        tasks = sorted(available)
     if not tasks:
         print(f"No finished runs on cell(s) {', '.join(cells)} under "
               f"{args.out_root}.", file=sys.stderr)

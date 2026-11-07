@@ -73,24 +73,38 @@ def _host_restore_args(metadata):
     )
 
 
-def read_checkpoint(path: Path) -> Dict[str, Any]:
-    """Reads a checkpoint payload off disk as host (NumPy) arrays."""
+def _restore_args(metadata, only):
+    """The `PyTreeRestore` of the whole payload, or of its `only` top-level keys."""
+    if only is None:
+        return ocp.args.PyTreeRestore(restore_args=_host_restore_args(metadata))
+    item = {key: metadata[key] for key in only}
+    return ocp.args.PyTreeRestore(
+        item=item, restore_args=_host_restore_args(item), partial_restore=True,
+    )
+
+
+def read_checkpoint(
+    path: Path, only: tuple[str, ...] | None = None,
+) -> Dict[str, Any]:
+    """Reads a checkpoint payload off disk as host (NumPy) arrays.
+
+    Args:
+        path: the checkpoint's step directory.
+        only: top-level payload keys to read, leaving the rest on disk; None
+          reads it all.
+    """
     step = checkpoint_steps(path)
     if step is not None and (path / CHECKPOINT_ITEM).is_dir():
         with ocp.CheckpointManager(
             path.parent, item_handlers=ocp.PyTreeCheckpointHandler()
         ) as manager:
             return manager.restore(
-                step,
-                args=ocp.args.PyTreeRestore(
-                    restore_args=_host_restore_args(manager.item_metadata(step))
-                ),
+                step, args=_restore_args(manager.item_metadata(step), only),
             )
 
     checkpointer = ocp.PyTreeCheckpointer()
     return checkpointer.restore(
-        path,
-        restore_args=_host_restore_args(checkpointer.metadata(path).item_metadata),
+        path, args=_restore_args(checkpointer.metadata(path).item_metadata, only),
     )
 
 
@@ -179,6 +193,10 @@ class AgentCheckpointer:
         for key in ("action_low", "action_high"):
             if key in hyper:
                 init_kwargs[key] = jnp.asarray(hyper[key], dtype=jnp.float32)
+        if hyper.get("task_counts"):
+            init_kwargs["env_task_counts"] = tuple(
+                int(c) for c in hyper["task_counts"]
+            )
 
         if agent_cls.hyperparams_cls is not None:
             fields = {f.name for f in dataclasses.fields(agent_cls.hyperparams_cls)}
@@ -222,7 +240,7 @@ class AgentCheckpointer:
         self._restore_obs_stats(ckpt_state)
 
         buffer_restored = False
-        if "buffer_state" in ckpt_state:
+        if "buffer_state" in ckpt_state and self._same_task_blocks(loaded):
             buffer_restored = self._restore_buffer(ckpt_state["buffer_state"])
 
         boundary = loaded.get("last_update_boundary", None)
@@ -253,6 +271,15 @@ class AgentCheckpointer:
                   "leaving observation normalization at its init values.")
             return
         obs = ckpt_state["obs_stats"]
+        for name in ("count", "sum", "sumsq"):
+            saved, current = np.shape(obs[name]), jnp.shape(getattr(live, name))
+            if saved != current:
+                # Rows are tasks and columns features: a mismatch is a
+                # different task set or layout, never something to broadcast.
+                raise ValueError(
+                    f"checkpoint obs_stats.{name} is {saved}, but this "
+                    f"agent's is {current}: the env's task layout differs."
+                )
         self.agent.state.obs_stats = live.replace(
             count=jnp.asarray(obs["count"], jnp.result_type(live.count)),
             sum=jnp.asarray(obs["sum"], jnp.result_type(live.sum)),
@@ -274,6 +301,26 @@ class AgentCheckpointer:
             f"{path} was trained on a {int(ckpt_width)}-dimensional "
             f"observation, but this env produces {live_width}."
         )
+
+    def _same_task_blocks(self, loaded: Dict[str, Any]) -> bool:
+        """Whether the saved replay's rows belong to the tasks they do live.
+
+        A replay row is one world's stream, and a multi-task env gives each task
+        a contiguous block of worlds, so moving worlds between tasks relabels
+        rows without changing a single shape.
+        """
+        saved = tuple(
+            int(c) for c in (loaded.get("hyperparams") or {}).get("task_counts") or ()
+        )
+        live = tuple(self.agent.task_counts or ())
+        if saved == live:
+            return True
+        print(
+            f"Warning: the checkpoint's replay holds task blocks of {saved} "
+            f"worlds, but this env has {live}; keeping the empty one — the "
+            "trainer will refill it."
+        )
+        return False
 
     def _restore_buffer(self, ckpt_buffer) -> bool:
         """Reconstructs Flashbax replay buffer state from host checkpoint arrays."""
