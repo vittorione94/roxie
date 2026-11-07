@@ -1,10 +1,50 @@
-"""Single-world interactive policy playback in a MuJoCo window."""
+"""Single-world interactive policy playback in MuJoCo's passive viewer."""
 
 import os
+import sys
+import sysconfig
 
 # Force CPU execution before JAX import for deterministic single-world playback.
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+
+
+def _exec_under_mjpython() -> None:
+    """Replaces this process with the same command run under `mjpython`.
+
+    On macOS `launch_passive` has to drive Cocoa from the thread holding the
+    com.apple.main-thread queue, which only mujoco's `mjpython` trampoline
+    arranges; under a plain interpreter it raises, and only after the whole
+    checkpoint restore has already run.
+    """
+    mjpython = os.path.join(os.path.dirname(sys.executable), "mjpython")
+    if not os.path.exists(mjpython):
+        sys.exit(
+            "The MuJoCo viewer needs mujoco's `mjpython` on macOS, and there "
+            f"is none next to {sys.executable}."
+        )
+
+    env = dict(os.environ)
+    # The trampoline resolves libpython's @executable_path against the venv's
+    # bin/, which for a uv-managed interpreter holds a symlink and no dylib, so
+    # dyld finds nothing. Point it at the real interpreter's lib dir first.
+    libdir = sysconfig.get_config_var("LIBDIR")
+    if libdir:
+        fallback = env.get("DYLD_FALLBACK_LIBRARY_PATH", "/usr/local/lib:/usr/lib")
+        env["DYLD_FALLBACK_LIBRARY_PATH"] = f"{libdir}:{fallback}"
+
+    entry = ["-m", __spec__.name] if __spec__ else [os.path.abspath(__file__)]
+    print(f"macOS viewer: re-executing under {mjpython}", flush=True)
+    os.execve(mjpython, [mjpython, *entry, *sys.argv[1:]], env)
+
+
+# MJPYTHON_BIN is set by the trampoline and inherited, so this fires at most once.
+if (
+    __name__ == "__main__"
+    and sys.platform == "darwin"
+    and "MJPYTHON_BIN" not in os.environ
+):
+    _exec_under_mjpython()
 
 import dataclasses
 import time
@@ -15,29 +55,32 @@ import click
 import jax
 import jax.numpy as jnp
 import mujoco
+import mujoco.viewer
 
 from hydra.utils import get_method
 
 from roxie.utils import playback
-from roxie.utils.viewer import Viewer
 
 # What is left to compile per launch is the agent's parameter init, 0.9 s of a
 # 1.5 s restore without this. Only `play.py` turns it on, for its own programs.
 _COMPILE_CACHE = Path.home() / ".cache" / "roxie" / "jax_compile"
 
+# GLFW key codes. Up and down are the arrows `simulate` leaves unbound.
+_KEY_SPACE = 32
+_KEY_BACKSPACE = 259
+_KEY_DELETE = 261
+_KEY_DOWN = 264
+_KEY_UP = 265
+
 _CONTROLS_HELP = """Viewer controls:
   space            pause / resume
   delete           reset the environment
-  tab              hide / show the panel
-  esc              free the camera
-  left drag        rotate the camera (shift: around the vertical)
-  right drag       move the camera (shift: horizontally)
-  scroll           zoom
-  double-click     left: select a body, right: look at a point
-  ctrl + right double-click
-                   track a body with the camera
+  double-click     select a body
   ctrl + drag      running: push selected body (right: translate, left: rotate)
                    paused: drag body pose directly"""
+
+_TASKS_HELP = """
+  up / down        previous / next task"""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -67,6 +110,41 @@ class _World:
     env_nbody: int
 
 
+class _Controls:
+    """What the viewer's keys asked for, set from its thread and read from ours.
+
+    Attributes:
+        tasks: the names of the tasks the replay can switch between.
+        task: the index of the chosen task in `tasks`.
+        paused: whether the replay is paused.
+        task_changed: whether `task` changed since the window opened on it.
+    """
+
+    def __init__(self, tasks: tuple[str | None, ...], task: int):
+        self.tasks = tasks
+        self.task = task
+        self.paused = False
+        self.task_changed = False
+        self._reset_requested = False
+
+    def key_callback(self, keycode: int) -> None:
+        """Handles a GLFW key code from the viewer's thread."""
+        if keycode == _KEY_SPACE:
+            self.paused = not self.paused
+            print("[viewer] paused" if self.paused else "[viewer] running", flush=True)
+        elif keycode in (_KEY_BACKSPACE, _KEY_DELETE):
+            self._reset_requested = True
+        elif keycode in (_KEY_UP, _KEY_DOWN) and len(self.tasks) > 1:
+            offset = 1 if keycode == _KEY_DOWN else -1
+            self.task = (self.task + offset) % len(self.tasks)
+            self.task_changed = True
+
+    def take_reset_request(self) -> bool:
+        """Whether a reset was asked for since the last call."""
+        requested, self._reset_requested = self._reset_requested, False
+        return requested
+
+
 def _build_world(play: playback.Playback, *, verbose: bool = True) -> _World:
     """Builds the stepper and the viewer's buffers for one restored task."""
     func_env = play.func_env
@@ -89,7 +167,7 @@ def _build_world(play: playback.Playback, *, verbose: bool = True) -> _World:
 
 
 def _warm_up(world: _World, agent: Any, key: Any) -> None:
-    """Runs one step of a world, so its first click finds it all traced."""
+    """Runs one step of a world, so switching to it finds it all traced."""
     state = world.reset(key)
     obs = jnp.expand_dims(world.observe(state.obs), axis=0)
     action, _noise, _extras = agent.select_action(obs, key, evaluate=True)
@@ -115,13 +193,41 @@ def _write_state_data(state, **fields):
     )
 
 
+def _aim_camera(
+    camera: mujoco.MjvCamera, model: mujoco.MjModel, previous: mujoco.MjvCamera | None,
+) -> None:
+    """Carries the last window's view over, or follows the root body at first."""
+    if previous is not None:
+        for name in ("type", "trackbodyid", "fixedcamid", "lookat", "distance",
+                     "azimuth", "elevation"):
+            setattr(camera, name, getattr(previous, name))
+    elif model.nbody > 1:
+        # A locomotion task leaves a fixed view within seconds.
+        camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        camera.trackbodyid = 1
+    # A tracked body or a fixed camera the model lacks aborts the whole process.
+    if camera.trackbodyid >= model.nbody or camera.fixedcamid >= model.ncam:
+        camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+
+
 @click.command(context_settings=dict(ignore_unknown_options=True))
 @click.option("--checkpoint-path", type=str, help="Path to the checkpoint directory.")
+@click.option(
+    "--task-id", type=str, default=None,
+    help="For a multi-task run, the task to start on; the first by default.",
+)
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
-def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
-    """Replays a trained agent checkpoint in an interactive MuJoCo window."""
+def main(
+    checkpoint_path: str, task_id: str | None, overrides: tuple[str, ...],
+) -> None:
+    """Replays a trained agent checkpoint in an interactive MuJoCo viewer."""
     _enable_compile_cache()
     plays = playback.load_tasks(checkpoint_path, overrides)
+    if task_id is not None and task_id not in plays:
+        raise click.BadParameter(
+            f"{task_id!r} is not a task this run can replay: {list(plays)}.",
+            param_hint="--task-id",
+        )
     agent = next(iter(plays.values())).agent
     worlds = {
         name: _build_world(play, verbose=index == 0)
@@ -132,126 +238,132 @@ def main(checkpoint_path: str, overrides: tuple[str, ...]) -> None:
     for world in worlds.values():
         _warm_up(world, agent, key)
 
-    _replay(worlds, agent, key)
+    tasks = tuple(worlds)
+    controls = _Controls(tasks, tasks.index(task_id) if task_id is not None else 0)
+    print(_CONTROLS_HELP + (_TASKS_HELP if len(tasks) > 1 else ""), flush=True)
+
+    camera = None
+    while True:
+        world = worlds[tasks[controls.task]]
+        if len(tasks) > 1:
+            print(f"[viewer] task {tasks[controls.task]}", flush=True)
+        # The passive viewer is bound to the model it opens with, so each task
+        # gets a window of its own and a switch closes one and opens the next.
+        with mujoco.viewer.launch_passive(
+            world.model, world.data, key_callback=controls.key_callback,
+        ) as viewer:
+            with viewer.lock():
+                _aim_camera(viewer.cam, world.model, camera)
+            key = _replay(world, agent, key, viewer, controls)
+            camera = mujoco.MjvCamera()
+            _aim_camera(camera, world.model, viewer.cam)
+        if not controls.task_changed:
+            return
+        controls.task_changed = False
 
 
-def _replay(worlds: dict[str | None, _World], agent: Any, key: Any) -> None:
-    """Runs the window until it closes, resetting into whichever task is chosen."""
-    current = next(iter(worlds))
-    world = worlds[current]
+def _replay(
+    world: _World, agent: Any, key: Any, viewer: Any, controls: _Controls,
+) -> Any:
+    """Plays one task until its window closes or another task is chosen.
 
-    print(_CONTROLS_HELP, flush=True)
+    Returns:
+        The key to carry on with.
+    """
 
-    with Viewer(world.model, world.data, tasks=tuple(worlds)) as viewer:
-        for other in worlds.values():
-            viewer.prepare(other.model)
+    def show(state):
+        """Synchronizes environment state into the visualizer MjData buffer."""
+        ghost, data = world.ghost, world.data
+        if ghost is not None:
+            info = state.info
+            abs_idx = int(info["clip_start"]) + int(info["phase_idx"])
+            data.qpos[:ghost.nq] = state.data.qpos
+            data.qvel[:ghost.nv] = state.data.qvel
+            data.qpos[ghost.nq:] = ghost.ref_qpos[abs_idx]
+            data.qvel[ghost.nv:] = ghost.ref_qvel[abs_idx]
+        else:
+            data.qpos = state.data.qpos
+            data.qvel = state.data.qvel
+        mujoco.mj_forward(world.model, data)
 
-        def show(state):
-            """Synchronizes environment state into the visualizer MjData buffer."""
-            ghost, data = world.ghost, world.data
-            if ghost is not None:
-                info = state.info
-                abs_idx = int(info["clip_start"]) + int(info["phase_idx"])
-                data.qpos[:ghost.nq] = state.data.qpos
-                data.qvel[:ghost.nv] = state.data.qvel
-                data.qpos[ghost.nq:] = ghost.ref_qpos[abs_idx]
-                data.qvel[ghost.nv:] = ghost.ref_qvel[abs_idx]
-            else:
-                data.qpos = state.data.qpos
-                data.qvel = state.data.qvel
-            mujoco.mj_forward(world.model, data)
+    state = None
+    score = 0.0
+    actions = []
+    perturbing = False
+    reset_requested = True
+    controls.paused = False
 
-        state = None
-        score = 0.0
-        actions = []
-        perturbing = False
-        reset_requested = True
+    while viewer.is_running():
+        step_start = time.time()
 
-        while viewer.is_running():
-            step_start = time.time()
+        if controls.task_changed:
+            break
 
-            reset_requested |= viewer.take_reset_request()
-            clicked = viewer.take_clicked_task()
-            if clicked is not None:
-                print(f"[viewer] task {clicked}", flush=True)
-                if worlds[clicked] is not world:
-                    world = worlds[clicked]
-                    viewer.show(world.model, world.data)
-                viewer.resume()
-                reset_requested = True
-
-            if reset_requested:
-                reset_requested = False
-                key, reset_key = jax.random.split(key)
-                state = world.reset(reset_key)
-                mujoco.mj_resetData(world.model, world.data)
-                show(state)
-                score = 0.0
-                actions = []
-                perturbing = False
-                print("[viewer] reset", flush=True)
-
-            pert = viewer.perturb
-            pert_active = bool(pert.active) and int(pert.select) > 0
-
-            if viewer.paused:
-                if pert_active:
-                    mujoco.mjv_applyPerturbPose(world.model, world.data, pert, 1)
-                    mujoco.mj_forward(world.model, world.data)
-                    state = _write_state_data(
-                        state, qpos=world.data.qpos[:world.env_nq]
-                    )
-                viewer.sync()
-                time.sleep(max(0.0, world.step_dt - (time.time() - step_start)))
-                continue
-
-            if pert_active or perturbing:
-                world.data.xfrc_applied[:] = 0.0
-                if pert_active:
-                    mujoco.mjv_applyPerturbForce(world.model, world.data, pert)
-                state = _write_state_data(
-                    state, xfrc_applied=world.data.xfrc_applied[:world.env_nbody].copy()
-                )
-                perturbing = pert_active
-
-            obs_b = jnp.expand_dims(world.observe(state.obs), axis=0)
-            action, _noise, _extras = agent.select_action(
-                obs_b, key, evaluate=True,
-            )
-
-            state = world.step(state, action[0])
-
-            world.data.ctrl = action
+        reset_requested |= controls.take_reset_request()
+        if reset_requested:
+            reset_requested = False
+            key, reset_key = jax.random.split(key)
+            state = world.reset(reset_key)
+            mujoco.mj_resetData(world.model, world.data)
             show(state)
+            score = 0.0
+            actions = []
+            perturbing = False
+            print("[viewer] reset", flush=True)
 
-            score += state.reward
-            actions.append(action)
+        pert = viewer.perturb
+        pert_active = bool(pert.active) and int(pert.select) > 0
 
-            metrics = state.metrics
-            components = " ".join(
-                f"{k.split('/', 1)[1]}={float(v):+.3f}"
-                for k, v in metrics.items()
-                if k.startswith("reward/")
-            )
-            print(f"reward={float(state.reward):+.3f} {components}")
-
-            if state.done:
-                print(f"Total score: {score}")
-                print(f"Actions mean: {jnp.mean(jnp.array(actions)):.2f}")
-                print(f"Actions std: {jnp.std(jnp.array(actions)):.2f}")
-                key, reset_key = jax.random.split(reset_key)
-                state = world.reset(reset_key)
-                mujoco.mj_resetData(world.model, world.data)
-                show(state)
-                score = 0.0
-                actions = []
-                perturbing = False
-
+        if controls.paused:
+            if pert_active:
+                mujoco.mjv_applyPerturbPose(world.model, world.data, pert, 1)
+                mujoco.mj_forward(world.model, world.data)
+                state = _write_state_data(state, qpos=world.data.qpos[:world.env_nq])
             viewer.sync()
+            time.sleep(max(0.0, world.step_dt - (time.time() - step_start)))
+            continue
 
-            time_until_next_step = world.step_dt - (time.time() - step_start)
-            if time_until_next_step > 0:
-                time.sleep(time_until_next_step)
+        if pert_active or perturbing:
+            world.data.xfrc_applied[:] = 0.0
+            if pert_active:
+                mujoco.mjv_applyPerturbForce(world.model, world.data, pert)
+            state = _write_state_data(
+                state, xfrc_applied=world.data.xfrc_applied[:world.env_nbody].copy()
+            )
+            perturbing = pert_active
+
+        obs_b = jnp.expand_dims(world.observe(state.obs), axis=0)
+        action, _noise, _extras = agent.select_action(obs_b, key, evaluate=True)
+
+        state = world.step(state, action[0])
+
+        world.data.ctrl = action
+        show(state)
+
+        score += state.reward
+        actions.append(action)
+
+        metrics = state.metrics
+        components = " ".join(
+            f"{k.split('/', 1)[1]}={float(v):+.3f}"
+            for k, v in metrics.items()
+            if k.startswith("reward/")
+        )
+        print(f"reward={float(state.reward):+.3f} {components}")
+
+        if state.done:
+            print(f"Total score: {score}")
+            print(f"Actions mean: {jnp.mean(jnp.array(actions)):.2f}")
+            print(f"Actions std: {jnp.std(jnp.array(actions)):.2f}")
+            reset_requested = True
+
+        viewer.sync()
+
+        time_until_next_step = world.step_dt - (time.time() - step_start)
+        if time_until_next_step > 0:
+            time.sleep(time_until_next_step)
+
+    return key
 
 
 if __name__ == "__main__":
