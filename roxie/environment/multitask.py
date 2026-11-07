@@ -42,11 +42,14 @@ def allocate_worlds(weights, total: int) -> tuple[int, ...]:
     task keeps at least one world.
 
     Raises:
-        ValueError: on a non-positive weight, or fewer worlds than tasks.
+        ValueError: on a weight that is not finite and positive, or fewer
+          worlds than tasks.
     """
     w = np.asarray(weights, dtype=np.float64)
-    if np.any(w <= 0):
-        raise ValueError(f"task weights {list(w)} must all be positive")
+    if not np.all(np.isfinite(w) & (w > 0)):
+        raise ValueError(
+            f"task weights {w.tolist()} must all be finite and positive"
+        )
     if total < w.size:
         raise ValueError(f"{total} worlds cannot cover {w.size} tasks")
     raw = w / w.sum() * total

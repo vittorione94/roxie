@@ -102,8 +102,9 @@ def test_worlds_split_in_proportion_and_sum_exactly():
 
 
 def test_world_split_refuses_what_it_cannot_honour():
-    with pytest.raises(ValueError, match="positive"):
-        allocate_worlds([1, 0], 4)
+    for weights in ([1, 0], [1, np.nan], [1, np.inf]):
+        with pytest.raises(ValueError, match="finite and positive"):
+            allocate_worlds(weights, 4)
     with pytest.raises(ValueError, match="cannot cover"):
         allocate_worlds([1, 1, 1], 2)
 
@@ -495,6 +496,8 @@ def test_weighted_curriculum_orders_weights_by_task():
     np.testing.assert_allclose(curriculum.update([np.nan, np.nan]), [0.25, 0.75])
     with pytest.raises(ValueError, match="unknown"):
         WeightedTasks({"fly": 1}).start(("stand", "run"))
+    with pytest.raises(ValueError, match="finite and positive"):
+        WeightedTasks({"run": float("nan")}).start(("stand", "run"))
 
 
 def test_learning_progress_favours_the_task_that_is_moving():

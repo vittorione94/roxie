@@ -34,8 +34,10 @@ class WeightedTasks:
         if unknown:
             raise ValueError(f"weights for unknown task(s) {unknown}")
         w = np.asarray([self.weights.get(n, 1.0) for n in task_names])
-        if np.any(w <= 0):
-            raise ValueError(f"task weights {self.weights} must be positive")
+        if not np.all(np.isfinite(w) & (w > 0)):
+            raise ValueError(
+                f"task weights {self.weights} must be finite and positive"
+            )
         self._weights = w / w.sum()
         return self._weights
 
