@@ -7,6 +7,18 @@ defaults:
   - /curriculum: null
   - _self_
 
+# Sized for 4,096 worlds. `max_length` is shared by all worlds, which reset in
+# lockstep here, so a window under one episode (500k would be 122 steps) only ever
+# holds one slice of the episode. 2,048 steps per world is close to the 1,953 that
+# 256 worlds get from the bench's 500k.
+agent:
+  hyperparams:
+    memory_warmup: 491_520      # 120 control steps per world
+    steps_between_updates: 4_096
+    learning_steps: 40          # with the line above, the bench's updates per env step
+  memory_config:
+    max_length: 8_388_608       # 2,048 steps per world, about 3.1 GB
+
 env:
   task_defaults:
     _target_: roxie.environment.loader.build_playground_env
@@ -17,14 +29,14 @@ env:
     run: {env_name: HumanoidRun}
   weights: {stand: 1, walk: 1, run: 1}
   seed: 0
-  parallel_envs: 256
+  parallel_envs: 4096
 
 runtime:
   device: gpu
   matmul_precision: tensorfloat32
 
 trainer:
-  steps: 500_000_000
+  steps: 1_000_000_000
   epoch_steps: 500_000
   save_steps: 5_000_000
   test_episodes: 10
