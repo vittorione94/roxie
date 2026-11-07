@@ -38,6 +38,20 @@ agents or backends (an agent without `obs_stats`, a backend that cannot
 be traced), and refusing a mismatch loudly (`checkpoint.py`'s observation-width
 and buffer-geometry checks). That is present-tense variation, not history.
 
+## Write Less Code
+
+**Write code only when the task cannot be done without it.** A simplification
+should leave the repo with fewer lines and fewer files than it found. Before
+adding a function, a file, a test or a config, look for a way to delete, reuse
+or reconfigure instead. If a change still seems to need new code, say so and
+ask before writing it. Don't build a replacement for something you are removing
+unless asked.
+
+**Write code a newcomer can read.** Name things for what they mean to someone
+who never saw the conversation that produced them, not with coined jargon
+(`_unreturned_reads`). Prefer the plain, obvious construct over a clever one: no
+compiler internals, tracing tricks or private APIs when a direct check will do.
+
 ## Docstrings and Comments
 
 **Docstrings are Google-style**, per section 3.8 of the style guide linked
