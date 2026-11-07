@@ -73,24 +73,38 @@ def _host_restore_args(metadata):
     )
 
 
-def read_checkpoint(path: Path) -> Dict[str, Any]:
-    """Reads a checkpoint payload off disk as host (NumPy) arrays."""
+def _restore_args(metadata, only):
+    """The `PyTreeRestore` of the whole payload, or of its `only` top-level keys."""
+    if only is None:
+        return ocp.args.PyTreeRestore(restore_args=_host_restore_args(metadata))
+    item = {key: metadata[key] for key in only}
+    return ocp.args.PyTreeRestore(
+        item=item, restore_args=_host_restore_args(item), partial_restore=True,
+    )
+
+
+def read_checkpoint(
+    path: Path, only: tuple[str, ...] | None = None,
+) -> Dict[str, Any]:
+    """Reads a checkpoint payload off disk as host (NumPy) arrays.
+
+    Args:
+        path: the checkpoint's step directory.
+        only: top-level payload keys to read, leaving the rest on disk; None
+          reads it all.
+    """
     step = checkpoint_steps(path)
     if step is not None and (path / CHECKPOINT_ITEM).is_dir():
         with ocp.CheckpointManager(
             path.parent, item_handlers=ocp.PyTreeCheckpointHandler()
         ) as manager:
             return manager.restore(
-                step,
-                args=ocp.args.PyTreeRestore(
-                    restore_args=_host_restore_args(manager.item_metadata(step))
-                ),
+                step, args=_restore_args(manager.item_metadata(step), only),
             )
 
     checkpointer = ocp.PyTreeCheckpointer()
     return checkpointer.restore(
-        path,
-        restore_args=_host_restore_args(checkpointer.metadata(path).item_metadata),
+        path, args=_restore_args(checkpointer.metadata(path).item_metadata, only),
     )
 
 

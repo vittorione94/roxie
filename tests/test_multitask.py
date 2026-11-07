@@ -529,6 +529,15 @@ def test_the_backend_banner_prints_once_however_many_tasks(tmp_path, capsys):
     assert capsys.readouterr().out.count("PHYSICS BACKEND LOADED") == 1
 
 
+def test_the_task_layout_reads_only_the_checkpoint_metadata(tmp_path):
+    from roxie.utils.checkpoint import read_checkpoint
+    from roxie.utils.playback import _task_layout
+
+    checkpoint = _saved_multi_task_run(tmp_path)
+    assert list(read_checkpoint(Path(checkpoint), only=("metadata",))) == ["metadata"]
+    assert _task_layout(checkpoint) == (2, 4, (2, 4))
+
+
 def test_a_task_whose_replay_width_changed_is_refused(tmp_path):
     from roxie.utils.playback import load_tasks
 

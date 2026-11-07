@@ -109,14 +109,13 @@ def select_task(cfg: Any, task_id: str | None) -> tuple[Any, int | None]:
 def _task_layout(checkpoint_path: str) -> tuple[int, int, tuple[int, ...]]:
     """`(num_tasks, padded_width, task_widths)` a multi-task policy trained on.
 
-    The layout is read off the checkpoint rather than the config: the statistics
-    give the task count and the padded width, and the trainer records each
-    task's own width beside its progress.
+    The layout is read off the checkpoint rather than the config: the trainer
+    records each task's own width beside its progress, and the padding is to
+    the widest.
     """
-    loaded = read_checkpoint(Path(checkpoint_path).resolve())
-    num_tasks, padded = np.shape(loaded["trainstate_state"]["obs_stats"]["sum"])
-    widths = loaded["metadata"]["task_obs_widths"]
-    return int(num_tasks), int(padded), tuple(int(width) for width in widths)
+    loaded = read_checkpoint(Path(checkpoint_path).resolve(), only=("metadata",))
+    widths = tuple(int(width) for width in loaded["metadata"]["task_obs_widths"])
+    return len(widths), max(widths), widths
 
 
 def _task_input(checkpoint_path: str, task: int, width: int):
