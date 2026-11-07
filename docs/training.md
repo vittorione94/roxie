@@ -91,7 +91,9 @@ Resume into a *different* run dir than the dead leg: the CSV backend opens `log.
 uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/500000
 ```
 
-Playback drives a single world into an interactive window, always with C MuJoCo on the CPU, even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override thThe window is `mujoco.viewer.launch_passive`, so the camera, picking, pushing and panels are MuJoCo's own `simulate`. The camera follows the root body until `esc` frees it; `play.py` prints the keyboard and mouse controls it adds when it starts. On macOS it re-executes itself under mujoco's `mjpython`, which the passive viewer needs.trols when it starts.
+Playback drives a single world into an interactive window, always with C MuJoCo on the CPU, even for a Warp-trained checkpoint — see [Determinism](backends.md#determinism-and-reproducibility). Trailing `key=value` args override the saved run config.
+
+The window is `mujoco.viewer.launch_passive`, so the camera, picking, pushing and panels are MuJoCo's own `simulate`. The camera follows the root body until `esc` frees it; `play.py` prints the keyboard and mouse controls it adds when it starts. On macOS it re-executes itself under mujoco's `mjpython`, which the passive viewer needs.
 
 `--vision`, for a run whose policy reads pixels, opens a second window showing the image at the front of each observation — colour and depth side by side, before the agent's observation normalization — and has the viewer draw every camera, with a frustum for any camera that declares a `resolution`. [`examples/vision/humanoid_rgbd.py`](../examples/vision/humanoid_rgbd.py) declares its camera's, out to `depth_scale`, the range the depth channel covers.
 
