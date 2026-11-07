@@ -225,7 +225,8 @@ class Agent(abc.ABC):
 
         Raises:
             ValueError: on a single-task env or an on-policy agent, which have
-              no task-weighted replay to steer.
+              no task-weighted replay to steer, or on weights that are not one
+              finite, non-negative number per task with a positive total.
         """
         live = getattr(self.state, "task_weights", None)
         if live is None:
@@ -233,13 +234,18 @@ class Agent(abc.ABC):
                 f"{type(self).__name__} samples no task-weighted replay: it "
                 f"needs a multi-task env and an off-policy agent."
             )
-        weights = jnp.asarray(weights, dtype=FLOAT)
-        if weights.shape != live.shape:
+        host = np.asarray(weights, dtype=np.float64)
+        if host.shape != live.shape:
             raise ValueError(
-                f"{weights.shape[0] if weights.ndim else 0} task weights for "
+                f"{host.shape[0] if host.ndim else 0} task weights for "
                 f"{live.shape[0]} tasks"
             )
-        self.state.task_weights = weights
+        if not (np.all(np.isfinite(host)) and np.all(host >= 0) and host.sum() > 0):
+            raise ValueError(
+                f"task weights {host.tolist()} must be finite and non-negative, "
+                f"with a positive total"
+            )
+        self.state.task_weights = jnp.asarray(host, dtype=FLOAT)
 
     def freeze_acting_norm(self):
         """The `ObsStats` acting uses for this chunk, or `None` for `state`'s.

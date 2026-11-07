@@ -402,6 +402,10 @@ def test_off_policy_agent_trains_on_the_composite_and_reweights_freely(rng_key):
 
     with pytest.raises(ValueError, match="task weights"):
         agent.set_task_weights([1.0, 1.0, 1.0])
+    for invalid in ([0.0, 0.0], [-0.5, 1.5], [np.nan, 1.0], [np.inf, 1.0]):
+        with pytest.raises(ValueError, match="non-negative"):
+            agent.set_task_weights(invalid)
+    agent.set_task_weights([0.0, 1.0])
 
 
 def test_on_policy_and_single_task_agents_have_no_task_weights():
