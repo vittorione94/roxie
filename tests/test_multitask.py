@@ -44,6 +44,7 @@ from roxie.utils.math import (
     obs_mean_std,
     update_obs_stats,
 )
+from roxie.utils.precision import FLOAT
 from roxie.utils.rollout import ChunkSums, build_rollout
 from roxie.utils.trainer import Trainer
 from tests.test_env_protocol import CounterEnv
@@ -350,8 +351,9 @@ def _filled_replay(n_step, counts=(2, 2, 4, 8), steps=50):
         "add_sequences": False, "add_batch_size": n,
     })
     prototype = Transition(
-        observation=jnp.zeros(3 + k), action=jnp.zeros(1), reward=jnp.zeros(()),
-        terminal=jnp.zeros((), bool), truncation=jnp.zeros((), bool),
+        observation=jnp.zeros(3 + k, FLOAT), action=jnp.zeros(1, FLOAT),
+        reward=jnp.zeros((), FLOAT), terminal=jnp.zeros((), bool),
+        truncation=jnp.zeros((), bool),
     )
     replay = build_replay(memory, n_step, prototype, task_ids=layout.task_ids)
     state = replay.init()
@@ -360,7 +362,7 @@ def _filled_replay(n_step, counts=(2, 2, 4, 8), steps=50):
         x = rng.normal(size=(n, 3)).astype(np.float32)
         state = replay.add(state, Transition(
             observation=layout.compose([x[sl] for sl in layout.slices]),
-            action=jnp.zeros((n, 1)), reward=jnp.zeros(n),
+            action=jnp.zeros((n, 1), FLOAT), reward=jnp.zeros(n, FLOAT),
             terminal=jnp.zeros(n, bool), truncation=jnp.zeros(n, bool),
         ))
     return replay, state, k
