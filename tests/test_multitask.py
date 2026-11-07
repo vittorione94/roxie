@@ -67,13 +67,15 @@ class WideCounter(CounterEnv):
 
 
 def build_counter_env(*, width=2, start=0.0, actions=1, max_steps=3,
-                      mode="train", num_envs=1, test_episodes=1, seed=0):
+                      eval_env=True, mode="train", num_envs=1, test_episodes=1,
+                      seed=0):
     """A toy builder with the injected keywords every builder takes."""
     env = WideCounter(width, start)
     env.action_space = functional.box(-1.0, 1.0, shape=(actions,))
     return EnvBundle(
         env=JaxVectorEnv(env, num_envs, max_episode_steps=max_steps),
-        test_env=JaxVectorEnv(env, test_episodes, max_episode_steps=max_steps),
+        test_env=(JaxVectorEnv(env, test_episodes, max_episode_steps=max_steps)
+                  if eval_env else None),
         env_cfg=None,
     )
 
@@ -233,6 +235,15 @@ def test_eval_waits_for_an_uncapped_task():
         task_defaults={"_target_": COUNTER}, num_envs=2,
     )
     assert bundle.test_env.max_episode_steps == UNCAPPED_EVAL_STEPS
+
+
+def test_a_task_without_an_eval_env_gets_one_of_its_own():
+    bundle = build_multitask_env(
+        {"a": {"eval_env": False}, "b": {}},
+        task_defaults={"_target_": COUNTER}, num_envs=6, test_episodes=2,
+    )
+    assert bundle.env.task_counts == (3, 3)
+    assert bundle.test_env.task_counts == (2, 2)
 
 
 # ---- the config surface ----------------------------------------------------

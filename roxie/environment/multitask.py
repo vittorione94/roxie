@@ -294,6 +294,11 @@ def build_multitask_env(
             block, mode=mode, num_envs=counts[k], test_episodes=test_episodes,
         )
         train[name], test[name] = bundle.env, bundle.test_env
+        if test[name] is None:
+            test[name] = build_env(
+                block, mode=mode, num_envs=test_episodes,
+                test_episodes=test_episodes,
+            ).env
 
     backends = {
         (isinstance(env, BatchVectorEnv), resolve_loaded_impl(env))
