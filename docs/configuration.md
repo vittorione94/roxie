@@ -12,9 +12,9 @@ Only four arguments are injected by `train.py` rather than coming from YAML — 
 
 Hardware placement is not an agent key: `runtime.device` (`cpu`/`gpu`/null) places the whole run, and a JAX platform has to be chosen before the first `jax.*` call — long before an agent exists. See [backends.md](backends.md#where-the-run-runs).
 
-The env block follows the same convention: `env._target_` names a **builder**, instantiated by [`loader.build_env`](../roxie/environment/loader.py). So the core training loop never branches on an env-type string and never names a specific task — the builder can live in another repo. Same for the viewer hook (`env.viewer`).
+The env block follows the same convention: `env._target_` names a **builder**, which [`loader.build_env`](../roxie/environment/loader.py) calls with the block's other keys. So the core training loop never branches on an env-type string and never names a specific task — the builder can live in another repo. Same for the viewer hook (`env.viewer`).
 
-A few keys under `env:` are *not* builder arguments, because roxie consumes them itself: `parallel_envs` and `test_episodes` reach the builder as the injected `num_envs`/`test_episodes`, `viewer`/`player` are `play.py`'s hooks, and `obs_size`/`action_size`/`obs_action_size` are written *back* into the block by `publish_env_shapes` once the env exists, so an agent yaml can interpolate `${env.obs_size}`. They are listed as `loader.TRAINER_ENV_KEYS` and stripped before instantiation. Everything else in the block is a builder keyword: a stale key is a `TypeError` at launch.
+A few keys under `env:` are *not* builder arguments, because roxie consumes them itself: `parallel_envs` and `test_episodes` reach the builder as the injected `num_envs`/`test_episodes`, `viewer`/`player` are `play.py`'s hooks, and `obs_size`/`action_size`/`obs_action_size` are written *back* into the block by `publish_env_shapes` once the env exists, so an agent yaml can interpolate `${env.obs_size}`. They are listed as `loader.TRAINER_ENV_KEYS` and stripped before the call. Everything else in the block is a builder keyword: a stale key is a `TypeError` at launch.
 
 ## Layout
 

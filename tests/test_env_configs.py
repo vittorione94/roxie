@@ -1,7 +1,7 @@
 """Every env knob must be reachable from yaml — the agent-config rule, for envs.
 
-`train.py` builds the env as `loader.build_env(cfg.env, ...)`, which is
-`hydra.utils.instantiate` plus a strip of `TRAINER_ENV_KEYS`, so an env config IS
+`train.py` builds the env as `loader.build_env(cfg.env, ...)`, which calls the
+builder `_target_` names after a strip of `TRAINER_ENV_KEYS`, so an env config IS
 the builder call: `_target_` names the builder and every other key is one of its
 keywords. A stale key is a `TypeError` at launch, after Hydra has composed and
 the process has already paid for `import jax`; a missing one is a knob pinned to
@@ -172,13 +172,9 @@ def test_interpolations_resolve_against_the_composed_config():
     assert kwargs["env_name"] == "WalkerWalk"
 
 
-def test_builder_defaults_to_playground():
-    from roxie.environment.loader import DEFAULT_BUILDER
-
-    fn = get_method(DEFAULT_BUILDER)
-    assert fn.__name__ == "build_playground_env"
-    # An env block that names no builder must still be instantiable.
-    assert "env_name" in inspect.signature(fn).parameters
+def test_a_block_without_a_builder_is_refused():
+    with pytest.raises(ValueError, match="_target_"):
+        _call({"env_name": "CartpoleBalance", "parallel_envs": 4})
 
 
 def test_uses_batch_reads_the_impl_key():

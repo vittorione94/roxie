@@ -101,9 +101,8 @@ Observations must be flat arrays. The 16 registered tasks whose observation is a
 
 ```yaml
 env:
-  task_defaults:                     # what every task shares: builder, backend
-    _target_: roxie.environment.loader.build_playground_env
-    impl: warp
+  task_defaults:                     # what every task shares; the group file
+    impl: warp                       # sets the builder, build_playground_env
   tasks:
     stand: {env_name: HumanoidStand}
     run: {env_name: HumanoidRun}

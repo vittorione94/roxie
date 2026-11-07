@@ -226,7 +226,8 @@ def test_tasks_must_share_a_physics_impl():
     with pytest.raises(ValueError, match="same backend"):
         build_multitask_env(
             {"toy": {"_target_": COUNTER},
-             "mjx": {"env_name": "CartpoleBalance", "impl": "jax"}},
+             "mjx": {"_target_": "roxie.environment.loader.build_playground_env",
+                     "env_name": "CartpoleBalance", "impl": "jax"}},
             num_envs=2,
         )
 

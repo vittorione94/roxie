@@ -13,7 +13,6 @@ _target_: roxie.environment.multitask.build_multitask_env
 #
 #   env:
 #     task_defaults:                   # what every task shares
-#       _target_: roxie.environment.loader.build_playground_env
 #       impl: warp
 #     tasks:
 #       walk: {env_name: WalkerWalk}
@@ -28,7 +27,8 @@ _target_: roxie.environment.multitask.build_multitask_env
 
 # Task name to that task's env block, merged over `task_defaults`.
 tasks: ???
-task_defaults: null
+task_defaults:
+  _target_: roxie.environment.loader.build_playground_env
 # Task name to its relative share of the training worlds; null splits evenly.
 weights: null
 seed: 0

@@ -6,7 +6,7 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import mujoco
-from hydra.utils import instantiate
+from hydra.utils import get_method
 from omegaconf import DictConfig, OmegaConf, open_dict
 from mujoco_playground import registry
 
@@ -247,9 +247,6 @@ def build_playground_env(
     )
 
 
-DEFAULT_BUILDER = "roxie.environment.loader.build_playground_env"
-
-
 def plain(cfg: Any) -> Any:
     """A config node as plain containers, its interpolations resolved."""
     if OmegaConf.is_config(cfg):
@@ -308,25 +305,26 @@ def resolve_placement(cfg: Any) -> tuple[str | None, str | None]:
 
 
 def build_env(
-    cfg_env: Any,
+    cfg_env: DictConfig | dict[str, Any],
     *,
     mode: str = "train",
     num_envs: int = 1,
     test_episodes: int = 1,
 ) -> EnvBundle:
-    """Instantiates an environment bundle from a Hydra configuration block."""
-    if isinstance(cfg_env, DictConfig):
-        resolved = OmegaConf.to_container(
+    """Calls the builder an env block names, with the block's keys as kwargs.
+
+    `_target_` is the builder's dotted path, so a builder may live outside
+    roxie. Every other key is one of its keyword arguments, except the
+    trainer's own (`TRAINER_ENV_KEYS`), which are dropped.
+    """
+    if OmegaConf.is_config(cfg_env):
+        cfg_env = OmegaConf.to_container(
             cfg_env, resolve=True, throw_on_missing=True,
         )
-    else:
-        resolved = dict(cfg_env)
-    node = {k: v for k, v in resolved.items() if k not in TRAINER_ENV_KEYS}
-    node["_target_"] = cfg_env.get("_target_", None) or DEFAULT_BUILDER
-    # Not recursive, as `build_agent` is not: a builder receives its nested
-    # blocks as data and builds them itself, which is how the multi-task
-    # builder hands each task's block to that task's own builder.
-    return instantiate(
-        node, _recursive_=False, mode=mode, num_envs=num_envs,
-        test_episodes=test_episodes,
+    kwargs = {k: v for k, v in cfg_env.items() if k not in TRAINER_ENV_KEYS}
+    if "_target_" not in kwargs:
+        raise ValueError(f"env block {sorted(kwargs)} names no `_target_` builder")
+    builder = get_method(kwargs.pop("_target_"))
+    return builder(
+        **kwargs, mode=mode, num_envs=num_envs, test_episodes=test_episodes,
     )
