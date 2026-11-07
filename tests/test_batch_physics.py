@@ -5,7 +5,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from roxie.environment import suites
 from roxie.environment.loader import (
     PlaygroundFuncEnv,
     build_playground_env,
@@ -23,7 +22,7 @@ def _actions(env, seed=0):
     )
 
 
-@pytest.mark.parametrize("task", suites.DMC_TASKS)
+@pytest.mark.parametrize("task", ["HumanoidStand", "HumanoidWalk", "HumanoidRun"])
 def test_one_step_matches_mjx(task):
     """Same reset, action and task code, so only the physics engine differs.
 

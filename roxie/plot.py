@@ -227,7 +227,7 @@ def discover_grid(root: Path):
     """Walk a release tree into {task: {(agent, cell): DataFrame}}.
 
     Expects ``<root>/<task>/<cell>/<agent>/<stamp>/log.csv``, which is the
-    layout `experiments/dmc/bench/dmc.yaml` gives `hydra.run.dir`. When an arm
+    layout `experiments/release/bench/release.yaml` gives `hydra.run.dir`. When an arm
     was run more than once (a resume, a re-run), the LAST timestamp wins — the
     tree is sorted, and a later stamp is the later attempt — and the dropped
     stamps are named on stdout, because a re-run at a changed config is exactly

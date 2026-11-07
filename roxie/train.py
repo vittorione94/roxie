@@ -44,7 +44,7 @@ hydra_searchpath.register()
 sys.path.insert(0, str(hydra_searchpath.REPO_ROOT))
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="dmc/bench_td3")
+@hydra.main(version_base=None, config_path="configs", config_name="release/bench_td3")
 def main(cfg: DictConfig):
     """Parses environment/agent configuration and runs the training pipeline."""
     print("Agent:", cfg.agent._target_)

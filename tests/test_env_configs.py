@@ -192,12 +192,12 @@ def test_batch_release_cell_is_recognised():
     """The cell that must stay GPU-free, checked through the composed block."""
     from roxie.environment.loader import uses_batch
 
-    cfg = OmegaConf.load(REPO / "experiments" / "dmc" / "backend" / "batch_cpu.yaml")
+    cfg = OmegaConf.load(REPO / "experiments" / "release" / "backend" / "batch_cpu.yaml")
     assert uses_batch(cfg.env)
     assert cfg.runtime.device == "cpu"
 
 
-BACKEND_CELLS = sorted((REPO / "experiments" / "dmc" / "backend").glob("*.yaml"))
+BACKEND_CELLS = sorted((REPO / "experiments" / "release" / "backend").glob("*.yaml"))
 
 
 @pytest.mark.parametrize(

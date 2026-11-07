@@ -16,7 +16,7 @@ Roxie runs on the GPU or on the CPU — the *physics* and the *agent* (networks,
 | Bounded by | VRAM | VRAM | system RAM + core count |
 | Built by | `loader.build_playground_env` | `loader.build_playground_env` (`impl: warp`) | `loader.build_playground_env` (`impl: batch`) |
 
-Selection is a Hydra config group: [`experiments/dmc/backend/`](../experiments/dmc/backend/) holds `warp_gpu.yaml`, `batch_cpu.yaml`, `mjx_gpu.yaml` and `mjx_cpu.yaml`, and a launchable picks one in its `defaults:`. Everything backend-mechanical (`impl`, solver budgets, graph mode, thread count, `runtime.device`) lives in that group; per-experiment tuning stays in the launchable.
+Selection is a Hydra config group: [`experiments/release/backend/`](../experiments/release/backend/) holds `warp_gpu.yaml`, `batch_cpu.yaml`, `mjx_gpu.yaml` and `mjx_cpu.yaml`, and a launchable picks one in its `defaults:`. Everything backend-mechanical (`impl`, solver budgets, graph mode, thread count, `runtime.device`) lives in that group; per-experiment tuning stays in the launchable.
 
 `impl` picks which physics steps the *same* task: the XML, the reset, the observation and the reward are upstream `mujoco_playground` code on all three. `loader.uses_batch` asks the config wherever roxie needs to know (pinning the run to the CPU in `train.py`).
 
@@ -77,7 +77,7 @@ RAM is not a throughput lever: steady-state throughput is essentially flat in `p
 ## Contact budgets: three backends, three models
 
 - **Native MuJoCo (CPU)** allocates contacts dynamically. There is nothing to size, so `backend/batch_cpu.yaml` leaves the Warp budget keys null.
-- **Warp (GPU)** uses a **single global contact arena shared across all vmapped worlds** (rows tagged by `contact__worldid`, so these Data leaves have no per-env batch dimension — which is why the auto-reset gather skips leaves lacking a leading per-env dim). `naconmax` therefore scales with `parallel_envs`, and must cover *broadphase AABB-overlap candidate pairs*, not just the contacts that resolve. `njmax` is per-world. `naccdmax` (GJK/EPA convex narrowphase) defaults to the full `naconmax` and reserves EPA scratch per buffer; a builder for a body where few geoms take the convex path should cap it below that. The dm_control bodies are small enough that `naconmax: null` — mujoco_playground's own per-env tuning — covers all 25, so `backend/warp_gpu.yaml` sets none of these. Watch for "broadphase/narrowphase/nefc overflow" warnings on anything heavier. Roxie leaves those on but silences Warp's solver and linesearch iteration warnings, because `mujoco_playground` caps those iterations low on purpose and hitting the cap would otherwise print for every world on most steps.
+- **Warp (GPU)** uses a **single global contact arena shared across all vmapped worlds** (rows tagged by `contact__worldid`, so these Data leaves have no per-env batch dimension — which is why the auto-reset gather skips leaves lacking a leading per-env dim). `naconmax` therefore scales with `parallel_envs`, and must cover *broadphase AABB-overlap candidate pairs*, not just the contacts that resolve. `njmax` is per-world. `naccdmax` (GJK/EPA convex narrowphase) defaults to the full `naconmax` and reserves EPA scratch per buffer; a builder for a body where few geoms take the convex path should cap it below that. The humanoid is small enough that `naconmax: null` — mujoco_playground's own per-env tuning — covers it, so `backend/warp_gpu.yaml` sets none of these. Watch for "broadphase/narrowphase/nefc overflow" warnings on anything heavier. Roxie leaves those on but silences Warp's solver and linesearch iteration warnings, because `mujoco_playground` caps those iterations low on purpose and hitting the cap would otherwise print for every world on most steps.
 - **MJX (`impl: jax`)** ignores `naconmax` and statically sizes contact arrays to *all potential geom pairs* — ~980 on a full humanoid, against Warp's budgeted handful. That is why `self_collisions=false` is the right default there and not elsewhere.
 
 The collision setting is not purely a performance knob: **it changes the task.** A retargeted motion-capture reference that interpenetrates its own limbs has to run without self-collision, or the solver pushes the body out of the pose the tracking reward asks it to hold. On the dm_control suite this does not arise; the bodies come with their own contact exclusions.
@@ -141,7 +141,7 @@ The GPU/CPU settings have to be applied at different moments, and getting this w
 
 ## Keeping the backends honest
 
-The cells run the same 25 `mujoco_playground` tasks — same XML, reset, observation and reward code — on a shared 0–1000 return scale, so a score gap between them is a finding about the physics or the hardware. What keeps that true:
+The cells run the same `mujoco_playground` tasks — same XML, reset, observation and reward code — on a shared 0–1000 return scale, so a score gap between them is a finding about the physics or the hardware. What keeps that true:
 
 - **The task code is literally shared.** [`tests/test_batch_physics.py`](../tests/test_batch_physics.py) steps every task once on MJX and on `mujoco.batch` from the same reset and fails if the observation or reward disagree.
 - **A task may not transform its action.** The batch steps before the task runs, so `BatchVectorEnv` raises rather than applying the wrong controls.

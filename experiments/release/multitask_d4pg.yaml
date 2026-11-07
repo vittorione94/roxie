@@ -1,10 +1,13 @@
 # @package _global_
 
 defaults:
-  - /dmc/agent@agent: d4pg_bench
-  - /dmc/noise@noise: bench_gaussian
-  - bench: humanoid
+  - agent: d4pg_bench
+  - noise: bench_gaussian
+  - bench: multitask
   - _self_
+
+release:
+  agent: d4pg
 
 # Sized for 4,096 worlds. `max_length` is shared by all worlds, which reset in
 # lockstep here, so a window under one episode (500k would be 122 steps) only ever
@@ -23,7 +26,3 @@ env:
 
 trainer:
   steps: 1_000_000_000
-
-hydra:
-  run:
-    dir: outputs/humanoid/d4pg/${now:%Y-%m-%d_%H-%M-%S}

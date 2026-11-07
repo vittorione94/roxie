@@ -1,8 +1,16 @@
 # @package _global_
 
+# The three humanoid tasks in one run, on Warp. Recorded as the task
+# `Multitask`, so its runs sit in the release grid beside the single-task ones.
 defaults:
+  - release
   - /env: multitask
   - /curriculum: null
+  - _self_
+
+release:
+  task: Multitask
+  cell: warp_gpu
 
 env:
   task_defaults:
@@ -12,18 +20,8 @@ env:
     walk: {env_name: HumanoidWalk}
     run: {env_name: HumanoidRun}
   weights: {stand: 1, walk: 1, run: 1}
-  seed: 0
   parallel_envs: 256
 
 runtime:
   device: gpu
   matmul_precision: tensorfloat32
-
-trainer:
-  steps: 500_000_000
-  epoch_steps: 500_000
-  save_steps: 5_000_000
-  test_episodes: 10
-  show_progress: true
-  replace_checkpoint: false
-  save_buffer: false

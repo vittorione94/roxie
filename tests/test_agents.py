@@ -304,7 +304,7 @@ def test_policy_delay_does_not_leak_zeros_into_the_actor_metrics():
 def test_the_saturation_penalty_reaches_every_deterministic_actor(name):
     """`pre_activation_coef` has to be live on all four deterministic arms.
 
-    `experiments/dmc/agent/ddpg_bench.yaml` calls them "a clean algorithm-only
+    `experiments/release/agent/ddpg_bench.yaml` calls them "a clean algorithm-only
     A/B" on the strength of them carrying the same coefficient, and an arm whose
     actor loss quietly ignored the argument would still round-trip the value
     through the config, the checkpoint and the hyperparameter log. Hence testing

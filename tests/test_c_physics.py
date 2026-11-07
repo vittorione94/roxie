@@ -11,7 +11,6 @@ from mujoco import mjx
 from mujoco.mjx._src import support
 
 from roxie.environment.loader import build_playground_env, load_playground_env
-from roxie.environment.suites import DMC_TASKS
 from roxie.utils import native_player
 from roxie.utils.native_player import CPhysicsPlayer, make_native_player
 
@@ -36,7 +35,7 @@ def c_calls(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("task", DMC_TASKS)
+@pytest.mark.parametrize("task", ["HumanoidStand", "HumanoidWalk", "HumanoidRun"])
 def test_every_benchmark_task_runs_with_its_physics_in_c(task, c_calls):
     func_env = _func_env(task)
     player = CPhysicsPlayer(func_env)

@@ -23,7 +23,7 @@ A few keys under `env:` are *not* builder arguments, because roxie consumes them
 - [`roxie/configs/curriculum/`](../roxie/configs/curriculum/) — task curricula for a multi-task env (`learning_progress`, `weighted`), pulled in as `curriculum=` ([training.md](training.md#several-tasks)).
 - [`roxie/configs/noise/`](../roxie/configs/noise/) — exploration noise modules (`ou`, `gaussian`, `adaptive`). Agents that explore from their own policy (SAC, MPO, PPO) take **no** noise group; adding one is a launch-time error.
 - [`experiments/<env>/`](../experiments/) — launchable experiments. `--config-name` includes the folder.
-- [`experiments/dmc/`](../experiments/dmc/) — the release benchmark, carrying its own groups: `agent/`, `backend/`, `bench/` and `noise/`.
+- [`experiments/release/`](../experiments/release/) — the release benchmark, single-task and multi-task, carrying its own groups: `agent/`, `backend/`, `bench/` and `noise/`.
 
 ## A launchable
 

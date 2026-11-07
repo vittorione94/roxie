@@ -6,18 +6,18 @@ Launching a run, resuming one, and watching a checkpoint.
 
 ## Train
 
-Every run is a self-contained experiment YAML under [`experiments/`](../experiments/), grouped by environment (`dmc/`). The folder is part of the config name:
+Every run is a self-contained experiment YAML under [`experiments/`](../experiments/). The folder is part of the config name:
 
 ```bash
-uv run python roxie/train.py --config-name dmc/bench_sac                          # WalkerWalk
-uv run python roxie/train.py --config-name dmc/bench_sac release.task=CheetahRun  # any of the 25
+uv run python roxie/train.py --config-name release/bench_sac                          # HumanoidWalk
+uv run python roxie/train.py --config-name release/bench_sac release.task=HumanoidRun  # or HumanoidStand
 ```
 
 Move a run between devices by switching its `backend` group; the physics and the learner move together and nothing else changes:
 
 ```bash
-uv run python roxie/train.py --config-name dmc/bench_sac dmc/backend@backend=batch_cpu  # GPU-free
-uv run python roxie/train.py --config-name dmc/bench_sac dmc/backend@backend=mjx_cpu
+uv run python roxie/train.py --config-name release/bench_sac release/backend@backend=warp_gpu  # GPU
+uv run python roxie/train.py --config-name release/bench_sac release/backend@backend=mjx_cpu
 ```
 
 The group lives in a subdirectory of the search path, so it needs the full `<dir>/backend@backend=` form; a bare `backend=` is rejected by Hydra's struct check.
@@ -25,11 +25,11 @@ The group lives in a subdirectory of the search path, so it needs the full `<dir
 Any key can be overridden from the command line:
 
 ```bash
-uv run python roxie/train.py --config-name dmc/bench_sac \
+uv run python roxie/train.py --config-name release/bench_sac \
     env.parallel_envs=400 trainer.save_steps=100_000
 ```
 
-The env is a config group like the agent — [`roxie/configs/env/`](../roxie/configs/env/) holds one complete `env:` block per builder ([configuration.md](configuration.md)), pulled into a launchable's `defaults:` as `- /env: playground`. The benchmark launchables do **not** use it: their env block comes from the `backend` group. Change their task with `release.task=` and anything else with a plain key override (`env.impl=warp`, `env.max_episode_steps=500`).
+The env is a config group like the agent — [`roxie/configs/env/`](../roxie/configs/env/) holds one complete `env:` block per builder ([configuration.md](configuration.md)), pulled into a launchable's `defaults:` as `- /env: playground`. The benchmark launchables do **not** use it: their env block comes from the `backend` group. Change their task with `release.task=` and anything else with a key override (`env.impl=warp`, or `+env.max_episode_steps=500` for a key the block does not set).
 
 `device=cpu` (or `device=gpu`) is a special override, parsed out of `sys.argv` before JAX is imported and hidden from Hydra, forcing the JAX platform for the whole process regardless of the config (and suppressing the banner's device checks, since it *is* the deliberate override). The configs express the same thing durably as `runtime.device` — see [Where the run runs](backends.md#where-the-run-runs) and [Ordering gotchas](backends.md#ordering-gotchas-env-vars-vs-jaxconfig).
 
@@ -39,11 +39,11 @@ Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch 
 
 A multi-task launchable names its tasks in an env block ([environments.md](environments.md#several-tasks-at-once)). 
 
-[`experiments/humanoid/sac.yaml`](../experiments/humanoid/sac.yaml) trains one policy for mujoco_playground's humanoid stand, walk and run, on Warp:
+[`experiments/release/multitask_sac.yaml`](../experiments/release/multitask_sac.yaml) trains one policy for mujoco_playground's humanoid stand, walk and run, on Warp:
 
 ```bash
-uv run --group cuda python roxie/train.py --config-name humanoid/sac
-uv run --group cuda python roxie/train.py --config-name humanoid/sac curriculum=learning_progress
+uv run --group cuda python roxie/train.py --config-name release/multitask_sac
+uv run --group cuda python roxie/train.py --config-name release/multitask_sac curriculum=learning_progress
 ```
 
 The env block's `weights` fix each task's share of the worlds for the run. A **curriculum** steers what the learner samples from them instead: it sets the replay's task weights before the first learning pass, then at every epoch boundary reads each task's training score and sets them for the passes that follow. [`roxie/configs/curriculum/`](../roxie/configs/curriculum/) holds `learning_progress`, which favours the tasks whose score is moving, and `weighted`, which pins fixed weights. A curriculum needs a multi-task env and an off-policy agent; `train.py` refuses anything else at launch.
@@ -70,7 +70,7 @@ A replay always runs its physics in C MuJoCo, whatever the run trained on. A run
 ## Resume
 
 ```bash
-uv run python roxie/train.py --config-name dmc/bench_td3 resume=outputs/<run>
+uv run python roxie/train.py --config-name release/bench_td3 resume=outputs/<run>
 ```
 
 `resume=` takes the run directory, its `checkpoints/` dir, or one `<N>` step dir; given a directory it picks the **highest** step. Like `device=`, it is parsed out of `sys.argv` before Hydra and is not a config key (a run that wants it recorded can set `resume.path` in its yaml).
@@ -80,7 +80,7 @@ The agent is built from the **config**, and only its numbers come from the check
 The replay buffer is the one thing not saved by default — it dominates a checkpoint's size and its host RAM while writing. Without it a resumed off-policy run replays its warmup to refill the buffer before learning again; with `trainer.save_buffer: true` the checkpoint carries it and the resume is exact:
 
 ```bash
-uv run python roxie/train.py --config-name dmc/bench_td3 trainer.save_buffer=true
+uv run python roxie/train.py --config-name release/bench_td3 trainer.save_buffer=true
 ```
 
 Resume into a *different* run dir than the dead leg: the CSV backend opens `log.csv` with `"w"` on its first row, so resuming in place truncates the curve the first leg wrote.

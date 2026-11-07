@@ -289,7 +289,7 @@ def test_humanoid_launchable_composes_the_three_tasks_on_warp():
     hydra_searchpath.register()
     with initialize_config_dir(config_dir=str(REPO / "roxie" / "configs"),
                                version_base=None):
-        cfg = compose(config_name="humanoid/sac")
+        cfg = compose(config_name="release/multitask_sac")
     assert list(cfg.env.tasks) == ["stand", "walk", "run"]
     assert requested_impl(cfg.env) == "warp"
     assert not uses_batch(cfg.env)

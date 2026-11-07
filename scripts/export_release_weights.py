@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from roxie.environment.suites import DMC_TASKS  # noqa: E402
 from roxie.utils.checkpoint import (  # noqa: E402
     CHECKPOINTS_DIRNAME,
     checkpoint_steps,
@@ -616,8 +615,7 @@ def main() -> int:
         return 1
 
     cells = [c.strip() for c in args.cells.split(",") if c.strip()]
-    # Read off the tree rather than DMC_TASKS, which is what makes a partial
-    # grid exportable.
+    # Read off the tree, which is what makes a partial grid exportable.
     available = {r["task"] for r in finished if r["cell"] in cells}
     if args.tasks:
         wanted_tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -626,8 +624,7 @@ def main() -> int:
             print(f"No finished runs for: {', '.join(missing)}", file=sys.stderr)
         tasks = [t for t in wanted_tasks if t in available]
     else:
-        tasks = [t for t in DMC_TASKS if t in available]
-        tasks += sorted(available - set(DMC_TASKS))
+        tasks = sorted(available)
     if not tasks:
         print(f"No finished runs on cell(s) {', '.join(cells)} under "
               f"{args.out_root}.", file=sys.stderr)

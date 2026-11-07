@@ -190,7 +190,8 @@ run_job() {
     local marker="$DONE_DIR/${t}_${a}_${c}"
     
     # Build command array to avoid duplicate if/else logic
-    local cmd=(uv run python roxie/train.py --config-name "dmc/bench_$a" "release.task=$t" "dmc/backend@backend=$c")
+    local cmd=(uv run python roxie/train.py --config-name "release/bench_$a" "release.task=$t" "release/backend@backend=$c")
+    [[ "$t" == Multitask ]] && cmd=(uv run python roxie/train.py --config-name "release/multitask_$a")
     local where="GPU"
     if [[ -n "$cores" ]]; then
         # mujoco.batch owns a second thread pool on top of XLA's.
@@ -225,6 +226,8 @@ gpu_jobs=()
 for t in $TASKS; do
     for a in $AGENTS; do
         for c in $CELLS; do
+            # The multi-task run's physics is fixed: Warp, on the GPU.
+            [[ "$t" == Multitask && "$c" != warp_gpu ]] && continue
             [[ $FORCE -eq 0 && -f "$DONE_DIR/${t}_${a}_${c}" ]] && { echo "--- skipping $t | $a | $c"; continue; }
             [[ "$c" == *gpu* ]] && gpu_jobs+=("$t $a $c") || cpu_jobs+=("$t $a $c")
         done

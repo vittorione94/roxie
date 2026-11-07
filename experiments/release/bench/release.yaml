@@ -2,14 +2,13 @@
 
 release:
   grid: release-v1
-  task: WalkerWalk
+  task: HumanoidWalk
   agent: ???
   cell: ???
 
 env:
   seed: 0
   parallel_envs: 1024
-  max_episode_steps: null
 
 trainer:
   steps: 500_000_000
