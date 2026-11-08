@@ -195,7 +195,13 @@ class _PixelWindow:
             return
         pixels = np.asarray(obs[: self._size]).reshape(self._shape)
         for image, (_name, channels) in zip(self._images, self._panels):
-            image.set_data(np.clip(pixels[..., channels], 0.0, 1.0))
+            frame = pixels[..., channels]
+            low, high = frame.min(), frame.max()
+            # Some tasks centre their frames (playground's Cartpole is `gray -
+            # 0.5`); clipping those to [0, 1] would black out half the image.
+            if low < 0.0 or high > 1.0:
+                frame = (frame - low) / max(high - low, 1e-6)
+            image.set_data(frame)
         self._fig.canvas.draw_idle()
         self.poll()
 
