@@ -5,7 +5,7 @@
 # reads it through the `vision` group's conv encoder. GPU only — the renderer
 # is warp.
 #
-#   uv run python roxie/train.py --config-name vision/cartpole_sac
+#   uv run --group cuda python roxie/train.py --config-name vision/cartpole_sac
 #
 # The `/vision` default is what any launchable adds to see; listing it as
 # `- /vision: null` instead makes it switchable from the command line
