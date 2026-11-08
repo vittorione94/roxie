@@ -18,8 +18,12 @@
 # `+vision=cnn` does not, since Hydra resolves it under the launchable's own
 # folder. `experiments/vision/cartpole_sac.yaml` is a complete example. With no
 # `vision` group selected the blocks resolve to null and the networks are plain
-# MLPs. To give one network a different encoder, override its own block, e.g.
-# `agent.critic_config.critic1.vision.latent_dim=100`.
+# MLPs. To give one network a different encoder, replace its whole block — its
+# `vision` is an interpolation, which a dotted override cannot reach into:
+#
+#   'agent.critic_config.critic1.vision={pixel_shape:${env.pixel_shape},
+#    channels:[32,32,32,32],kernel_sizes:[3,3,3,3],strides:[2,1,1,1],
+#    latent_dim:100}'
 #
 # The env has to produce pixels — `env.pixel_shape` is published by the env
 # once it is built, and stays null on an env without them, which the encoder
