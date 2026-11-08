@@ -380,10 +380,15 @@ def test_a_rendering_env_is_sized_per_world():
     assert func_env.observation_space.shape == (4 * 4 * 2 + 3,)
 
 
-def test_a_second_camera_is_refused():
+@pytest.mark.parametrize("extra, match", [
+    ({"pixels/view_1": (4, 4, 2)}, "exactly one"),
+    # An asymmetric task's critic-only group must not reach the actor.
+    ({"privileged_state": (5,)}, "privileged_state"),
+])
+def test_a_dict_observation_beyond_one_camera_and_state_is_refused(extra, match):
     env = _DictObsEnv()
-    env.observation_size = {**env.observation_size, "pixels/view_1": (4, 4, 2)}
-    with pytest.raises(ValueError, match="exactly one"):
+    env.observation_size = {**env.observation_size, **extra}
+    with pytest.raises(ValueError, match=match):
         PlaygroundFuncEnv(env, "warp")
 
 
@@ -401,6 +406,11 @@ def test_playground_vision_needs_the_warp_renderer():
     failure would otherwise surface only when the first reset is traced."""
     with pytest.raises(ValueError, match="impl=warp"):
         load_playground_env("CartpoleBalance", impl="jax", vision=True)
+
+
+def test_a_vision_flag_without_a_render_config_is_refused():
+    with pytest.raises(ValueError, match="no vision mode"):
+        load_playground_env("HumanoidWalk", impl="warp", vision=True)
 
 
 # End to end

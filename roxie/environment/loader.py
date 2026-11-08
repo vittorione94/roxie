@@ -87,7 +87,11 @@ def _obs_layout(sizes: Mapping) -> tuple[tuple[str, ...], tuple[int, ...] | None
 
     Returns:
         `(keys, pixel_shape)` — every group in concatenation order, and the
-        shape of the `pixels/` group, or `None` when there is none.
+        shape of the `pixels/` group.
+
+    Raises:
+        ValueError: on more than one camera, on none, or on any group besides
+          `state`.
     """
     pixels = sorted(key for key in sizes if key.startswith("pixels/"))
     if len(pixels) > 1:
@@ -96,7 +100,15 @@ def _obs_layout(sizes: Mapping) -> tuple[tuple[str, ...], tuple[int, ...] | None
             f"encoder reads exactly one"
         )
     rest = sorted(key for key in sizes if not key.startswith("pixels/"))
-    pixel_shape = tuple(int(d) for d in sizes[pixels[0]]) if pixels else None
+    # Flattening hands every group to the actor, so only a camera and the
+    # actor's own `state` qualify: an asymmetric task's `privileged_state` is
+    # simulator-only information meant for the critic.
+    if not pixels or set(rest) - {"state"}:
+        raise ValueError(
+            f"a dict observation is flattened for the policy only as one "
+            f"`pixels/` camera and an optional `state`; got {sorted(sizes)}"
+        )
+    pixel_shape = tuple(int(d) for d in sizes[pixels[0]])
     return tuple(pixels + rest), pixel_shape
 
 
@@ -225,7 +237,8 @@ def load_playground_env(
     if njmax is not None:
         env_cfg.njmax = njmax
     if vision:
-        if "vision" not in env_cfg:
+        # Some tasks (`Humanoid`) carry a `vision` flag but no render config.
+        if "vision_config" not in env_cfg:
             raise ValueError(f"{env_name} has no vision mode in mujoco_playground")
         # `mjx.render` and `refit_bvh` raise NotImplementedError off the warp
         # impl, but only once the first reset is traced; fail before the load.
