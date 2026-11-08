@@ -89,6 +89,7 @@ class JaxVectorEnv:
 
         self.single_observation_space = func_env.observation_space
         self.single_action_space = func_env.action_space
+        self.pixel_shape = getattr(func_env, "pixel_shape", None)
         self.metadata = dict(getattr(func_env, "metadata", {}) or {})
 
         self._v_initial = jax.vmap(func_env.initial, in_axes=(0, None))

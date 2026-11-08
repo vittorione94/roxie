@@ -1,6 +1,8 @@
 """Environment loading, MuJoCo adapters, and vector environment builders."""
 
 import functools
+import math
+from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 import jax
@@ -15,11 +17,24 @@ from roxie.environment.vector import BatchVectorEnv, JaxVectorEnv
 
 
 class PlaygroundFuncEnv(FuncEnv):
-    """Functional environment wrapper for `mujoco_playground` environments."""
+    """Functional environment wrapper for `mujoco_playground` environments.
 
-    def __init__(self, env: Any, impl: str):
+    `nworld` is the world count of the warp render context the env carries, and
+    `None` for an env that renders nothing.
+    """
+
+    def __init__(self, env: Any, impl: str, nworld: int | None = None):
         self.env = env
-        self.observation_space = functional.unbounded_box(env.observation_size)
+        obs_size = (
+            env.observation_size if nworld is None
+            else _rendered_obs_size(env, nworld)
+        )
+        if isinstance(obs_size, Mapping):
+            self._obs_keys, self.pixel_shape = _obs_layout(obs_size)
+            obs_size = sum(math.prod(obs_size[k]) for k in self._obs_keys)
+        else:
+            self._obs_keys = None
+        self.observation_space = functional.unbounded_box(obs_size)
         ctrl_range = env.mj_model.actuator_ctrlrange
         self.action_space = functional.box(ctrl_range[:, 0], ctrl_range[:, 1])
         self.metadata = {"jax": True, "impl": impl}
@@ -31,7 +46,12 @@ class PlaygroundFuncEnv(FuncEnv):
         return self.env.step(state, action)
 
     def observation(self, state, rng, params=None):
-        return state.obs
+        if self._obs_keys is None:
+            return state.obs
+        return jnp.concatenate([
+            state.obs[key].reshape(-1).astype(jnp.float32)
+            for key in self._obs_keys
+        ])
 
     def reward(self, state, action, next_state, rng, params=None):
         return next_state.reward
@@ -49,6 +69,47 @@ class PlaygroundFuncEnv(FuncEnv):
         if name.startswith("__") or "env" not in self.__dict__:
             raise AttributeError(name)
         return getattr(self.env, name)
+
+
+def _rendered_obs_size(env: Any, nworld: int) -> Mapping:
+    """Per-world observation shapes of an env carrying a warp render context."""
+    # The context renders all `nworld` worlds on every call, so the unbatched
+    # trace behind `env.observation_size` reports an image as `(nworld, H, W,
+    # C)`. Vmapped at exactly `nworld` the batch axis IS the world axis and
+    # comes off cleanly; a batch of any other size does not trace at all.
+    keys = jax.random.split(jax.random.PRNGKey(0), int(nworld))
+    obs = jax.eval_shape(jax.vmap(env.reset), keys).obs
+    return {key: tuple(x.shape[1:]) for key, x in obs.items()}
+
+
+def _obs_layout(sizes: Mapping) -> tuple[tuple[str, ...], tuple[int, ...] | None]:
+    """Orders a dict observation's groups for flattening, the image first.
+
+    Returns:
+        `(keys, pixel_shape)` — every group in concatenation order, and the
+        shape of the `pixels/` group.
+
+    Raises:
+        ValueError: on more than one camera, on none, or on any group besides
+          `state`.
+    """
+    pixels = sorted(key for key in sizes if key.startswith("pixels/"))
+    if len(pixels) > 1:
+        raise ValueError(
+            f"the env renders {len(pixels)} cameras ({pixels}); the pixel "
+            f"encoder reads exactly one"
+        )
+    rest = sorted(key for key in sizes if not key.startswith("pixels/"))
+    # Flattening hands every group to the actor, so only a camera and the
+    # actor's own `state` qualify: an asymmetric task's `privileged_state` is
+    # simulator-only information meant for the critic.
+    if not pixels or set(rest) - {"state"}:
+        raise ValueError(
+            f"a dict observation is flattened for the policy only as one "
+            f"`pixels/` camera and an optional `state`; got {sorted(sizes)}"
+        )
+    pixel_shape = tuple(int(d) for d in sizes[pixels[0]])
+    return tuple(pixels + rest), pixel_shape
 
 
 BATCH_IMPL = "batch"
@@ -129,7 +190,7 @@ def log_loaded_backend(
 DEFAULT_WARP_GRAPH_MODE = "WARP_STAGED_EX"
 
 
-def _put_warp_model(env: Any, graph_mode: str) -> None:
+def put_warp_model(env: Any, graph_mode: str) -> None:
     """Re-puts a playground environment's MJX model for a long Warp run."""
     from mujoco import mjx
     from mujoco.mjx.third_party import mujoco_warp as mjw
@@ -160,8 +221,13 @@ def load_playground_env(
     naconmax: int | None = None,
     njmax: int | None = None,
     graph_mode: str | None = None,
+    vision: bool = False,
+    nworld: int = 1,
 ):
-    """Loads a `mujoco_playground` environment with optional overrides."""
+    """Loads a `mujoco_playground` environment with optional overrides.
+
+    `nworld` sizes the render context under `vision`, and nothing otherwise.
+    """
     env_cfg = registry.get_default_config(env_name)
     # `batch` swaps only the step: resets and the task's model stay on MJX.
     if impl is not None:
@@ -170,12 +236,26 @@ def load_playground_env(
         env_cfg.naconmax = naconmax
     if njmax is not None:
         env_cfg.njmax = njmax
+    if vision:
+        # Some tasks (`Humanoid`) carry a `vision` flag but no render config.
+        if "vision_config" not in env_cfg:
+            raise ValueError(f"{env_name} has no vision mode in mujoco_playground")
+        # `mjx.render` and `refit_bvh` raise NotImplementedError off the warp
+        # impl, but only once the first reset is traced; fail before the load.
+        if str(env_cfg.get("impl", "")) != "warp":
+            raise ValueError(
+                f"{env_name} renders pixels through mujoco_warp; set "
+                f"env.impl=warp (got {env_cfg.get('impl', None)!r})"
+            )
+        env_cfg.vision = True
+        env_cfg.vision_config.nworld = int(nworld)
 
     env = registry.load(env_name, config=env_cfg)
     if env_cfg.impl == "warp":
-        _put_warp_model(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
+        put_warp_model(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
     loaded_impl = BATCH_IMPL if impl == BATCH_IMPL else env_cfg.impl
-    return PlaygroundFuncEnv(env, loaded_impl), env_cfg
+    func_env = PlaygroundFuncEnv(env, loaded_impl, nworld=nworld if vision else None)
+    return func_env, env_cfg
 
 
 class EnvBundle(NamedTuple):
@@ -194,15 +274,24 @@ TRAINER_ENV_KEYS = frozenset({
     "obs_size",
     "action_size",
     "obs_action_size",
+    "pixel_shape",
 })
 
 
-def publish_env_shapes(cfg_env: DictConfig, obs_size: int, action_size: int) -> None:
-    """Writes observation and action dimensions into the Hydra configuration block."""
+def publish_env_shapes(
+    cfg_env: DictConfig,
+    obs_size: int,
+    action_size: int,
+    pixel_shape: tuple[int, ...] | None = None,
+) -> None:
+    """Writes the observation, action and pixel shapes into the env block."""
     with open_dict(cfg_env):
         cfg_env.obs_size = int(obs_size)
         cfg_env.action_size = int(action_size)
         cfg_env.obs_action_size = int(obs_size) + int(action_size)
+        cfg_env.pixel_shape = (
+            None if pixel_shape is None else [int(d) for d in pixel_shape]
+        )
 
 
 def build_playground_env(
@@ -216,15 +305,24 @@ def build_playground_env(
     naconmax: int | None = None,
     njmax: int | None = None,
     graph_mode: str | None = None,
+    vision: bool = False,
     max_episode_steps: int | None = None,
     num_threads: int | None = None,
 ) -> EnvBundle:
     """Instantiates vectorized training and test drivers for `mujoco_playground` tasks."""
-    func_env, env_cfg = load_playground_env(
-        env_name, impl=impl, naconmax=naconmax, njmax=njmax,
-        graph_mode=graph_mode,
-    )
-    if mode == "play":
+    def load(nworld: int):
+        return load_playground_env(
+            env_name, impl=impl, naconmax=naconmax, njmax=njmax,
+            graph_mode=graph_mode, vision=vision, nworld=nworld,
+        )
+
+    func_env, env_cfg = load(num_envs)
+    # A render context is allocated for a fixed `nworld` that JAX cannot see, so
+    # the eval batch needs its own env rather than sharing the training one.
+    test_func_env = load(test_episodes)[0] if vision else func_env
+    # Pixels are drawn by warp's renderer, so a vision replay keeps its physics
+    # on warp rather than C MuJoCo.
+    if mode == "play" and not vision:
         func_env.metadata["impl"] = "native"
     max_steps = int(max_episode_steps or env_cfg.episode_length)
     if impl == BATCH_IMPL:
@@ -233,7 +331,7 @@ def build_playground_env(
         driver = JaxVectorEnv
     return EnvBundle(
         env=driver(func_env, num_envs, max_episode_steps=max_steps),
-        test_env=driver(func_env, test_episodes, max_episode_steps=max_steps),
+        test_env=driver(test_func_env, test_episodes, max_episode_steps=max_steps),
         env_cfg=env_cfg,
     )
 

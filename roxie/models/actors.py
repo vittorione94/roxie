@@ -2,13 +2,14 @@
 
 import functools
 import math
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import distrax
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from roxie.models.vision import vision_encoder
 from roxie.utils import precision
 from roxie.utils.math import finite_or_zero, inv_softplus
 
@@ -148,10 +149,12 @@ class DeterministicActor(nnx.Module):
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,
         output_init_scale: float = 0.01,
+        vision: Optional[Mapping] = None,
     ):
         self.use_layer_norm = use_layer_norm
         self.activation_fn = activation_fn
         self.action_dim = action_dim
+        self.encoder, in_features = vision_encoder(vision, in_features, rngs=rngs)
 
         hidden_layers = []
         norm_layers = []
@@ -179,6 +182,8 @@ class DeterministicActor(nnx.Module):
 
     def forward(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Computes a single forward pass, returning `(action, pre_activation)`."""
+        if self.encoder is not None:
+            x = self.encoder(x)
         for i, layer in enumerate(self.hidden_layers):
             x = layer(x)
             if self.use_layer_norm:
@@ -212,6 +217,7 @@ class StochasticActor(nnx.Module):
         squash: bool = True,
         log_std_param: bool = False,
         torch_init: bool = False,
+        vision: Optional[Mapping] = None,
     ):
         if log_std_param and state_dependent_std:
             raise ValueError(
@@ -226,6 +232,7 @@ class StochasticActor(nnx.Module):
         self.state_dependent_std = state_dependent_std
         self.squash = squash
         self.log_std_param = log_std_param
+        self.encoder, in_features = vision_encoder(vision, in_features, rngs=rngs)
 
         hidden_layers = []
         norm_layers = []
@@ -277,6 +284,8 @@ class StochasticActor(nnx.Module):
             )
 
     def __call__(self, x: jnp.ndarray) -> TanhNormal:
+        if self.encoder is not None:
+            x = self.encoder(x)
         for i, layer in enumerate(self.hidden_layers):
             x = layer(x)
             if self.use_layer_norm:

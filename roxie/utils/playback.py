@@ -142,7 +142,15 @@ def _single_task(obs):
 
 def resolve_single_world(cfg: Any) -> Any:
     """Rewrites a trained config onto a backend that can step one world."""
-    if cfg.env.get("impl", None) in ("warp", BATCH_IMPL):
+    # A `vision` encoder group, or a playground env asked to render, means the
+    # policy reads pixels only warp's CUDA renderer draws, so it replays where
+    # it trained.
+    if cfg.get("vision") or cfg.env.get("vision"):
+        # JAX's default 75% preallocation leaves warp too little to allocate
+        # the world in.
+        os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
+        jax.config.update("jax_platforms", "cuda")
+    elif cfg.env.get("impl", None) in ("warp", BATCH_IMPL):
         cfg.env.impl = "jax"
     cfg.env.pop("num_threads", None)
 
@@ -173,7 +181,10 @@ def _load_world(
     observe = _single_task
     if task is not None:
         observe, obs_size = _task_input(checkpoint_path, task, obs_size)
-    publish_env_shapes(cfg.env, obs_size, action_size)
+    publish_env_shapes(
+        cfg.env, obs_size, action_size,
+        pixel_shape=getattr(func_env, "pixel_shape", None),
+    )
 
     return {
         "cfg": cfg,
@@ -265,20 +276,33 @@ def make_stepper(cfg: Any, func_env: Any, *, verbose: bool = True):
     """Returns `(reset, step)` for one world, with its physics in C MuJoCo.
 
     A functional env with no MuJoCo task behind it has no physics to move, and
-    is jitted whole. The step key is fixed rather than threaded because playback
-    is evaluation: consecutive replays of the same weights should be comparable.
+    is jitted whole, as is a vision run, whose pixels only warp renders. The
+    step key is fixed rather than threaded because playback is evaluation:
+    consecutive replays of the same weights should be comparable.
     """
-    player_path = cfg.env.get("player", "roxie.utils.native_player.make_native_player")
-    player = get_method(player_path)(func_env)
+    player = None
+    if not (cfg.get("vision") or cfg.env.get("vision")):
+        player_path = cfg.env.get(
+            "player", "roxie.utils.native_player.make_native_player"
+        )
+        player = get_method(player_path)(func_env)
     if player is not None:
         if verbose:
             print("Playback stepper: native MuJoCo (CPU)", flush=True)
         return player.reset, player.step
 
-    transition = jax.jit(func_env.transition)
-    reset = jax.jit(func_env.initial)
+    key = jax.random.PRNGKey(0)
 
+    # The env state keeps a dict observation's groups apart; `obs` is swapped
+    # for the flat vector the policy was trained on.
+    @jax.jit
+    def reset(reset_key):
+        state = func_env.initial(reset_key)
+        return state.replace(obs=func_env.observation(state, key))
+
+    @jax.jit
     def step(state, action):
-        return transition(state, action, jax.random.PRNGKey(0))
+        state = func_env.transition(state, action, key)
+        return state.replace(obs=func_env.observation(state, key))
 
     return reset, step

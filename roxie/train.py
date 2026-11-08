@@ -67,7 +67,12 @@ def main(cfg: DictConfig):
     if pinned:
         print(f"CPU affinity: {pinned} cores ({sorted(os.sched_getaffinity(0))})")
 
-    os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+    # Without autotuning cuDNN runs the pixel encoder's convolutions 72x slower
+    # (160 ms against 2.2 ms per fwd+bwd of a 256 x 64x64x4 batch, RTX 5080,
+    # 2026-11-01), which held a vision run to ~32 env steps/s. Vision renders on
+    # warp, where autotuning did not hang.
+    if not cfg.get("vision"):
+        os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 
     matmul_dtype = str(runtime_cfg.get("matmul_dtype", "") or "").lower()
     if matmul_dtype in ("bf16", "bfloat16"):
@@ -101,7 +106,10 @@ def main(cfg: DictConfig):
     )
 
     obs_space, act_space = env.single_observation_space, env.single_action_space
-    publish_env_shapes(cfg.env, space_size(obs_space), space_size(act_space))
+    publish_env_shapes(
+        cfg.env, space_size(obs_space), space_size(act_space),
+        pixel_shape=getattr(env, "pixel_shape", None),
+    )
 
     output_dir = HydraConfig.get().runtime.output_dir
 

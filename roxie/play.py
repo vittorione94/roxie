@@ -47,6 +47,7 @@ if (
     _exec_under_mjpython()
 
 import dataclasses
+import math
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -54,8 +55,10 @@ from typing import Any, Callable
 import click
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import mujoco
 import mujoco.viewer
+import numpy as np
 
 from hydra.utils import get_method
 
@@ -81,6 +84,13 @@ _CONTROLS_HELP = """Viewer controls:
 
 _TASKS_HELP = """
   up / down        previous / next task"""
+
+# mujoco_warp renders colour, depth, or both stacked colour-first.
+_PIXEL_PANELS = {
+    1: (("depth", 0),),
+    3: (("RGB", slice(0, 3)),),
+    4: (("RGB", slice(0, 3)), ("depth", 3)),
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,6 +153,65 @@ class _Controls:
         """Whether a reset was asked for since the last call."""
         requested, self._reset_requested = self._reset_requested, False
         return requested
+
+
+class _PixelWindow:
+    """A window showing the image at the front of each observation."""
+
+    def __init__(self, pixel_shape: tuple[int, ...]):
+        self._shape = tuple(pixel_shape)
+        self._size = math.prod(self._shape)
+        self._panels = _PIXEL_PANELS.get(self._shape[-1])
+        if self._panels is None:
+            raise click.UsageError(
+                f"--vision shows RGB and depth images; this run's pixels have "
+                f"{self._shape[-1]} channels"
+            )
+        plt.ion()
+        self._fig, axes = plt.subplots(
+            1, len(self._panels), figsize=(4 * len(self._panels), 4.2),
+            squeeze=False,
+        )
+        self._fig.canvas.manager.set_window_title("What the policy sees")
+        self._images = []
+        for ax, (name, channels) in zip(axes[0], self._panels):
+            rgb = isinstance(channels, slice)
+            blank = np.zeros(self._shape[:2] + ((3,) if rgb else ()))
+            image = ax.imshow(
+                blank, vmin=0.0, vmax=1.0, interpolation="nearest",
+                cmap=None if rgb else "gray_r",
+            )
+            if name == "depth":
+                self._fig.colorbar(image, ax=ax, fraction=0.046, label="near → far")
+            ax.set_title(name)
+            ax.axis("off")
+            self._images.append(image)
+        self._fig.tight_layout()
+        plt.show(block=False)
+
+    def show(self, obs) -> None:
+        """Draws the image part of a flat observation."""
+        if not plt.fignum_exists(self._fig.number):
+            return
+        pixels = np.asarray(obs[: self._size]).reshape(self._shape)
+        for image, (_name, channels) in zip(self._images, self._panels):
+            frame = pixels[..., channels]
+            low, high = frame.min(), frame.max()
+            # Some tasks centre their frames (playground's Cartpole is `gray -
+            # 0.5`); clipping those to [0, 1] would black out half the image.
+            if low < 0.0 or high > 1.0:
+                frame = (frame - low) / max(high - low, 1e-6)
+            image.set_data(frame)
+        self._fig.canvas.draw_idle()
+        self.poll()
+
+    def poll(self) -> None:
+        """Keeps the window responsive between draws."""
+        if plt.fignum_exists(self._fig.number):
+            self._fig.canvas.flush_events()
+
+    def close(self) -> None:
+        plt.close(self._fig)
 
 
 def _build_world(play: playback.Playback, *, verbose: bool = True) -> _World:
@@ -216,9 +285,16 @@ def _aim_camera(
     "--task-id", type=str, default=None,
     help="For a multi-task run, the task to start on; the first by default.",
 )
+@click.option(
+    "--vision", is_flag=True,
+    help="Show the policy's camera images and the camera's frustum.",
+)
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
 def main(
-    checkpoint_path: str, task_id: str | None, overrides: tuple[str, ...],
+    checkpoint_path: str,
+    task_id: str | None,
+    vision: bool,
+    overrides: tuple[str, ...],
 ) -> None:
     """Replays a trained agent checkpoint in an interactive MuJoCo viewer."""
     _enable_compile_cache()
@@ -229,6 +305,13 @@ def main(
             param_hint="--task-id",
         )
     agent = next(iter(plays.values())).agent
+
+    pixel_window = None
+    if vision:
+        pixel_shape = next(iter(plays.values())).func_env.pixel_shape
+        if pixel_shape is None:
+            raise click.UsageError("--vision needs a run whose policy reads pixels")
+        pixel_window = _PixelWindow(pixel_shape)
     worlds = {
         name: _build_world(play, verbose=index == 0)
         for index, (name, play) in enumerate(plays.items())
@@ -254,16 +337,32 @@ def main(
         ) as viewer:
             with viewer.lock():
                 _aim_camera(viewer.cam, world.model, camera)
-            key = _replay(world, agent, key, viewer, controls)
+                if vision:
+                    viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CAMERA] = 1
+            if vision and not (world.model.cam_resolution > 1).any():
+                print(
+                    "--vision: no camera declares a resolution, so MuJoCo has "
+                    "no frustum to draw",
+                    flush=True,
+                )
+            key = _replay(world, agent, key, viewer, controls, pixel_window)
             camera = mujoco.MjvCamera()
             _aim_camera(camera, world.model, viewer.cam)
         if not controls.task_changed:
-            return
+            break
         controls.task_changed = False
+
+    if pixel_window is not None:
+        pixel_window.close()
 
 
 def _replay(
-    world: _World, agent: Any, key: Any, viewer: Any, controls: _Controls,
+    world: _World,
+    agent: Any,
+    key: Any,
+    viewer: Any,
+    controls: _Controls,
+    pixel_window: _PixelWindow | None = None,
 ) -> Any:
     """Plays one task until its window closes or another task is chosen.
 
@@ -285,6 +384,8 @@ def _replay(
             data.qpos = state.data.qpos
             data.qvel = state.data.qvel
         mujoco.mj_forward(world.model, data)
+        if pixel_window is not None:
+            pixel_window.show(state.obs)
 
     state = None
     score = 0.0
@@ -320,6 +421,8 @@ def _replay(
                 mujoco.mj_forward(world.model, world.data)
                 state = _write_state_data(state, qpos=world.data.qpos[:world.env_nq])
             viewer.sync()
+            if pixel_window is not None:
+                pixel_window.poll()
             time.sleep(max(0.0, world.step_dt - (time.time() - step_start)))
             continue
 
