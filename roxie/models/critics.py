@@ -91,6 +91,11 @@ class QCritic(nnx.Module):
     ) -> jnp.ndarray:
         if self.encoder is not None:
             observations = self.encoder(observations)
+        # MPO scores `(samples, batch)` actions against `(batch,)` observations;
+        # tiling only after the encoder runs it once per image, not per sample.
+        observations = jnp.broadcast_to(
+            observations, actions.shape[:-1] + observations.shape[-1:]
+        )
         x = jnp.concatenate([observations, actions], axis=-1)
         x = self.mlp(x, training=training)
         return self.output_layer(x)

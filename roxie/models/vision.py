@@ -106,8 +106,8 @@ class PixelEncoder(nnx.Module):
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         lead = x.shape[:-1]
-        # Any number of leading axes — MPO tiles observations over its action
-        # samples — collapsed to one batch axis for the convs and restored after.
+        # Any number of leading axes, collapsed to one batch axis for the convs
+        # and restored after.
         h = x[..., : self.pixel_size].reshape((-1,) + self.pixel_shape)
         for conv in self.conv_layers:
             h = self.activation_fn(as_float(conv(h)))

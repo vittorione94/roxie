@@ -242,8 +242,7 @@ def mpo_actor_loss_fn(
     )
 
     actions_scaled = scale_to_env(actions, action_low, action_high)
-    obs_tiled = jnp.broadcast_to(obs, (num_action_samples,) + obs.shape)
-    q_values = critic_model(obs_tiled, actions_scaled)
+    q_values = critic_model(obs, actions_scaled)
     q_values = jax.lax.stop_gradient(jnp.squeeze(q_values, axis=-1))
 
     online_dist = actor_model(obs)
