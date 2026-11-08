@@ -190,7 +190,7 @@ def log_loaded_backend(
 DEFAULT_WARP_GRAPH_MODE = "WARP_STAGED_EX"
 
 
-def _put_warp_model(env: Any, graph_mode: str) -> None:
+def put_warp_model(env: Any, graph_mode: str) -> None:
     """Re-puts a playground environment's MJX model for a long Warp run."""
     from mujoco import mjx
     from mujoco.mjx.third_party import mujoco_warp as mjw
@@ -252,7 +252,7 @@ def load_playground_env(
 
     env = registry.load(env_name, config=env_cfg)
     if env_cfg.impl == "warp":
-        _put_warp_model(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
+        put_warp_model(env, graph_mode or DEFAULT_WARP_GRAPH_MODE)
     loaded_impl = BATCH_IMPL if impl == BATCH_IMPL else env_cfg.impl
     func_env = PlaygroundFuncEnv(env, loaded_impl, nworld=nworld if vision else None)
     return func_env, env_cfg

@@ -32,7 +32,6 @@ import mujoco
 import numpy as np
 from ml_collections import config_dict
 from mujoco import mjx
-from mujoco.mjx.warp import types as mjxw_types
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.dm_control_suite import humanoid
 from scipy import ndimage
@@ -41,6 +40,7 @@ from roxie.environment.loader import (
     DEFAULT_WARP_GRAPH_MODE,
     EnvBundle,
     PlaygroundFuncEnv,
+    put_warp_model,
 )
 from roxie.environment.vector import JaxVectorEnv
 from roxie.utils import precision
@@ -232,11 +232,7 @@ class HumanoidRGBD(humanoid.Humanoid):
         self._mj_model.vis.scale.frustum = self._config.depth_scale
         # mjx's default graph mode recaptures every step and leaks host memory;
         # see `loader.DEFAULT_WARP_GRAPH_MODE`.
-        self._mjx_model = mjx.put_model(
-            self._mj_model,
-            impl="warp",
-            graph_mode=getattr(mjxw_types.GraphMode, self._config.graph_mode),
-        )
+        put_warp_model(self, self._config.graph_mode)
 
         tracking = (mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODY,
                     mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODYCOM)
