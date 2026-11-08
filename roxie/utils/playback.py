@@ -142,10 +142,12 @@ def _single_task(obs):
 
 def resolve_single_world(cfg: Any) -> Any:
     """Rewrites a trained config onto a backend that can step one world."""
-    if cfg.get("vision"):
-        # The policy reads pixels only warp's CUDA renderer draws, so it replays
-        # where it trained. JAX's default 75% preallocation leaves warp too
-        # little to allocate the world in.
+    # A `vision` encoder group, or a playground env asked to render, means the
+    # policy reads pixels only warp's CUDA renderer draws, so it replays where
+    # it trained.
+    if cfg.get("vision") or cfg.env.get("vision"):
+        # JAX's default 75% preallocation leaves warp too little to allocate
+        # the world in.
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
         jax.config.update("jax_platforms", "cuda")
     elif cfg.env.get("impl", None) in ("warp", BATCH_IMPL):
@@ -279,7 +281,7 @@ def make_stepper(cfg: Any, func_env: Any, *, verbose: bool = True):
     consecutive replays of the same weights should be comparable.
     """
     player = None
-    if not cfg.get("vision"):
+    if not (cfg.get("vision") or cfg.env.get("vision")):
         player_path = cfg.env.get(
             "player", "roxie.utils.native_player.make_native_player"
         )

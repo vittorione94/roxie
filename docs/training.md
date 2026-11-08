@@ -97,7 +97,7 @@ The window is `mujoco.viewer.launch_passive`, so the camera, picking, pushing an
 
 `--vision`, for a run whose policy reads pixels, opens a second window showing the image at the front of each observation — colour and depth side by side, before the agent's observation normalization — and has the viewer draw every camera, with a frustum for any camera that declares a `resolution`. [`examples/vision/humanoid_rgbd.py`](../examples/vision/humanoid_rgbd.py) declares its camera's, out to `depth_scale`, the range the depth channel covers.
 
-Both entry points restore the checkpoint through `roxie.utils.playback`, which reads the run's saved Hydra config and rewrites it onto the C physics above. C and the engine a run trained on are not numerically identical, so a replay's score can differ a little from the run's own eval. A run with a `vision` group is the exception: its policy reads images only warp's CUDA renderer draws, so it replays on warp and the GPU where it trained (`uv run --group cuda`).
+Both entry points restore the checkpoint through `roxie.utils.playback`, which reads the run's saved Hydra config and rewrites it onto the C physics above. C and the engine a run trained on are not numerically identical, so a replay's score can differ a little from the run's own eval. A run with a `vision` group or `env.vision: true` is the exception: its policy reads images only warp's CUDA renderer draws, so it replays on warp and the GPU where it trained (`uv run --group cuda`).
 
 ### Rendering without a display
 
