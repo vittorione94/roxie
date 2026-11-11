@@ -61,13 +61,12 @@ class Trainer:
 
     def __init__(
         self, output_dir, steps=int(1e7), epoch_steps=int(3e5), save_steps=int(1e5),
-        test_episodes=5, show_progress=True, replace_checkpoint=False,
+        show_progress=True, replace_checkpoint=False,
         save_buffer=False, resume=None, curriculum=None,
     ):
         self.max_steps = steps
         self.epoch_steps = epoch_steps
         self.save_steps = save_steps
-        self.test_episodes = test_episodes
         self.show_progress = show_progress
         self.replace_checkpoint = replace_checkpoint
         self.output_dir = output_dir
@@ -79,8 +78,7 @@ class Trainer:
             for k in ("steps", "epochs", "episodes", "gradient_steps")
         )
         self.skip_warmup = bool(resume.get("buffer_restored", False))
-        # A `roxie.utils.curriculum` object, or None to keep the replay's task
-        # mix at the env's collection shares.
+        # None keeps the replay's task mix at the collection shares.
         self.curriculum = curriculum
         self._checkpoint_manager = None
 
@@ -121,8 +119,7 @@ class Trainer:
             "gradient_steps": int(gradient_steps),
         }
         if layout is not None:
-            # What playback needs to rebuild one task's input: how many of the
-            # padded observation's columns that task really fills.
+            # How many padded observation columns each task really fills.
             metadata["task_obs_widths"] = [int(w) for w in layout.widths]
         payload = agent.checkpoint_payload(
             include_buffer=self.save_buffer, extra_metadata=metadata,
@@ -164,9 +161,8 @@ class Trainer:
 
         if not isinstance(agent.hp, OffPolicyHyperparams):
             return agent_key
-        # This is a real learning pass. flashbax allocates with `jnp.empty_like`,
-        # so a buffer it cannot sample yields uninitialised memory on a GPU, and
-        # one pass on that can leave NaN weights for the rest of the run.
+        # flashbax allocates with `jnp.empty_like`: sampling a short buffer
+        # reads uninitialised GPU memory and can leave NaN weights for good.
         if not agent.replay.can_sample(agent.state.buffer_state):
             raise ValueError(
                 f"memory_warmup={agent.hp.memory_warmup:,} leaves the replay too "
@@ -349,8 +345,7 @@ class Trainer:
         task_scores = self._task_scores(acc["sums"])
         task_weights = None
         if self.curriculum is not None:
-            # From the next learning pass on; the trace sees a new array of the
-            # same shape, so nothing recompiles.
+            # Same shape, so the next learning pass takes it with no recompile.
             task_weights = self.curriculum.update(task_scores)
             agent.set_task_weights(task_weights)
 
@@ -492,8 +487,7 @@ class Trainer:
                      float(np.mean(scores / np.maximum(lengths, 1))))
         logger.store("test/distinct_starts",
                      float(len(np.unique(start_obs, axis=0))))
-        # A multi-task eval's `(names, task_ids)`: every task gets the same
-        # number of eval worlds, so each mean is over its own episodes.
+        # Every task gets the same number of eval worlds.
         names, task_ids = tasks if tasks is not None else ((), None)
         for k, name in enumerate(names):
             logger.store(f"test/task/{name}/score",

@@ -21,9 +21,7 @@ def finite_or_zero(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(jnp.isfinite(x), x, 0.0)
 
 
-# `clip` is static so `None` can switch the bound off in the trace rather than
-# at runtime. It comes off the frozen hyperparams and never moves within a run,
-# so this costs no retrace.
+# `clip` is static so `None` drops the bound at trace time; it is fixed per run.
 @functools.partial(jax.jit, static_argnums=(3,))
 def normalize_obs(
     x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, clip: float | None
@@ -46,9 +44,8 @@ def normalize_obs(
         z = (x - mean[0]) / std[0]
         return z if clip is None else jnp.clip(z, -clip, clip)
     hot = x[..., width:]
-    # Picked by argmax rather than read off `hot @ std`: a terminated n-step
-    # window bootstraps from an all-zero observation, one-hot included, and the
-    # product would divide by a std of zero there.
+    # Argmax, not `hot @ std`: a terminated n-step window bootstraps from an
+    # all-zero observation, where the product would give a std of zero.
     task = jnp.argmax(hot, axis=-1)
     z = (x[..., :width] - mean[task]) / std[task]
     z = z if clip is None else jnp.clip(z, -clip, clip)
@@ -101,9 +98,7 @@ def update_obs_stats(stats: ObsStats, batch_obs: jnp.ndarray) -> ObsStats:
     features, hot = batch_obs[:, :width], batch_obs[:, width:]
 
     def per_task(values):
-        # HIGHEST: these are running sums, and the GPU cells' tensorfloat32
-        # default would round every observation to a 10-bit mantissa on its
-        # way into them.
+        # HIGHEST: GPU tf32 would round observations to a 10-bit mantissa.
         return jnp.einsum(
             "bk,bd->kd", hot, values, precision=jax.lax.Precision.HIGHEST,
         )

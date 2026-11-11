@@ -16,7 +16,7 @@ works unchanged under every agent's target copies, optimizers and checkpoints.
 """
 
 import math
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 import jax.numpy as jnp
 from flax import nnx
@@ -41,7 +41,6 @@ class PixelEncoder(nnx.Module):
         latent_dim: int,
         *,
         rngs: nnx.Rngs,
-        activation_fn: Callable = nnx.relu,
     ):
         if pixel_shape is None:
             raise ValueError(
@@ -59,7 +58,6 @@ class PixelEncoder(nnx.Module):
                 f"pixel_shape must be (H, W, C), got {self.pixel_shape}"
             )
         self.latent_dim = int(latent_dim)
-        self.activation_fn = activation_fn
 
         height, width, current = self.pixel_shape
         conv_layers = []
@@ -106,14 +104,11 @@ class PixelEncoder(nnx.Module):
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         lead = x.shape[:-1]
-        # Any number of leading axes, collapsed to one batch axis for the convs
-        # and restored after.
         h = x[..., : self.pixel_size].reshape((-1,) + self.pixel_shape)
         for conv in self.conv_layers:
-            h = self.activation_fn(as_float(conv(h)))
+            h = nnx.relu(as_float(conv(h)))
         h = as_float(self.projection(h.reshape(h.shape[0], -1)))
-        # LayerNorm then tanh bounds the latent the MLP sees, the DrQ/SAC-AE
-        # recipe, so a drifting encoder cannot blow up the head's input scale.
+        # LayerNorm then tanh (DrQ/SAC-AE): bounds a drifting encoder's output.
         h = jnp.tanh(self.norm(h)).reshape(lead + (self.latent_dim,))
         return jnp.concatenate([h, x[..., self.pixel_size:]], axis=-1)
 

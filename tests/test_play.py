@@ -8,7 +8,6 @@ import pytest
 @pytest.fixture
 def play(monkeypatch):
     monkeypatch.setenv("JAX_PLATFORMS", "cpu")
-    monkeypatch.setenv("XLA_FLAGS", "")
     from roxie import play
 
     return play

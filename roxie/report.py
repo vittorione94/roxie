@@ -104,8 +104,7 @@ def discover(entity, prefix, grid_name, tasks):
         except Exception:
             continue
         for run in runs:
-            # Set from release.cell, so a run missing it was not launched by
-            # the grid.
+            # Set from release.cell; a run without it is not from the grid.
             cell = run.job_type
             if not cell:
                 continue
@@ -183,8 +182,7 @@ def build(wr, grid, entity, prefix, grid_name, report_project, title, descriptio
                 f"{len(ordered_cells)} cell(s) ({', '.join(ordered_cells)}). "
                 f"Project: {prefix}{task}."
             ),
-            # One runset per cell rather than per task: the two are different
-            # implementations, so they get their own colour groups.
+            # One runset per cell: each implementation gets its own colours.
             wr.PanelGrid(
                 runsets=[
                     _runset(wr, entity, task, prefix, grid_name, cell, cell=cell)

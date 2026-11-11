@@ -13,6 +13,7 @@ from flax import nnx
 from omegaconf import OmegaConf
 
 from roxie.utils.diagnostics import DIAGNOSTIC_MAX_KEYS
+from roxie.utils.math import normalize_samples
 from roxie.utils.memory import ReplayManager
 
 
@@ -242,6 +243,15 @@ def build_replay(memory_config, n_step: int, prototype, task_ids=None):
         buffer, prototype, time_axis=n_step > 1, task_ids=task_ids,
         sample_batch_size=int(memory_config.sample_batch_size),
         sample_sequence_length=sequence_length,
+    )
+
+
+def sample_replay(state, key, hp, replay_sample_fn, obs_mean, obs_std):
+    """A replay batch for one gradient step, repacked and normalized."""
+    samples = replay_sample_fn(state.buffer_state, key, state.task_weights)
+    return normalize_samples(
+        repack_samples(samples, hp.gamma, hp.n_step), obs_mean, obs_std,
+        hp.obs_norm_clip, hp.normalize_observations,
     )
 
 

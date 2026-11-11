@@ -53,8 +53,7 @@ def main(cfg: DictConfig):
     # Before `pin_cpu_cores`, so the watcher does not compete for the run's cores.
     system.start_memory_guard(runtime_cfg.get("memory_reserve_gb", None))
 
-    # Read through a multi-task block's tasks: there the backend sits in
-    # `task_defaults`, and missing it here would skip Warp's memory setup.
+    # Reads through a multi-task block, whose backend sits in `task_defaults`.
     impl = requested_impl(cfg.env)
     if impl == "warp":
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
@@ -67,10 +66,8 @@ def main(cfg: DictConfig):
     if pinned:
         print(f"CPU affinity: {pinned} cores ({sorted(os.sched_getaffinity(0))})")
 
-    # Without autotuning cuDNN runs the pixel encoder's convolutions 72x slower
-    # (160 ms against 2.2 ms per fwd+bwd of a 256 x 64x64x4 batch, RTX 5080,
-    # 2026-11-01), which held a vision run to ~32 env steps/s. Vision renders on
-    # warp, where autotuning did not hang.
+    # Vision keeps autotuning: the encoder ran 72x slower without it (RTX 5080,
+    # 2026-11-01), and on warp, where vision renders, it did not hang.
     if not cfg.get("vision"):
         os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 
@@ -93,7 +90,7 @@ def main(cfg: DictConfig):
     print("JAX devices:", jax.devices())
     print("JAX platform:", jax.default_backend())
 
-    env, test_env, env_cfg = build_env(
+    env, test_env = build_env(
         cfg.env,
         mode="train",
         num_envs=int(cfg.env.parallel_envs),
@@ -184,7 +181,6 @@ def main(cfg: DictConfig):
         steps=int(cfg.trainer.steps),
         epoch_steps=int(cfg.trainer.epoch_steps),
         save_steps=int(cfg.trainer.save_steps),
-        test_episodes=int(cfg.trainer.test_episodes),
         show_progress=cfg.trainer.show_progress,
         replace_checkpoint=cfg.trainer.replace_checkpoint,
         save_buffer=bool(cfg.trainer.get("save_buffer", False)),

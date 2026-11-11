@@ -35,8 +35,7 @@ def _run(body: str, *args, **kwargs):
 
 # ---- CPU core selection -----------------------------------------------------
 #
-# Which cpus the run gets, not just how many: a learning pass slows down once
-# the mask spans two L3 domains, so it has to stay inside one while it fits.
+# A learning pass slows once the mask spans two L3 domains.
 
 
 def test_cpu_list_parsing_handles_ranges_and_singletons():

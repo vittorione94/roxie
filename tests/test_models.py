@@ -159,9 +159,8 @@ class TestStochasticActor:
             _, pre = dist.sample_from_pre(seed=rng_key)
             return float(jnp.mean(dist.log_prob_from_pre(pre)))
 
-        # Past the float32 tanh rail at |u| >= 8, where the Jacobian term is the
-        # whole density; the Gaussian is translation-invariant there and the
-        # squashed one is not.
+        # Past the float32 tanh rail (|u| >= 8) the Gaussian is translation-
+        # invariant and the squashed one is not.
         assert logp(False, 1.0) == pytest.approx(logp(False, 40.0), abs=1.0)
         assert logp(True, 40.0) - logp(True, 1.0) > 100.0
 

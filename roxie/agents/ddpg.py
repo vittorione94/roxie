@@ -14,7 +14,7 @@ from roxie.agents.utils import (
     build_replay,
     fused_grad_steps,
     reduce_diagnostics,
-    repack_samples,
+    sample_replay,
     soft_update,
     transition_prototype,
 )
@@ -23,7 +23,6 @@ from roxie.losses.critic_losses import ddpg_critic_loss_fn
 from roxie.models.actors import deterministic_step_fn
 from roxie.utils.math import (
     normalize_obs,
-    normalize_samples,
     obs_mean_std,
     scale_to_env,
 )
@@ -42,16 +41,8 @@ def _ddpg_grad_step(
 ):
     """Executes a single DDPG gradient step updating actor and critic networks."""
     key, noise_key = jax.random.split(key)
-    samples = replay_sample_fn(
-        state.buffer_state, key, state.task_weights
-    )
-    re_packed_samples = repack_samples(samples, hp.gamma, hp.n_step)
-    re_packed_samples = normalize_samples(
-        re_packed_samples,
-        obs_mean,
-        obs_std,
-        hp.obs_norm_clip,
-        hp.normalize_observations,
+    re_packed_samples = sample_replay(
+        state, key, hp, replay_sample_fn, obs_mean, obs_std
     )
 
     (critic_loss, critic_aux), critic_grads = nnx.value_and_grad(

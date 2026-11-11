@@ -9,10 +9,10 @@ hyperparams:
   actor_learning_rate: 3e-4
   critic_learning_rate: 3e-4
   dual_learning_rate: 1e-2
-  num_action_samples: 20          # actions sampled per state for the E-step
-  epsilon: 0.1                    # E-step temperature KL bound
-  epsilon_mean: 1e-3              # M-step KL bound on the policy mean
-  epsilon_stddev: 1e-5            # M-step KL bound on the policy covariance
+  num_action_samples: 20
+  epsilon: 0.1
+  epsilon_mean: 1e-3
+  epsilon_stddev: 1e-5
   init_temperature: 1.0
   init_alpha_mean: 1.0
   init_alpha_stddev: 1.0

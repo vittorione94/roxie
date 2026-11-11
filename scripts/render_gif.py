@@ -92,9 +92,7 @@ def write_gif(frames, path, fps, colors, dither):
     reference = Image.fromarray(frames[len(frames) // 2]).quantize(
         colors=colors, method=Image.MEDIANCUT
     )
-    # Dithering is off by default: it turns the smooth sky gradient into
-    # per-frame speckle, which reads as noise and, being uncorrelated between
-    # frames, also defeats the GIF's inter-frame compression.
+    # No dithering: it speckles the sky per frame and defeats inter-frame compression.
     mode = Image.FLOYDSTEINBERG if dither else Image.NONE
     images = [
         Image.fromarray(f).quantize(palette=reference, dither=mode) for f in frames

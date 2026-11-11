@@ -15,14 +15,8 @@ env:
 runtime:
   device: cpu
   matmul_precision: null
-  # `bfloat16` narrows the hidden Linear layers' GEMM operands (params,
-  # gradients and reductions stay float32 — see `precision.linear_kwargs`).
-  # LEFT OFF: it only pays through oneDNN's custom call, and that rewriter
-  # aborts real learner graphs on this XLA build with a shape RET_CHECK
-  # (minimal MLPs compile fine). Without the flag bf16 is slower than float32.
-  # Retry after an XLA bump — the upside is small either way.
+  # Not bfloat16: oneDNN's rewriter aborts real learner graphs with a shape
+  # RET_CHECK on this XLA build, and without it bf16 is slower. Retry after an XLA bump.
   matmul_dtype: float32
-  # Kept equal to env.num_threads above: pin_cpu_cores narrows the process's
-  # OS affinity to this count, so a smaller value here packs more physics
-  # threads onto fewer cores than the taskset slot gave it.
+  # Keep equal to env.num_threads: a smaller affinity packs the physics threads onto fewer cores.
   cpu_cores: 12

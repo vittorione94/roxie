@@ -9,12 +9,12 @@ hyperparams:
   critic_learning_rate: 3e-4
   target_policy_noise: 0.0        # D4PG paper doesn't smooth the target policy
   target_noise_clip: 0.0
-  n_step: 5                       # paper's N-step return horizon
+  n_step: 5
   memory_warmup: 30_000
   steps_between_updates: 400
   learning_steps: 100
   max_grad_norm: 1
-  pre_activation_coef: 0.0   # actor pre-tanh saturation penalty; 0 = off
+  pre_activation_coef: 0.0
   normalize_observations: true
   obs_norm_clip: 5.0
   obs_norm_eps: 1e-08

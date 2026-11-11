@@ -294,13 +294,8 @@ class StochasticActor(nnx.Module):
 
         mean = self.output_layer(x)
         if self.log_std_param:
-            # The parameter IS log sigma, exponentiated and left unclipped, as
-            # the mjbatch reference has it. That makes d(log sigma)/d(param)
-            # exactly 1, so Adam's per-parameter step moves the spread by the
-            # learning rate. Under the softplus branch below that derivative is
-            # sigmoid(raw)/sigma instead — 0.82 at sigma=0.4, and it drifts as
-            # sigma moves, so the entropy bonus and the surrogate pull on the
-            # spread in a ratio that depends on where the spread already is.
+            # Unclipped log sigma keeps d(log sigma)/d(param) at 1; softplus
+            # gives sigmoid(raw)/sigma, which drifts with sigma (0.82 at 0.4).
             std = jnp.exp(jnp.broadcast_to(self.log_std[...], mean.shape))
         else:
             raw_std = (

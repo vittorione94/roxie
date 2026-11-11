@@ -1,7 +1,6 @@
 """Maximum a Posteriori Policy Optimization (MPO) agent."""
 
 import functools
-import math
 from typing import Any
 
 import hydra
@@ -16,7 +15,7 @@ from roxie.agents.utils import (
     fused_grad_steps,
     make_optimizer,
     reduce_diagnostics,
-    repack_samples,
+    sample_replay,
     soft_update,
     transition_prototype,
 )
@@ -25,7 +24,6 @@ from roxie.losses.critic_losses import mpo_critic_loss_fn
 from roxie.models.actors import stochastic_step_fn
 from roxie.utils.math import (
     normalize_obs,
-    normalize_samples,
     obs_mean_std,
     scale_to_env,
     inv_softplus,
@@ -75,16 +73,8 @@ def _mpo_grad_step(
 
     key, sample_key, critic_key, actor_key = jax.random.split(key, 4)
 
-    samples = replay_sample_fn(
-        state.buffer_state, sample_key, state.task_weights
-    )
-    re_packed_samples = repack_samples(samples, hp.gamma, hp.n_step)
-    re_packed_samples = normalize_samples(
-        re_packed_samples,
-        obs_mean,
-        obs_std,
-        hp.obs_norm_clip,
-        hp.normalize_observations,
+    re_packed_samples = sample_replay(
+        state, sample_key, hp, replay_sample_fn, obs_mean, obs_std
     )
 
     (critic_loss, critic_aux), critic_grads = nnx.value_and_grad(

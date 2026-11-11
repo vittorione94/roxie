@@ -38,9 +38,8 @@ _OFF_POLICY_OVERRIDES = (
     "agent.memory_config.sample_batch_size=8",
 )
 
-# PPO has no warmup and no replay: its queue IS the update window, so the chunk
-# comes from `sample_sequence_length`, which `steps_between_updates` derives
-# from. `num_minibatches` must divide `add_batch_size`.
+# PPO's queue is the update window, so the chunk is `sample_sequence_length`;
+# `num_minibatches` must divide `add_batch_size`.
 _OVERRIDES = {
     "ppo": (
         f"agent.memory_config.sample_sequence_length={CHUNK}",
@@ -70,23 +69,19 @@ def _build(agent_name, backend, extra=()):
                 f"release/backend@backend={BACKENDS[backend]}",
                 "release.task=CartpoleBalance",
                 f"env.parallel_envs={NUM_ENVS}",
-                # Enough to condition the observation statistics first:
-                # `obs_mean_std` takes the variance as E[x^2] - E[x]^2, which
-                # cancels catastrophically while the samples are few, so float
-                # reassociation between the two paths would move the action.
+                # Conditions the obs stats: E[x^2] - E[x]^2 cancels on few
+                # samples, and float reassociation would then move the action.
                 "agent.hyperparams.learning_steps=1",
                 "logging.wandb.enabled=false",
                 *_OVERRIDES.get(agent_name, _OFF_POLICY_OVERRIDES),
                 *extra,
             ],
         )
-    env, test_env, _ = build_env(
+    env, test_env = build_env(
         cfg.env, mode="train", num_envs=NUM_ENVS, test_episodes=2,
     )
     act_space = env.single_action_space
-    # What `train.py` does between the env and the agent: the network blocks
-    # interpolate `${env.obs_size}` and friends, which nothing knows until the
-    # env exists.
+    # As `train.py` does: network blocks interpolate `${env.obs_size}` & co.
     publish_env_shapes(
         cfg.env, space_size(env.single_observation_space), space_size(act_space),
     )
@@ -191,10 +186,8 @@ def _stepwise_collect(rollout, agent, rstate, n_steps):
     sums["metrics"] = {k: zero for k in rollout.metric_keys}
     train_state = agent.state
     noise = getattr(agent, "noise_module", None)
-    # Acting is pinned for the whole chunk on BOTH paths: the fused one folds
-    # the chunk's own observations into the statistics only once it is over, so
-    # a reference that let them advance per step would score every step after
-    # the first under a normalizer the real loop never used.
+    # Pinned for the whole chunk: the fused path folds the chunk's observations
+    # into the statistics only once it is over.
     pin = agent.freeze_acting_norm()
     if pin is None:
         pin = train_state.obs_stats
@@ -293,12 +286,8 @@ def _both_paths(agent_name, backend):
     return _fused_run(*fused_side), _stepwise_run(*stepwise_side)
 
 
-# The combinations that are actually distinct. What varies with the AGENT is
-# what rides in the scan carry — a noise module, obs statistics, PPO's stored
-# behaviour extras — and that is the same whichever `advance` runs underneath.
-# What varies with the BACKEND is the physics alone. So every agent goes through
-# the batch, and one goes through the traced JAX env, whose MJX physics costs a
-# ~10s compile per case. TD3 is that one: its carry is the fullest of the four.
+# The agent varies the scan carry, the backend only the physics: every agent
+# runs on the batch, and only TD3 (fullest carry) on MJX: ~10s compile a case.
 CASES = [
     ("td3", "jax"),
     ("td3", "batch"),
@@ -341,10 +330,7 @@ def test_the_noise_schedule_advances_by_env_frames_inside_the_scan():
 
 # --- the eval loop ---------------------------------------------------------
 #
-# `evaluate` is compiled for the same reason `collect` is, and carries the same
-# obligation: score a policy exactly as the `agent.select_action` loop it
-# replaced did. Its episodes are capped hard here — the comparison is per-step,
-# so 25 of them catch what 1000 would.
+# The comparison is per-step, so 25-step episodes catch what 1000 would.
 
 _SHORT_EPISODES = ("+env.max_episode_steps=25",)
 

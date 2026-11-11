@@ -7,16 +7,16 @@ hyperparams:
   tau: 0.005
   actor_learning_rate: 3e-4
   critic_learning_rate: 3e-4
-  target_policy_noise: 0.2        # TD3 paper's target smoothing, in the actor's [-1, 1] units
+  target_policy_noise: 0.2        # in the actor's [-1, 1] units
   target_noise_clip: 0.5
-  policy_delay: 2                 # actor + target updates every 2 critic steps
+  policy_delay: 2
   twin_q_weight: 1.0
-  n_step: 5                       # D4PG paper's N-step return horizon
+  n_step: 5
   memory_warmup: 30_000
   steps_between_updates: 400
   learning_steps: 100
   max_grad_norm: 1
-  pre_activation_coef: 0.0   # actor pre-tanh saturation penalty; 0 = off
+  pre_activation_coef: 0.0
   normalize_observations: true
   obs_norm_clip: 5.0
   obs_norm_eps: 1e-08
@@ -45,7 +45,7 @@ critic_config:
     num_atoms: 51
     features: [256, 256]
     vision: ${oc.select:vision,null}
-    use_layer_norm: true            # strong stabilizer against value divergence
+    use_layer_norm: true
     dropout_rate: 0.
     rngs:
       _target_: roxie.agents.utils.network_rngs

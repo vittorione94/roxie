@@ -4,13 +4,13 @@ hyperparams:
   _target_: roxie.agents.hyperparams.PPOHyperparams
 
   gamma: 0.99
-  gae_lambda: 0.95                # GAE bias/variance trade-off (1 = Monte Carlo)
-  clip_eps: 0.2                   # PPO surrogate clip range
-  entropy_coef: 0.002             # entropy bonus weight in the actor loss
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.002
   actor_learning_rate: 3e-4
   critic_learning_rate: 3e-4
-  learning_steps: 5               # EPOCHS: passes over each rollout
-  num_minibatches: 4              # MINIBATCHES: splits per pass
+  learning_steps: 5               # epochs over each rollout
+  num_minibatches: 4
   adv_norm_decay: 0.0
   target_kl: null
   max_grad_norm: 1
@@ -35,7 +35,7 @@ actor_config:
   std_max: 5.0
   torch_init: true
   output_init_scale: 0.01
-  init_std: 0.4                   # exp(LOG_STD)
+  init_std: 0.4
   state_dependent_std: false
   rngs:
     _target_: roxie.agents.utils.network_rngs

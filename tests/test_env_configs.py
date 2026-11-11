@@ -125,7 +125,7 @@ def record_builder(**kwargs):
 def build_env_result(kwargs):
     from roxie.environment.loader import EnvBundle
 
-    return EnvBundle(env=kwargs, test_env=None, env_cfg=None)
+    return EnvBundle(env=kwargs, test_env=None)
 
 
 RECORD = f"{__name__}.record_builder"

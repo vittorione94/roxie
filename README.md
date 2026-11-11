@@ -32,7 +32,7 @@ or, with plain pip: `pip install -e .`. The `cuda` group pins `warp-lang==1.18.0
 uv run python roxie/train.py --config-name release/bench_sac                          # HumanoidWalk, GPU-free
 uv run python roxie/train.py --config-name release/bench_sac release.task=HumanoidRun  # or HumanoidStand
 uv run python roxie/train.py --config-name release/bench_sac release/backend@backend=warp_gpu  # GPU
-uv run python roxie/train.py --config-name release/multitask_sac                      # all three in one run
+uv run python roxie/train.py --config-name release/bench_sac release/bench@bench=multitask '~release/backend@backend'  # all three in one run
 uv run python roxie/play.py --checkpoint-path outputs/<run>/checkpoints/step_5000000
 ```
 

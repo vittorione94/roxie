@@ -311,6 +311,4 @@ def build_multitask_env(
         raise ValueError(
             f"every task must run on the same backend; got {sorted(backends)}"
         )
-    return EnvBundle(
-        env=MultiTaskEnv(train), test_env=MultiTaskEnv(test), env_cfg=None,
-    )
+    return EnvBundle(env=MultiTaskEnv(train), test_env=MultiTaskEnv(test))

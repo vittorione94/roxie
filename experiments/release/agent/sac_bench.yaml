@@ -25,8 +25,7 @@ hyperparams:
   seed: 0
 
 actor_config:
-  # Layer norm ON to match the rest of the benchmark (the library sac.yaml
-  # leaves it off).
+  # Layer norm ON to match the rest of the benchmark (sac.yaml leaves it off).
   _target_: roxie.models.actors.StochasticActor
   in_features: ${env.obs_size}
   action_dim: ${env.action_size}

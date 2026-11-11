@@ -40,15 +40,13 @@ def _collect_and_update(agent, key, drift=2.0, unfreeze_norm=False):
     harness.drive(agent, _rollout_len(agent), key, drift=drift)
 
     if unfreeze_norm:
-        # Throw away BOTH caches so the update re-derives mean/std from the
-        # drifted running stats — the failure mode the freeze prevents.
+        # Both caches, so the update re-derives from the drifted stats; dropping
         # `_obs_norm` alone would re-derive the same numbers.
         agent._obs_stats_snapshot = None
         agent._obs_norm = None
 
-    # The trainer's `steps` is cumulative, and the gate CONSUMES the boundary it
-    # fires on, so a second rollout on the same agent must be asked at its own
-    # step count rather than at the first one's again.
+    # The gate consumes the boundary it fires on, so each rollout asks at its
+    # own cumulative step count.
     steps = max(agent._last_update_boundary, 0) + _rollout_len(agent) * ENVS
     assert agent.due_for_update(steps), "the queue never filled"
     agent.learn(jax.random.fold_in(key, 99))
@@ -216,10 +214,8 @@ class TestFusedUpdateMatchesTheLoop:
     sticky flag in the scan carry. That is only a throughput change if it lands
     exactly where the loop landed, so these run one rollout through both."""
 
-    # `None` exercises the no-stop path; the tiny bound trips MID-rollout
-    # (`approx_kl` is identically 0 on the first pass). A bound that tripped
-    # immediately, or never, would not cover the sticky flag — which is why the
-    # tripping case asserts where it stopped, not just that it agreed.
+    # 1e-9 trips mid-rollout (`approx_kl` is 0 on the first pass), which is what
+    # exercises the sticky stop flag.
     @pytest.mark.parametrize("target_kl", [None, 1e-9])
     def test_fused_update_matches_the_per_minibatch_loop(self, target_kl):
         agent = _agent(learning_steps=3, num_minibatches=2, target_kl=target_kl)

@@ -127,11 +127,8 @@ def _prepare_rollout(
 
     residual_var = jnp.var(returns_t - v_t)
 
-    # Flattened over `(env, time)` so the update's minibatches are draws from the
-    # rollout's TRANSITIONS: permuting the env axis alone hands each minibatch
-    # whole trajectories, every step of which shares a start state and a policy.
-    # The policy tensors are sliced to the GAE horizon here rather than in the
-    # losses, so one permutation serves every leaf.
+    # Flattened over `(env, time)` so minibatches draw transitions, not whole
+    # trajectories that share a start state.
     def flat(x):
         return x[:, :-1].reshape((-1,) + x.shape[2:])
 
@@ -141,9 +138,8 @@ def _prepare_rollout(
     returns_t = returns_t.reshape(-1)
     adv_t = adv_t.reshape(-1)
 
-    # Normalizing by this rollout's own spread rescales a rollout with no
-    # reward in it to unit variance, so PPO takes a full trust-region step on
-    # value-function noise.
+    # Not this rollout's own spread: that scales a rewardless rollout's noise up
+    # to a full trust-region step.
     centered = adv_t - jnp.mean(adv_t)
     decay = hp.adv_norm_decay
     mean_sq = decay * adv_scale.mean_sq[...] + (1.0 - decay) * jnp.mean(
@@ -217,8 +213,7 @@ def _ppo_grad_step(
         returns=returns_t,
     )
 
-    # Both gradients before either update, so the clip below sees the same pair
-    # the reference's single backward pass produces.
+    # Both gradients before either update, as one backward pass would give.
     actor_grads, critic_grads = _clip_jointly(
         (actor_grads, critic_grads), hp.max_grad_norm
     )
@@ -343,8 +338,7 @@ class PPO(Agent):
     hyperparams_cls = PPOHyperparams
     derived_hyperparams = frozenset({"steps_between_updates"})
     freeze_obs_norm_per_chunk = True
-    # `max_grad_norm` is one norm over the actor and the critic together, as the
-    # reference has it; `_clip_jointly` applies it and the optimizers carry none.
+    # `max_grad_norm` is one norm over actor and critic together.
     joint_grad_clip = True
 
     def __init__(
@@ -383,9 +377,7 @@ class PPO(Agent):
             steps_between_updates=self.sample_sequence_length * int(self.batch_size),
         )
 
-        # A minibatch is a draw from the rollout's TRANSITIONS, not from its
-        # trajectories, and GAE spends the last step of every trajectory on the
-        # bootstrap — so the pool is `envs * (T - 1)` wide, not `envs`.
+        # GAE spends each trajectory's last step on the bootstrap.
         self.rollout_transitions = int(self.batch_size) * (
             self.sample_sequence_length - 1
         )
@@ -525,9 +517,7 @@ class PPO(Agent):
             self.hp,
             self.minibatch_size,
         )
-        # The one sync on the learning path, and unavoidable: the trust region
-        # decided this count on device, and every host-side consumer of it —
-        # the trainer's running total, the diagnostics weighting — is an int.
+        # The one sync on the learning path: the count is decided on device.
         return steps_taken.item(), dataclasses.replace(
             output, diagnostics={**output.diagnostics, **rollout_stats}
         )

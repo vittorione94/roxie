@@ -125,11 +125,9 @@ class OrnsteinUhlenbeck(PlayOnlyAgent):
         self.mu = mu
         self.seed = int(seed)
 
-        # Per-env OU state in [-1, 1], lazily sized on the first ``step`` once
-        # the batch (number of parallel envs) is known.
+        # Sized on the first `step`, once the number of envs is known.
         self.actions = None
-        # Folded into the externally supplied key each step so the noise still
-        # advances when the caller passes a constant key (e.g. the play loop).
+        # Folded into the key so the noise advances under a constant key (play).
         self._t = 0
 
         print("OrnsteinUhlenbeck agent initialized.")
@@ -164,10 +162,7 @@ class OrnsteinUhlenbeck(PlayOnlyAgent):
 
     def buffer_transitions(self, transition, next_obs, *, state=None,
                            update_stats=True):
-        # Nothing to store — no buffer and no train state here, so `state` and
-        # `update_stats` both go unread. The OU process is decorrelated for any
-        # env whose episode just ended, so a fresh episode starts from zero
-        # noise.
+        # Nothing to store; a fresh episode starts from zero noise.
         if self.actions is not None:
             done = jnp.logical_or(transition.terminal, transition.truncation)
             keep = (1.0 - done.astype(self.actions.dtype))[:, None]
@@ -184,10 +179,7 @@ class OrnsteinUhlenbeck(PlayOnlyAgent):
             "env_action_size": int(self.action_size),
         }
 
-    # No learned params: just the hyperparameters and action bounds, so ``play``
-    # can rebuild an identical agent. Overriding only the payload leaves the
-    # writing to the trainer's ``CheckpointManager``, so ``Agent``'s reader
-    # still reads it.
+    # Only the payload is overridden, so `Agent`'s reader still reads it.
     def checkpoint_payload(self, *, extra_metadata=None, **_):
         return {
             "format_version": 1,

@@ -6,10 +6,8 @@ import jax.numpy as jnp
 
 from roxie.utils.precision import FLOAT
 
-# Metric keys reduced using max rather than a weighted average.
 DIAGNOSTIC_MAX_KEYS = frozenset({"pre_act_max"})
 
-# Metric keys summed across an epoch rather than averaged.
 DIAGNOSTIC_SUM_KEYS = frozenset({"kl_early_stops"})
 
 

@@ -1,9 +1,0 @@
-# @package _global_
-
-defaults:
-  - agent: ppo_bench
-  - bench: multitask
-  - _self_
-
-release:
-  agent: ppo

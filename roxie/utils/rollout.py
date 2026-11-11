@@ -9,7 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from roxie.agents.agent import Agent
 from roxie.agents.utils import Transition
 from roxie.environment.functional import space_size
 from roxie.environment.vector import UNCAPPED_EVAL_STEPS
@@ -139,19 +138,14 @@ def task_one_hot(environment):
     return np.eye(len(environment.task_names), dtype=np.float32)[task_ids]
 
 
-def chunk_step(carry, _, *, agent, advance, observe_params, acting_stats,
+def chunk_step(carry, _, *, environment, reset_pool, agent, acting_stats,
                metric_keys):
     """Runs one environment step of the fused chunk: act, advance, buffer, tally.
 
     Args:
         carry: `(train_state, noise_module, state, rng, params, scores,
             lengths)` — only what a step must read back from the one before it.
-        _: The scan's unused `xs` slot.
-        agent: The static agent instance.
-        advance: The backend's step, with the env and reset pool bound.
-        observe_params: The backend's `params` update, likewise bound.
         acting_stats: The normalizer, constant for the chunk.
-        metric_keys: Tuple of metric keys reported by the environment.
 
     Returns:
         The scan pair `(carry, stacked)`.
@@ -165,8 +159,8 @@ def chunk_step(carry, _, *, agent, advance, observe_params, acting_stats,
         actor=train_state.actor, critic=train_state.critic,
         noise_module=noise_module, obs_stats=acting_stats,
     )
-    state, timestep = advance(state, action, step_key, params)
-    params = observe_params(params, timestep)
+    state, timestep, params = advance(environment, state, action, step_key,
+                                      reset_pool, params)
 
     agent.buffer_transitions(
         Transition(
@@ -209,50 +203,45 @@ def reset_envs(key, params=None, *, environment, num_envs=None):
     """
     return environment.reset(key, params, num_envs=num_envs)[0]
 
-def jax_advance(environment, state, action, key, reset_pool, params):
-    """Advances a vmapped JAX env by one step, as `(state, timestep)`."""
-    return environment.step(state, action, key, reset_pool, params)
 
+def advance(environment, state, action, key, reset_pool, params):
+    """Steps the envs and folds the outcome into their `params`.
 
-def jax_observe_params(environment, params, timestep):
-    """Folds one step's outcome into the env's own `params`.
+    `FuncEnv.observe_params` is a no-op by default, so an env that does not
+    adapt needs no branch.
 
-    Reached through `environment` rather than a captured `func_env` so this
-    stays a plain function. `FuncEnv.observe_params` is a no-op by default, so
-    an env that does not adapt needs no branch.
+    Returns:
+        A tuple of `(state, timestep, params)`.
     """
-    # `terminated` rather than `done`: a non-failure cutoff must never be
-    # presented to the env as a failure.
-    return environment.func_env.observe_params(
+    state, timestep = environment.step(state, action, key, reset_pool, params)
+    # `terminated`, not `done`: a non-failure cutoff must not read as a failure.
+    params = environment.func_env.observe_params(
         params, timestep.info, timestep.terminated,
     )
+    return state, timestep, params
 
 
-@functools.partial(
-    jax.jit, static_argnames=("environment", "advance", "observe_params"),
-)
-def step_envs(rstate, actions, key, *, environment, advance, observe_params):
+@functools.partial(jax.jit, static_argnames=("environment",))
+def step_envs(rstate, actions, key, *, environment):
     """Advances the environments one step, with the env's own `params` update.
 
     Returns:
         A tuple of `(rstate, prev_obs, timestep)`.
     """
-    state, timestep = advance(
+    state, timestep, params = advance(
         environment, rstate.env, actions, key, rstate.reset_pool, rstate.params,
     )
-    params = observe_params(environment, rstate.params, timestep)
     return rstate.replace(env=state, params=params), rstate.obs, timestep
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=("environment", "advance", "observe_params", "agent",
-                     "n_steps", "metric_keys", "unroll"),
+    static_argnames=("environment", "agent", "n_steps", "metric_keys",
+                     "unroll"),
     donate_argnums=(0, 1),
 )
 def collect_chunk(train_state, noise_module, rstate, frozen_stats, *,
-                  environment, advance, observe_params, agent, n_steps,
-                  metric_keys, unroll):
+                  environment, agent, n_steps, metric_keys, unroll):
     """Fuses acting, physics, buffering and scoring into a single JAX scan.
 
     `chunk_step` holds the per-step work and the carry; this holds what the
@@ -265,30 +254,17 @@ def collect_chunk(train_state, noise_module, rstate, frozen_stats, *,
         rstate: The environment-side state carry (`RolloutState`).
         frozen_stats: Pinned normalizer statistics for on-policy rollouts, or
             None to pin to the statistics as they stood when the chunk opened.
-        environment: The training environment driver.
-        advance: The backend-specific step function.
-        observe_params: The backend-specific parameter update function.
         agent: The static agent instance; only its code may be used in a trace.
-        n_steps: The number of environment steps to collect.
-        metric_keys: Tuple of metric keys reported by the environment.
         unroll: Loop unroll count for XLA optimization.
 
     Returns:
         A tuple of `(train_state, noise_module, rstate, chunk_sums)`.
     """
-    reset_pool = rstate.reset_pool
-
-    def advance_step(state, action, key, params):
-        return advance(environment, state, action, key, reset_pool, params)
-
-    def observe(params, timestep):
-        return observe_params(environment, params, timestep)
-
     acting_stats = (train_state.obs_stats if frozen_stats is None
                     else frozen_stats)
     body = functools.partial(
-        chunk_step, agent=agent, advance=advance_step, observe_params=observe,
-        acting_stats=acting_stats, metric_keys=metric_keys,
+        chunk_step, environment=environment, reset_pool=rstate.reset_pool,
+        agent=agent, acting_stats=acting_stats, metric_keys=metric_keys,
     )
 
     init = (
@@ -312,20 +288,10 @@ def collect_chunk(train_state, noise_module, rstate, frozen_stats, *,
 
 @functools.partial(
     jax.jit,
-    static_argnames=("environment", "advance", "num_envs", "action_size",
-                     "iters"),
+    static_argnames=("environment", "num_envs", "action_size", "iters"),
 )
-def roll_random_actions(rstate, *, environment, advance, num_envs,
-                        action_size, iters):
+def roll_random_actions(rstate, *, environment, num_envs, action_size, iters):
     """Rolls uniform-action warmup steps, as one `(T, B, ...)` block.
-
-    Args:
-        rstate: The environment-side state carry (`RolloutState`).
-        environment: The training environment driver.
-        advance: The backend-specific step function.
-        num_envs: Worlds stepped per iteration.
-        action_size: Width of one action.
-        iters: The number of steps to roll.
 
     Returns:
         A tuple of `(rstate, transitions, next_obs)`, the last two stacked over
@@ -343,9 +309,8 @@ def roll_random_actions(rstate, *, environment, advance, num_envs,
         )
         actions = low + (high - low) * u
         prev_obs = state.obs
-        state, timestep = advance(
-            environment, state, actions, step_key, rstate.reset_pool,
-            rstate.params,
+        state, timestep = environment.step(
+            state, actions, step_key, rstate.reset_pool, rstate.params,
         )
         return (state, rng), (
             Transition(
@@ -366,10 +331,9 @@ def roll_random_actions(rstate, *, environment, advance, num_envs,
 
 @functools.partial(
     jax.jit,
-    static_argnames=("environment", "advance", "agent", "max_steps"),
+    static_argnames=("environment", "agent", "max_steps"),
 )
-def evaluate_policy(actor, obs_stats, state, *, environment, advance, agent,
-                    max_steps):
+def evaluate_policy(actor, obs_stats, state, *, environment, agent, max_steps):
     """Rolls the eval environments to their own ends, scoring as they go.
 
     Args:
@@ -378,20 +342,14 @@ def evaluate_policy(actor, obs_stats, state, *, environment, advance, agent,
             first epoch's weights.
         obs_stats: The normalizer acting ran under. Traced, for the same reason.
         state: The eval envs from `reset_test`, so the draw is pinned.
-        environment: The evaluation environment driver.
-        advance: The backend-specific step function.
-        agent: The static agent instance.
-        max_steps: Episode-length cap for the loop.
 
     Returns:
         A tuple of `(scores, lengths, start_obs)`, per eval environment.
     """
-    # A `while_loop`, so the termination check is on device and a run of short
-    # episodes costs what it should.
+    # A `while_loop`, so the termination check stays on device.
     num_tests = state.obs.shape[0]
     start_obs = state.obs.reshape(num_tests, -1)
-    # Fixed for the same reason the draw is: an eval is a measurement, and
-    # nothing in it may vary between two evals of the same weights.
+    # Fixed, like the pinned draw: two evals of the same weights must agree.
     eval_key = jax.random.PRNGKey(0)
 
     def cond(carry):
@@ -401,10 +359,8 @@ def evaluate_policy(actor, obs_stats, state, *, environment, advance, agent,
     def body(carry):
         i, state, dones, scores, lengths = carry
         action = agent.eval_action(state.obs, actor, obs_stats)
-        # reset_pool=None: no auto-reset — each episode runs to its own end
-        # and finished worlds are masked out below.
-        state, timestep = advance(environment, state, action, eval_key, None,
-                                  None)
+        # No reset pool, so no auto-reset: finished worlds are masked instead.
+        state, timestep = environment.step(state, action, eval_key, None, None)
         not_done = ~dones
         scores = scores + timestep.reward * not_done.astype(jnp.float32)
         lengths = lengths + not_done.astype(jnp.int32)
@@ -433,9 +389,6 @@ class Rollout:
     is the only way to get one.
 
     Attributes:
-        advance: The env's step function, `self`-free so it can be a static
-            argument without dragging the instance into the cache key.
-        observe_params: The env's `params` update, likewise.
         scan_unroll: How many chunk steps XLA sees as straight-line code per
             `lax.scan` trip. It buys fusion and register reuse ACROSS env steps
             at the price of a proportionally larger graph to compile.
@@ -444,21 +397,11 @@ class Rollout:
         task_names: A multi-task env's tasks, in one-hot order; empty if single.
     """
 
-    advance = staticmethod(jax_advance)
-    observe_params = staticmethod(jax_observe_params)
     scan_unroll = 2
 
     _frozen = False
 
     def __init__(self, environment, test_environment, num_envs, metric_keys):
-        # `FuncEnv` declares `init_params`/`observe_params`/`epoch_refresh` as
-        # no-ops, so an env that does not adapt needs no branch here — and the
-        # driver vmaps `truncal` unconditionally, so an env missing roxie's
-        # method set could not reach a rollout in the first place.
-        self.func_env = environment.func_env
-        # Gathered from, so it need not match num_envs; equal means one reset
-        # program serves both.
-        self.pool_size = int(num_envs)
         self.environment = environment
         self.test_environment = test_environment
         self.num_envs = int(num_envs)
@@ -468,19 +411,14 @@ class Rollout:
         self._frozen = True
 
     def __setattr__(self, name, value):
-        # `metric_keys` and `num_envs` feed STATIC jit arguments, so a write
-        # after the first trace would silently reuse a stale compilation.
-        # `_probe` settles both before an instance exists; nothing may move
-        # them afterwards.
+        # `metric_keys` and `num_envs` feed static jit arguments: a later write
+        # would silently reuse a stale compilation.
         if self._frozen:
             raise AttributeError(
                 f"{type(self).__name__} is frozen: cannot set {name!r}. "
                 f"Anything that varies belongs in `RolloutState`."
             )
         object.__setattr__(self, name, value)
-
-    def _reset(self, n, key, params):
-        return reset_envs(key, params, environment=self.environment, num_envs=n)
 
     @classmethod
     def _probe(cls, environment, num_envs, rng):
@@ -492,16 +430,14 @@ class Rollout:
         """
         num_envs = int(num_envs)
         rng, reset_key, pool_key = jax.random.split(rng, 3)
-        # `params` travels as the traced FuncEnv argument, so refreshing it each
-        # epoch does not retrigger a compile. None for envs that do not adapt.
+        # Traced, so refreshing it each epoch does not recompile.
         params = environment.func_env.init_params()
 
         def reset(n, key):
             return reset_envs(key, params, environment=environment, num_envs=n)
 
         state = timed(reset, num_envs, reset_key, label="reset")
-        # The pool is gathered from, so it need not match `num_envs`; equal
-        # means one reset program serves both.
+        # Sized like the envs only so one reset program serves both.
         reset_pool = timed(reset, num_envs, pool_key, label="reset pool")
         scores, lengths = fresh_tally(num_envs)
         rstate = RolloutState(
@@ -513,16 +449,13 @@ class Rollout:
         dummy_actions = jnp.zeros((num_envs, action_size), dtype=FLOAT)
         _, _, dummy_timestep = timed(
             step_envs, rstate, dummy_actions, rng, label="train step",
-            environment=environment, advance=cls.advance,
-            observe_params=cls.observe_params,
+            environment=environment,
         )
         metric_keys = tuple(dummy_timestep.info.get("metrics", {}))
 
-        # The compile call above stepped this state; training must not continue
-        # from it.
+        # The compile call stepped this state; training must not start from it.
         rng, key = jax.random.split(rng)
-        return (rstate.replace(env=reset(num_envs, key), rng=rng),
-                num_envs, metric_keys)
+        return rstate.replace(env=reset(num_envs, key), rng=rng), metric_keys
 
     def reset_test(self):
         return reset_envs(
@@ -537,18 +470,19 @@ class Rollout:
         episodes referred to, so the live envs are reset and the caller is told
         to drop their part-scored episodes.
         """
-        params, invalidated = self.func_env.epoch_refresh(rstate.params)
+        params, invalidated = self.environment.func_env.epoch_refresh(
+            rstate.params)
+        reset = functools.partial(
+            reset_envs, params=params, environment=self.environment,
+            num_envs=self.num_envs,
+        )
 
         rng, pool_key = jax.random.split(rstate.rng)
         rstate = rstate.replace(
-            params=params, rng=rng,
-            reset_pool=self._reset(self.pool_size, pool_key, params),
-        )
+            params=params, rng=rng, reset_pool=reset(pool_key))
         if invalidated:
             rng, reset_key = jax.random.split(rstate.rng)
-            rstate = rstate.replace(
-                rng=rng, env=self._reset(self.num_envs, reset_key, params),
-            )
+            rstate = rstate.replace(rng=rng, env=reset(reset_key))
         return rstate, invalidated
 
     def reset_tally(self, rstate):
@@ -558,36 +492,25 @@ class Rollout:
 
     def step(self, rstate, actions, key):
         """Advances the envs one step. See `step_envs`."""
-        return step_envs(
-            rstate, actions, key, environment=self.environment,
-            advance=self.advance, observe_params=self.observe_params,
-        )
+        return step_envs(rstate, actions, key, environment=self.environment)
 
     def collect(self, train_state, noise_module, rstate, frozen_stats, *,
                 agent, n_steps):
         """Collects one chunk. See `collect_chunk`, which this only binds."""
         return collect_chunk(
             train_state, noise_module, rstate, frozen_stats,
-            environment=self.environment, advance=self.advance,
-            observe_params=self.observe_params, agent=agent, n_steps=n_steps,
+            environment=self.environment, agent=agent, n_steps=n_steps,
             metric_keys=self.metric_keys,
             # A chunk shorter than the unroll would otherwise be traced as a
             # peeled remainder with no scan left around it.
             unroll=max(1, min(self.scan_unroll, n_steps)),
         )
 
-    def roll_random(self, rstate, *, iters):
-        """Rolls `iters` random-action steps. See `roll_random_actions`."""
-        return roll_random_actions(
-            rstate, environment=self.environment, advance=self.advance,
-            num_envs=self.num_envs, action_size=self.action_size, iters=iters,
-        )
-
     def evaluate(self, actor, obs_stats, state, *, agent):
         """Runs the held-out eval. See `evaluate_policy`."""
         return evaluate_policy(
             actor, obs_stats, state, environment=self.test_environment,
-            advance=self.advance, agent=agent,
+            agent=agent,
             max_steps=int(
                 self.test_environment.max_episode_steps or UNCAPPED_EVAL_STEPS
             ),
@@ -598,7 +521,10 @@ class Rollout:
         print(f"Rolling {iters} warmup iters (compiles on the first)...",
               flush=True)
         t0 = time.time()
-        rstate, transitions, next_obs = self.roll_random(rstate, iters=iters)
+        rstate, transitions, next_obs = roll_random_actions(
+            rstate, environment=self.environment, num_envs=self.num_envs,
+            action_size=self.action_size, iters=iters,
+        )
         jax.block_until_ready(next_obs)
         print(f"  {time.time() - t0:.1f}s", flush=True)
 
@@ -621,6 +547,6 @@ def build_rollout(environment, test_environment, num_envs, rng):
         A tuple of `(rollout, rstate)` — the frozen rollout, and the run's
         first `RolloutState` with every env program already compiled.
     """
-    rstate, num_envs, metric_keys = Rollout._probe(environment, num_envs, rng)
+    rstate, metric_keys = Rollout._probe(environment, num_envs, rng)
     rollout = Rollout(environment, test_environment, num_envs, metric_keys)
     return rollout, rstate

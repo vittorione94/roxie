@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from types import SimpleNamespace
 from typing import Any
 
 import jax
@@ -12,15 +11,14 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 
-# What a step reads and no earlier step can recompute. Everything else in the
-# `MjData` is derived from these, or scratch.
+# What a step reads and no earlier step can recompute.
 _STATE_FIELDS = (
     "time", "qpos", "qvel", "act", "qacc_warmstart", "ctrl", "qfrc_applied",
     "xfrc_applied", "mocap_pos", "mocap_quat",
 )
 # Same size in both, different meaning: C's `M` is sparse in its own order.
 _LAID_OUT_DIFFERENTLY = frozenset({"M"})
-# Pytree metadata in an MJX `Contact`: the layout, which no step can change.
+# Pytree metadata in an MJX `Contact`, which no step can change.
 _STATIC_CONTACT_FIELDS = frozenset({"dim", "efc_address"})
 # What MJX gives a contact slot nothing occupies.
 _NO_CONTACT_DIST = 1e10
@@ -31,9 +29,7 @@ class _CPhysics:
 
     def __init__(self, model: mujoco.MjModel, mjx_model: Any):
         self._model = model
-        # `_C_PHYSICS` is keyed by this object's id, which is only unique while
-        # the object lives: freed, its id can pass to an unrelated model, whose
-        # physics would then silently leave for C.
+        # Kept alive: `_C_PHYSICS` is keyed by its id, reused once freed.
         self._mjx_model = mjx_model
         self._data = mujoco.MjData(model)
         self._warned_contacts = False
@@ -85,8 +81,7 @@ class _CPhysics:
         free = {dim: list(np.flatnonzero(dims == dim)) for dim in np.unique(dims)}
         found = data.contact
         dropped = 0
-        # Deepest first: MJX sizes these per geom pair and C does not, so box on box
-        # can outgrow its slots, and what is lost should be the shallowest.
+        # Deepest first: box on box overflows MJX's slots; drop the shallowest.
         for index in np.argsort(found.dist[: data.ncon]):
             dim = found.dim[index]
             if not free.get(dim):
@@ -160,8 +155,7 @@ class _CPhysics:
             "efc_force": spec_of(impl.efc_force),
         }
         state = {name: getattr(data, name) for name in _STATE_FIELDS if name in results}
-        # Pure, not `io_callback`: every call carries the whole state in and out,
-        # so the `MjData` here is only scratch space between the two.
+        # Pure, not `io_callback`: the whole state goes in and out each call.
         updated = jax.pure_callback(
             functools.partial(
                 self._advance, substeps=substeps, specs=specs,

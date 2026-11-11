@@ -47,19 +47,11 @@ class Timestep(NamedTuple):
     info: dict
 
 
-# Past this, a finite observation is a diverged world all the same. MuJoCo passes
-# through finite values on the way to NaN: Warp emitted ~1e11 the step before its
-# NaN, and the C engine behind `mujoco.batch` emits ~1e7 velocities until its own
-# QACC check resets the world, which never reaches NaN at all. One such step,
-# folded into the all-time `ObsStats`, scales that task's normalized inputs to ~0
-# for the rest of the run: humanoid `stand` went 985 -> 34 at 436M on Warp, and a
-# batch run never learned `run` in 500M (2026-11-07). Healthy humanoid columns
-# kept an RMS under 26 over 1B steps, and under random actions no loadable
-# playground task passed 78 in a 1,000-step episode.
+# Past this a finite observation is a diverged world: one in `ObsStats` sank
+# humanoid `stand` 985 -> 34 on Warp (2026-11-07). Healthy ones stay under 78.
 DIVERGED_OBS_LIMIT = 1e3
 
-# How long an eval runs an episode on a driver with `max_episode_steps=0`,
-# which puts no cutoff of its own on it.
+# Eval episode length when `max_episode_steps=0` sets no cutoff.
 UNCAPPED_EVAL_STEPS = 1000
 
 
@@ -192,11 +184,8 @@ class JaxVectorEnv:
         return jax.tree.map(_leaf, reset_pool, stepped)
 
 
-# The state a world is rebuilt from, and the derived fields the batch copies back.
-# A task may read only these off `data`: every other field keeps its reset value
-# (`fields_the_task_reads_that_batch_never_updates` finds such a task). Add only
-# fields `mj_step` always computes: the batch shares an MjData across worlds, so
-# any other holds another world's value (the `mujoco.batch` docstring).
+# A task may read only these off `data`. Add only fields `mj_step` always
+# computes: the batch shares one MjData across worlds.
 _BATCH_CARRIED = (
     "qpos", "qvel", "act", "qacc_warmstart", "mocap_pos", "mocap_quat", "time",
 )
@@ -325,9 +314,7 @@ class BatchVectorEnv(JaxVectorEnv):
                 row[ids] = np.asarray(value)[ids].reshape(row[ids].shape)
 
         self._rows["ctrl"][:] = np.asarray(action)
-        # mjSTAGE_NONE, the default: derived fields lag the state by a substep,
-        # exactly as they do after `mjx.step`, which is what the tasks were
-        # written against.
+        # mjSTAGE_NONE: derived fields lag a substep, as after `mjx.step`.
         self._batch.step(nstep=self._n_substeps)
 
         out = {

@@ -168,9 +168,6 @@ def _save(agent, path, **kwargs):
         checkpointer.save(Path(path).resolve(), payload)
 
 
-# Locating a checkpoint
-
-
 class TestFindCheckpoint:
     def test_parses_step_count_from_the_directory_name(self):
         assert checkpoint_steps("/runs/x/checkpoints/500000") == 500_000
@@ -199,9 +196,6 @@ class TestFindCheckpoint:
             find_checkpoint(tmp_path)
 
 
-# The per-agent round trip
-
-
 @pytest.mark.parametrize("name", AGENTS)
 def test_resume_continues_the_run_it_interrupted(name, tmp_path):
     """The whole feature in one assertion, for every agent that learns.
@@ -228,10 +222,8 @@ def test_resume_continues_the_run_it_interrupted(name, tmp_path):
     assert metadata["buffer_restored"] is True
     _assert_same_state(uninterrupted, resumed)
 
-    # Same continuation for both: the same fresh transitions, then the same
-    # update with the same key.
-    # Four iterations rather than a second warmup: the buffers are already
-    # full, and PPO's queue is exactly `sample_sequence_length` rows wide.
+    # Four iterations, not a warmup: the buffers are already full, and PPO's
+    # queue is exactly `sample_sequence_length` rows wide.
     continue_key = jax.random.PRNGKey(7)
     for agent in (uninterrupted, resumed):
         harness.drive(agent, 4, continue_key)
@@ -240,12 +232,7 @@ def test_resume_continues_the_run_it_interrupted(name, tmp_path):
     _assert_same_state(uninterrupted, resumed)
 
 
-# What a checkpoint carries, driven through one agent
-#
-# These five are claims about the SAVE FORMAT rather than about any one
-# algorithm — the per-agent round trip above is what covers the algorithms — so
-# they share one trained TD3 and the two checkpoints it writes. Training an
-# agent is a compile; writing a checkpoint is not.
+# What a checkpoint carries: save-format claims, so one trained TD3 serves all.
 
 
 @pytest.fixture(scope="module")
@@ -466,7 +453,7 @@ def test_trainer_resumes_the_run_end_to_end(tmp_path, logging_to):
     def run(steps, agent, resume=None):
         trainer = Trainer(
             output_dir=str(tmp_path), steps=steps, epoch_steps=8 * ENVS,
-            save_steps=first, test_episodes=2, show_progress=False,
+            save_steps=first, show_progress=False,
             save_buffer=True, resume=resume,
         )
         trainer.run(agent, env, test_env, ENVS, nnx.Rngs(envs=0, agent=3))
@@ -507,7 +494,7 @@ def test_a_fresh_run_fills_the_replay_before_its_first_pass(tmp_path, logging_to
     env, test_env = _fake_vector_env(), _fake_vector_env(num_envs=2)
     trainer = Trainer(
         output_dir=str(tmp_path), steps=16 * ENVS, epoch_steps=8 * ENVS,
-        save_steps=16 * ENVS, test_episodes=2, show_progress=False,
+        save_steps=16 * ENVS, show_progress=False,
     )
     trainer.run(agent, env, test_env, ENVS, nnx.Rngs(envs=0, agent=3))
 
@@ -534,7 +521,7 @@ def test_a_resume_without_a_saved_buffer_refills_it(tmp_path, logging_to):
 
     trainer = Trainer(
         output_dir=str(tmp_path), steps=steps, epoch_steps=8 * ENVS,
-        save_steps=steps, test_episodes=2, show_progress=False,
+        save_steps=steps, show_progress=False,
     )
     trainer.run(harness.build("td3"), env, env, ENVS, nnx.Rngs(envs=0, agent=3))
 
@@ -544,7 +531,7 @@ def test_a_resume_without_a_saved_buffer_refills_it(tmp_path, logging_to):
 
     resumed = Trainer(
         output_dir=str(tmp_path), steps=steps + 8 * ENVS, epoch_steps=8 * ENVS,
-        save_steps=steps, test_episodes=2, show_progress=False, resume=metadata,
+        save_steps=steps, show_progress=False, resume=metadata,
     )
     assert resumed._warmup_iters(resumed_agent.hp.memory_warmup, ENVS) == (
         resumed_agent.hp.memory_warmup // ENVS

@@ -1,41 +1,11 @@
-# The pixel encoder every actor and critic puts in front of its MLP — the
-# DrQ-v2 conv stack, then a projection to `latent_dim` through LayerNorm + tanh.
-# This file IS the `roxie.models.vision.PixelEncoder` call: every key below is
-# one of its keyword arguments (`tests/test_vision.py` pins both directions).
-#
-# Selecting the group turns vision on for the whole agent, because every
-# network block in every agent config reads `vision: ${oc.select:vision,null}`.
-# A launchable selects it in its defaults list, with the leading `/` as for
-# `/agent:` and `/env:`:
-#
-#   defaults:
-#     - /agent: sac
-#     - /env: playground
-#     - /vision: cnn      # or `null`, to leave it to the command line
-#     - _self_
-#
-# Listed that way, `vision=cnn` / `vision.latent_dim=100` work as overrides;
-# `+vision=cnn` does not, since Hydra resolves it under the launchable's own
-# folder. `experiments/vision/cartpole_sac.yaml` is a complete example. With no
-# `vision` group selected the blocks resolve to null and the networks are plain
-# MLPs. To give one network a different encoder, replace its whole block — its
-# `vision` is an interpolation, which a dotted override cannot reach into:
-#
-#   'agent.critic_config.critic1.vision={pixel_shape:${env.pixel_shape},
-#    channels:[32,32,32,32],kernel_sizes:[3,3,3,3],strides:[2,1,1,1],
-#    latent_dim:100}'
-#
-# The env has to produce pixels — `env.pixel_shape` is published by the env
-# once it is built, and stays null on an env without them, which the encoder
-# refuses loudly. On playground that means `env.vision=true env.impl=warp`.
-#
-# Replay stores observations as float32, pixels included: a 64x64x3 frame is
-# 48 KB, so a 500k-transition buffer is ~25 GB. Shrink
-# `agent.memory_config.max_length` to fit.
+# The pixel encoder in front of every network's MLP (`roxie.models.vision.PixelEncoder`
+# kwargs). Usage, and how to give one network its own encoder: docs/configuration.md#vision.
+# Replay stores pixels as float32: a 64x64x3 frame is 48 KB, so a 500k-transition
+# buffer is ~25 GB. Shrink `agent.memory_config.max_length` to fit.
 
 pixel_shape: ${env.pixel_shape}
 
-# One entry per conv layer; VALID padding. 64x64 -> 31 -> 29 -> 27 -> 25.
+# VALID padding: 64x64 -> 31 -> 29 -> 27 -> 25.
 channels: [32, 32, 32, 32]
 kernel_sizes: [3, 3, 3, 3]
 strides: [2, 1, 1, 1]

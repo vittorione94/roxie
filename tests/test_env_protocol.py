@@ -118,9 +118,8 @@ def test_params_stay_traced_and_reach_initial(vec_env, rng_key):
     at_two = np.asarray(jitted(rng_key, 2.0))
 
     assert np.allclose(at_two - at_zero, 2.0)
-    # One compile for both values is the property under test. Counted by trace,
-    # not `_cache_size()`: on jax 0.10.2 (what Python 3.11 locks to), a new
-    # function reads 0 there once the suite has filled the global jit cache.
+    # One compile for both. Counted by trace: on jax 0.10.2 `_cache_size()`
+    # reads 0 once the suite has filled the global jit cache.
     assert len(traces) == 1
 
 
@@ -263,9 +262,7 @@ def test_transition_info_metrics_are_batched(vec_env, rng_key):
 
     _, ts = vec_env.step(state, jnp.ones((4, 1), dtype=jnp.float32), rng_key, pool)
 
-    # The env's own keys, plus the one the DRIVER owns: `nonfinite` is reported
-    # by both backends (see the module docstring), so a run that is quietly
-    # resetting diverged worlds says so in `train/nonfinite`.
+    # Plus the driver's `nonfinite`, which both backends report.
     assert set(ts.info["metrics"]) == {"x", "nonfinite"}
     assert np.asarray(ts.info["metrics"]["x"]).shape == (4,)
     assert np.asarray(ts.info["metrics"]["nonfinite"]).shape == (4,)

@@ -58,9 +58,6 @@ def _obs(key, lead=(16,), width=OBS):
     return jax.random.normal(key, lead + (width,), dtype=jnp.float32)
 
 
-# The encoder
-
-
 class TestPixelEncoder:
     def test_replaces_the_image_with_a_bounded_latent(self, rng_key):
         encoder = _encoder()
@@ -477,7 +474,7 @@ def test_a_pixel_env_trains_saves_and_reloads(name, tmp_path):
     trainer = Trainer(
         output_dir=str(tmp_path), steps=20 * harness.ENVS,
         epoch_steps=10 * harness.ENVS, save_steps=20 * harness.ENVS,
-        test_episodes=2, show_progress=False,
+        show_progress=False,
     )
     try:
         trainer.run(agent, env, test_env, harness.ENVS, nnx.Rngs(envs=0, agent=3))

@@ -6,7 +6,6 @@ import sysconfig
 
 # Force CPU execution before JAX import for deterministic single-world playback.
 os.environ["JAX_PLATFORMS"] = "cpu"
-os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0")
 
 
 def _exec_under_mjpython() -> None:
@@ -25,9 +24,8 @@ def _exec_under_mjpython() -> None:
         )
 
     env = dict(os.environ)
-    # The trampoline resolves libpython's @executable_path against the venv's
-    # bin/, which for a uv-managed interpreter holds a symlink and no dylib, so
-    # dyld finds nothing. Point it at the real interpreter's lib dir first.
+    # A uv venv's bin/ holds a symlink, not libpython, so dyld needs the real
+    # interpreter's lib dir.
     libdir = sysconfig.get_config_var("LIBDIR")
     if libdir:
         fallback = env.get("DYLD_FALLBACK_LIBRARY_PATH", "/usr/local/lib:/usr/lib")
@@ -64,8 +62,7 @@ from hydra.utils import get_method
 
 from roxie.utils import playback
 
-# What is left to compile per launch is the agent's parameter init, 0.9 s of a
-# 1.5 s restore without this. Only `play.py` turns it on, for its own programs.
+# Saves the parameter-init compile, 0.9 s of a 1.5 s restore. Play-only.
 _COMPILE_CACHE = Path.home() / ".cache" / "roxie" / "jax_compile"
 
 # GLFW key codes. Up and down are the arrows `simulate` leaves unbound.
@@ -330,8 +327,7 @@ def main(
         world = worlds[tasks[controls.task]]
         if len(tasks) > 1:
             print(f"[viewer] task {tasks[controls.task]}", flush=True)
-        # The passive viewer is bound to the model it opens with, so each task
-        # gets a window of its own and a switch closes one and opens the next.
+        # The passive viewer is bound to its model: one window per task.
         with mujoco.viewer.launch_passive(
             world.model, world.data, key_callback=controls.key_callback,
         ) as viewer:

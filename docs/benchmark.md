@@ -8,7 +8,8 @@ and the only ones where the agents actually separate. The grid runs them two way
 - **Single-task** (`bench_<agent>.yaml`): each task trained on its own, on two
   implementations of the physics. **3 tasks × 7 agents × 2 cells = 42 runs**, each 500M
   env steps at 1024 parallel envs, one seed. The results below are these runs.
-- **Multi-task** (`multitask_<agent>.yaml`): one policy for all three tasks in one run, on
+- **Multi-task** (`bench_<agent>.yaml` with `release/bench@bench=multitask`; d4pg has its
+  own `multitask_d4pg.yaml`): one policy for all three tasks in one run, on
   Warp at 256 parallel envs. It is recorded as the task `Multitask`, so it shares the
   output tree, the W&B grouping, the plots and the export with the single-task runs. No
   released result comes from it yet.
@@ -96,7 +97,7 @@ uv run python scripts/export_release_weights.py      # publish the policies
 ```
 experiments/release/
   bench_<agent>.yaml         single-task launchable, one per agent
-  multitask_<agent>.yaml     multi-task launchable, one per agent
+  multitask_d4pg.yaml        d4pg's multi-task launchable, its replay sized for 4,096 worlds
   agent/<agent>_bench.yaml   matched hyperparameters, one per agent
   backend/<cell>.yaml        the four device cells (single-task only)
   bench/release.yaml         shared env + trainer + logging block
@@ -113,11 +114,12 @@ uv run python roxie/train.py --config-name release/bench_td3                 # H
 uv run python roxie/train.py --config-name release/bench_td3 release.task=HumanoidRun
 uv run python roxie/train.py --config-name release/bench_ppo release.task=HumanoidRun \
     release/backend@backend=warp_gpu
-uv run python roxie/train.py --config-name release/multitask_td3             # all three, warp_gpu
+uv run python roxie/train.py --config-name release/bench_td3 \
+    release/bench@bench=multitask '~release/backend@backend'                # all three, warp_gpu
 ```
 
 The backend group lives in a subdirectory of the search path, so `backend=batch_cpu` is
-rejected (`Key 'backend' is not in struct`) and `+backend=envpool_cpu` appends a second
+rejected (`Key 'backend' is not in struct`) and `+backend=warp_gpu` appends a second
 entry instead of replacing the default. `release/backend@backend=` is the form that works.
 
 ## Held identical across every arm

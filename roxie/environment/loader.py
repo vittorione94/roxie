@@ -73,10 +73,8 @@ class PlaygroundFuncEnv(FuncEnv):
 
 def _rendered_obs_size(env: Any, nworld: int) -> Mapping:
     """Per-world observation shapes of an env carrying a warp render context."""
-    # The context renders all `nworld` worlds on every call, so the unbatched
-    # trace behind `env.observation_size` reports an image as `(nworld, H, W,
-    # C)`. Vmapped at exactly `nworld` the batch axis IS the world axis and
-    # comes off cleanly; a batch of any other size does not trace at all.
+    # The context renders all `nworld` worlds per call, so `observation_size`
+    # reports `(nworld, H, W, C)`; only a vmap at exactly `nworld` traces.
     keys = jax.random.split(jax.random.PRNGKey(0), int(nworld))
     obs = jax.eval_shape(jax.vmap(env.reset), keys).obs
     return {key: tuple(x.shape[1:]) for key, x in obs.items()}
@@ -100,9 +98,7 @@ def _obs_layout(sizes: Mapping) -> tuple[tuple[str, ...], tuple[int, ...] | None
             f"encoder reads exactly one"
         )
     rest = sorted(key for key in sizes if not key.startswith("pixels/"))
-    # Flattening hands every group to the actor, so only a camera and the
-    # actor's own `state` qualify: an asymmetric task's `privileged_state` is
-    # simulator-only information meant for the critic.
+    # Flattening hands every group to the actor, so `privileged_state` is out.
     if not pixels or set(rest) - {"state"}:
         raise ValueError(
             f"a dict observation is flattened for the policy only as one "
@@ -206,9 +202,8 @@ def put_warp_model(env: Any, graph_mode: str) -> None:
         impl="warp",
         graph_mode=getattr(mjxw_types.GraphMode, graph_mode),
     )
-    # Playground caps the solver low on purpose, so these two print per world per
-    # step: 40-50k lines a minute on the humanoids at 256 worlds (2026-11-06). The
-    # contact and constraint overflows stay on; those are a budget set too small.
+    # Playground caps these on purpose: 40-50k warnings a minute on humanoids
+    # at 256 worlds (2026-11-06). Contact and constraint overflows stay on.
     capped = mjw.OverflowType.ITERATIONS | mjw.OverflowType.LS_ITERATIONS
     impl = model.opt._impl
     impl = impl.replace(warn_overflow=int(impl.warn_overflow) & ~int(capped))
@@ -263,7 +258,6 @@ class EnvBundle(NamedTuple):
 
     env: Any
     test_env: Any
-    env_cfg: Any
 
 
 TRAINER_ENV_KEYS = frozenset({
@@ -317,11 +311,9 @@ def build_playground_env(
         )
 
     func_env, env_cfg = load(num_envs)
-    # A render context is allocated for a fixed `nworld` that JAX cannot see, so
-    # the eval batch needs its own env rather than sharing the training one.
+    # A render context is sized for a fixed `nworld`, so eval needs its own env.
     test_func_env = load(test_episodes)[0] if vision else func_env
-    # Pixels are drawn by warp's renderer, so a vision replay keeps its physics
-    # on warp rather than C MuJoCo.
+    # Pixels come from warp's renderer, so a vision replay stays on warp.
     if mode == "play" and not vision:
         func_env.metadata["impl"] = "native"
     max_steps = int(max_episode_steps or env_cfg.episode_length)
@@ -332,7 +324,6 @@ def build_playground_env(
     return EnvBundle(
         env=driver(func_env, num_envs, max_episode_steps=max_steps),
         test_env=driver(test_func_env, test_episodes, max_episode_steps=max_steps),
-        env_cfg=env_cfg,
     )
 
 
@@ -348,9 +339,8 @@ def task_blocks(cfg_env: Any) -> list:
     # Left a config, so `get` on a single block still resolves its interpolations.
     if "tasks" not in cfg_env:
         return [cfg_env]
-    # Resolved while they are still part of the composed config their
-    # interpolations point into, and copied out of it: Hydra locks it, so a
-    # task block's own keys could not be merged into the defaults.
+    # Resolved inside the composed config their interpolations point into, then
+    # copied out, since Hydra locks it against merging.
     defaults = plain(cfg_env.get("task_defaults", None)) or {}
     return [{**defaults, **(plain(block) or {})}
             for block in cfg_env["tasks"].values()]

@@ -245,18 +245,3 @@ def test_a_rollout_is_frozen_once_built():
             setattr(rollout, name, value)
     # ...and the values actually survived the attempts.
     assert rollout.num_envs == 4 and rollout.metric_keys == ("height",)
-
-
-def test_the_step_functions_carry_no_instance():
-    """What lets the compiled programs take `advance` as a static argument.
-
-    A bound method would hold its rollout in `__self__`, putting the instance
-    back in the jit cache key and retracing the whole chunk once per rollout —
-    which is exactly what a static `self` used to do.
-    """
-    for name in ("advance", "observe_params"):
-        fn = getattr(Rollout, name)
-        assert not hasattr(fn, "__self__"), (
-            f"Rollout.{name} is bound and would key the cache on its instance"
-        )
-        assert hash(fn) is not None

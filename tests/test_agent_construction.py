@@ -23,10 +23,8 @@ from roxie.agents.utils import build_agent, build_optimizer, network_rngs
 REPO = Path(__file__).resolve().parent.parent
 
 OBS, ACT = 16, 6
-# PPO splits `add_batch_size * (sample_sequence_length - 1)` transitions into
-# `num_minibatches`, and the shrink below caps the sequence at 8 — so this has
-# to leave `ENVS * 7` divisible by every `num_minibatches` the repo's PPO
-# configs name (4).
+# PPO minibatches `ENVS * 7` transitions (sequence capped at 8 below), so this
+# must divide by every shipped `num_minibatches` (4).
 ENVS = 40
 
 CONFIG_FILES = sorted(
@@ -46,9 +44,7 @@ def _accepts(cls, name: str) -> bool:
 def _build(agent_cfg):
     """Construct one agent exactly as train.py does, with the replay buffers
     shrunk — this is a wiring check, not a memory test."""
-    # `obs_size` / `action_size` / `obs_action_size` stand in for what
-    # `loader.publish_env_shapes` writes back once the real env is built; the
-    # network blocks interpolate them.
+    # Stand-ins for what `loader.publish_env_shapes` writes back.
     cfg = OmegaConf.create(
         {
             "env": {

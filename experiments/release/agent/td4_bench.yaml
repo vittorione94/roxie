@@ -16,7 +16,7 @@ hyperparams:
   steps_between_updates: 2_048
   learning_steps: 20
   max_grad_norm: 1
-  pre_activation_coef: 0.0        # see ddpg_bench.yaml
+  pre_activation_coef: 0.0
   normalize_observations: true
   obs_norm_clip: 5.0
   obs_norm_eps: 1e-08

@@ -14,7 +14,6 @@ against toy envs on the JAX path and two small tasks on `mujoco.batch`:
 
 from pathlib import Path
 
-import flashbax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -77,7 +76,6 @@ def build_counter_env(*, width=2, start=0.0, actions=1, max_steps=3,
         env=JaxVectorEnv(env, num_envs, max_episode_steps=max_steps),
         test_env=(JaxVectorEnv(env, test_episodes, max_episode_steps=max_steps)
                   if eval_env else None),
-        env_cfg=None,
     )
 
 
@@ -289,7 +287,9 @@ def test_humanoid_launchable_composes_the_three_tasks_on_warp():
     hydra_searchpath.register()
     with initialize_config_dir(config_dir=str(REPO / "roxie" / "configs"),
                                version_base=None):
-        cfg = compose(config_name="release/multitask_sac")
+        cfg = compose(config_name="release/bench_sac", overrides=[
+            "release/bench@bench=multitask", "~release/backend@backend",
+        ])
     assert list(cfg.env.tasks) == ["stand", "walk", "run"]
     assert requested_impl(cfg.env) == "warp"
     assert not uses_batch(cfg.env)

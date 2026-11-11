@@ -1,35 +1,13 @@
 _target_: roxie.environment.multitask.build_multitask_env
 
-# Several independent tasks trained as one batch, each built by its own builder
-# from its own env block. Every task keeps its own physics, observation and
-# reward; they only have to share an action space.
-#
-# A launchable picks it up in its defaults list and names the tasks:
-#
-#   defaults:
-#     - /agent: sac
-#     - /env: multitask
-#     - _self_
-#
-#   env:
-#     task_defaults:                   # what every task shares
-#       impl: warp
-#     tasks:
-#       walk: {env_name: WalkerWalk}
-#       run: {env_name: WalkerRun}
-#     weights: {walk: 1, run: 2}       # each task's share of the worlds
-#
-# The observation is every task's own, zero-padded to the widest one, with the
-# task's one-hot appended. `weights` split `parallel_envs` once, at launch: a
-# world never changes task. Eval gives every task `trainer.test_episodes`
-# worlds of its own. To change what the learner trains on as it goes, add a
-# `curriculum` group instead (roxie/configs/curriculum/).
+# Several tasks trained as one batch, each from its own env block; they must
+# share an action space. Usage and observation layout: docs/environments.md.
 
 # Task name to that task's env block, merged over `task_defaults`.
 tasks: ???
 task_defaults:
   _target_: roxie.environment.loader.build_playground_env
-# Task name to its relative share of the training worlds; null splits evenly.
+# Each task's share of the worlds, fixed at launch; null splits evenly.
 weights: null
 seed: 0
 parallel_envs: 256

@@ -33,22 +33,18 @@ class Playback:
 
     Attributes:
         cfg: the run's Hydra config, after the single-world rewrites.
-        env: the environment bundle, built with `num_envs=1`.
-        func_env: `env.func_env`, the unbatched functional environment.
+        func_env: the unbatched functional environment.
         agent: the restored agent, ready for `select_action(..., evaluate=True)`.
         obs_size: width of the observation the agent was trained on.
-        action_size: width of the action space.
         observe: maps one world's observation to what the policy was trained
             on; the identity for a single-task run, and for one task of a
             multi-task run, padding to the trained width plus its one-hot.
     """
 
     cfg: Any
-    env: Any
     func_env: Any
     agent: Any
     obs_size: int
-    action_size: int
     observe: Callable[[Any], Any]
 
 
@@ -98,8 +94,8 @@ def select_task(cfg: Any, task_id: str | None) -> tuple[Any, int | None]:
             f"one of them, not {task_id!r}."
         )
     task = names.index(task_id)
-    # The trainer's keys stay: the agent's blocks interpolate
-    # `${env.parallel_envs}` to rebuild the replay geometry it trained with.
+    # Kept: the agent's blocks interpolate `${env.parallel_envs}` for the replay
+    # geometry it trained with.
     shared = {k: cfg.env[k] for k in TRAINER_ENV_KEYS if k in cfg.env}
     cfg.env = OmegaConf.create({**shared, **task_blocks(cfg.env)[task]})
     return cfg, task
@@ -142,12 +138,9 @@ def _single_task(obs):
 
 def resolve_single_world(cfg: Any) -> Any:
     """Rewrites a trained config onto a backend that can step one world."""
-    # A `vision` encoder group, or a playground env asked to render, means the
-    # policy reads pixels only warp's CUDA renderer draws, so it replays where
-    # it trained.
+    # A pixel policy needs warp's CUDA renderer, so it replays where it trained.
     if cfg.get("vision") or cfg.env.get("vision"):
-        # JAX's default 75% preallocation leaves warp too little to allocate
-        # the world in.
+        # JAX's default 75% preallocation leaves warp too little for the world.
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
         jax.config.update("jax_platforms", "cuda")
     elif cfg.env.get("impl", None) in ("warp", BATCH_IMPL):
@@ -171,7 +164,7 @@ def _load_world(
     cfg, task = select_task(load_config(checkpoint_path, overrides), task_id)
     cfg = resolve_single_world(cfg)
 
-    env, _, _env_cfg = build_env(cfg.env, mode="play", num_envs=1, test_episodes=1)
+    env = build_env(cfg.env, mode="play", num_envs=1, test_episodes=1).env
     if verbose:
         log_loaded_backend(env)
 
@@ -188,10 +181,8 @@ def _load_world(
 
     return {
         "cfg": cfg,
-        "env": env,
         "func_env": func_env,
         "obs_size": obs_size,
-        "action_size": action_size,
         "observe": observe,
     }
 
@@ -206,7 +197,7 @@ def _load_agent(checkpoint_path: str, world: dict[str, Any]) -> Any:
     return get_class(cfg.agent._target_).load(
         path=checkpoint_path,
         env_obs_size=world["obs_size"],
-        env_act_size=world["action_size"],
+        env_act_size=space_size(world["func_env"].action_space),
         **agent_args,
     )
 

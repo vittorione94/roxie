@@ -149,9 +149,7 @@ def ppo_loss_fn(
     key
 ):
     """Computes the PPO clipped surrogate actor loss and diagnostic metrics."""
-    # Every argument arrives flat over `(env, time)` and already trimmed to the
-    # GAE horizon — `_prepare_rollout` slices and flattens once, so that a single
-    # permutation can shuffle transitions rather than whole trajectories.
+    # Arguments arrive flattened over `(env, time)`, trimmed to the GAE horizon.
     distribution = actor_model(observations)
     logp_new = distribution.log_prob_from_pre(pre_actions)
 

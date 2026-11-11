@@ -66,8 +66,7 @@ class TrainState(nnx.Module):
 
         self.buffer_state = buffer_state
         self.obs_stats = obs_stats
-        # Traced, so a curriculum can move it between learning passes with no
-        # recompile; None leaves the replay sampling uniformly.
+        # Traced, so a curriculum can change it without a recompile.
         self.task_weights = task_weights
 
 
@@ -91,32 +90,19 @@ class Agent(abc.ABC):
     freeze_obs_norm_per_chunk = False
     joint_grad_clip = False
 
-    # The slots below are declared here rather than left for a subclass's
-    # `__init__` to inject, so a non-learning baseline — which gets none of
-    # them — still answers rather than raising.
-
-    # Per-actuator env action bounds, what `scale_to_env` maps [-1, 1] onto.
+    # The slots below are declared so a non-learning baseline, which never
+    # sets them, still answers rather than raising.
     action_low = None
     action_high = None
 
-    # Set by `_init_train_state`. `state` is deliberately NOT declared here:
-    # `hasattr(agent, "state")` is what tells a learning agent from a
-    # play-only baseline in `checkpoint.py` and `trainer.py`, and a class-level
-    # `None` would answer true for both.
+    # `state` is deliberately NOT declared: `hasattr(agent, "state")` is what
+    # tells a learning agent from a play-only baseline.
     diagnostics = None
-
-    # The `utils.memory.ReplayManager` a buffered agent builds in its
-    # `__init__`, and the geometry it was built with.
     replay = None
     buffer_size = None
     batch_size = None
-
-    # Built on first save or restore, by the `checkpointer` property.
     _checkpointer = None
-
-    # Each task's number of training worlds, in one-hot order, and each world's
-    # task, for a multi-task env; both None for a single-task one. Set by
-    # `_bind_tasks` before anything is sized off them.
+    # Worlds per task in one-hot order, and each world's task; None if one task.
     task_counts = None
     task_ids = None
 
@@ -269,8 +255,7 @@ class Agent(abc.ABC):
             observation = normalize_obs(
                 observation, mean, std, self.hp.obs_norm_clip,
             )
-        # This path's own NaN scrub: `clip` would pass one straight through to
-        # the physics.
+        # Own NaN scrub: `clip` would pass a NaN straight to the physics.
         action = jnp.clip(
             finite_or_zero(deterministic_action(actor(observation))), -1.0, 1.0
         )
@@ -312,17 +297,11 @@ class Agent(abc.ABC):
         """
         state = self.state if state is None else state
         width = next_obs.shape[-1]
-        # Three passes rather than one over a concatenation: the sums are
-        # associative, and a (3 * T * B, D) temporary is the one array here
-        # large enough to be worth not materializing.
+        # Three passes, not one concatenation: avoids a (3*T*B, D) temporary.
         landed = next_obs.reshape(-1, width)
         stats = state.obs_stats
-        # The weighting is the per-step path's: under normalization the landing
-        # observation counts twice, once from the pair `buffer_transitions`
-        # folds in and once from the fold the rollout does deliberately on top
-        # of it. Dropping either reweights the statistics away from every run
-        # logged so far. Without normalization only that second fold ever ran,
-        # so the statistics still advance for anything that reads them later.
+        # Matches the per-step path, where under normalization the landing
+        # observation is folded twice; without it only the second fold runs.
         if self.hp.normalize_observations:
             stats = update_obs_stats(stats, observation.reshape(-1, width))
             stats = update_obs_stats(stats, landed)
@@ -370,15 +349,13 @@ class Agent(abc.ABC):
         """
         self.diagnostics = DiagnosticsTracker(type(self).__name__.lower())
 
-        # The buffer is the authority on observation width, so stats built
-        # from it cannot disagree with `add`. A multi-task observation ends in
-        # its task's one-hot, which the statistics read rather than average.
+        # Width from the buffer, so it cannot disagree with `add`, minus the
+        # trailing task one-hot, which the statistics do not average.
         num_tasks = 0 if self.task_counts is None else len(self.task_counts)
         width = buffer_state.experience.observation.shape[-1] - num_tasks
         task_weights = None
         if num_tasks and isinstance(self.hp, OffPolicyHyperparams):
-            # The collection shares, so the replay starts out drawing tasks
-            # exactly as uniform sampling would.
+            # Start at the collection shares, i.e. what uniform sampling draws.
             task_weights = jnp.asarray(
                 np.asarray(self.task_counts) / sum(self.task_counts),
                 dtype=FLOAT,

@@ -1,16 +1,8 @@
 # @package _global_
 
-# SAC balancing a cartpole from pixels alone: mujoco_playground renders a
-# 64x64 stack of three grayscale frames through mujoco_warp, and every network
-# reads it through the `vision` group's conv encoder. GPU only — the renderer
-# is warp.
+# SAC balancing a cartpole from 64x64 pixels rendered by mujoco_warp. GPU only.
 #
 #   uv run --group cuda python roxie/train.py --config-name vision/cartpole_sac
-#
-# The `/vision` default is what any launchable adds to see; listing it as
-# `- /vision: null` instead makes it switchable from the command line
-# (`vision=cnn`). `+vision=cnn` cannot work from a launchable in a
-# subdirectory: Hydra looks for the group under the launchable's own folder.
 
 defaults:
   - /agent: sac

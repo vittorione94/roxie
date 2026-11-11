@@ -39,11 +39,13 @@ Each run writes to its Hydra output dir: resolved config under `.hydra/`, epoch 
 
 A multi-task launchable names its tasks in an env block ([environments.md](environments.md#several-tasks-at-once)). 
 
-[`experiments/release/multitask_sac.yaml`](../experiments/release/multitask_sac.yaml) trains one policy for mujoco_playground's humanoid stand, walk and run, on Warp:
+[`experiments/release/bench/multitask.yaml`](../experiments/release/bench/multitask.yaml) swapped in for a bench launchable's single task trains one policy for mujoco_playground's humanoid stand, walk and run, on Warp:
 
 ```bash
-uv run --group cuda python roxie/train.py --config-name release/multitask_sac
-uv run --group cuda python roxie/train.py --config-name release/multitask_sac curriculum=learning_progress
+uv run --group cuda python roxie/train.py --config-name release/bench_sac \
+    release/bench@bench=multitask '~release/backend@backend'
+uv run --group cuda python roxie/train.py --config-name release/bench_sac \
+    release/bench@bench=multitask '~release/backend@backend' curriculum=learning_progress
 ```
 
 The env block's `weights` fix each task's share of the worlds for the run. A **curriculum** steers what the learner samples from them instead: it sets the replay's task weights before the first learning pass, then at every epoch boundary reads each task's training score and sets them for the passes that follow. [`roxie/configs/curriculum/`](../roxie/configs/curriculum/) holds `learning_progress`, which favours the tasks whose score is moving, and `weighted`, which pins fixed weights. A curriculum needs a multi-task env and an off-policy agent; `train.py` refuses anything else at launch.

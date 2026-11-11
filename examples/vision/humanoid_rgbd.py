@@ -46,9 +46,7 @@ from roxie.environment.vector import JaxVectorEnv
 from roxie.utils import precision
 
 _HIDDEN_GROUP = 5
-# The field sits this far below the floor plane, so ground the terrain leaves
-# at zero is the plane's alone: coplanar surfaces would double every contact
-# there and fight over which one the viewer draws.
+# Sunk below the floor plane: coplanar surfaces would double every contact there.
 _TERRAIN_SINK = 0.005
 # Half-width of the square under the feet that a start is lifted clear of.
 _FOOTPRINT = 0.4
@@ -82,9 +80,8 @@ class TerrainConfig:
     """
 
     size: float = 64.0
-    # warp keeps the first 50 terrain triangles a geom touches and drops the
-    # rest; at 0.1 m a falling humanoid overran that 5 times in 51,200
-    # random-action world-steps, at 0.15 m never, at the same step time.
+    # warp keeps 50 terrain triangles per geom: at 0.1 m a falling humanoid overran
+    # that 5 times in 51,200 random world-steps, at 0.15 m never.
     cell: float = 0.15
     hill_height: float = 1.0
     hill_length: float = 8.0
@@ -154,10 +151,8 @@ def add_terrain(spec: mujoco.MjSpec, heights: np.ndarray, size: float) -> None:
         material="terrain",
         conaffinity=1,
     )
-    # Relief only reaches the colour channels as shading. dm_control's navy
-    # floor is too dark to shade visibly, and the humanoid's own light is a
-    # spot 2 m over it that leaves everything past arm's reach unlit, so the
-    # field gets a light checker (1 m squares, for scale) and a low sun.
+    # Relief only shows as shading, invisible on the navy floor under the humanoid's
+    # spot light, hence a light 1 m checker and a low sun.
     spec.add_texture(
         name="terrain",
         type=mujoco.mjtTexture.mjTEXTURE_2D,
@@ -243,11 +238,8 @@ class HumanoidRGBD(humanoid.Humanoid):
             for name in ("pos", "dir", "pos0", "poscom0", "dir0")
         }
 
-        # The egocentric camera sits exactly on the head sphere's surface and
-        # warp's ray tracer has no near plane, so whether a world sees out or
-        # sees the inside of its own head is float rounding. The context picks
-        # its geoms by group when it is built, so hiding them in a copy of the
-        # model leaves the physics alone.
+        # The camera sits on the head's surface and warp's ray tracer has no near
+        # plane, so hide the head from the render model (a copy; physics unchanged).
         render_model = copy.copy(self._mj_model)
         for name in self._config.hidden_geoms:
             render_model.geom_group[render_model.geom(name).id] = _HIDDEN_GROUP
@@ -291,12 +283,8 @@ class HumanoidRGBD(humanoid.Humanoid):
 
     def _pose_lights(self, data: mjx.Data) -> mjx.Data:
         """Fills in the light poses warp's staged graph mode leaves at zero."""
-        # Under `WARP_STAGED_EX` the step never copies `light_xpos`/`light_xdir`
-        # back, so every light reaches the renderer pointing nowhere and frames
-        # are lit by the ambient term alone (2026-11-01). `JAX` graph mode
-        # keeps them but steps 12x slower: 117 ms against 9.7 ms, 256 worlds.
-        # This is mujoco_warp's own `_light_local_to_global`, less the target
-        # modes `__init__` refuses.
+        # `JAX` graph mode keeps the lights but steps 12x slower (117 vs 9.7 ms, 256
+        # worlds, 2026-11-01). Mirrors mujoco_warp's `_light_local_to_global`.
         lights = self._lights
         body = self._mj_model.light_bodyid
         mode = self._mj_model.light_mode[:, None]
@@ -341,9 +329,8 @@ class HumanoidRGBD(humanoid.Humanoid):
     def reset(self, rng):
         rng, qvel_key, spawn_key, yaw_key = jax.random.split(rng, 4)
         state = super().reset(rng)
-        # The parent's start pose ignores `rng`, so under vmap its data has no
-        # batch axis, the render runs unbatched and hands every world all
-        # `nworld` images. Drawing the start state from `rng` batches it.
+        # The parent's start pose ignores `rng`, so under vmap the render runs
+        # unbatched and every world gets all `nworld` images.
         qvel = self._config.reset_qvel_scale * jax.random.normal(
             qvel_key, (self.mjx_model.nv,), dtype=precision.FLOAT,
         )
@@ -438,5 +425,4 @@ def build_humanoid_rgbd_env(
         test_env=JaxVectorEnv(
             load(test_episodes), test_episodes, max_episode_steps=max_steps,
         ),
-        env_cfg=config,
     )

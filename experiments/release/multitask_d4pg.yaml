@@ -9,10 +9,8 @@ defaults:
 release:
   agent: d4pg
 
-# Sized for 4,096 worlds. `max_length` is shared by all worlds, which reset in
-# lockstep here, so a window under one episode (500k would be 122 steps) only ever
-# holds one slice of the episode. 2,048 steps per world is close to the 1,953 that
-# 256 worlds get from the bench's 500k.
+# Sized for 4,096 lockstep worlds: the bench's 500k would hold 122 steps each, under
+# one episode; 2,048 per world is close to the 1,953 that 256 worlds get from 500k.
 agent:
   hyperparams:
     memory_warmup: 491_520      # 120 control steps per world

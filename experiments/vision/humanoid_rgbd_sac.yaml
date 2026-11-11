@@ -1,16 +1,9 @@
 # @package _global_
 
-# SAC walking the humanoid across generated terrain (hills, rough patches, flat
-# ground, raised blocks) from a head-mounted RGB-D camera plus its own
-# proprioception. The env is not a mujoco_playground vision task: it is built by
-# `examples/vision/humanoid_rgbd.py`, a builder outside `roxie/` named by
-# `env._target_`, which renders the `egocentric` camera through mujoco_warp and
-# stacks colour and depth into one 64x64x4 image. GPU only.
+# SAC walking the humanoid over generated terrain from a head-mounted RGB-D camera
+# plus proprioception; the env comes from `examples/vision/humanoid_rgbd.py`. GPU only.
 #
 #   uv run --group cuda python roxie/train.py --config-name vision/humanoid_rgbd_sac
-#
-# No `/env` group: this block is the whole builder call, every key one of
-# `build_humanoid_rgbd_env`'s keywords.
 
 defaults:
   - /agent: sac
@@ -28,12 +21,9 @@ env:
   # Metres mapped to depth 1; anything further, and the sky, reads 1.
   depth_scale: 10.0
   use_textures: true   # the checker is the visual cue of motion and scale
-  # Joint angles, velocities and the rest of the state task's 67 entries,
-  # after the image. False trains from pixels alone.
+  # The state task's 67 entries after the image; false trains from pixels alone.
   proprio: true
-  # `TerrainConfig`'s fields, in metres; `terrain: null` is flat floor. One
-  # field is shared by every world, each episode starting at a random spot and
-  # heading on it.
+  # `TerrainConfig`'s fields, in metres; null is flat floor. One field shared by every world.
   terrain:
     size: 64.0
     cell: 0.15

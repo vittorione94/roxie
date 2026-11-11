@@ -129,9 +129,7 @@ class TestNStepRepack:
             b = repack_samples(_PairSample(experience=_Pair(first, second)), GAMMA, 1)
             for k in ("observations", "rewards", "bootstrap"):
                 np.testing.assert_allclose(a[k], b[k], rtol=1e-6, err_msg=f"{k} term={term}")
-            # next_observations only matters where the bootstrap coefficient is
-            # nonzero (at terminals the traj path zeroes it, the pair path
-            # carries the unused next obs — both multiplied by 0 in the target).
+            # At terminals the bootstrap is 0, so next_observations is unused there.
             if not term:
                 np.testing.assert_allclose(
                     a["next_observations"], b["next_observations"], rtol=1e-6,
