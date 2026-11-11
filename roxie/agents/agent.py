@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx, struct
 
+from roxie.agents.hyperparams import OffPolicyHyperparams
 from roxie.agents.utils import make_optimizer, serialize_bound
 from roxie.models.actors import deterministic_action
 from roxie.utils.checkpoint import AgentCheckpointer
 from roxie.utils.diagnostics import DiagnosticsTracker
+from roxie.utils.precision import FLOAT
 from roxie.utils.math import (
     finite_or_zero,
     init_obs_stats,
@@ -38,6 +41,7 @@ class TrainState(nnx.Module):
     target_critic: Optional[nnx.Module] = nnx.data()
     buffer_state: Any = nnx.data()
     obs_stats: Any = nnx.data()
+    task_weights: Any = nnx.data()
 
     def __init__(
         self,
@@ -50,6 +54,7 @@ class TrainState(nnx.Module):
         critic_optimizer: nnx.Optimizer,
         buffer_state: Any,
         obs_stats: Any,
+        task_weights: Any = None,
     ):
         self.actor = actor
         self.critic = critic
@@ -61,6 +66,8 @@ class TrainState(nnx.Module):
 
         self.buffer_state = buffer_state
         self.obs_stats = obs_stats
+        # Traced, so a curriculum can change it without a recompile.
+        self.task_weights = task_weights
 
 
 @struct.dataclass
@@ -83,28 +90,21 @@ class Agent(abc.ABC):
     freeze_obs_norm_per_chunk = False
     joint_grad_clip = False
 
-    # The slots below are declared here rather than left for a subclass's
-    # `__init__` to inject, so a non-learning baseline — which gets none of
-    # them — still answers rather than raising.
-
-    # Per-actuator env action bounds, what `scale_to_env` maps [-1, 1] onto.
+    # The slots below are declared so a non-learning baseline, which never
+    # sets them, still answers rather than raising.
     action_low = None
     action_high = None
 
-    # Set by `_init_train_state`. `state` is deliberately NOT declared here:
-    # `hasattr(agent, "state")` is what tells a learning agent from a
-    # play-only baseline in `checkpoint.py` and `trainer.py`, and a class-level
-    # `None` would answer true for both.
+    # `state` is deliberately NOT declared: `hasattr(agent, "state")` is what
+    # tells a learning agent from a play-only baseline.
     diagnostics = None
-
-    # The `utils.memory.ReplayManager` a buffered agent builds in its
-    # `__init__`, and the geometry it was built with.
     replay = None
     buffer_size = None
     batch_size = None
-
-    # Built on first save or restore, by the `checkpointer` property.
     _checkpointer = None
+    # Worlds per task in one-hot order, and each world's task; None if one task.
+    task_counts = None
+    task_ids = None
 
     # Highest update boundary already served; see `due_for_update`.
     _last_update_boundary = -1
@@ -189,6 +189,52 @@ class Agent(abc.ABC):
         """The clip the OPTIMIZERS apply; `None` when the agent clips jointly."""
         return None if type(self).joint_grad_clip else self.hp.max_grad_norm
 
+    def _bind_tasks(self, env_task_counts) -> None:
+        """Records the env's task layout; call before the replay or state.
+
+        A multi-task env batches each task's worlds as one contiguous block, in
+        one-hot order, so the counts alone give every world's task.
+        """
+        if env_task_counts is None:
+            return
+        self.task_counts = tuple(int(c) for c in env_task_counts)
+        self.task_ids = np.repeat(
+            np.arange(len(self.task_counts)), self.task_counts
+        )
+
+    def set_task_weights(self, weights) -> None:
+        """Weights the replay's draws by task from the next learning pass on.
+
+        Args:
+            weights: one non-negative weight per task, in one-hot order; it
+              need not sum to 1, and is stored normalised.
+
+        Raises:
+            ValueError: on a single-task env or an on-policy agent, which have
+              no task-weighted replay to steer, or on weights that are not one
+              finite, non-negative number per task with a positive total.
+        """
+        live = getattr(self.state, "task_weights", None)
+        if live is None:
+            raise ValueError(
+                f"{type(self).__name__} samples no task-weighted replay: it "
+                f"needs a multi-task env and an off-policy agent."
+            )
+        host = np.asarray(weights, dtype=np.float64)
+        if host.shape != live.shape:
+            raise ValueError(
+                f"{host.shape[0] if host.ndim else 0} task weights for "
+                f"{live.shape[0]} tasks"
+            )
+        if not (np.all(np.isfinite(host)) and np.all(host >= 0) and host.sum() > 0):
+            raise ValueError(
+                f"task weights {host.tolist()} must be finite and non-negative, "
+                f"with a positive total"
+            )
+        # Normalised before the float32 cast, which would turn 1e40 into inf.
+        host = host / host.max()
+        self.state.task_weights = jnp.asarray(host / host.sum(), dtype=FLOAT)
+
     def freeze_acting_norm(self):
         """The `ObsStats` acting uses for this chunk, or `None` for `state`'s.
 
@@ -209,8 +255,7 @@ class Agent(abc.ABC):
             observation = normalize_obs(
                 observation, mean, std, self.hp.obs_norm_clip,
             )
-        # This path's own NaN scrub: `clip` would pass one straight through to
-        # the physics.
+        # Own NaN scrub: `clip` would pass a NaN straight to the physics.
         action = jnp.clip(
             finite_or_zero(deterministic_action(actor(observation))), -1.0, 1.0
         )
@@ -252,17 +297,11 @@ class Agent(abc.ABC):
         """
         state = self.state if state is None else state
         width = next_obs.shape[-1]
-        # Three passes rather than one over a concatenation: the sums are
-        # associative, and a (3 * T * B, D) temporary is the one array here
-        # large enough to be worth not materializing.
+        # Three passes, not one concatenation: avoids a (3*T*B, D) temporary.
         landed = next_obs.reshape(-1, width)
         stats = state.obs_stats
-        # The weighting is the per-step path's: under normalization the landing
-        # observation counts twice, once from the pair `buffer_transitions`
-        # folds in and once from the fold the rollout does deliberately on top
-        # of it. Dropping either reweights the statistics away from every run
-        # logged so far. Without normalization only that second fold ever ran,
-        # so the statistics still advance for anything that reads them later.
+        # Matches the per-step path, where under normalization the landing
+        # observation is folded twice; without it only the second fold runs.
         if self.hp.normalize_observations:
             stats = update_obs_stats(stats, observation.reshape(-1, width))
             stats = update_obs_stats(stats, landed)
@@ -310,6 +349,18 @@ class Agent(abc.ABC):
         """
         self.diagnostics = DiagnosticsTracker(type(self).__name__.lower())
 
+        # Width from the buffer, so it cannot disagree with `add`, minus the
+        # trailing task one-hot, which the statistics do not average.
+        num_tasks = 0 if self.task_counts is None else len(self.task_counts)
+        width = buffer_state.experience.observation.shape[-1] - num_tasks
+        task_weights = None
+        if num_tasks and isinstance(self.hp, OffPolicyHyperparams):
+            # Start at the collection shares, i.e. what uniform sampling draws.
+            task_weights = jnp.asarray(
+                np.asarray(self.task_counts) / sum(self.task_counts),
+                dtype=FLOAT,
+            )
+
         self.state = TrainState(
             actor=actor,
             critic=critic,
@@ -328,11 +379,8 @@ class Agent(abc.ABC):
                 max_grad_norm=self._optimizer_grad_clip(),
             ),
             buffer_state=buffer_state,
-            # The buffer is the authority on observation width, so stats built
-            # from it cannot disagree with `add`.
-            obs_stats=init_obs_stats(
-                buffer_state.experience.observation.shape[-1]
-            ),
+            obs_stats=init_obs_stats(width, max(num_tasks, 1)),
+            task_weights=task_weights,
         )
 
     def due_for_update(self, steps: int) -> bool:
@@ -395,6 +443,9 @@ class Agent(abc.ABC):
             # Per-actuator lists, not just the first actuator's bounds.
             "action_low": serialize_bound(self.action_low),
             "action_high": serialize_bound(self.action_high),
+            # What `Agent.load` needs to size per-task statistics again.
+            **({} if self.task_counts is None
+               else {"task_counts": list(self.task_counts)}),
         }
 
     def _replay_hyperparams(self) -> Dict[str, Any]:

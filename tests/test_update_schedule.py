@@ -121,11 +121,11 @@ class TestBenchConfigsAligned:
         from omegaconf import OmegaConf
 
         parallel_envs = OmegaConf.load(
-            "experiments/dmc/bench/dmc.yaml"
+            "experiments/release/bench/release.yaml"
         ).env.parallel_envs
 
         checked = 0
-        for path in glob.glob("experiments/dmc/agent/*_bench.yaml"):
+        for path in glob.glob("experiments/release/agent/*_bench.yaml"):
             text = open(path).read()
             for key in ("memory_warmup", "steps_between_updates"):
                 # Indented: they live inside the `hyperparams:` block.

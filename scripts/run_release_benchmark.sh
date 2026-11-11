@@ -4,14 +4,12 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-# --- 1. Configuration (Idiomatic defaults) ---
+# --- 1. Configuration ---
 : "${TASKS:=HumanoidWalk HumanoidRun HumanoidStand}"
 : "${AGENTS:=ppo}"
-: "${CELLS:=envpool_cpu}"
+: "${CELLS:=batch_cpu}"
 : "${FORCE:=1}"
-# Sized so the CPU budget divides: this is a per-run count of LOGICAL cores and
-# the slot count is (ncores - GPU reserve) / it, so 12 on a 24-thread box floors
-# to a single run and idles 10 threads.
+# Logical cores; slots = (ncores - GPU reserve) / this, so 12 on 24 threads gives one slot.
 : "${CORES_PER_RUN:=10}"
 : "${GB_PER_RUN:=18}"
 : "${GPU_RESERVE_CORES:=2}"
@@ -70,10 +68,36 @@ physical_core_groups() {
 mapfile -t PHYS_GROUPS < <(physical_core_groups)
 GROUP_SIZE=$(( $(grep -o ',' <<< "${PHYS_GROUPS[0]:-0}" | wc -l) + 1 ))
 
+# The L3 domain of each physical-core group, in PHYS_GROUPS order.
+l3_domains() {
+    local group first path
+    for group in "${PHYS_GROUPS[@]}"; do
+        first=${group%%[,-]*}
+        path="/sys/devices/system/cpu/cpu$first/cache/index3/shared_cpu_list"
+        if [[ -r "$path" ]]; then cat "$path"; else echo all; fi
+    done
+}
+
+# Each slot's first physical-core group. A slot straddling two L3 domains runs far
+# slower, so it moves past the boundary whenever the remaining slots still fit.
+plan_slot_starts() {
+    local i=$(( reserve_cores / GROUP_SIZE )) n=${#PHYS_GROUPS[@]} slot end next
+    for (( slot = 0; slot < MAX_CPU_JOBS; slot++ )); do
+        end=$(( i + groups_per_run - 1 ))
+        if (( end < n )) && [[ "${L3_DOMAINS[i]}" != "${L3_DOMAINS[end]}" ]]; then
+            next=$i
+            while [[ "${L3_DOMAINS[next]}" == "${L3_DOMAINS[i]}" ]]; do next=$(( next + 1 )); done
+            if (( next + (MAX_CPU_JOBS - slot) * groups_per_run <= n )); then i=$next; fi
+        fi
+        echo "$i"
+        i=$(( i + groups_per_run ))
+    done
+}
+
 # The core string for job slot $2, given $1 physical-core groups per job.
 job_core_string() {
     local groups_per_run=$1 slot=$2 start i ids=()
-    start=$(( reserve_cores / GROUP_SIZE + slot * groups_per_run ))
+    start=${SLOT_STARTS[slot]}
     for (( i = start; i < start + groups_per_run; i++ )); do
         ids+=("${PHYS_GROUPS[i]}")
     done
@@ -94,6 +118,9 @@ by_ram=$(( (avail_gb - reserve_gb) / GB_PER_RUN ))
 groups_per_run=$(( CORES_PER_RUN / GROUP_SIZE ))
 (( groups_per_run < 1 )) && groups_per_run=1
 
+mapfile -t L3_DOMAINS < <(l3_domains)
+mapfile -t SLOT_STARTS < <(plan_slot_starts)
+
 PIN=1
 command -v taskset >/dev/null || { PIN=0; echo "! taskset missing — CPU runs will not be pinned"; }
 
@@ -101,10 +128,8 @@ echo "== grid: [$TASKS] x [$AGENTS] x [$CELLS]"
 echo "== plan: $MAX_CPU_JOBS concurrent CPU runs (${ncores}c, ${avail_gb}GB avail; caps: ${by_core} by core, ${by_ram} by ram)"
 
 # --- 3. Signal Handling ---
-# The trainers are not our direct children: each job is
-#   script -> subshell -> uv -> python (-> envpool/vector workers)
-# so `pkill -P $$` only reaps the subshell and orphans the rest onto init,
-# where they keep holding cores and RAM. Walk the whole tree instead.
+# Jobs run as script -> subshell -> uv -> python, so `pkill -P $$` would orphan the
+# trainers onto init; walk the whole tree instead.
 descendants() {
     local pid=$1 child
     for child in $(pgrep -P "$pid" 2>/dev/null); do
@@ -124,10 +149,7 @@ cleanup() {
     trap '' INT TERM HUP   # a second Ctrl-C must not re-enter mid-teardown
     echo -e "\n[!] Caught Ctrl-C! Stopping child processes..."
 
-    # Snapshot the tree ONCE and track those PIDs by liveness from here on.
-    # Re-walking it would silently lose anything that reparents to init as its
-    # intermediate parent dies — exactly the processes we most need to escalate
-    # against, since they are the ones that ignored SIGTERM.
+    # Snapshot once: a re-walk loses processes reparented to init, the ones ignoring SIGTERM.
     local pids
     pids=$(descendants $$)
     [[ -z "$pids" ]] && { echo "[!] Nothing left to stop."; exit 130; }
@@ -159,16 +181,14 @@ run_job() {
     local log="logs/${t}_${a}_${c}.log"
     local marker="$DONE_DIR/${t}_${a}_${c}"
     
-    # Build command array to avoid duplicate if/else logic
-    local cmd=(uv run python roxie/train.py --config-name "dmc/bench_$a" "release.task=$t" "dmc/backend@backend=$c")
+    local cmd=(uv run python roxie/train.py --config-name "release/bench_$a" "release.task=$t" "release/backend@backend=$c")
+    [[ "$t" == Multitask ]] && cmd=(uv run python roxie/train.py --config-name "release/bench_$a" "release/bench@bench=multitask" "~release/backend@backend")
+    [[ "$t" == Multitask && "$a" == d4pg ]] && cmd=(uv run python roxie/train.py --config-name release/multitask_d4pg)
     local where="GPU"
     if [[ -n "$cores" ]]; then
-        # EnvPool owns a second thread pool on top of XLA's — only this cell
-        # has the key, so mjx_cpu (build_playground_env, no num_threads
-        # argument) must not get it or Hydra's instantiate() errors.
-        [[ "$c" == "envpool_cpu" ]] && cmd+=("env.num_threads=$CORES_PER_RUN")
-        # Thread cap applies whether or not pinning is available, otherwise each
-        # run's BLAS/OMP pools fan out across every core and oversubscribe.
+        # mujoco.batch owns a second thread pool on top of XLA's.
+        [[ "$c" == "batch_cpu" ]] && cmd+=("env.num_threads=$CORES_PER_RUN")
+        # Cap threads even unpinned, or every run's BLAS/OMP pools span all cores.
         cmd=(env "OMP_NUM_THREADS=$CORES_PER_RUN" "${cmd[@]}")
         if (( PIN )); then
             cmd=(taskset -c "$cores" "${cmd[@]}")
@@ -190,13 +210,15 @@ run_job() {
     fi
 }
 
-# --- 5. Pre-sort Queue (Fixes GPU blocking bug) ---
+# --- 5. Pre-sort Queue ---
 cpu_jobs=()
 gpu_jobs=()
 
 for t in $TASKS; do
     for a in $AGENTS; do
         for c in $CELLS; do
+            # The multi-task run's physics is fixed: Warp, on the GPU.
+            [[ "$t" == Multitask && "$c" != warp_gpu ]] && continue
             [[ $FORCE -eq 0 && -f "$DONE_DIR/${t}_${a}_${c}" ]] && { echo "--- skipping $t | $a | $c"; continue; }
             [[ "$c" == *gpu* ]] && gpu_jobs+=("$t $a $c") || cpu_jobs+=("$t $a $c")
         done
@@ -206,11 +228,8 @@ done
 # --- 6. Dispatch Loops ---
 declare -a SLOT_PID
 
-# 6a. The GPU queue is sequential in itself — one device — so the whole of it
-# goes to the background as a single job and overlaps the CPU queue. In the
-# foreground it would instead wait for 6b to DISPATCH its last job, which at
-# MAX_CPU_JOBS slots means idling the GPU until all but that many CPU runs have
-# finished.
+# 6a. The sequential GPU queue runs as one background job, so the GPU need not idle
+# until 6b has dispatched its last CPU job.
 gpu_pid=""
 if (( ${#gpu_jobs[@]} )); then
     (
@@ -232,12 +251,10 @@ for job in "${cpu_jobs[@]}"; do
             if ! kill -0 "${SLOT_PID[i]:-}" 2>/dev/null; then
                 run_job "$t" "$a" "$c" "$(job_core_string "$groups_per_run" "$i")" &
                 SLOT_PID[i]=$!
-                break 2 # Break out of both the 'for' and 'while' loops
+                break 2
             fi
         done
-        # The slot PIDs by name, not a bare `wait -n`: the GPU queue is a
-        # background job too, and reaping THAT here would wake this loop
-        # without having freed a slot.
+        # Not a bare `wait -n`: reaping the background GPU queue would free no slot.
         wait -n "${SLOT_PID[@]}" 2>/dev/null
     done
 done

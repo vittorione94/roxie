@@ -5,11 +5,9 @@ import os
 import jax.numpy as jnp
 import numpy as np
 
-# Global canonical float dtypes for learner computations.
 FLOAT = jnp.float32
 NP_FLOAT = np.float32
 
-# Flags enabling oneDNN custom calls for CPU bfloat16 performance.
 ONEDNN_BF16_FLAGS = (
     "--xla_cpu_experimental_onednn_custom_call "
     "--xla_cpu_experimental_onednn_fusion_type=dot"

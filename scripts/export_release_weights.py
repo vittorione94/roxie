@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from roxie.environment.suites import DMC_TASKS  # noqa: E402
 from roxie.utils.checkpoint import (  # noqa: E402
     CHECKPOINTS_DIRNAME,
     checkpoint_steps,
@@ -24,19 +23,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT_ROOT = REPO_ROOT / "outputs" / "release_v1"
 DEFAULT_DONE_DIR = REPO_ROOT / "logs" / ".done"
 
-# Both release cells. envpool_cpu is dm_control's XMLs through EnvPool and
-# warp_gpu is mujoco_playground: different physics behind an observation of the
-# same 67 dimensions and an action of the same 21, so `_check_obs_width` cannot
-# refuse a swap and the cell in the bundle name is the only thing separating
-# them.
-DEFAULT_CELLS = ("envpool_cpu", "warp_gpu")
+# Same tasks on two physics engines: `_check_obs_width` cannot refuse a swap, so
+# only the cell in the bundle name separates them.
+DEFAULT_CELLS = ("batch_cpu", "warp_gpu")
 
-# Where --push-to-hub publishes. The version is in the repo id so a later grid
-# gets its own repo instead of overwriting this one's history.
+# Versioned so a later grid gets its own repo.
 DEFAULT_HUB_REPO = "vittorione/roxie-release-v1"
-# Frontmatter for weights/README.md, which on the Hub IS the model card. No
-# `model-index`: its structured results would publish one headline number per
-# task, and on the arms that peaked and collapsed that number is the peak.
+# No `model-index`: its one number per task would be the peak on arms that collapsed.
 MODEL_CARD_FRONTMATTER = """\
 ---
 license: mit
@@ -45,24 +38,20 @@ pipeline_tag: reinforcement-learning
 tags:
   - reinforcement-learning
   - deep-reinforcement-learning
-  - dm-control
+  - mujoco-playground
   - mujoco
   - jax
 ---
 """
 
-# Selection metric, plus the columns copied into metadata.json alongside it.
-# `score_per_step` and `length` come along because on tasks that can terminate
-# early the sum alone cannot separate "acts well" from "survives long".
 DEFAULT_METRIC = "test/score"
 # Matches the "final return" the release table and figures report.
 FINAL_EVALS = 10
-# How far under the target budget a run may land and still count as having
-# reached it. Agents step the env at different per-iteration increments, so one
-# 500M-step budget finishes at 500,000,768 for six of the seven and 500,006,912
-# for PPO; an exact match would publish only PPO. A piloted or smoke run is
-# short by orders of magnitude, not by this.
+# A 500M budget ends at 500,000,768 for six agents and 500,006,912 for PPO, so an
+# exact match would publish only PPO.
 BUDGET_TOLERANCE = 0.99
+# With `score_per_step` and `length`, since on early-terminating tasks the sum alone cannot
+# separate "acts well" from "survives long".
 REPORTED_COLUMNS = (
     "test/score", "test/score/std", "test/score_per_step",
     "test/length", "test/length/std", "test/distinct_starts",
@@ -175,8 +164,7 @@ def pick_checkpoint(run_dir: Path, metric: str) -> tuple[int, Path, dict] | None
         return None
 
     rows = read_log(run_dir)
-    # Derived from the log rather than assumed, so this holds whatever cadence
-    # a run was launched with.
+    # From the log, so it holds for any launch cadence.
     tolerance = _epoch_tolerance(rows)
     scored: list[tuple[float, int, dict]] = []
     for row in rows:
@@ -338,8 +326,10 @@ def write_index(dest_root: Path, exported: list[dict], *, cells: list[str],
         f"agent(s) — each selected by best `{metric}` among its run's "
         "checkpoints, not by taking the final checkpoint.",
         "",
-        "Scores are dm_control episode returns, so 1000 is the ceiling on every "
-        "task and the table is comparable down its rows as well as across them. "
+        "Scores are episode returns on mujoco_playground's port of the dm_control "
+        "suite, not comparable to published dm_control results. 1000 is the "
+        "ceiling on every task and the table is comparable down its rows as well "
+        "as across them. "
         "Each entry gives the published checkpoint's own score, then in "
         f"parentheses the mean of its run's last {FINAL_EVALS} evaluations — "
         "where the run ENDED, which is what the release figures plot. The two "
@@ -357,11 +347,10 @@ def write_index(dest_root: Path, exported: list[dict], *, cells: list[str],
             lines.append("| " + " | ".join(row) + " |")
     lines += [
         "",
-        "The two cells are two different environments, not one environment on "
-        "two machines: `envpool_cpu` is dm_control's XMLs through EnvPool and "
-        "`warp_gpu` is `mujoco_playground`. Their observations are the same "
-        "width, so loading one against the other raises nothing — go by the "
-        "cell in the bundle name.",
+        "The two cells run the same `mujoco_playground` tasks on different "
+        "physics: `batch_cpu` on `mujoco.batch` and `warp_gpu` on mujoco_warp. "
+        "Their observations are the same width, so loading one against the "
+        "other raises nothing — go by the cell in the bundle name.",
         "",
         "The full record — per-bundle steps, budget, `test/score_per_step`, "
         "`test/length`, size and the commit each was cut from — is in "
@@ -479,9 +468,7 @@ def verify(bundle: Path) -> str | None:
     """
     import jax
 
-    # Read on the host: a release checkpoint is a GPU run's, and this only
-    # inspects the tree. Must precede the first array op, which initializes the
-    # backend — importing jax does not.
+    # Must precede the first array op, which initializes the backend (importing jax does not).
     jax.config.update("jax_platforms", "cpu")
 
     checkpoints = find_checkpoints(bundle)
@@ -513,9 +500,7 @@ def export_all(finished: list[dict], dest_root: Path, *, tasks: list[str],
     skipped: list[tuple[str, str]] = []
     for task in tasks:
         for cell in cells:
-            # Per (task, cell), not once for the whole export: a partial grid can
-            # have one arm finished at 500M and another piloted at 5M, and a
-            # single global budget would silently drop the piloted one.
+            # Per (task, cell): a partial grid can have one arm at 500M and another piloted at 5M.
             budget = None if any_budget else (
                 steps if steps is not None else budget_for(finished, task, cell)
             )
@@ -554,9 +539,7 @@ def export_all(finished: list[dict], dest_root: Path, *, tasks: list[str],
                     problem = verify(bundle)
                     print(f"         verify: {problem or 'ok'}")
                     if problem:
-                        # Left staged to be looked at, but out of the index and
-                        # the upload: a bundle that did not read back is not
-                        # something to hand anyone.
+                        # Left staged for inspection, but out of the index and the upload.
                         skipped.append(
                             (label, f"failed verification: {problem}")
                         )
@@ -617,8 +600,7 @@ def main() -> int:
         return 1
 
     cells = [c.strip() for c in args.cells.split(",") if c.strip()]
-    # Read off the tree rather than DMC_TASKS, which is what makes a partial
-    # grid exportable.
+    # Read off the tree, which is what makes a partial grid exportable.
     available = {r["task"] for r in finished if r["cell"] in cells}
     if args.tasks:
         wanted_tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -627,8 +609,7 @@ def main() -> int:
             print(f"No finished runs for: {', '.join(missing)}", file=sys.stderr)
         tasks = [t for t in wanted_tasks if t in available]
     else:
-        tasks = [t for t in DMC_TASKS if t in available]
-        tasks += sorted(available - set(DMC_TASKS))
+        tasks = sorted(available)
     if not tasks:
         print(f"No finished runs on cell(s) {', '.join(cells)} under "
               f"{args.out_root}.", file=sys.stderr)
@@ -645,9 +626,7 @@ def main() -> int:
     print(f"{len(tasks)} task(s) x {len(cells)} cell(s), selecting by "
           f"{args.metric}  {where}\n")
 
-    # Staged rather than kept: anyone who trained the grid already has the
-    # checkpoints under outputs/, so a second copy in the working tree is only
-    # the upload's raw material.
+    # Staged, not kept: whoever trained the grid already has it under outputs/.
     staging = None if args.dest is not None else tempfile.TemporaryDirectory(
         prefix="roxie-weights-")
     dest_root = args.dest if staging is None else Path(staging.name)
@@ -667,9 +646,7 @@ def main() -> int:
                         hub_repo=args.hub_repo)
             total_bytes = sum(m["bytes"] for m in exported)
             print(f"\n{len(exported)} bundle(s), {total_bytes / 1e6:.0f} MB")
-            # After the index and the card, so what lands on the Hub is the
-            # complete tree — and after `skipped` is collected, so a bundle that
-            # failed verification is not what gets published.
+            # Last, so the Hub gets the complete tree without unverified bundles.
             if pushing:
                 push_to_hub(dest_root, args.hub_repo, private=args.private,
                             commit=commit)

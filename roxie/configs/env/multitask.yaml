@@ -1,0 +1,13 @@
+_target_: roxie.environment.multitask.build_multitask_env
+
+# Several tasks trained as one batch, each from its own env block; they must
+# share an action space. Usage and observation layout: docs/environments.md.
+
+# Task name to that task's env block, merged over `task_defaults`.
+tasks: ???
+task_defaults:
+  _target_: roxie.environment.loader.build_playground_env
+# Each task's share of the worlds, fixed at launch; null splits evenly.
+weights: null
+seed: 0
+parallel_envs: 256

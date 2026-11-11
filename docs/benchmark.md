@@ -1,19 +1,24 @@
 # The release benchmark
 
 Every launchable config in this repo belongs to one grid: seven agents (DDPG, TD3, TD4,
-D4PG, SAC, MPO, PPO) on three tasks, at matched hyperparameters and a matched step
-budget, on two independent implementations of the physics.
+D4PG, SAC, MPO, PPO) on `HumanoidStand`, `HumanoidWalk` and `HumanoidRun`, at matched
+hyperparameters and a matched step budget. They are the hardest three tasks of the suite,
+and the only ones where the agents actually separate. The grid runs them two ways:
 
-**3 tasks × 7 agents × 2 cells = 42 runs**, each 500M env steps at 1024 parallel envs,
-one seed.
-
-The tasks are `HumanoidStand`, `HumanoidWalk` and `HumanoidRun` — the hardest three of
-the suite, and the only ones where the agents actually separate. The other 22 in
-`roxie.environment.suites.DMC_TASKS` are one `release.task=` override away and carry the
-same EnvPool mapping and the same tests; they are not in the grid because a 25-task sweep
-of curves nobody reads costs a fortnight of the box.
+- **Single-task** (`bench_<agent>.yaml`): each task trained on its own, on two
+  implementations of the physics. **3 tasks × 7 agents × 2 cells = 42 runs**, each 500M
+  env steps at 1024 parallel envs, one seed. The results below are these runs.
+- **Multi-task** (`bench_<agent>.yaml` with `release/bench@bench=multitask`; d4pg has its
+  own `multitask_d4pg.yaml`): one policy for all three tasks in one run, on
+  Warp at 256 parallel envs. It is recorded as the task `Multitask`, so it shares the
+  output tree, the W&B grouping, the plots and the export with the single-task runs. No
+  released result comes from it yet.
 
 ## Results
+
+**The figures and tables below were measured at v0.1.0, when the GPU-free cell was EnvPool
+over dm_control's XMLs (`envpool_cpu`).** That cell is now `batch_cpu`, `mujoco.batch` over
+the `mujoco_playground` XMLs, and has not been re-run, so they do not describe it.
 
 Colour is the agent and so is the dash; the pale band behind each curve is the raw
 evaluation, the solid line a 9-eval rolling mean. Final numbers, per task and per cell,
@@ -27,8 +32,8 @@ in [`images/release-scores.md`](../images/release-scores.md).
 </picture>
 
 **`warp_gpu` — mujoco_playground over mujoco_warp.** A separate figure, and not directly
-comparable: the two cells are independent reimplementations of the same tasks, so a score
-gap between the figures tangles physics with algorithm.
+comparable: at v0.1.0 the two cells were independent reimplementations of the same tasks,
+so a score gap between these figures tangles physics with algorithm.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/vittorione94/roxie/blob/main/images/release-playground-gpu-dark.png?raw=true">
@@ -36,11 +41,9 @@ gap between the figures tangles physics with algorithm.
 </picture>
 
 **What each backend costs.** A rate, so an arm that stopped short of the budget is still
-comparable — those are marked `*`. `mjbatch` is an external
-[C++ thread-pool stepper](https://github.com/kevinzakka/mjbatch) benchmarked against
-EnvPool on the same cores by `scripts/run_release_benchmark_mjbatch_cpu.py`; it is a
-comparison, not a roxie backend, and it has its own curve figure in
-[`images/`](../images/).
+comparable — those are marked `*`. `mjbatch` was an external
+[C++ thread-pool stepper](https://github.com/kevinzakka/mjbatch), the design `mujoco.batch`
+later followed, benchmarked with a separate torch learner rather than through roxie.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/vittorione94/roxie/blob/main/images/release-speed-dark.png?raw=true">
@@ -52,14 +55,11 @@ comparison, not a roxie backend, and it has its own curve figure in
 | Cell | Physics | Learner | In the default grid |
 |---|---|---|---|
 | `warp_gpu` | GPU — `mujoco_playground` + mujoco_warp | GPU | yes |
-| `envpool_cpu` | CPU — EnvPool's native MuJoCo pool | CPU | yes — **fully GPU-free** |
+| `batch_cpu` | CPU — `mujoco_playground` + `mujoco.batch` | CPU | yes — **fully GPU-free** |
 | `mjx_gpu` | GPU — `mujoco_playground` + MJX | GPU | no, one flag away |
 | `mjx_cpu` | CPU — `mujoco_playground` + MJX | CPU | no, one flag away |
 
-The two grid cells are not the same code — `mujoco_playground` reimplements the
-dm_control tasks as JAX/MJX programs while EnvPool wraps dm_control's own C++ physics, so
-their observation vectors are not always identical and a policy trained on one cell
-cannot be loaded against the other. See
+The two grid cells run the same task code on different physics. See
 [Keeping the backends honest](backends.md#keeping-the-backends-honest).
 
 ## Running it
@@ -68,61 +68,66 @@ The runner is configured by environment, not by flags, and packs CPU runs into p
 core slots while the GPU queue drains alongside them:
 
 ```bash
-scripts/run_release_benchmark.sh                              # defaults: 3 tasks, ppo, envpool_cpu
+scripts/run_release_benchmark.sh                              # defaults: 3 tasks, ppo, batch_cpu
+TASKS=Multitask CELLS=warp_gpu scripts/run_release_benchmark.sh  # the multi-task run
 AGENTS="ddpg td3 td4 d4pg sac mpo ppo" \
-CELLS="envpool_cpu warp_gpu" scripts/run_release_benchmark.sh # the whole grid
+CELLS="batch_cpu warp_gpu" scripts/run_release_benchmark.sh # the whole grid
 CELLS=warp_gpu AGENTS=ppo TASKS=HumanoidRun scripts/run_release_benchmark.sh   # one leg
 FORCE=0 scripts/run_release_benchmark.sh                      # skip finished legs
 ```
 
 `FORCE=0` honours the `logs/.done` markers, which is what makes an interrupted sweep
 resumable at run granularity. `CORES_PER_RUN`, `GB_PER_RUN` and the `GPU_RESERVE_*` pair
-size the slots; `CORES_PER_RUN` is **logical** cores, and `envpool_cpu` also gets it as
-`env.num_threads` so EnvPool's own pool matches the pinning.
+size the slots; `CORES_PER_RUN` is **logical** cores, and `batch_cpu` also gets it as
+`env.num_threads` so the batch's own pool matches the pinning.
+Slots are planned to stay inside one L3 domain whenever they all still fit, because a slot
+crossing two domains runs far slower: TD3 measured about 15k steps/s across a domain
+boundary against about 19k inside one, on a 2-die Ryzen.
 
 Then:
 
 ```bash
 uv run python roxie/report.py                        # assemble the W&B report
-uv run python roxie/plot.py --grid \
-    --path outputs/release_v1 outputs/mjbatch_v1 --output images/release
+uv run python roxie/plot.py --grid --path outputs/release_v1 --output images/release
 uv run python scripts/export_release_weights.py      # publish the policies
 ```
 
 ## Layout
 
 ```
-experiments/dmc/
-  bench_<agent>.yaml         launchable, one per agent — this is what you run
+experiments/release/
+  bench_<agent>.yaml         single-task launchable, one per agent
+  multitask_d4pg.yaml        d4pg's multi-task launchable, its replay sized for 4,096 worlds
   agent/<agent>_bench.yaml   matched hyperparameters, one per agent
-  backend/<cell>.yaml        the four device cells
-  bench/dmc.yaml             shared env + trainer + logging block
+  backend/<cell>.yaml        the four device cells (single-task only)
+  bench/release.yaml         shared env + trainer + logging block
+  bench/multitask.yaml       release.yaml plus the three-task env, on Warp
   noise/bench_gaussian.yaml  exploration noise for the deterministic arms
 ```
 
-**The task is an override, not a file.** `release.task` names the task and the backend
-group turns it into either a playground registry name or an EnvPool task id — those
-differ for two of the 25 (`BallInCup` → `BallInCupCatch-v1`, `PointMass` →
-`PointMassEasy-v1`), so the mapping lives in `roxie/environment/suites.py` with a test on
-it rather than in yaml.
+**The tasks are `mujoco_playground`'s port of the dm_control suite, not dm_control itself.** The port changes timesteps, solver settings and contacts to run well on a GPU (the package lists them in `mujoco_playground/_src/dm_control_suite/xmls/README.md`), so scores here are not directly comparable to published dm_control results.
+
+**The single-task run's task is an override, not a file.** `release.task` is a playground registry name.
 
 ```bash
-uv run python roxie/train.py --config-name dmc/bench_td3                     # WalkerWalk, warp_gpu
-uv run python roxie/train.py --config-name dmc/bench_td3 release.task=HumanoidRun
-uv run python roxie/train.py --config-name dmc/bench_ppo release.task=HumanoidRun \
-    dmc/backend@backend=envpool_cpu
+uv run python roxie/train.py --config-name release/bench_td3                 # HumanoidWalk, batch_cpu
+uv run python roxie/train.py --config-name release/bench_td3 release.task=HumanoidRun
+uv run python roxie/train.py --config-name release/bench_ppo release.task=HumanoidRun \
+    release/backend@backend=warp_gpu
+uv run python roxie/train.py --config-name release/bench_td3 \
+    release/bench@bench=multitask '~release/backend@backend'                # all three, warp_gpu
 ```
 
-The backend group lives in a subdirectory of the search path, so `backend=envpool_cpu` is
-rejected (`Key 'backend' is not in struct`) and `+backend=envpool_cpu` appends a second
-entry instead of replacing the default. `dmc/backend@backend=` is the form that works.
+The backend group lives in a subdirectory of the search path, so `backend=batch_cpu` is
+rejected (`Key 'backend' is not in struct`) and `+backend=warp_gpu` appends a second
+entry instead of replacing the default. `release/backend@backend=` is the form that works.
 
 ## Held identical across every arm
 
 | Held fixed | Where |
 |---|---|
-| step budget, epoch size, eval protocol | `bench/dmc.yaml` |
-| `parallel_envs` (1024), seed | `bench/dmc.yaml` |
+| step budget, epoch size, eval protocol | `bench/release.yaml` |
+| `parallel_envs` (1024; 256 multi-task), seed | `bench/release.yaml`, `bench/multitask.yaml` |
 | actor + critic MLP `[256, 256]` | every `agent/*_bench.yaml` |
 | layer norm (the six off-policy arms; PPO runs without) | every `agent/*_bench.yaml` |
 | batch size, replay ratio, buffer capacity, warmup | every off-policy `agent/*_bench.yaml` |
@@ -171,8 +176,7 @@ cells on one score scale.
 `roxie/report.py` assembles one W&B report with a section per task.
 `roxie/plot.py --grid` reads the local `log.csv` files instead — no API round-trip — and
 writes the figures above: one per (suite, device), plus the speed bars and the score
-table, in light and dark for a `<picture>`. It takes several roots and merges them, which
-is how `mjbatch_cpu` joins from its own tree.
+table, in light and dark for a `<picture>`. It takes several roots and merges them.
 
 `Trainer._store_epoch_metrics` is the single place metric names are assigned, under
 `train/`, `test/` and `sys/`. Two rules it enforces:
@@ -221,10 +225,9 @@ a run finished. Three selection rules:
   on an arm that peaked and then collapsed the two are far apart: `HumanoidWalk/warp_gpu`
   PPO ships a checkpoint scoring 953 out of a run that ends at 25.
 
-The two cells are two different environments, not one environment on two machines:
-`envpool_cpu` is dm_control's XMLs through EnvPool, `warp_gpu` is `mujoco_playground`.
-Both give a 67-dim observation and a 21-dim action, so `checkpoint.py`'s width check
-cannot refuse a swap — the cell in the bundle name is what separates them.
+The two cells run the same `mujoco_playground` task on different physics. Both give the
+same observation and action width, so `checkpoint.py`'s width check cannot refuse a swap —
+the cell in the bundle name is what separates them.
 
 A bundle mirrors a run dir's shape, because `play.py` resolves its config as
 `<checkpoint>/../../.hydra/config.yaml`:

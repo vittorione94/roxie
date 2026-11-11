@@ -336,8 +336,7 @@ def mpo_critic_loss_fn(
     next_actions = next_dist.sample(seed=key, sample_shape=(num_action_samples,))
     next_actions = scale_to_env(next_actions, action_low, action_high)
 
-    next_obs_tiled = jnp.broadcast_to(next_obs, (num_action_samples,) + next_obs.shape)
-    next_q = target_critic_model(next_obs_tiled, next_actions)
+    next_q = target_critic_model(next_obs, next_actions)
     next_q = jnp.mean(jnp.squeeze(next_q, axis=-1), axis=0)
 
     reward = jnp.squeeze(samples["rewards"])

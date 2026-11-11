@@ -13,6 +13,8 @@ from flax import nnx
 from omegaconf import OmegaConf
 
 from roxie.utils.diagnostics import DIAGNOSTIC_MAX_KEYS
+from roxie.utils.math import normalize_samples
+from roxie.utils.memory import ReplayManager
 
 
 def build_agent(config, **kwargs):
@@ -206,29 +208,50 @@ def transition_prototype(
     )
 
 
-def build_replay(memory_config, n_step: int):
-    """Instantiates an off-policy replay buffer based on TD step horizon.
+def build_replay(memory_config, n_step: int, prototype, task_ids=None):
+    """Builds an off-policy replay sized by the TD step horizon.
+
+    A flat buffer at `n_step` 1, a trajectory buffer above it, since n-step
+    targets need consecutive items.
 
     Args:
         memory_config: Hydra memory configuration block.
         n_step: Temporal difference step horizon.
+        prototype: the transition the buffer allocates.
+        task_ids: each world's task in a multi-task env, so the replay can
+          weight its draws by task; None for a single-task env.
 
     Returns:
-        A Flashbax flat or trajectory replay buffer instance.
+        The `ReplayManager` over the buffer.
     """
     if n_step <= 1:
-        return hydra.utils.instantiate(memory_config)
-
-    add_batch = int(memory_config.add_batch_size)
-    return flashbax.make_trajectory_buffer(
-        add_batch_size=add_batch,
+        buffer, sequence_length = hydra.utils.instantiate(memory_config), 2
+    else:
+        add_batch = int(memory_config.add_batch_size)
+        sequence_length = n_step + 1
+        buffer = flashbax.make_trajectory_buffer(
+            add_batch_size=add_batch,
+            sample_batch_size=int(memory_config.sample_batch_size),
+            sample_sequence_length=sequence_length,
+            period=1,
+            min_length_time_axis=max(
+                n_step + 1, int(memory_config.min_length) // add_batch
+            ),
+            max_length_time_axis=int(memory_config.max_length) // add_batch,
+        )
+    return ReplayManager(
+        buffer, prototype, time_axis=n_step > 1, task_ids=task_ids,
         sample_batch_size=int(memory_config.sample_batch_size),
-        sample_sequence_length=n_step + 1,
-        period=1,
-        min_length_time_axis=max(
-            n_step + 1, int(memory_config.min_length) // add_batch
-        ),
-        max_length_time_axis=int(memory_config.max_length) // add_batch,
+        sample_sequence_length=sequence_length,
+    )
+
+
+def sample_replay(state, key, hp, replay_sample_fn, obs_mean, obs_std):
+    """A replay batch for one gradient step, repacked and normalized."""
+    samples = replay_sample_fn(state.buffer_state, key, state.task_weights)
+    return normalize_samples(
+        repack_samples(samples, hp.gamma, hp.n_step), obs_mean, obs_std,
+        hp.obs_norm_clip, hp.normalize_observations,
     )
 
 

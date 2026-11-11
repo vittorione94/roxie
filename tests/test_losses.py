@@ -36,9 +36,7 @@ BATCH = 16
 FEATURES = [32, 32]
 
 
-# Module-scoped on purpose: these are read-only here — every test that perturbs
-# a network `deepcopy`s it first — and rebuilding a network per test is what a
-# loss-function file spends its time on otherwise.
+# Module-scoped: read-only, since every test that perturbs a network copies it.
 
 
 @pytest.fixture(scope="module")
@@ -95,9 +93,7 @@ def ddpg_samples():
         "actions": jax.random.normal(k2, (BATCH, ACT_DIM), dtype=jnp.float32),
         "rewards": jax.random.normal(k3, (BATCH,), dtype=jnp.float32),
         "next_observations": jax.random.normal(k4, (BATCH, OBS_DIM), dtype=jnp.float32),
-        # Per-sample bootstrap coefficient (gamma^b, 0 at terminals) — every
-        # off-policy critic loss consumes this instead of gamma + terminal
-        # flags. `terminals` is kept for MPO, which still reads it directly.
+        # gamma^b, 0 at terminals; `terminals` is kept for MPO, which reads it.
         "bootstrap": 0.99 * jnp.ones(BATCH, dtype=jnp.float32),
         "terminals": jnp.zeros(BATCH, dtype=jnp.bool_),
     }
@@ -362,9 +358,7 @@ class TestPPOLoss:
     @pytest.fixture(scope="module")
     def ppo_data(self, stoch_actor, stoch_critic):
         key = jax.random.PRNGKey(0)
-        # Flat over `(env, time)`, as `_prepare_rollout` hands it over: the
-        # slicing to the GAE horizon and the flattening both happen there, so
-        # the losses see one transition axis and nothing else.
+        # Flat over `(env, time)`, as `_prepare_rollout` hands it over.
         num_transitions = 36
         obs = jax.random.normal(key, (num_transitions, OBS_DIM), dtype=jnp.float32)
         dist = stoch_actor(obs)
@@ -443,9 +437,8 @@ class TestPPOLoss:
         for leaf in jax.tree.leaves(grads):
             assert jnp.isfinite(leaf).all()
 
-        # And the trust region must still be able to see the divergence:
-        # `NaN > target_kl` is False, which is how the early stop switched
-        # itself off for the last 487M steps of that run.
+        # `NaN > target_kl` is False: that silently disabled a run's early stop
+        # for its last 487M steps.
         assert jnp.isfinite(aux["approx_kl"]) and aux["approx_kl"] > 1.0
         assert float(aux["clip_frac"]) == pytest.approx(1.0)
 

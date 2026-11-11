@@ -6,14 +6,12 @@ Roxie's environments dispatch the physics backend through mjx's pluggable
 only works when three pieces line up:
 
   1. ``mujoco`` ships its warp bridge (``mujoco.mjx.warp``),
-  2. ``warp-lang`` exposes the layout that bridge imports
-     (``warp._src.jax_experimental.ffi.GraphMode``), and
-  3. the two agree on Warp's internal module layout.
+  2. ``warp-lang`` is the version that bridge is built against, which
+     ``mujoco-mjx`` pins in its own ``warp`` extra, and
+  3. a real ``impl='warp'`` step runs and stays finite.
 
-As of this writing the package index serves a ``warp-lang`` whose layout does
-not match the bridge, so ``impl='warp'`` raises at ``put_model``. Run this
-script after any dependency bump to tell, in one shot, whether the backend has
-become usable. Exit code 0 == warp works; non-zero == still blocked (with the
+Run this script after any dependency bump to tell, in one shot, whether the
+backend is usable. Exit code 0 == warp works; non-zero == blocked (with the
 reason printed).
 
 Usage:
@@ -54,13 +52,10 @@ def _diagnose_bridge() -> str | None:
 
     if u.find_spec("warp") is None:
         return "warp-lang is not installed"
-    # The mujoco warp bridge imports GraphMode from this exact path.
-    if u.find_spec("warp._src.jax_experimental") is None:
-        return (
-            "warp-lang lacks 'warp._src.jax_experimental' (the module the "
-            "mujoco warp bridge imports GraphMode from). The installed "
-            "warp-lang predates / mismatches mujoco's expected Warp layout."
-        )
+    try:
+        from mujoco.mjx.warp import types  # noqa: F401
+    except Exception as e:  # mjx raises TypeError, not ImportError, on an old warp
+        return f"mujoco's warp bridge failed to import: {type(e).__name__}: {e}"
     return None
 
 

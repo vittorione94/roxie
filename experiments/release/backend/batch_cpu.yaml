@@ -1,0 +1,22 @@
+# @package _global_
+
+release:
+  cell: batch_cpu
+
+env:
+  _target_: roxie.environment.loader.build_playground_env
+  env_name: ${release.task}
+  impl: batch
+  naconmax: null
+  njmax: null
+  # mujoco.batch's own thread pool, independent of the learner's XLA pool.
+  num_threads: 12
+
+runtime:
+  device: cpu
+  matmul_precision: null
+  # Not bfloat16: oneDNN's rewriter aborts real learner graphs with a shape
+  # RET_CHECK on this XLA build, and without it bf16 is slower. Retry after an XLA bump.
+  matmul_dtype: float32
+  # Keep equal to env.num_threads: a smaller affinity packs the physics threads onto fewer cores.
+  cpu_cores: 12

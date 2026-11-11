@@ -1,0 +1,66 @@
+# @package _global_
+
+# SAC walking the humanoid over generated terrain from a head-mounted RGB-D camera
+# plus proprioception; the env comes from `examples/vision/humanoid_rgbd.py`. GPU only.
+#
+#   uv run --group cuda python roxie/train.py --config-name vision/humanoid_rgbd_sac
+
+defaults:
+  - /agent: sac
+  - /vision: cnn
+  - _self_
+
+env:
+  _target_: examples.vision.humanoid_rgbd.build_humanoid_rgbd_env
+  task: walk           # stand | walk | run
+  impl: warp
+  camera: egocentric
+  # Geoms the camera cannot see: it sits on the head sphere's surface.
+  hidden_geoms: [head]
+  cam_res: [64, 64]
+  # Metres mapped to depth 1; anything further, and the sky, reads 1.
+  depth_scale: 10.0
+  use_textures: true   # the checker is the visual cue of motion and scale
+  # The state task's 67 entries after the image; false trains from pixels alone.
+  proprio: true
+  # `TerrainConfig`'s fields, in metres; null is flat floor. One field shared by every world.
+  terrain:
+    size: 64.0
+    cell: 0.15
+    hill_height: 1.0
+    hill_length: 8.0
+    roughness: 0.12
+    bump_length: 0.75
+    region_length: 12.0
+    block_height: 0.25
+    block_density: 1.0
+    spawn_margin: 8.0
+    seed: 0
+  naconmax: null
+  njmax: null
+  graph_mode: null
+  max_episode_steps: null
+  seed: 0
+  # Also the render context's `nworld`, which warp allocates up front.
+  parallel_envs: 256
+
+agent:
+  memory_config:
+    # Pixels are stored as float32: 64 KB a frame, so ~3.3 GB at this length.
+    max_length: 50_000
+
+runtime:
+  device: gpu
+
+trainer:
+  steps: 20_000_000
+  epoch_steps: 200_000
+  save_steps: 2_000_000
+  test_episodes: 10
+  show_progress: true
+  replace_checkpoint: false
+  save_buffer: false
+
+hydra:
+  run:
+    dir: outputs/vision/humanoid_rgbd_sac/${now:%Y-%m-%d_%H-%M-%S}

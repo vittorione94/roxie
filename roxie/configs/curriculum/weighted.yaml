@@ -1,0 +1,4 @@
+# Fixed replay weights by task name, e.g. {stand: 1, run: 4}; a task left out weighs 1.
+# Unlike the env block's `weights` (which split the worlds), these weight sampling.
+_target_: roxie.utils.curriculum.WeightedTasks
+weights: ???

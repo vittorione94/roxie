@@ -6,14 +6,7 @@ There are exactly two ways to attach an environment to roxie, both shaped like [
 
 ## The two ways in
 
-| | Write a `FuncEnv` | Bring a batched env |
-|---|---|---|
-| Defined in | [`roxie/environment/functional.py`](../roxie/environment/functional.py) | [`roxie/environment/vector.py`](../roxie/environment/vector.py) |
-| For | anything functional and JAX-traceable | anything already batched |
-| State | passed explicitly, one env at a time | carried by the caller, batched |
-| Examples | MuJoCo Playground, Waymax | EnvPool |
-
-Write a `FuncEnv` and `JaxVectorEnv` batches it. Bring something that already speaks Gymnasium's 5-tuple and `EnvPoolVectorEnv` fronts it directly.
+Write a [`FuncEnv`](../roxie/environment/functional.py) — anything functional and JAX-traceable, one env at a time, with the state passed explicitly — and [`JaxVectorEnv`](../roxie/environment/vector.py) batches it. `mujoco_playground` is the one family roxie ships, wrapped in this shape; an env from another repo attaches the same way.
 
 ## Writing a `FuncEnv`
 
@@ -49,15 +42,7 @@ The driver only carries the value: it takes one from `init_params`, passes it to
 
 ### Adapting a monolithic-step env
 
-Playground, Brax and Waymax compute physics, observation, reward and termination in a single `step` call, so the accessors cannot recompute them independently without paying for the physics twice. The recipe is [`MuJoCoFuncEnv`](../roxie/environment/loader.py), which splits `FuncEnv`'s eight methods into the two that *make physics happen* (`initial`, `transition`) and the six that *answer questions about a state*: every MuJoCo env answers the six identically by reading the field off an `mjx_env.State`.
-
-```
-FuncEnv                    the interface; knows nothing about MuJoCo
-└── MuJoCoFuncEnv          + "my state is an mjx_env.State" -> the 6 accessors
-    └── PlaygroundFuncEnv  + initial/transition by WRAPPING a playground env
-```
-
-An env in another repo that subclasses `MuJoCoFuncEnv` inherits the same accessors, so two backends cannot drift on what a termination means.
+Playground tasks compute physics, observation, reward and termination in a single `step` call, so the accessors cannot recompute them independently without paying for the physics twice. [`PlaygroundFuncEnv`](../roxie/environment/loader.py) splits `FuncEnv`'s methods into the two that *make physics happen* (`initial`, `transition`), which call the wrapped env's `reset` and `step`, and the accessors that *answer questions about a state* by reading the field off an `mjx_env.State`.
 
 ## Bringing an already-batched env
 
@@ -93,20 +78,47 @@ def build_my_env(
 
 The three injected arguments are supplied by [`loader.build_env`](../roxie/environment/loader.py), not by the yaml, and override any same-named key in it. `num_envs`/`test_episodes` are trainer quantities — the same env definition is driven at `env.parallel_envs` worlds for training and at `trainer.test_episodes` for evaluation, and injecting them stops the eval pool from drifting out of step with the eval loop. `mode` lets a builder apply playback-specific tweaks.
 
-Everything else under `env:` is a keyword argument, so a stale key fails at launch. The exceptions are `loader.TRAINER_ENV_KEYS` — `parallel_envs`, `test_episodes`, `viewer`, `player`, and the `obs_size`/`action_size`/`obs_action_size` that `publish_env_shapes` writes back into the block for the agent yaml to interpolate — which roxie consumes itself and strips before instantiating. Which hardware the physics runs on is `runtime.device`, applied long before a builder exists ([backends.md](backends.md#where-the-run-runs)). [`tests/test_env_configs.py`](../tests/test_env_configs.py) pins a config against its builder's signature in both directions.
+Everything else under `env:` is a keyword argument, so a stale key fails at launch. The exceptions are `loader.TRAINER_ENV_KEYS` — `parallel_envs`, `test_episodes`, `viewer`, `player`, and the `obs_size`/`action_size`/`obs_action_size`/`pixel_shape` that `publish_env_shapes` writes back into the block for the agent yaml to interpolate — which roxie consumes itself and strips before instantiating. Which hardware the physics runs on is `runtime.device`, applied long before a builder exists ([backends.md](backends.md#where-the-run-runs)). [`tests/test_env_configs.py`](../tests/test_env_configs.py) pins a config against its builder's signature in both directions.
 
-The two shipped builders are `build_playground_env` and `build_envpool_env` in [`roxie/environment/loader.py`](../roxie/environment/loader.py), with a config-group file each in [`roxie/configs/env/`](../roxie/configs/env/) — a complete `env:` block an experiment pulls in and overrides:
+The shipped builder is `build_playground_env` in [`roxie/environment/loader.py`](../roxie/environment/loader.py), with a config-group file in [`roxie/configs/env/`](../roxie/configs/env/) — a complete `env:` block an experiment pulls in and overrides:
 
 ```yaml
 defaults:
   - /agent: sac
-  - /env: playground     # or /env: envpool
+  - /env: playground
   - _self_
 
 env:
   env_name: CheetahRun
   impl: warp
 ```
+
+Observations must be flat arrays. The 16 registered tasks whose observation is a dictionary, such as `Go1JoystickFlatTerrain` and `LeapCubeReorient`, do not load.
+
+## Several tasks at once
+
+[`roxie/environment/multitask.py`](../roxie/environment/multitask.py) trains one policy on several tasks by composing their envs into one batch. Each task is an ordinary env block, built by its own builder, with its own physics, observation and reward. Nothing is shared between tasks or detected about them; they only have to agree on an action space. `build_multitask_env` is the builder and [`roxie/configs/env/multitask.yaml`](../roxie/configs/env/multitask.yaml) its group file:
+
+```yaml
+env:
+  task_defaults:                     # what every task shares; the group file
+    impl: warp                       # sets the builder, build_playground_env
+  tasks:
+    stand: {env_name: HumanoidStand}
+    run: {env_name: HumanoidRun}
+  weights: {stand: 1, run: 3}        # each task's share of `parallel_envs`
+```
+
+The rollout, the agents and the replay see one env:
+
+- **Worlds.** Each task gets a fixed, contiguous block of worlds, in one-hot order, sized by `weights` at launch. A world never changes task: its physics belongs to its task's env, and moving it would mean recompiling.
+- **Observations.** Each task's own, zero-padded to the widest task, then the task's one-hot. The padding is the observation mask: the agent keeps its statistics per task, so a column a task does not fill only ever accumulates zeros and normalizes to exactly zero ([agents.md](agents.md#observation-normalization)).
+- **Rewards and done flags.** Each task's own, untouched.
+- **Eval.** Every task gets `trainer.test_episodes` worlds of its own, whatever the weights.
+
+`MultiTaskEnv` steps the task envs side by side inside the trace, threading each task's own `params` through its own hooks. Every task must run on the same backend: tasks that load different `impl`s are refused.
+
+The weights fix what the worlds *collect*. What the learner *trains on* is the replay's to steer, through a curriculum ([training.md](training.md#several-tasks)).
 
 ## Spaces
 

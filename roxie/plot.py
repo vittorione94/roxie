@@ -120,40 +120,29 @@ def load_runs(paths):
     return runs
 
 
-# Which task IMPLEMENTATION a cell steps — the axis the figure must not
-# collapse. The playground cells share one set of XMLs, so overlaying them IS a
-# parity check; EnvPool steps dm_control's own C++ physics off a different XML,
-# and the two disagree on integrator (9 of 25 tasks) and sim dt (8). So a
-# cross-suite score gap tangles physics with algorithm, and each suite gets its
-# own figure.
+# Which task implementation a cell steps; cells sharing one overlay as a parity
+# check.
 CELL_SUITE = {
     "warp_gpu": "playground",
     "mjx_gpu": "playground",
     "mjx_cpu": "playground",
-    "envpool_cpu": "dm_control",
-    "mjbatch_cpu": "mjbatch",
+    "batch_cpu": "playground",
 }
 
-# Named in each figure's subtitle.
 SUITE_PHYSICS = {
     "playground": "mujoco_playground XMLs, MJX-tuned solver settings",
-    "dm_control": "dm_control XMLs, native MuJoCo",
-    "mjbatch": "dm_control XMLs, native MuJoCo, batched rollout",
 }
 
 DEVICE_LABEL = {"cpu": "CPU", "gpu": "GPU"}
 
-# Named in the speed figure's legend, where the series is the backend cell.
 CELL_LABEL = {
-    "envpool_cpu": "EnvPool (CPU)",
-    "mjbatch_cpu": "mjbatch (CPU)",
+    "batch_cpu": "mujoco.batch (CPU)",
     "warp_gpu": "mujoco_warp (GPU)",
     "mjx_gpu": "MJX (GPU)",
     "mjx_cpu": "MJX (CPU)",
 }
 
-# The rate the speed figure reports, so a run that has not reached the budget is
-# still comparable rather than silently reading as cheap.
+# Rates are per this many steps, so a run short of the budget stays comparable.
 RATE_STEPS = 1e8
 
 THEMES = {
@@ -167,10 +156,8 @@ THEMES = {
     },
 }
 
-# Colour identifies the agent and so does the dash: the second encoding is what
-# keeps the dark-mode green/yellow pair (all-pairs CVD ΔE 6.9, inside the 6–8
-# band that is legal only with secondary encoding) apart, and what survives a
-# greyscale print.
+# The dash is a second encoding: the dark-mode green/yellow pair is only CVD
+# ΔE 6.9 apart on colour, and dashes survive a greyscale print.
 AGENT_COLORS = {
     "light": {"ddpg": "#2a78d6", "td3": "#eda100", "d4pg": "#e87ba4", "td4": "#008300",
               "sac": "#eb6834", "mpo": "#1baf7a", "ppo": "#4a3aa7"},
@@ -183,16 +170,12 @@ AGENT_DASH = {
     "sac": (), "mpo": (5.0, 1.8), "ppo": (1.5, 1.5),
 }
 
-# Seven curves cannot share one panel: the palette clears its all-pairs CVD and
-# normal-vision floors at four series and no further, and no re-ordering of the
-# eight documented hues changes that. The split is by policy class, so a panel
-# is also a like-for-like comparison.
+# At most four series per panel: past that the palette fails its CVD floors.
 FAMILIES = [
     ("deterministic policy", ["ddpg", "td3", "d4pg", "td4"]),
     ("stochastic policy", ["sac", "mpo", "ppo"]),
 ]
 
-# The caption over each half of a release figure, in row order.
 BLOCK_CAPTIONS = {
     "steps": "sample efficiency — return against environment steps",
     "time": "compute efficiency — return against wall-clock time",
@@ -234,7 +217,7 @@ def discover_grid(root: Path):
     """Walk a release tree into {task: {(agent, cell): DataFrame}}.
 
     Expects ``<root>/<task>/<cell>/<agent>/<stamp>/log.csv``, which is the
-    layout `experiments/dmc/bench/dmc.yaml` gives `hydra.run.dir`. When an arm
+    layout `experiments/release/bench/release.yaml` gives `hydra.run.dir`. When an arm
     was run more than once (a resume, a re-run), the LAST timestamp wins — the
     tree is sorted, and a later stamp is the later attempt — and the dropped
     stamps are named on stdout, because a re-run at a changed config is exactly
@@ -335,8 +318,7 @@ def plot_release(grid, output: str, suite: str, device: str, theme: str):
 
     half = len(rows) // 2
     fig = plt.figure(figsize=(3.7 * len(tasks), 2.55 * len(rows) + 0.75))
-    # A spacer row rather than a uniform hspace: the gap between the halves has
-    # to be wider than the gap inside one, and hspace cannot vary per row.
+    # A spacer row widens the gap between halves; hspace cannot vary per row.
     ratios = [1.0] * half + [0.24] + [1.0] * half
     spec = fig.add_gridspec(len(rows) + 1, len(tasks), height_ratios=ratios)
     axs = [[fig.add_subplot(spec[r if r < half else r + 1, c])
@@ -362,8 +344,7 @@ def plot_release(grid, output: str, suite: str, device: str, theme: str):
                 drawn.add(agent)
                 x, xlabel = _axis_series(df, axis)
                 raw = df["test/score"]
-                # The eval is ten episodes, so a single point swings; the band
-                # behind the line is what shows that rather than hiding it.
+                # A ten-episode eval swings, so the raw curve stays behind.
                 line = raw.rolling(SMOOTH_WINDOW, center=True, min_periods=1).mean()
                 style = dict(color=colors[agent], linewidth=1.9,
                              dashes=AGENT_DASH[agent] or (1, 0),
@@ -401,8 +382,7 @@ def plot_release(grid, output: str, suite: str, device: str, theme: str):
     # The end labels live outside the axes, which tight_layout cannot see.
     fig.subplots_adjust(wspace=0.36)
 
-    # Offsets in inches, not figure fractions: the grid is two rows per half at
-    # any task count, but the figure's height is not.
+    # Offsets in inches, not figure fractions: the figure's height varies.
     left = axs[0][0].get_position().x0
     right = axs[0][-1].get_position().x1
     captions = []
@@ -413,8 +393,7 @@ def plot_release(grid, output: str, suite: str, device: str, theme: str):
         captions.append(y)
         fig.text(left, y, BLOCK_CAPTIONS[axis].upper(), fontsize=8.5,
                  fontweight="bold", color=tokens["secondary"], va="bottom")
-    # Centred in the band that is actually empty, which starts under the upper
-    # half's x-label — an offset from the axes box lands too high by its height.
+    # Centred below the upper half's x-label, not its axes box (lands high).
     fig.canvas.draw()
     label = axs[half - 1][0].xaxis.get_label().get_window_extent(
         fig.canvas.get_renderer()).transformed(fig.transFigure.inverted())
@@ -422,9 +401,8 @@ def plot_release(grid, output: str, suite: str, device: str, theme: str):
     fig.add_artist(Line2D([left, right], [rule_y, rule_y], color=tokens["axis"],
                           linewidth=0.9, zorder=0))
 
-    # Stacked up from the first caption rather than down from the figure top:
-    # the panel grid is two rows for a one-family group and four for two, and a
-    # header pinned to the top leaves a hole above the grid at the short height.
+    # Stacked up from the first caption: the grid height varies, and a header
+    # pinned to the figure top leaves a hole above a short grid.
     cells_seen = {cell for c in grid.values() for _, cell in c}
     backend = (CELL_LABEL.get(next(iter(cells_seen)), suite)
                if len(cells_seen) == 1 else DEVICE_LABEL[device])
@@ -494,8 +472,7 @@ def plot_speed(grid, output: str, theme: str):
     _style_axes(ax, tokens)
     ax.grid(False, axis="y")
 
-    # A cell keeps its slot whether or not it ran this agent, so the groups stay
-    # aligned down the chart instead of recentring per row.
+    # A cell keeps its slot even where it did not run, so groups stay aligned.
     bar_h = min(0.27, 0.82 / len(cells))
     pitch = bar_h + 0.05
     span = max(v for values in rates.values() for v in values)

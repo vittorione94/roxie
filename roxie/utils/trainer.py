@@ -10,10 +10,33 @@ from flax import nnx
 from roxie.agents.hyperparams import OffPolicyHyperparams
 from roxie.utils import logger
 from roxie.utils.checkpoint import CHECKPOINTS_DIRNAME
+from roxie.utils.playback import load_config
 from roxie.utils.rollout import ChunkSums, RolloutState, build_rollout
 
 
-def _new_epoch_acc(metric_keys):
+def check_resumed_tasks(checkpoint, environment, metadata) -> None:
+    """Refuses to resume a multi-task run into an env that lays its tasks out anew.
+
+    Equal-width tasks in another order pass every shape check, and would each
+    get another task's one-hot and statistics row. The order a run trained in
+    is its saved config's, and the widths are what `Trainer` records.
+
+    Raises:
+        ValueError: if the tasks or their observation widths differ.
+    """
+    layout = getattr(environment, "layout", None)
+    if layout is None:
+        return
+    trained = tuple(load_config(str(checkpoint)).env.tasks)
+    widths = tuple(int(w) for w in metadata.get("task_obs_widths") or ())
+    if (trained, widths) != (layout.names, layout.widths):
+        raise ValueError(
+            f"{checkpoint} trained tasks {trained} with observation widths "
+            f"{widths}, but this env has {layout.names} with {layout.widths}."
+        )
+
+
+def _new_epoch_acc(metric_keys, num_tasks=0):
     """Per-epoch accumulators, reset at every epoch boundary.
 
     `sums` is the `ChunkSums` `rollout.collect` returns per chunk, summed; it
@@ -22,7 +45,7 @@ def _new_epoch_acc(metric_keys):
     stay host-side: they are one entry per learning pass, not per step.
     """
     return dict(
-        sums=ChunkSums.zeros(metric_keys),
+        sums=ChunkSums.zeros(metric_keys, num_tasks),
         steps=0, actor_losses=[], critic_losses=[],
     )
 
@@ -30,8 +53,7 @@ def _new_epoch_acc(metric_keys):
 class Trainer:
     """One training loop over every backend.
 
-    What varies between a vmapped JAX env and a C++ EnvPool pool is behind
-    `roxie.utils.rollout`, which fuses a whole update window of acting,
+    `roxie.utils.rollout` fuses a whole update window of acting,
     physics, buffering and scoring into one compiled chunk. What is left here is
     the step budget, the epoch and save cadences, the learning pass's own
     bookkeeping, episode statistics and metric namespacing.
@@ -39,13 +61,12 @@ class Trainer:
 
     def __init__(
         self, output_dir, steps=int(1e7), epoch_steps=int(3e5), save_steps=int(1e5),
-        test_episodes=5, show_progress=True, replace_checkpoint=False,
-        save_buffer=False, resume=None,
+        show_progress=True, replace_checkpoint=False,
+        save_buffer=False, resume=None, curriculum=None,
     ):
         self.max_steps = steps
         self.epoch_steps = epoch_steps
         self.save_steps = save_steps
-        self.test_episodes = test_episodes
         self.show_progress = show_progress
         self.replace_checkpoint = replace_checkpoint
         self.output_dir = output_dir
@@ -57,12 +78,9 @@ class Trainer:
             for k in ("steps", "epochs", "episodes", "gradient_steps")
         )
         self.skip_warmup = bool(resume.get("buffer_restored", False))
+        # None keeps the replay's task mix at the collection shares.
+        self.curriculum = curriculum
         self._checkpoint_manager = None
-
-    def initialize(self, agent, environment, test_environment=None):
-        self.agent = agent
-        self.environment = environment
-        self.test_environment = test_environment
 
     def _warmup_iters(self, memory_warmup, num_envs):
         """Zero when a resume restored a populated buffer — refilling would add
@@ -89,16 +107,22 @@ class Trainer:
             )
         return self._checkpoint_manager
 
-    def _save(self, agent, epochs, episodes, gradient_steps):
-        """Write a checkpoint, tagged with the progress needed to resume it."""
+    def _save(self, agent, epochs, episodes, gradient_steps, layout=None):
+        """Write a checkpoint, tagged with the progress needed to resume it.
+
+        `layout` is a multi-task env's `TaskLayout`, or None for a single task.
+        """
+        metadata = {
+            "steps": int(self.steps),
+            "epochs": int(epochs),
+            "episodes": int(episodes),
+            "gradient_steps": int(gradient_steps),
+        }
+        if layout is not None:
+            # How many padded observation columns each task really fills.
+            metadata["task_obs_widths"] = [int(w) for w in layout.widths]
         payload = agent.checkpoint_payload(
-            include_buffer=self.save_buffer,
-            extra_metadata={
-                "steps": int(self.steps),
-                "epochs": int(epochs),
-                "episodes": int(episodes),
-                "gradient_steps": int(gradient_steps),
-            },
+            include_buffer=self.save_buffer, extra_metadata=metadata,
         )
         if payload is None:  # a baseline with nothing to checkpoint
             return
@@ -137,6 +161,13 @@ class Trainer:
 
         if not isinstance(agent.hp, OffPolicyHyperparams):
             return agent_key
+        # flashbax allocates with `jnp.empty_like`: sampling a short buffer
+        # reads uninitialised GPU memory and can leave NaN weights for good.
+        if not agent.replay.can_sample(agent.state.buffer_state):
+            raise ValueError(
+                f"memory_warmup={agent.hp.memory_warmup:,} leaves the replay too "
+                f"short to sample from; raise it."
+            )
         print("Compiling gradient step...", flush=True)
         t0 = time.time()
         agent_key, warm_key = jax.random.split(agent_key)
@@ -172,30 +203,37 @@ class Trainer:
             flush=True,
         )
 
-    def run(self, NUM_ENVS, rngs):
-        """Build the backend rollout, then train.
+    def run(self, agent, environment, test_environment, num_envs, rngs):
+        """Builds the backend rollout, then trains `agent` on it.
 
         A play-only baseline from `agents.basic` does not belong here and says
         so itself: its `learn` raises, and its acting cannot be compiled against
         a handed-in actor because the policy IS its own Python state.
+
+        Args:
+            agent: what is trained.
+            environment: the training env.
+            test_environment: the env the epoch-end eval runs on; None skips it.
+            num_envs: the configured number of training worlds.
+            rngs: the run's `envs` and `agent` key streams.
         """
         rollout, rstate = build_rollout(
-            self.environment, self.test_environment, NUM_ENVS, rngs.envs(),
+            environment, test_environment, num_envs, rngs.envs(),
         )
         try:
-            self._run(rollout, rstate, rngs)
+            self._run(agent, rollout, rstate, rngs)
         finally:
             if self._checkpoint_manager is not None:
                 self._checkpoint_manager.close()
 
-    def _run(self, rollout, rstate: RolloutState, rngs):
+    def _run(self, agent, rollout, rstate: RolloutState, rngs):
         start_time = last_epoch_time = time.time()
-        agent = self.agent
+        layout = getattr(rollout.environment, "layout", None)
         num_envs = rollout.num_envs
         self.num_envs = num_envs
         agent_key = rngs.agent()
 
-        memory_warmup = getattr(agent, "memory_warmup", 0)
+        memory_warmup = getattr(agent.hp, "memory_warmup", 0)
         warmup_iters = self._warmup_iters(memory_warmup, num_envs)
         epochs, episodes, tot_gradient_steps = self._init_counters()
 
@@ -211,12 +249,14 @@ class Trainer:
             print(f"  Done: {self.steps:,} steps, {int(episodes)} episodes",
                   flush=True)
 
+        if self.curriculum is not None:
+            agent.set_task_weights(self.curriculum.start(rollout.task_names))
         agent_key = self._precompile_update(agent, agent_key)
 
         print("Training...", flush=True)
         collect_steps = self._collect_steps(agent, num_envs)
         chunk_env_steps = collect_steps * num_envs
-        acc = _new_epoch_acc(rollout.metric_keys)
+        acc = _new_epoch_acc(rollout.metric_keys, len(rollout.task_names))
         grad_steps = 0
         first_chunk, bench_t0, bench_steps = True, None, 0
 
@@ -273,6 +313,7 @@ class Trainer:
             stop_training = self._checkpoint_if_due(
                 agent, epochs=epochs, episodes=episodes,
                 gradient_steps=tot_gradient_steps, prev_steps=prev_steps,
+                layout=layout,
             )
             if stop_training:
                 break
@@ -289,13 +330,24 @@ class Trainer:
         if hasattr(agent, "noise_module"):
             agent.noise_module.reset_noise()
 
-        if self.test_environment and hasattr(agent, "state"):
+        test_env = rollout.test_environment
+        if test_env and hasattr(agent, "state"):
             pin = agent.freeze_acting_norm()
             self._store_test_metrics(*rollout.evaluate(
                 agent.state.actor,
                 agent.state.obs_stats if pin is None else pin,
                 rollout.reset_test(), agent=agent,
+            ), tasks=(
+                None if getattr(test_env, "task_ids", None) is None
+                else (test_env.task_names, test_env.task_ids)
             ))
+
+        task_scores = self._task_scores(acc["sums"])
+        task_weights = None
+        if self.curriculum is not None:
+            # Same shape, so the next learning pass takes it with no recompile.
+            task_weights = self.curriculum.update(task_scores)
+            agent.set_task_weights(task_weights)
 
         epochs += 1
         self._store_epoch_metrics(
@@ -305,12 +357,13 @@ class Trainer:
             sps=self.steps / (time.time() - start_time),
             gradient_steps=gradient_steps,
             times=(start_time, last_epoch_time),
+            tasks=(rollout.task_names, task_scores, task_weights),
         )
         logger.dump(step=self.steps)
-        return epochs, _new_epoch_acc(rollout.metric_keys)
+        return epochs, _new_epoch_acc(rollout.metric_keys, len(rollout.task_names))
 
     def _checkpoint_if_due(self, agent, *, epochs, episodes,
-                           gradient_steps, prev_steps):
+                           gradient_steps, prev_steps, layout=None):
         """Saves on the save cadence and at the step budget.
 
         Returns:
@@ -319,7 +372,7 @@ class Trainer:
         stop_training = self.steps >= self.max_steps
         if stop_training or self._crossed(prev_steps, self.steps,
                                           self.save_steps):
-            self._save(agent, epochs, episodes, gradient_steps)
+            self._save(agent, epochs, episodes, gradient_steps, layout)
         return stop_training
 
     @staticmethod
@@ -343,11 +396,24 @@ class Trainer:
         return (n, mean_ret, std(sums.ret_sq, mean_ret),
                 mean_len, std(sums.length_sq, mean_len))
 
+    @staticmethod
+    def _task_scores(sums):
+        """Each task's mean finished-episode return; nan where none finished."""
+        if sums.task_ret is None:
+            return np.zeros(0)
+        ret, count = np.asarray(sums.task_ret), np.asarray(sums.task_count)
+        return np.where(count > 0, ret / np.maximum(count, 1.0), np.nan)
+
     def _store_epoch_metrics(
         self, agent, stats, acc, *, epochs, episodes, sps, gradient_steps,
-        times,
+        times, tasks=((), (), None),
     ):
-        """Store one epoch's metrics under the shared namespace scheme."""
+        """Store one epoch's metrics under the shared namespace scheme.
+
+        `tasks` is a multi-task env's `(names, scores, weights)`: each task's
+        mean finished-episode return, and the replay weights the curriculum
+        chose from them for the next epoch, or None without one.
+        """
         ep_n, score, score_std, length, length_std = stats
         start_time, last_epoch_time = times
 
@@ -361,6 +427,15 @@ class Trainer:
         logger.store("train/episodes/epoch", ep_n)
         logger.store("train/episodes/total", int(episodes))
         logger.store("train/gradient_steps", gradient_steps)
+
+        names, task_scores, task_weights = tasks
+        for i, name in enumerate(names):
+            # Absent rather than zero when no episode of it finished.
+            logger.store(f"train/task/{name}/score", (
+                None if np.isnan(task_scores[i]) else float(task_scores[i])
+            ))
+            if task_weights is not None:
+                logger.store(f"train/task/{name}/weight", float(task_weights[i]))
 
         for name in ("actor", "critic"):
             values = acc[f"{name}_losses"]
@@ -395,7 +470,7 @@ class Trainer:
             pass
 
     @staticmethod
-    def _store_test_metrics(scores, lengths, start_obs):
+    def _store_test_metrics(scores, lengths, start_obs, tasks=None):
         """Stored, not printed: the eval runs just before `logger.dump()`, so its
         stats land in the same dump as the training stats.
 
@@ -412,3 +487,8 @@ class Trainer:
                      float(np.mean(scores / np.maximum(lengths, 1))))
         logger.store("test/distinct_starts",
                      float(len(np.unique(start_obs, axis=0))))
+        # Every task gets the same number of eval worlds.
+        names, task_ids = tasks if tasks is not None else ((), None)
+        for k, name in enumerate(names):
+            logger.store(f"test/task/{name}/score",
+                         float(np.mean(scores[task_ids == k])))

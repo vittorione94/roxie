@@ -25,11 +25,17 @@ class FuncEnv(Generic[StateType, ObsType, ActType, ParamsType]):
     at least `initial`, `transition`, `observation`, `reward`, and `terminal`.
     Methods must be written for a single environment and contain no Python
     branching on traced values, as they are vmapped by the driver.
+
+    Attributes:
+        pixel_shape: `(H, W, C)` of an image leading the flat observation,
+          flattened row-major; `None` for an env without pixels. See
+          `roxie.models.vision`.
     """
 
     observation_space: spaces.Space
     action_space: spaces.Space
     metadata: dict[str, Any] = {"jax": True}
+    pixel_shape: tuple[int, ...] | None = None
 
     def initial(self, rng: Any, params: ParamsType | None = None) -> StateType:
         """Generates the start state of a fresh episode."""

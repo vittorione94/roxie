@@ -12,12 +12,12 @@ from roxie.agents.hyperparams import TD3Hyperparams
 from roxie.agents.utils import (
     fused_grad_steps,
     reduce_diagnostics,
-    repack_samples,
+    sample_replay,
     soft_update,
 )
 from roxie.losses.actor_losses import skipped_actor_aux, td3_actor_loss_fn
 from roxie.losses.critic_losses import td3_critic_loss_fn
-from roxie.utils.math import normalize_samples, obs_mean_std
+from roxie.utils.math import obs_mean_std
 
 
 def _td3_grad_step(
@@ -34,14 +34,8 @@ def _td3_grad_step(
 ):
     """Executes a single TD3 gradient step, conditionally updating policy and target networks."""
     key, noise_key = jax.random.split(key)
-    samples = replay_sample_fn(state.buffer_state, key)
-    re_packed_samples = repack_samples(samples, hp.gamma, hp.n_step)
-    re_packed_samples = normalize_samples(
-        re_packed_samples,
-        obs_mean,
-        obs_std,
-        hp.obs_norm_clip,
-        hp.normalize_observations,
+    re_packed_samples = sample_replay(
+        state, key, hp, replay_sample_fn, obs_mean, obs_std
     )
 
     (critic_loss, critic_aux), critic_grads = nnx.value_and_grad(
@@ -151,7 +145,7 @@ class TD3(DDPG):
             agent_rng,
             target_steps,
             self.hp,
-            self.replay.sample,
+            self.replay.draw,
             self.action_low,
             self.action_high,
         )

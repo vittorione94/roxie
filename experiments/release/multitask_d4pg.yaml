@@ -1,0 +1,26 @@
+# @package _global_
+
+defaults:
+  - agent: d4pg_bench
+  - noise: bench_gaussian
+  - bench: multitask
+  - _self_
+
+release:
+  agent: d4pg
+
+# Sized for 4,096 lockstep worlds: the bench's 500k would hold 122 steps each, under
+# one episode; 2,048 per world is close to the 1,953 that 256 worlds get from 500k.
+agent:
+  hyperparams:
+    memory_warmup: 491_520      # 120 control steps per world
+    steps_between_updates: 4_096
+    learning_steps: 40          # with the line above, the bench's updates per env step
+  memory_config:
+    max_length: 8_388_608       # 2,048 steps per world, about 3.1 GB
+
+env:
+  parallel_envs: 4096
+
+trainer:
+  steps: 1_000_000_000

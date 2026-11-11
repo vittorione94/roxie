@@ -1,0 +1,13 @@
+# The pixel encoder in front of every network's MLP (`roxie.models.vision.PixelEncoder`
+# kwargs). Usage, and how to give one network its own encoder: docs/configuration.md#vision.
+# Replay stores pixels as float32: a 64x64x3 frame is 48 KB, so a 500k-transition
+# buffer is ~25 GB. Shrink `agent.memory_config.max_length` to fit.
+
+pixel_shape: ${env.pixel_shape}
+
+# VALID padding: 64x64 -> 31 -> 29 -> 27 -> 25.
+channels: [32, 32, 32, 32]
+kernel_sizes: [3, 3, 3, 3]
+strides: [2, 1, 1, 1]
+
+latent_dim: 50

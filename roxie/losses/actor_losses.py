@@ -149,9 +149,7 @@ def ppo_loss_fn(
     key
 ):
     """Computes the PPO clipped surrogate actor loss and diagnostic metrics."""
-    # Every argument arrives flat over `(env, time)` and already trimmed to the
-    # GAE horizon — `_prepare_rollout` slices and flattens once, so that a single
-    # permutation can shuffle transitions rather than whole trajectories.
+    # Arguments arrive flattened over `(env, time)`, trimmed to the GAE horizon.
     distribution = actor_model(observations)
     logp_new = distribution.log_prob_from_pre(pre_actions)
 
@@ -242,8 +240,7 @@ def mpo_actor_loss_fn(
     )
 
     actions_scaled = scale_to_env(actions, action_low, action_high)
-    obs_tiled = jnp.broadcast_to(obs, (num_action_samples,) + obs.shape)
-    q_values = critic_model(obs_tiled, actions_scaled)
+    q_values = critic_model(obs, actions_scaled)
     q_values = jax.lax.stop_gradient(jnp.squeeze(q_values, axis=-1))
 
     online_dist = actor_model(obs)

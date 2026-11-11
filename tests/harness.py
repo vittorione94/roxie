@@ -27,36 +27,37 @@ from roxie.environment.vector import Timestep
 REPO = Path(__file__).resolve().parent.parent
 CONFIGS = REPO / "roxie" / "configs"
 
-# Every agent that learns, in the order the docs list them. The baselines in
-# `basic.py` have no `state` and are covered by `test_basic_agents.py`.
+# The learning agents; the `basic.py` baselines are in `test_basic_agents.py`.
 AGENTS = ("ddpg", "d4pg", "td3", "td4", "sac", "mpo", "ppo")
-# The deterministic arms: they explore through a noise module rather than
-# through their own policy, and carry the pre-activation penalty.
+# Explore through a noise module and carry the pre-activation penalty.
 DETERMINISTIC = ("ddpg", "d4pg", "td3", "td4")
 
 OBS, ACT, ENVS = 8, 3, 8
 
-# Enough iterations to fill every shipped buffer geometry: the flat pair
-# buffer's `min_length`, a trajectory buffer's `n_step + 1` window (D4PG and
-# TD4 ship `n_step: 5`) and PPO's queue width alike.
+# Fills every shipped buffer: the pair `min_length`, an `n_step + 1` window
+# (D4PG and TD4 ship `n_step: 5`) and PPO's queue.
 WARMUP_ITERS = 8
 
 
-def agent_config(name: str, **hyperparams):
-    """The shipped config for `name`, shrunk to what a CPU test can drive."""
-    # The env shapes `loader.publish_env_shapes` would have written back; the
-    # network blocks interpolate them.
-    cfg = OmegaConf.create(
-        {
-            "env": {
-                "parallel_envs": ENVS,
-                "obs_size": OBS,
-                "action_size": ACT,
-                "obs_action_size": OBS + ACT,
-            },
-            "agent": OmegaConf.load(CONFIGS / "agent" / f"{name}.yaml"),
-        }
-    ).agent
+def agent_config(name: str, *, vision=None, obs_size: int = OBS, **hyperparams):
+    """The shipped config for `name`, shrunk to what a CPU test can drive.
+
+    `vision` is the top-level block a launchable's `/vision` group selection
+    composes in; the network blocks read it through `oc.select`.
+    """
+    # Stand-ins for what `loader.publish_env_shapes` writes back.
+    root = {
+        "env": {
+            "parallel_envs": ENVS,
+            "obs_size": obs_size,
+            "action_size": ACT,
+            "obs_action_size": obs_size + ACT,
+        },
+        "agent": OmegaConf.load(CONFIGS / "agent" / f"{name}.yaml"),
+    }
+    if vision is not None:
+        root["vision"] = vision
+    cfg = OmegaConf.create(root).agent
 
     cfg.actor_config.features = [16, 16]
     for critic in _critic_blocks(cfg.critic_config):
@@ -75,11 +76,9 @@ def agent_config(name: str, **hyperparams):
         if key in cfg.memory_config:
             cfg.memory_config[key] = value
 
-    # Learn as soon as the buffer is legitimately full, then every iteration:
-    # what these exercise is the learning pass, not the schedule
-    # (`test_update_schedule.py` covers that).
+    # Learn every iteration once full; `test_update_schedule.py` tests cadence.
     defaults = {
-        "memory_warmup": 4 * ENVS,
+        "memory_warmup": 8 * ENVS,
         "steps_between_updates": ENVS,
         "learning_steps": 2,
         "num_minibatches": 2,
@@ -91,11 +90,11 @@ def agent_config(name: str, **hyperparams):
     return cfg
 
 
-def build(name: str, **hyperparams):
+def build(name: str, *, vision=None, obs_size: int = OBS, **hyperparams):
     """Construct the agent `name` the way `train.py` does."""
-    cfg = agent_config(name, **hyperparams)
+    cfg = agent_config(name, vision=vision, obs_size=obs_size, **hyperparams)
     kwargs = dict(
-        env_obs_size=OBS,
+        env_obs_size=obs_size,
         env_action_size=ACT,
         action_low=-jnp.ones(ACT, dtype=jnp.float32),
         action_high=jnp.ones(ACT, dtype=jnp.float32),
@@ -130,27 +129,25 @@ def drive(agent, iterations: int, key, obs=None, drift: float = 0.0) -> int:
         obs = jax.random.normal(
             jax.random.PRNGKey(1), (ENVS, OBS), dtype=jnp.float32
         )
+    width = obs.shape[-1]
     false = jnp.zeros((ENVS,), jnp.bool_)
 
     for i in range(iterations):
         step_key = jax.random.fold_in(key, i)
         act_key, obs_key, reward_key = jax.random.split(step_key, 3)
         action, _noise, extras = agent.select_action(obs, act_key)
-        # `scale - 1` shifts the mean along with the spread, so both running
-        # moments move; at drift 0 both terms vanish and this is a standard
-        # normal, which is what every other caller gets.
+        # `scale - 1` shifts the mean too, so both moments move.
         scale = 1.0 + drift * i
         timestep = Timestep(
-            obs=jax.random.normal(obs_key, (ENVS, OBS), dtype=jnp.float32) * scale
+            obs=jax.random.normal(obs_key, (ENVS, width), dtype=jnp.float32) * scale
             + (scale - 1.0),
             reward=jax.random.normal(reward_key, (ENVS,), dtype=jnp.float32),
             terminated=false,
             truncated=false,
             info={},
         )
-        # What `Learner.buffer` does: the action and the behaviour extras come
-        # from the `select_action` that chose them, since the agent keeps no
-        # acting state of its own.
+        # As `Learner.buffer` does: the agent keeps no acting state, so the
+        # action and behaviour extras come from `select_action`.
         agent.buffer_transitions(
             Transition(
                 observation=obs,

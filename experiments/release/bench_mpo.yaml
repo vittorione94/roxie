@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - agent: mpo_bench
+  - bench: release
+  - backend: batch_cpu
+  - _self_
+
+release:
+  agent: mpo

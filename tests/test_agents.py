@@ -37,9 +37,8 @@ DPG = SQUASHED_ACTOR | BOOTSTRAPPED_CRITIC | {
 }
 TWIN = {"twin_gap"}
 
-# What each agent must report, beyond the `updates_per_env_step` / `buffer_frac`
-# levels the base class adds. Spelled out per agent rather than derived, so
-# dropping a metric is a test failure and not a quiet regression.
+# Spelled out per agent so dropping a metric fails; the base class adds
+# `updates_per_env_step` / `buffer_frac`.
 EXPECTED = {
     "ddpg": DPG,
     "d4pg": DPG,
@@ -60,9 +59,8 @@ EXPECTED = {
     },
 }
 
-# Bounded by construction; a value outside says the reduction divided by the
-# wrong denominator (the classic being `n_steps` where the actor only ran on
-# `n_steps / policy_delay` of them).
+# Out of range means a wrong denominator, e.g. `n_steps` where the actor ran on
+# `n_steps / policy_delay`.
 FRACTIONS = {
     "sat_frac", "tanh_grad", "target_smooth_clip_frac", "target_act_rail_frac",
     "clip_frac", "buffer_frac",
@@ -211,9 +209,7 @@ def test_consecutive_passes_survive_the_donated_state(name, passes):
         assert steps > 0
         assert jnp.isfinite(actor_loss) and jnp.isfinite(critic_loss)
 
-    # This is the one test that advances a shared agent; draining what it banked
-    # leaves the module's fixture as every other test expects to find it,
-    # whatever order they run in.
+    # The one test that advances a shared agent: leave its fixture clean.
     agent.pop_diagnostics()
 
 
@@ -304,7 +300,7 @@ def test_policy_delay_does_not_leak_zeros_into_the_actor_metrics():
 def test_the_saturation_penalty_reaches_every_deterministic_actor(name):
     """`pre_activation_coef` has to be live on all four deterministic arms.
 
-    `experiments/dmc/agent/ddpg_bench.yaml` calls them "a clean algorithm-only
+    `experiments/release/agent/ddpg_bench.yaml` calls them "a clean algorithm-only
     A/B" on the strength of them carrying the same coefficient, and an arm whose
     actor loss quietly ignored the argument would still round-trip the value
     through the config, the checkpoint and the hyperparameter log. Hence testing

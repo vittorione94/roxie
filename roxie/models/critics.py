@@ -1,11 +1,12 @@
 """Critic neural network models for value estimation."""
 
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import jax.numpy as jnp
 from flax import nnx
 
 from roxie.models.actors import torch_linear_init
+from roxie.models.vision import vision_encoder
 from roxie.utils.precision import FLOAT, as_float, linear_kwargs
 
 
@@ -72,7 +73,9 @@ class QCritic(nnx.Module):
         activation_fn: Callable = nnx.relu,
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,
+        vision: Optional[Mapping] = None,
     ):
+        self.encoder, in_features = vision_encoder(vision, in_features, rngs=rngs)
         self.mlp = MLPBlock(
             in_features,
             features,
@@ -86,6 +89,13 @@ class QCritic(nnx.Module):
     def __call__(
         self, observations: jnp.ndarray, actions: jnp.ndarray, training: bool = False
     ) -> jnp.ndarray:
+        if self.encoder is not None:
+            observations = self.encoder(observations)
+        # MPO scores `(samples, batch)` actions against `(batch,)` observations;
+        # tiling only after the encoder runs it once per image, not per sample.
+        observations = jnp.broadcast_to(
+            observations, actions.shape[:-1] + observations.shape[-1:]
+        )
         x = jnp.concatenate([observations, actions], axis=-1)
         x = self.mlp(x, training=training)
         return self.output_layer(x)
@@ -106,6 +116,7 @@ class DistributionalQCritic(nnx.Module):
         activation_fn: Callable = nnx.relu,
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,
+        vision: Optional[Mapping] = None,
     ):
         self.v_min = float(v_min)
         self.v_max = float(v_max)
@@ -114,6 +125,7 @@ class DistributionalQCritic(nnx.Module):
             self.v_min, self.v_max, self.num_atoms, dtype=FLOAT
         )
 
+        self.encoder, in_features = vision_encoder(vision, in_features, rngs=rngs)
         self.mlp = MLPBlock(
             in_features,
             features,
@@ -127,6 +139,8 @@ class DistributionalQCritic(nnx.Module):
     def __call__(
         self, observations: jnp.ndarray, actions: jnp.ndarray, training: bool = False
     ) -> jnp.ndarray:
+        if self.encoder is not None:
+            observations = self.encoder(observations)
         x = jnp.concatenate([observations, actions], axis=-1)
         x = self.mlp(x, training=training)
         return self.output_layer(x)
@@ -158,7 +172,9 @@ class VCritic(nnx.Module):
         use_layer_norm: bool = False,
         dropout_rate: float = 0.0,
         torch_init: bool = False,
+        vision: Optional[Mapping] = None,
     ):
+        self.encoder, in_features = vision_encoder(vision, in_features, rngs=rngs)
         self.mlp = MLPBlock(
             in_features,
             features,
@@ -175,5 +191,7 @@ class VCritic(nnx.Module):
         self.output_layer = nnx.Linear(self.mlp.out_features, 1, rngs=rngs, **head)
 
     def __call__(self, observations: jnp.ndarray, training: bool = False) -> jnp.ndarray:
+        if self.encoder is not None:
+            observations = self.encoder(observations)
         x = self.mlp(observations, training=training)
         return self.output_layer(x)

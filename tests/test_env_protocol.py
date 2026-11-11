@@ -17,10 +17,11 @@ from flax import struct
 
 from roxie.environment import functional
 from roxie.environment.vector import (
-    EnvPoolVectorEnv,
+    DIVERGED_OBS_LIMIT,
     JaxVectorEnv,
     Timestep,
     VecState,
+    nonfinite_worlds,
 )
 
 
@@ -106,13 +107,20 @@ def test_params_stay_traced_and_reach_initial(vec_env, rng_key):
     """`params` must be an ARGUMENT, not a closure constant: an env that adapts
     its params refreshes them every epoch, and a recompile there would cost more
     than the adaptation buys."""
-    jitted = jax.jit(lambda k, p: vec_env.reset(k, params=p)[0].obs)
+    traces = []
+
+    def reset_obs(k, p):
+        traces.append(p)
+        return vec_env.reset(k, params=p)[0].obs
+
+    jitted = jax.jit(reset_obs)
     at_zero = np.asarray(jitted(rng_key, 0.0))
     at_two = np.asarray(jitted(rng_key, 2.0))
 
     assert np.allclose(at_two - at_zero, 2.0)
-    # One compile for both values is the property under test.
-    assert jitted._cache_size() == 1
+    # One compile for both. Counted by trace: on jax 0.10.2 `_cache_size()`
+    # reads 0 once the suite has filled the global jit cache.
+    assert len(traces) == 1
 
 
 def test_failure_is_terminated_not_truncated(vec_env, rng_key):
@@ -254,9 +262,7 @@ def test_transition_info_metrics_are_batched(vec_env, rng_key):
 
     _, ts = vec_env.step(state, jnp.ones((4, 1), dtype=jnp.float32), rng_key, pool)
 
-    # The env's own keys, plus the one the DRIVER owns: `nonfinite` is reported
-    # by both backends (see the module docstring), so a run that is quietly
-    # resetting diverged worlds says so in `train/nonfinite`.
+    # Plus the driver's `nonfinite`, which both backends report.
     assert set(ts.info["metrics"]) == {"x", "nonfinite"}
     assert np.asarray(ts.info["metrics"]["x"]).shape == (4,)
     assert np.asarray(ts.info["metrics"]["nonfinite"]).shape == (4,)
@@ -265,33 +271,22 @@ def test_transition_info_metrics_are_batched(vec_env, rng_key):
 class DivergingEnv(CounterEnv):
     """A `CounterEnv` whose physics blows up past x >= 2, exactly as a MuJoCo
     world does: the state goes non-finite and every predicate written about it
-    silently answers False from then on."""
+    silently answers False from then on.
+
+    `blown` is what the state blows up to: NaN, or a huge finite value, which is
+    what a MuJoCo world emits on its way to NaN.
+    """
+
+    def __init__(self, blown: float = float("nan")):
+        super().__init__()
+        self.blown = blown
 
     def transition(self, state, action, rng, params=None):
         x = state.x + jnp.squeeze(action)
-        return state.replace(x=jnp.where(x >= 2.0, jnp.nan, x))
+        return state.replace(x=jnp.where(x >= 2.0, self.blown, x))
 
     def reward(self, state, action, next_state, rng, params=None):
         return next_state.x - state.x
-
-
-class _FakePool:
-    """The minimum surface `EnvPoolVectorEnv` needs from a C++ pool."""
-
-    num_envs = 4
-
-    def __init__(self):
-        self.observation_space = functional.unbounded_box(2)
-        self.action_space = functional.box(-1.0, 1.0, shape=(1,))
-        self.obs = np.zeros((4, 2), dtype=np.float32)
-        self.reward = np.zeros(4, dtype=np.float32)
-
-    def reset(self):
-        return self.obs, {}
-
-    def step(self, action):
-        false = np.zeros(4, dtype=bool)
-        return self.obs, self.reward, false, false, {}
 
 
 class TestNonFiniteWorlds:
@@ -303,8 +298,12 @@ class TestNonFiniteWorlds:
     buffer and into the observation statistics, neither of which recovers.
     """
 
+    blown = float("nan")
+
     def _diverged(self, rng_key, reset_pool=True):
-        env = JaxVectorEnv(DivergingEnv(), num_envs=4, max_episode_steps=0)
+        env = JaxVectorEnv(
+            DivergingEnv(self.blown), num_envs=4, max_episode_steps=0,
+        )
         state = _pool(env, rng_key)
         pool = _pool(env, rng_key) if reset_pool else None
         # Two steps of +1: the second crosses the threshold into NaN.
@@ -374,22 +373,30 @@ class TestNonFiniteWorlds:
         assert not np.any(np.asarray(ts.terminated))
         assert np.all(np.asarray(ts.info["metrics"]["nonfinite"]) == 0.0)
 
-    def test_pool_backend_zeroes_without_forcing_a_reset(self):
-        """The pool owns its episode boundaries in C++, so the driver zeroes and
-        reports but does NOT invent a termination it cannot act on — that would
-        re-fire every step and count one dead world as thousands of episodes."""
-        pool = _FakePool()
-        env = EnvPoolVectorEnv(pool, max_episode_steps=0)
-        state, _ = env.reset()
-        pool.obs = np.full((4, 2), np.nan, dtype=np.float32)
-        pool.reward = np.full(4, np.nan, dtype=np.float32)
 
-        _, ts = env.step(state, np.zeros((4, 1), dtype=np.float32))
+class TestFiniteBlowUps(TestNonFiniteWorlds):
+    """The same contract for a world that blows up without reaching NaN.
 
-        assert np.all(np.isfinite(ts.obs)) and ts.obs.dtype == np.float32
-        assert np.all(np.isfinite(ts.reward)) and ts.reward.dtype == np.float32
-        assert not np.any(ts.terminated)
-        assert np.all(ts.info["metrics"]["nonfinite"] == 1.0)
+    `mujoco.batch` resets such a world itself at its QACC check, so its
+    observations stay finite throughout; one of them in the all-time
+    observation statistics is as permanent as a NaN in them.
+    """
+
+    blown = 1e7
+
+
+def test_the_limit_is_on_magnitude_per_world():
+    obs = jnp.asarray([
+        [DIVERGED_OBS_LIMIT, 0.0],
+        [-DIVERGED_OBS_LIMIT, 0.0],
+        [2.0 * DIVERGED_OBS_LIMIT, 0.0],
+        [0.0, -2.0 * DIVERGED_OBS_LIMIT],
+        [jnp.inf, 0.0],
+    ], dtype=jnp.float32)
+    reward = jnp.zeros((5,), dtype=jnp.float32)
+    assert nonfinite_worlds(obs, reward).tolist() == [
+        False, False, True, True, True,
+    ]
 
 
 def test_timestep_unpacks_as_the_gymnasium_five_tuple(vec_env, rng_key):
